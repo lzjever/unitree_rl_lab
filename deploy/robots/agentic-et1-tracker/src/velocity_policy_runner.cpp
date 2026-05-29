@@ -79,8 +79,8 @@ Vec projectedGravity(const LowStateSample& low_state) {
   }
   const float inv = 1.0F / norm_sq;
   return {
-      2.0F * (x * z - w * y) * inv,
-      2.0F * (y * z + w * x) * inv,
+      2.0F * (w * y - x * z) * inv,
+      -2.0F * (w * x + y * z) * inv,
       -(w * w - x * x - y * y + z * z) * inv,
   };
 }
@@ -155,6 +155,16 @@ std::vector<Vec> currentTermValues(const VelocityDeployConfig& config,
   return values;
 }
 
+Vec processedAction(const VelocityDeployConfig& config, const Vec& raw_action) {
+  Vec processed;
+  processed.reserve(kVelocityPolicyJointDim);
+  for (std::size_t i = 0; i < kVelocityPolicyJointDim; ++i) {
+    processed.push_back(raw_action.at(i) * static_cast<float>(config.action_scale.at(i)) +
+                        static_cast<float>(config.action_offset.at(i)));
+  }
+  return processed;
+}
+
 }  // namespace
 
 VelocityPolicyInputs makeVelocityPolicyInputs(const VelocityDeployConfig& config,
@@ -177,20 +187,21 @@ VelocityPolicyInputs makeVelocityPolicyInputs(const VelocityDeployConfig& config
 
 LowCmdFrame makeVelocityLowCmdFrame(const VelocityDeployConfig& config,
                                     const Vec& raw_action,
-                                    std::uint8_t expected_mode_machine) {
+                                    std::uint8_t expected_mode_machine,
+                                    const LowCmdFrame* base_frame) {
   validateConfig(config);
   requireSize("raw_action", raw_action.size(), kVelocityPolicyJointDim);
   requireFinite("raw_action", raw_action);
+  const Vec processed_action = processedAction(config, raw_action);
 
-  LowCmdFrame frame;
+  LowCmdFrame frame = base_frame == nullptr ? LowCmdFrame{} : *base_frame;
   frame.mode_machine = expected_mode_machine;
   frame.mode_pr = 0;
   for (std::size_t i = 0; i < kVelocityPolicyJointDim; ++i) {
     const std::size_t slot = sdkSlot(config, i);
     MotorCommand& motor = frame.motors.at(slot);
     motor.mode = 1;
-    motor.q = raw_action.at(i) * static_cast<float>(config.action_scale.at(i)) +
-              static_cast<float>(config.action_offset.at(i));
+    motor.q = processed_action.at(i);
     motor.dq = 0.0F;
     motor.kp = static_cast<float>(config.stiffness.at(i));
     motor.kd = static_cast<float>(config.damping.at(i));
@@ -211,7 +222,8 @@ void VelocityStepRunner::reset() {
 }
 
 VelocityStepResult VelocityStepRunner::step(const LowStateSample& low_state,
-                                            VelocityPolicyInference& policy) {
+                                            VelocityPolicyInference& policy,
+                                            const LowCmdFrame* base_frame) {
   VelocityStepResult result;
   validateConfig(config_);
   requireSize("last_action", last_action_.size(), kVelocityPolicyJointDim);
@@ -235,8 +247,12 @@ VelocityStepResult VelocityStepRunner::step(const LowStateSample& low_state,
   }
   result.inputs.obs = flattenTermMajorHistory(term_history_);
   result.raw_action = policy.infer(result.inputs);
+  requireSize("raw_action", result.raw_action.size(), kVelocityPolicyJointDim);
+  requireFinite("raw_action", result.raw_action);
+  result.processed_action = processedAction(config_, result.raw_action);
   result.low_cmd = makeVelocityLowCmdFrame(config_, result.raw_action,
-                                           expected_mode_machine_);
+                                           expected_mode_machine_,
+                                           base_frame);
   last_action_ = result.raw_action;
   return result;
 }

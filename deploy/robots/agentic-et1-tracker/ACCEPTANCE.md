@@ -24,6 +24,7 @@ fallback to the ET1 app tree:
 - GeneralTracker: `config/policy/general_tracker`
 - StandbyVelocity: `config/policy/velocity/v0`
 - FixStand posture: `config/posture/fixstand/v0/fixstand.yaml`
+- Passive posture: `config/posture/passive/v0/passive.yaml`
 
 ## Manual MuJoCo acceptance
 
@@ -40,7 +41,7 @@ Pending manual acceptance should record:
 - Operator-controlled MuJoCo rope/keyboard timing for track scenarios.
 - `/execute` with a local allowed `.trk` path only; no uploads or other formats.
 - Queue FIFO, interrupt, and stop/cancel behavior.
-- After `.trk` done or `/stop` hold, top-level `ctrl:"standby_velocity"`.
+- After `.trk` done or `/stop`, top-level `ctrl:"standby_velocity"`.
 - Fault/disconnect handling and latency/performance evidence.
 
 ## Remaining external pending

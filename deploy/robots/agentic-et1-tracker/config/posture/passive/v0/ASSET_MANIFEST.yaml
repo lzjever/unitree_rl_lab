@@ -1,0 +1,13 @@
+profile: Passive
+owner: agentic-et1-tracker
+asset_dir: config/posture/passive/v0
+purpose: release/package audit only
+runtime_use: "not a runtime fallback, downloader config, or registry"
+runtime_contract:
+  source_state: FSM.Passive
+  joint_order: ET1 motor_cmd order
+required_files:
+  - path: passive.yaml
+    sha256: "6d9871c9c8bd51c62b952fae5b2734fe6126531dcc10833722de887eb801f866"
+    size_bytes: 476
+source_notes: "numeric Passive mode/kd snapshot copied into app-owned release assets; runtime fallback to ET1 config.yaml is forbidden"

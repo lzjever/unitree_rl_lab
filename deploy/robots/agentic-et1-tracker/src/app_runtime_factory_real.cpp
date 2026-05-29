@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "agentic_et1_tracker/control/fixstand.hpp"
+#include "agentic_et1_tracker/control/passive.hpp"
 #include "agentic_et1_tracker/policy/deploy_config.hpp"
 #include "agentic_et1_tracker/policy/onnx_policy_runtime.hpp"
 #include "agentic_et1_tracker/policy/velocity_deploy_config.hpp"
@@ -86,6 +87,7 @@ AppRuntimeFactoryResult createAppRuntimeDeps(const AppConfig& config) {
     VelocityDeployConfig velocity_deploy_config =
         loadVelocityDeployConfig(config.control.velocity_deploy);
     FixStandConfig fixstand_config = loadFixStandConfig(config.control.fixstand_config);
+    PassiveConfig passive_config = loadPassiveConfig(config.control.passive_config);
 
     phase = FactoryPhase::Policy;
     const std::filesystem::path policy_model_path = modelPath(config.policy);
@@ -115,6 +117,7 @@ AppRuntimeFactoryResult createAppRuntimeDeps(const AppConfig& config) {
     deps.deploy_config = std::move(deploy_config);
     deps.velocity_deploy_config = std::move(velocity_deploy_config);
     deps.fixstand_config = std::move(fixstand_config);
+    deps.passive_config = std::move(passive_config);
     deps.startup_control = startupControl(config.control);
     deps.mode = runtimeMode(config);
 
@@ -126,6 +129,8 @@ AppRuntimeFactoryResult createAppRuntimeDeps(const AppConfig& config) {
   } catch (const VelocityDeployConfigError&) {
     return modelNotReady(config);
   } catch (const FixStandConfigError&) {
+    return modelNotReady(config);
+  } catch (const PassiveConfigError&) {
     return modelNotReady(config);
   } catch (const PolicyRuntimeError&) {
     return modelNotReady(config);

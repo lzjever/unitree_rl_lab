@@ -108,6 +108,8 @@ std::string toString(ControllerState state) {
       return "starting";
     case ControllerState::Idle:
       return "idle";
+    case ControllerState::Passive:
+      return "passive";
     case ControllerState::FixStand:
       return "fixstand";
     case ControllerState::StandbyVelocity:

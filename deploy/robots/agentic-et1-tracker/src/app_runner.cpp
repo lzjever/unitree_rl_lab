@@ -228,6 +228,7 @@ class AppRunner::Impl {
                             *deps.velocity_policy,
                             deps.velocity_deploy_config,
                             deps.fixstand_config,
+                            deps.passive_config,
                             deps.startup_control,
                             static_cast<std::uint8_t>(config_.mode_machine),
                             deps.mode);
@@ -241,6 +242,7 @@ class AppRunner::Impl {
                           *deps.robot_io,
                           *deps.policy,
                           deps.deploy_config,
+                          deps.passive_config,
                           static_cast<std::uint8_t>(config_.mode_machine),
                           deps.mode);
   }

@@ -146,4 +146,32 @@ TEST_CASE("FixStandRunner starts from current q, interpolates, then holds target
   REQUIRE(held.motors.at(34).kp == 0.0F);
 }
 
+TEST_CASE("FixStandRunner starts from base LowCmd q and preserves unmapped motors") {
+  const FixStandConfig config = minimalConfig();
+  const LowStateSample low = lowState();
+  LowCmdFrame base;
+  for (std::size_t i = 0; i < base.motors.size(); ++i) {
+    MotorCommand& motor = base.motors.at(i);
+    motor.mode = static_cast<std::uint8_t>(20 + i);
+    motor.q = 10.0F + static_cast<float>(i);
+    motor.dq = 20.0F + static_cast<float>(i);
+    motor.kp = 30.0F + static_cast<float>(i);
+    motor.kd = 40.0F + static_cast<float>(i);
+    motor.tau = 50.0F + static_cast<float>(i);
+  }
+  FixStandRunner runner(config, kExpectedModeMachine, 50.0);
+
+  const LowCmdFrame first = runner.step(low, &base);
+
+  for (std::size_t i = 0; i < kFixStandMotorCount; ++i) {
+    REQUIRE(first.motors.at(i).q == base.motors.at(i).q);
+    REQUIRE(first.motors.at(i).kp == static_cast<float>(config.kp.at(i)));
+    REQUIRE(first.motors.at(i).kd == static_cast<float>(config.kd.at(i)));
+  }
+  REQUIRE(first.motors.at(33).mode == base.motors.at(33).mode);
+  REQUIRE(first.motors.at(33).q == base.motors.at(33).q);
+  REQUIRE(first.motors.at(33).kp == base.motors.at(33).kp);
+  REQUIRE(first.motors.at(33).kd == base.motors.at(33).kd);
+}
+
 }  // namespace agentic_et1_tracker

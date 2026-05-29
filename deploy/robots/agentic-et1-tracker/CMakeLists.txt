@@ -124,6 +124,7 @@ target_link_libraries(agentic_et1_tracker_policy_io_contract
 
 add_library(agentic_et1_tracker_control
   src/fixstand.cpp
+  src/passive.cpp
 )
 
 target_compile_features(agentic_et1_tracker_control PUBLIC cxx_std_17)

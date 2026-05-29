@@ -273,6 +273,38 @@ TEST_CASE("PolicyStepRunner first step uses zero last action and emits scaled Lo
   REQUIRE(result.low_cmd.mode_machine == 7);
 }
 
+TEST_CASE("PolicyStepRunner overlays active track LowCmd on a base frame") {
+  const DeployConfig config = validConfig();
+  const TrkTrack track = makeTrack(1);
+  const LowStateSample low = liveState(config);
+  PolicyStepRunner runner(config, track, low, 7);
+  RecordingPolicy policy(seq(0.1F, kJointDim));
+
+  LowCmdFrame base;
+  base.mode_machine = 3;
+  base.motors.at(14).mode = 6;
+  base.motors.at(14).q = 42.0F;
+  base.motors.at(14).dq = -2.0F;
+  base.motors.at(14).kp = 12.0F;
+  base.motors.at(14).kd = 1.25F;
+  base.motors.at(14).tau = 0.75F;
+
+  const PolicyStepResult result = runner.step(0, low, policy, &base);
+
+  REQUIRE(result.low_cmd.mode_machine == 7);
+  REQUIRE(result.low_cmd.motors.at(14).mode == base.motors.at(14).mode);
+  REQUIRE(result.low_cmd.motors.at(14).q == base.motors.at(14).q);
+  REQUIRE(result.low_cmd.motors.at(14).dq == base.motors.at(14).dq);
+  REQUIRE(result.low_cmd.motors.at(14).kp == base.motors.at(14).kp);
+  REQUIRE(result.low_cmd.motors.at(14).kd == base.motors.at(14).kd);
+  REQUIRE(result.low_cmd.motors.at(14).tau == base.motors.at(14).tau);
+
+  const auto mapped_slot = static_cast<std::size_t>(config.sdk_joint_ids_map.at(0));
+  REQUIRE(result.low_cmd.motors.at(mapped_slot).q != base.motors.at(mapped_slot).q);
+  REQUIRE(result.low_cmd.motors.at(mapped_slot).kp ==
+          Catch::Approx(static_cast<float>(config.policy_kp.at(0))));
+}
+
 TEST_CASE("PolicyStepRunner second step feeds prior action and oldest-to-newest history") {
   const DeployConfig config = validConfig();
   const TrkTrack track = makeTrack(2);

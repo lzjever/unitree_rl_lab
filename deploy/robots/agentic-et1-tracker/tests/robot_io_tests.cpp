@@ -99,8 +99,13 @@ TEST_CASE("RobotIO mode_machine check handles missing sim and mismatched lowstat
 
   const auto sim_when_real_expected = checkModeMachine(lowState(0), 1);
   REQUIRE(sim_when_real_expected.connected);
-  REQUIRE_FALSE(sim_when_real_expected.ok);
+  REQUIRE(sim_when_real_expected.ok);
   REQUIRE(sim_when_real_expected.observed == 0);
+
+  const auto real_when_sim_expected = checkModeMachine(lowState(1), 0);
+  REQUIRE(real_when_sim_expected.connected);
+  REQUIRE_FALSE(real_when_sim_expected.ok);
+  REQUIRE(real_when_sim_expected.observed == 1);
 
   const auto mismatch = checkModeMachine(lowState(2), 1);
   REQUIRE(mismatch.connected);
@@ -125,7 +130,7 @@ TEST_CASE("RobotIO readiness maps lowstate and lowcmd occupancy to stable status
     REQUIRE(status.low_ms == 123);
   }
 
-  SECTION("simulator mode 0 passes only when simulator mode is expected") {
+  SECTION("simulator mode 0 passes when simulator mode is expected") {
     const RobotReadinessStatus status = mapRobotReadiness(lowState(0, true, 8), {}, 0);
     REQUIRE(status.robot == RobotState::Idle);
     REQUIRE(status.err == ErrorCode::Ok);
@@ -133,8 +138,16 @@ TEST_CASE("RobotIO readiness maps lowstate and lowcmd occupancy to stable status
     REQUIRE(status.low_ms == 8);
   }
 
-  SECTION("simulator mode 0 mismatches when real mode is expected") {
+  SECTION("simulator mode 0 also passes when real mode is expected") {
     const RobotReadinessStatus status = mapRobotReadiness(lowState(0, true, 8), {}, 1);
+    REQUIRE(status.robot == RobotState::Idle);
+    REQUIRE(status.err == ErrorCode::Ok);
+    REQUIRE(status.block.empty());
+    REQUIRE(status.low_ms == 8);
+  }
+
+  SECTION("real mode 1 mismatches when simulator mode is expected") {
+    const RobotReadinessStatus status = mapRobotReadiness(lowState(1, true, 8), {}, 0);
     REQUIRE(status.robot == RobotState::NotReady);
     REQUIRE(status.err == ErrorCode::RobotNotReady);
     REQUIRE(status.block == "mode_machine_mismatch");
@@ -158,6 +171,35 @@ TEST_CASE("RobotIO readiness maps lowstate and lowcmd occupancy to stable status
     REQUIRE(status.low_ms == 10);
   }
 
+  SECTION("missing lowstate with lowcmd occupied") {
+    const RobotReadinessStatus status = mapRobotReadiness(std::nullopt, {true, 3}, 1);
+
+    REQUIRE(status.robot == RobotState::NotReady);
+    REQUIRE(status.err == ErrorCode::RobotNotReady);
+    REQUIRE(status.block == "lowcmd_occupied");
+    REQUIRE_FALSE(status.low_ms.has_value());
+  }
+
+  SECTION("stale lowstate with lowcmd occupied") {
+    const RobotReadinessStatus status =
+        mapRobotReadiness(lowState(1, false, 123), {true, 3}, 1);
+
+    REQUIRE(status.robot == RobotState::NotReady);
+    REQUIRE(status.err == ErrorCode::RobotNotReady);
+    REQUIRE(status.block == "lowcmd_occupied");
+    REQUIRE(status.low_ms == 123);
+  }
+
+  SECTION("mode mismatch with lowcmd occupied") {
+    const RobotReadinessStatus status =
+        mapRobotReadiness(lowState(2, true, 13), {true, 3}, 1);
+
+    REQUIRE(status.robot == RobotState::NotReady);
+    REQUIRE(status.err == ErrorCode::RobotNotReady);
+    REQUIRE(status.block == "lowcmd_occupied");
+    REQUIRE(status.low_ms == 13);
+  }
+
   SECTION("bad orientation") {
     LowStateSample low = lowState(1, true, 11);
     low.quat_wxyz = {0.70710677F, 0.70710677F, 0.0F, 0.0F};
@@ -168,6 +210,18 @@ TEST_CASE("RobotIO readiness maps lowstate and lowcmd occupancy to stable status
     REQUIRE(status.err == ErrorCode::RobotBadOrientation);
     REQUIRE(status.block == "bad_orientation");
     REQUIRE(status.low_ms == 11);
+  }
+
+  SECTION("lowcmd occupancy overrides bad orientation") {
+    LowStateSample low = lowState(1, true, 12);
+    low.quat_wxyz = {0.70710677F, 0.70710677F, 0.0F, 0.0F};
+
+    const RobotReadinessStatus status = mapRobotReadiness(low, {true, 8}, 1);
+
+    REQUIRE(status.robot == RobotState::NotReady);
+    REQUIRE(status.err == ErrorCode::RobotNotReady);
+    REQUIRE(status.block == "lowcmd_occupied");
+    REQUIRE(status.low_ms == 12);
   }
 
   SECTION("good lowstate") {

@@ -254,6 +254,9 @@ AppConfig loadAppConfig(const std::filesystem::path& path) {
       throw error("mode_machine must be 0 or 1");
     }
     config.stop_hold_s = optionalNonNegativeDouble(section, "stop_hold_s", config.stop_hold_s);
+    if (config.stop_hold_s != 0.0) {
+      throw error("stop_hold_s must be 0.0");
+    }
     config.runtime.stop_hold_s = config.stop_hold_s;
     config.idle_mode = optionalString(section, "idle_mode", config.idle_mode);
     if (config.idle_mode != kIdleModeHoldCurrent) {
@@ -266,7 +269,6 @@ AppConfig loadAppConfig(const std::filesystem::path& path) {
         optionalPositiveSize(section, "queue_limit", config.runtime.queue_limit);
     config.runtime.recent_limit =
         optionalPositiveSize(section, "recent_limit", config.runtime.recent_limit);
-    const bool has_runtime_hz = static_cast<bool>(section["hz"]);
     config.runtime.hz = optionalRuntimeRate(section, "hz", config.runtime.hz);
 
     config.trk.allowlist_dirs = requiredMotionDirs(section);
@@ -305,6 +307,8 @@ AppConfig loadAppConfig(const std::filesystem::path& path) {
           optionalString(control, "velocity_deploy", config.control.velocity_deploy);
       config.control.fixstand_config =
           optionalString(control, "fixstand_config", config.control.fixstand_config);
+      config.control.passive_config =
+          optionalString(control, "passive_config", config.control.passive_config);
     }
     if (config.control.startup_control != kStartupFixStand &&
         config.control.startup_control != kStartupStandbyVelocity) {
@@ -328,15 +332,14 @@ AppConfig loadAppConfig(const std::filesystem::path& path) {
     config.control.fixstand_config =
         resolveConfigPath("control.fixstand_config", config.control.fixstand_config,
                           config_dir);
+    config.control.passive_config =
+        resolveConfigPath("control.passive_config", config.control.passive_config,
+                          config_dir);
     validateDeployPath(config.control.velocity_policy_dir, config.control.velocity_deploy);
     validatePolicyModelPath("control velocity model", config.control.velocity_policy_dir,
                             config.control.velocity_policy_file);
 
     config.trk.fps = config.policy.fps;
-    if (!has_runtime_hz) {
-      config.runtime.hz = config.policy.fps;
-    }
-
     return config;
   } catch (const ConfigError&) {
     throw;

@@ -66,7 +66,8 @@ void PolicyStepRunner::reset(const LowStateSample& entry_low_state) {
 
 PolicyStepResult PolicyStepRunner::step(std::size_t frame_index,
                                         const LowStateSample& low_state,
-                                        PolicyInference& policy) {
+                                        PolicyInference& policy,
+                                        const LowCmdFrame* base_frame) {
   try {
     const TrkFrameView frame = requireFrame(track_, frame_index);
     const PolicyObservationParts parts =
@@ -86,7 +87,7 @@ PolicyStepResult PolicyStepRunner::step(std::size_t frame_index,
     const Vec raw_action = policy.infer(result.inputs);
     result.output = scaleAction(config_, raw_action);
     result.low_cmd =
-        makeLowCmdFrame(config_, result.output, expected_mode_machine_);
+        makeLowCmdFrame(config_, result.output, expected_mode_machine_, base_frame);
 
     history_ = std::move(next_history);
     history_ready_ = true;

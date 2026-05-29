@@ -411,6 +411,13 @@ FixStandConfig fixStandConfig() {
   return config;
 }
 
+PassiveConfig passiveConfig() {
+  PassiveConfig config;
+  config.mode = std::vector<int>(kFixStandMotorCount, 1);
+  config.kd = std::vector<double>(kFixStandMotorCount, 0.5);
+  return config;
+}
+
 AppRuntimeDeps makeDeps(FakeRobotIO*& robot,
                         FakePolicy*& policy,
                         std::uint8_t mode_machine = kExpectedModeMachine,
@@ -432,6 +439,7 @@ AppRuntimeDeps makeDeps(FakeRobotIO*& robot,
   deps.deploy_config = config;
   deps.velocity_deploy_config = velocityDeployConfig();
   deps.fixstand_config = fixStandConfig();
+  deps.passive_config = passiveConfig();
   deps.startup_control = ControlMode::FixStand;
   deps.mode = mode;
   return deps;
@@ -710,6 +718,8 @@ TEST_CASE("HTTP execute reaches RuntimeControlLoop policy write") {
     return json.at("ready") == true;
   });
 
+  body(client.Post("/standby_velocity", "", "application/json"), 200);
+
   const auto execute =
       body(client.Post("/execute",
                        (std::string(R"({"path":")") + path.string() + R"("})").c_str(),
@@ -742,6 +752,8 @@ TEST_CASE("AppRunner passes sim mode_machine through to RuntimeControlLoop LowCm
   pollJson(client, "/status", [](const nlohmann::json& json) {
     return json.at("ready") == true;
   });
+
+  body(client.Post("/standby_velocity", "", "application/json"), 200);
 
   const auto execute =
       body(client.Post("/execute",

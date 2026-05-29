@@ -320,6 +320,13 @@ class UnusedPolicy final : public PolicyInference {
   Vec infer(const PolicyInputs&) override { return Vec(kPolicyJointDim, 0.0F); }
 };
 
+PassiveConfig passiveConfig() {
+  PassiveConfig config;
+  config.mode = std::vector<int>(kFixStandMotorCount, 1);
+  config.kd = std::vector<double>(kFixStandMotorCount, 0.5);
+  return config;
+}
+
 AppRuntimeDeps makeTimestampDeps(TimestampRobotIO*& robot) {
   const DeployConfig deploy_config = minimalDeployConfig();
   auto robot_owner = std::make_unique<TimestampRobotIO>(readyLowState(deploy_config));
@@ -329,6 +336,7 @@ AppRuntimeDeps makeTimestampDeps(TimestampRobotIO*& robot) {
   deps.robot_io = std::move(robot_owner);
   deps.policy = std::make_unique<UnusedPolicy>();
   deps.deploy_config = deploy_config;
+  deps.passive_config = passiveConfig();
   deps.mode = RuntimeMode::Sim;
   return deps;
 }

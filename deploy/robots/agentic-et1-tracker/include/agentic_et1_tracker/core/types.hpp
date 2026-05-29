@@ -67,6 +67,7 @@ enum class RuntimeMode {
 enum class ControllerState {
   Starting,
   Idle,
+  Passive,
   FixStand,
   StandbyVelocity,
   Preparing,

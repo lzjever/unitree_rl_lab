@@ -105,11 +105,13 @@ RobotReadinessStatus mapRobotReadiness(const std::optional<LowStateSample>& low_
 
 LowCmdFrame makeLowCmdFrame(const DeployConfig& config,
                             const PolicyOutput& output,
-                            std::uint8_t expected_mode_machine);
+                            std::uint8_t expected_mode_machine,
+                            const LowCmdFrame* base_frame = nullptr);
 
 LowCmdFrame makeLowCmdFrame(const std::vector<int>& sdk_joint_ids_map,
                             const PolicyOutput& output,
-                            std::uint8_t expected_mode_machine);
+                            std::uint8_t expected_mode_machine,
+                            const LowCmdFrame* base_frame = nullptr);
 
 LowCmdFrame makeHoldLowCmdFrame(const DeployConfig& config,
                                 const LowStateSample& low_state,

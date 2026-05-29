@@ -9,7 +9,7 @@ agentic_et1_tracker:
   queue_limit: 8
   recent_limit: 32
   max_track_duration_s: 120
-  stop_hold_s: 0.5
+  stop_hold_s: 0.0
   idle_mode: "hold_current"
   policy:
     profile: "GeneralTracker"
@@ -23,3 +23,4 @@ agentic_et1_tracker:
     velocity_policy_file: "policy.onnx"
     velocity_deploy: "config/policy/velocity/v0/params/deploy.yaml"
     fixstand_config: "config/posture/fixstand/v0/fixstand.yaml"
+    passive_config: "config/posture/passive/v0/passive.yaml"

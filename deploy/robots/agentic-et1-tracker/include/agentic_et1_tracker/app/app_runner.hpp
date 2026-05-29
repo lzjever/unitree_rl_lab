@@ -5,6 +5,7 @@
 
 #include "agentic_et1_tracker/app/app_config.hpp"
 #include "agentic_et1_tracker/control/fixstand.hpp"
+#include "agentic_et1_tracker/control/passive.hpp"
 #include "agentic_et1_tracker/policy/deploy_config.hpp"
 #include "agentic_et1_tracker/policy/policy_step_runner.hpp"
 #include "agentic_et1_tracker/policy/velocity_deploy_config.hpp"
@@ -20,6 +21,7 @@ struct AppRuntimeDeps {
   DeployConfig deploy_config;
   VelocityDeployConfig velocity_deploy_config;
   FixStandConfig fixstand_config;
+  PassiveConfig passive_config;
   ControlMode startup_control{ControlMode::FixStand};
   RuntimeMode mode{RuntimeMode::Sim};
 };

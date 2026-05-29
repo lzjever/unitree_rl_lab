@@ -105,8 +105,8 @@ agentic_et1_tracker:
   REQUIRE(config.http.thread_pool_size == kHttpServerDefaultThreadPoolSize);
   REQUIRE(config.runtime.queue_limit == 8);
   REQUIRE(config.runtime.recent_limit == 32);
-  REQUIRE(config.runtime.hz == 50.0);
-  REQUIRE(config.runtime.stop_hold_s == 0.5);
+  REQUIRE(config.runtime.hz == 1000.0);
+  REQUIRE(config.runtime.stop_hold_s == 0.0);
   REQUIRE(config.trk.fps == 50.0);
   REQUIRE(config.trk.max_duration_s == 120.0);
   REQUIRE(config.trk.allowlist_dirs == std::vector<std::filesystem::path>{"/home/galbot/motions"});
@@ -132,9 +132,13 @@ agentic_et1_tracker:
           (config_dir / "config/posture/fixstand/v0/fixstand.yaml")
               .lexically_normal()
               .string());
+  REQUIRE(config.control.passive_config ==
+          (config_dir / "config/posture/passive/v0/passive.yaml")
+              .lexically_normal()
+              .string());
 }
 
-TEST_CASE("AppConfig default file keeps StandbyVelocity and FixStand app-owned") {
+TEST_CASE("AppConfig default file keeps StandbyVelocity and posture assets app-owned") {
   const auto root = appRoot();
   const auto config = loadAppConfig(root / "config.yaml");
 
@@ -147,7 +151,11 @@ TEST_CASE("AppConfig default file keeps StandbyVelocity and FixStand app-owned")
               .string());
   REQUIRE(pathIsAtOrWithin(config.control.fixstand_config,
                            root / "config/posture/fixstand/v0"));
+  REQUIRE(pathIsAtOrWithin(config.control.passive_config,
+                           root / "config/posture/passive/v0"));
   REQUIRE(config.control.startup_control == "FixStand");
+  REQUIRE(config.stop_hold_s == 0.0);
+  REQUIRE(config.runtime.stop_hold_s == 0.0);
 }
 
 TEST_CASE("AppConfig maps complete PRD YAML into component configs") {
@@ -164,7 +172,7 @@ agentic_et1_tracker:
   queue_limit: 3
   recent_limit: 9
   max_track_duration_s: 42.5
-  stop_hold_s: 0.25
+  stop_hold_s: 0.0
   idle_mode: "hold_current"
   lock_path: "/tmp/agentic-et1-tracker-test.lock"
   policy:
@@ -179,6 +187,7 @@ agentic_et1_tracker:
     velocity_policy_file: "standby.onnx"
     velocity_deploy: "config/policy/velocity/custom/params/deploy.yaml"
     fixstand_config: "config/posture/fixstand/custom/fixstand.yaml"
+    passive_config: "config/posture/passive/custom/passive.yaml"
 )yaml");
   const auto config = tmp.load();
   const auto config_dir = tmp.path.parent_path();
@@ -187,8 +196,8 @@ agentic_et1_tracker:
   REQUIRE(config.http.port == 18080);
   REQUIRE(config.runtime.queue_limit == 3);
   REQUIRE(config.runtime.recent_limit == 9);
-  REQUIRE(config.runtime.hz == 60.0);
-  REQUIRE(config.runtime.stop_hold_s == 0.25);
+  REQUIRE(config.runtime.hz == 1000.0);
+  REQUIRE(config.runtime.stop_hold_s == 0.0);
   REQUIRE(config.trk.allowlist_dirs ==
           std::vector<std::filesystem::path>{"/srv/motions/a", "/srv/motions/b"});
   REQUIRE(config.trk.max_duration_s == 42.5);
@@ -196,7 +205,7 @@ agentic_et1_tracker:
   REQUIRE(config.network == "eth0");
   REQUIRE(config.domain_id == 7);
   REQUIRE(config.mode_machine == 0);
-  REQUIRE(config.stop_hold_s == 0.25);
+  REQUIRE(config.stop_hold_s == 0.0);
   REQUIRE(config.idle_mode == "hold_current");
   REQUIRE(config.lock_path == "/tmp/agentic-et1-tracker-test.lock");
   REQUIRE(config.policy.policy_dir ==
@@ -216,6 +225,10 @@ agentic_et1_tracker:
               .string());
   REQUIRE(config.control.fixstand_config ==
           (config_dir / "config/posture/fixstand/custom/fixstand.yaml")
+              .lexically_normal()
+              .string());
+  REQUIRE(config.control.passive_config ==
+          (config_dir / "config/posture/passive/custom/passive.yaml")
               .lexically_normal()
               .string());
 }
@@ -559,6 +572,16 @@ agentic_et1_tracker:
 )yaml"),
                         ContainsSubstring("ET1"));
   }
+
+  SECTION("passive_config") {
+    REQUIRE_THROWS_WITH(loadYaml(R"yaml(
+agentic_et1_tracker:
+  motion_dirs: ["/tmp/motions"]
+  control:
+    passive_config: "/home/galbot/works/et1/unitree_rl_lab/deploy/robots/et1/config/config.yaml"
+)yaml"),
+                        ContainsSubstring("ET1"));
+  }
 }
 
 TEST_CASE("AppConfig rejects policy paths that symlink into the ET1 app policy tree") {
@@ -688,6 +711,16 @@ agentic_et1_tracker:
 )yaml"),
                         ContainsSubstring("ET1"));
   }
+
+  SECTION("passive_config") {
+    REQUIRE_THROWS_WITH(tmp.load(R"yaml(
+agentic_et1_tracker:
+  motion_dirs: ["/tmp/motions"]
+  control:
+    passive_config: "fixstand_link.yaml"
+)yaml"),
+                        ContainsSubstring("ET1"));
+  }
 }
 
 TEST_CASE("AppConfig rejects unsupported GA mode fields") {
@@ -734,6 +767,15 @@ agentic_et1_tracker:
   idle_mode: "zero_torque"
 )yaml"),
                         ContainsSubstring("idle_mode"));
+  }
+
+  SECTION("stop_hold_s must stay disabled") {
+    REQUIRE_THROWS_WITH(loadYaml(R"yaml(
+agentic_et1_tracker:
+  motion_dirs: ["/tmp/motions"]
+  stop_hold_s: 0.01
+)yaml"),
+                        ContainsSubstring("stop_hold_s"));
   }
 }
 

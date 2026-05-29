@@ -42,7 +42,8 @@ class PolicyStepRunner {
 
   PolicyStepResult step(std::size_t frame_index,
                         const LowStateSample& low_state,
-                        PolicyInference& policy);
+                        PolicyInference& policy,
+                        const LowCmdFrame* base_frame = nullptr);
 
  private:
   DeployConfig config_;

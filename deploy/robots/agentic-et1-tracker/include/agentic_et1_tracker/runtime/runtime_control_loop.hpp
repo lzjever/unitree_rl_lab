@@ -9,6 +9,7 @@
 #include "agentic_et1_tracker/core/command_mailbox.hpp"
 #include "agentic_et1_tracker/core/types.hpp"
 #include "agentic_et1_tracker/control/fixstand.hpp"
+#include "agentic_et1_tracker/control/passive.hpp"
 #include "agentic_et1_tracker/policy/policy_step_runner.hpp"
 #include "agentic_et1_tracker/policy/velocity_policy_runner.hpp"
 #include "agentic_et1_tracker/runtime/runtime_bridge.hpp"
@@ -17,6 +18,24 @@
 #include "agentic_et1_tracker/trk/loader.hpp"
 
 namespace agentic_et1_tracker {
+
+enum class RuntimeInternalState {
+  Passive,
+  FixStand,
+  Velocity,
+  GeneralTrackerIdle,
+  GeneralTrackerActive,
+  Stopping,
+  Fault,
+};
+
+enum class RuntimeInternalEvent {
+  FixStand,
+  Velocity,
+  MotionRequest,
+  SafetyPassive,
+  Fault,
+};
 
 class RuntimeControlLoop final {
  public:
@@ -31,6 +50,7 @@ class RuntimeControlLoop final {
                      RobotIO& robot_io,
                      PolicyInference& policy,
                      DeployConfig deploy_config,
+                     PassiveConfig passive_config,
                      std::uint8_t expected_mode_machine,
                      RuntimeMode mode = RuntimeMode::Real);
   RuntimeControlLoop(RuntimeConfig config,
@@ -43,11 +63,13 @@ class RuntimeControlLoop final {
                      VelocityPolicyInference& velocity_policy,
                      VelocityDeployConfig velocity_deploy_config,
                      FixStandConfig fixstand_config,
+                     PassiveConfig passive_config,
                      ControlMode startup_control,
                      std::uint8_t expected_mode_machine,
                      RuntimeMode mode = RuntimeMode::Real);
 
   void tick();
+  RuntimeInternalState internalStateForTest() const;
 
  private:
   struct SnapshotRuntimeState {
@@ -65,21 +87,43 @@ class RuntimeControlLoop final {
   void handleInterrupt(MotionRequest request);
   void cancelWaiting(StopReason reason);
   void cancelWaiting(StopReason reason, std::uint64_t sequence);
+  ControllerState controllerStateForInternal(RuntimeInternalState state) const;
+  void enterInternalState(RuntimeInternalState state);
+  void handleInternalEvent(RuntimeInternalEvent event);
+  void enterPassiveState(const RobotReadinessStatus& readiness);
+  void enterFixStandState();
+  void enterVelocityState();
+  void enterGeneralTrackerIdleState();
+  void enterTrackPreparingState();
+  void enterTrackActiveState();
+  bool isMotionAcceptingState() const;
+  bool isControlPublishingState() const;
+  void runPassiveState();
   void startNext();
   void completePreparing();
   void advanceActive();
   void advanceActiveWithPolicy();
   void publishIdleHoldIfReady();
   void publishControlIfReady();
+  bool writePassiveDamping();
   bool writeFixStand();
   bool writeStandbyVelocity();
   bool writeStoppingHold();
+  bool republishLowCmdBuffer();
+  void applyGeneralTrackerIdleHold(LowCmdFrame& frame) const;
+  const LowCmdFrame* lowCmdBaseFrame() const;
+  void writeLowCmdFrame(const LowCmdFrame& frame);
   void markActiveStopping(StopReason reason);
   void completeStoppingActive(MotionState state, ErrorCode error);
   std::optional<MotionRequest> finishActive(MotionState state,
                                             StopReason reason,
                                             ErrorCode error);
   void enterStopping(StopReason reason);
+  std::size_t ticksForPeriod(double seconds) const;
+  std::size_t ticksForRate(double rate_hz) const;
+  bool consumeStepDue(std::size_t& ticks_until_next, std::size_t interval_ticks);
+  std::size_t velocityPolicyIntervalTicks() const;
+  std::size_t activePolicyIntervalTicks() const;
   std::size_t stopHoldTicks() const;
   void publishActive();
   void publishSnapshot();
@@ -111,6 +155,7 @@ class RuntimeControlLoop final {
   VelocityPolicyInference* velocity_policy_{nullptr};
   std::optional<VelocityDeployConfig> velocity_deploy_config_;
   std::optional<FixStandConfig> fixstand_config_;
+  std::optional<PassiveConfig> passive_config_;
   std::optional<FixStandRunner> fixstand_runner_;
   std::optional<VelocityStepRunner> velocity_runner_;
   std::uint8_t expected_mode_machine_{0};
@@ -119,12 +164,16 @@ class RuntimeControlLoop final {
   std::optional<MotionRequest> active_;
   std::optional<PolicyStepRunner> policy_runner_;
   SnapshotRuntimeState runtime_state_;
+  RuntimeInternalState fsm_state_{RuntimeInternalState::GeneralTrackerIdle};
   ControllerState ctrl_{ControllerState::Idle};
   StopReason stop_reason_{StopReason::None};
   bool stop_to_idle_pending_{false};
   ControlMode post_stop_control_{ControlMode::StandbyVelocity};
   bool active_first_advance_{false};
   std::size_t stopping_hold_ticks_remaining_{0};
+  std::size_t active_policy_ticks_until_next_{0};
+  std::size_t velocity_policy_ticks_until_next_{0};
+  std::optional<LowCmdFrame> lowcmd_buffer_;
 };
 
 }  // namespace agentic_et1_tracker

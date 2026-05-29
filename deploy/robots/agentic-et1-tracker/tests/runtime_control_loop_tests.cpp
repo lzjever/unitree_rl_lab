@@ -9,7 +9,6 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -17,6 +16,7 @@
 #include "agentic_et1_tracker/runtime/runtime_control_loop.hpp"
 #include "agentic_et1_tracker/runtime/runtime_status_store.hpp"
 #include "agentic_et1_tracker/control/fixstand.hpp"
+#include "agentic_et1_tracker/control/passive.hpp"
 #include "agentic_et1_tracker/policy/velocity_deploy_config.hpp"
 #include "agentic_et1_tracker/policy/velocity_policy_runner.hpp"
 #include "agentic_et1_tracker/trk/schema.hpp"
@@ -389,6 +389,23 @@ FixStandConfig fixStandConfig() {
   return config;
 }
 
+PassiveConfig passiveConfig() {
+  PassiveConfig config;
+  config.mode = std::vector<int>(kFixStandMotorCount, 1);
+  config.kd = doubleSeq(3.25, 0.25, kFixStandMotorCount);
+  config.mode.at(14) = 0;
+  config.mode.at(31) = 0;
+  config.mode.at(32) = 0;
+  config.kd.at(14) = 0.0;
+  config.kd.at(31) = 0.0;
+  config.kd.at(32) = 0.0;
+  return config;
+}
+
+std::filesystem::path appRoot() {
+  return std::filesystem::path(__FILE__).parent_path().parent_path();
+}
+
 ExecuteCommand executeCommand(std::string id,
                               const std::filesystem::path& path,
                               MotionMode mode = MotionMode::Queue,
@@ -417,7 +434,8 @@ RuntimeControlLoop makePolicyLoop(RuntimeConfig config,
                                   const TrkValidationConfig& trk_config,
                                   FakeRobotIO& robot,
                                   FakePolicy& policy,
-                                  DeployConfig deploy_config = deployConfig()) {
+                                  DeployConfig deploy_config = deployConfig(),
+                                  PassiveConfig passive_config = passiveConfig()) {
   return RuntimeControlLoop(config,
                             bridge,
                             store,
@@ -425,6 +443,7 @@ RuntimeControlLoop makePolicyLoop(RuntimeConfig config,
                             robot,
                             policy,
                             std::move(deploy_config),
+                            std::move(passive_config),
                             kExpectedModeMachine,
                             RuntimeMode::Real);
 }
@@ -440,7 +459,8 @@ RuntimeControlLoop makeControlLoop(RuntimeConfig config,
                                    VelocityDeployConfig velocity_deploy_config =
                                        velocityDeployConfig(),
                                    FixStandConfig fixstand_config = fixStandConfig(),
-                                   ControlMode startup_control = ControlMode::FixStand) {
+                                   ControlMode startup_control = ControlMode::FixStand,
+                                   PassiveConfig passive_config = passiveConfig()) {
   return RuntimeControlLoop(config,
                             bridge,
                             store,
@@ -451,6 +471,7 @@ RuntimeControlLoop makeControlLoop(RuntimeConfig config,
                             velocity_policy,
                             std::move(velocity_deploy_config),
                             std::move(fixstand_config),
+                            std::move(passive_config),
                             startup_control,
                             kExpectedModeMachine,
                             RuntimeMode::Real);
@@ -513,6 +534,48 @@ void requireVelocityFrame(const LowCmdFrame& frame,
   }
 }
 
+void requireMotorPreserved(const LowCmdFrame& frame,
+                           const LowCmdFrame& base,
+                           std::size_t sdk_slot) {
+  REQUIRE(frame.motors.at(sdk_slot).mode == base.motors.at(sdk_slot).mode);
+  REQUIRE(frame.motors.at(sdk_slot).q == base.motors.at(sdk_slot).q);
+  REQUIRE(frame.motors.at(sdk_slot).dq == base.motors.at(sdk_slot).dq);
+  REQUIRE(frame.motors.at(sdk_slot).kp == base.motors.at(sdk_slot).kp);
+  REQUIRE(frame.motors.at(sdk_slot).kd == base.motors.at(sdk_slot).kd);
+  REQUIRE(frame.motors.at(sdk_slot).tau == base.motors.at(sdk_slot).tau);
+}
+
+void requirePassiveDampingFrame(const LowCmdFrame& frame,
+                                const LowStateSample& low_state,
+                                const PassiveConfig& passive_config) {
+  REQUIRE(frame.mode_machine == kExpectedModeMachine);
+  REQUIRE(frame.mode_pr == 0);
+  for (std::size_t i : {std::size_t{0}, std::size_t{14}, std::size_t{29},
+                        std::size_t{30}, std::size_t{31}}) {
+    REQUIRE(frame.motors.at(i).mode ==
+            static_cast<std::uint8_t>(passive_config.mode.at(i)));
+    REQUIRE(frame.motors.at(i).q == low_state.motors.at(i).q);
+    REQUIRE(frame.motors.at(i).dq == 0.0F);
+    REQUIRE(frame.motors.at(i).kp == 0.0F);
+    REQUIRE(frame.motors.at(i).kd == static_cast<float>(passive_config.kd.at(i)));
+    REQUIRE(frame.motors.at(i).tau == 0.0F);
+  }
+}
+
+void requireFixStandHoldMotor(const LowCmdFrame& frame,
+                              const FixStandConfig& config,
+                              std::size_t sdk_slot) {
+  REQUIRE(frame.motors.at(sdk_slot).mode == 1);
+  REQUIRE(frame.motors.at(sdk_slot).q ==
+          static_cast<float>(config.target_q.at(sdk_slot)));
+  REQUIRE(frame.motors.at(sdk_slot).dq == 0.0F);
+  REQUIRE(frame.motors.at(sdk_slot).kp ==
+          static_cast<float>(config.kp.at(sdk_slot)));
+  REQUIRE(frame.motors.at(sdk_slot).kd ==
+          static_cast<float>(config.kd.at(sdk_slot)));
+  REQUIRE(frame.motors.at(sdk_slot).tau == 0.0F);
+}
+
 void startQueuedRun(RuntimeControlLoop& loop,
                     RuntimeStatusStore& store,
                     const std::string& id) {
@@ -527,6 +590,40 @@ void startQueuedRun(RuntimeControlLoop& loop,
   REQUIRE(snapshot.ctrl == ControllerState::Running);
   REQUIRE(snapshot.exec.has_value());
   REQUIRE(snapshot.exec->id == id);
+}
+
+TEST_CASE("PassiveConfig loads app-owned ET1 passive damping asset") {
+  const PassiveConfig config =
+      loadPassiveConfig(appRoot() / "config/posture/passive/v0/passive.yaml");
+
+  REQUIRE(config.mode.size() == kFixStandMotorCount);
+  REQUIRE(config.kd.size() == kFixStandMotorCount);
+  REQUIRE(config.mode.at(0) == 1);
+  REQUIRE(config.kd.at(0) == 8.0);
+  REQUIRE(config.mode.at(14) == 0);
+  REQUIRE(config.kd.at(14) == 0.0);
+  REQUIRE(config.mode.at(30) == 1);
+  REQUIRE(config.kd.at(30) == 0.5);
+  REQUIRE(config.mode.at(31) == 0);
+  REQUIRE(config.kd.at(31) == 0.0);
+
+  const LowStateSample low_state = readyLowState(deployConfig());
+  const LowCmdFrame frame =
+      makePassiveLowCmdFrame(config, low_state, kExpectedModeMachine);
+
+  REQUIRE(frame.mode_machine == kExpectedModeMachine);
+  REQUIRE(frame.mode_pr == 0);
+  REQUIRE(frame.motors.at(0).mode == 1);
+  REQUIRE(frame.motors.at(0).q == low_state.motors.at(0).q);
+  REQUIRE(frame.motors.at(0).dq == 0.0F);
+  REQUIRE(frame.motors.at(0).kp == 0.0F);
+  REQUIRE(frame.motors.at(0).kd == 8.0F);
+  REQUIRE(frame.motors.at(0).tau == 0.0F);
+  REQUIRE(frame.motors.at(14).mode == 0);
+  REQUIRE(frame.motors.at(14).q == low_state.motors.at(14).q);
+  REQUIRE(frame.motors.at(14).kd == 0.0F);
+  REQUIRE(frame.motors.at(30).mode == 1);
+  REQUIRE(frame.motors.at(30).kd == 0.5F);
 }
 
 }  // namespace
@@ -568,18 +665,18 @@ TEST_CASE("RuntimeControlLoop loads queued trk and publishes deterministic progr
   REQUIRE(snapshot.exec->time_s == 0.0);
   REQUIRE(snapshot.exec->progress == 1.0 / 3.0);
 
-  std::this_thread::sleep_for(std::chrono::milliseconds(45));
+  for (int i = 0; i < 3; ++i) {
+    loop.tick();
+    snapshot = store.snapshot();
+    REQUIRE(snapshot.exec->frame == 0);
+  }
   loop.tick();
   snapshot = store.snapshot();
   REQUIRE(snapshot.exec->frame == 1);
   REQUIRE(snapshot.exec->time_s == 0.04);
   REQUIRE(snapshot.exec->progress == 2.0 / 3.0);
 
-  for (int i = 0; i < 20; ++i) {
-    if (!store.snapshot().exec.has_value()) {
-      break;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+  for (int i = 0; i < 4; ++i) {
     loop.tick();
   }
   requireIdle(store);
@@ -637,7 +734,8 @@ TEST_CASE("RuntimeControlLoop policy mode refreshes idle readiness without queue
     loop.tick();
 
     const auto snapshot = store.snapshot();
-    REQUIRE(snapshot.ctrl == ControllerState::Idle);
+    REQUIRE(snapshot.ctrl ==
+            (expected_ready ? ControllerState::Idle : ControllerState::Passive));
     REQUIRE(snapshot.ready == expected_ready);
     REQUIRE(snapshot.robot == expected_robot);
     REQUIRE(snapshot.err == expected_err);
@@ -688,7 +786,7 @@ TEST_CASE("RuntimeControlLoop policy mode refreshes idle readiness without queue
   }
 }
 
-TEST_CASE("RuntimeControlLoop policy idle readiness faults on bad orientation and lowcmd occupancy") {
+TEST_CASE("RuntimeControlLoop policy idle readiness maps safety sink and LowCmd occupancy") {
   TempTree tmp;
   const RuntimeConfig config = runtimeConfig();
   const DeployConfig deploy_config = deployConfig();
@@ -697,6 +795,8 @@ TEST_CASE("RuntimeControlLoop policy idle readiness faults on bad orientation an
     const char* id;
     LowStateSample low_state;
     LowCmdOccupancy occupancy;
+    RuntimeInternalState expected_fsm;
+    ControllerState expected_ctrl;
     ErrorCode err;
     RobotState robot;
     std::string block;
@@ -706,12 +806,16 @@ TEST_CASE("RuntimeControlLoop policy idle readiness faults on bad orientation an
       {"idle-bad-orientation",
        badOrientationLowState(deploy_config, 61),
        {},
+       RuntimeInternalState::Passive,
+       ControllerState::Passive,
        ErrorCode::RobotBadOrientation,
        RobotState::Fault,
        "bad_orientation"},
       {"idle-lowcmd-occupied",
        readyLowState(deploy_config, kExpectedModeMachine, true, 62),
        {true, 3},
+       RuntimeInternalState::Fault,
+       ControllerState::Fault,
        ErrorCode::RobotNotReady,
        RobotState::NotReady,
        "lowcmd_occupied"},
@@ -729,7 +833,8 @@ TEST_CASE("RuntimeControlLoop policy idle readiness faults on bad orientation an
     loop.tick();
 
     const auto snapshot = store.snapshot();
-    REQUIRE(snapshot.ctrl == ControllerState::Fault);
+    REQUIRE(loop.internalStateForTest() == item.expected_fsm);
+    REQUIRE(snapshot.ctrl == item.expected_ctrl);
     REQUIRE_FALSE(snapshot.ready);
     REQUIRE(snapshot.robot == item.robot);
     REQUIRE(snapshot.err == item.err);
@@ -851,7 +956,7 @@ TEST_CASE("RuntimeControlLoop start gate keeps queued work when robot is not rea
   loop.tick();
 
   const auto snapshot = store.snapshot();
-  REQUIRE(snapshot.ctrl == ControllerState::Idle);
+  REQUIRE(snapshot.ctrl == ControllerState::Passive);
   REQUIRE_FALSE(snapshot.ready);
   REQUIRE(snapshot.robot == RobotState::NotReady);
   REQUIRE(snapshot.err == ErrorCode::RobotNotReady);
@@ -890,7 +995,7 @@ TEST_CASE("RuntimeControlLoop preparing gate keeps queued work when robot become
   loop.tick();
 
   snapshot = store.snapshot();
-  REQUIRE(snapshot.ctrl == ControllerState::Idle);
+  REQUIRE(snapshot.ctrl == ControllerState::Passive);
   REQUIRE_FALSE(snapshot.ready);
   REQUIRE(snapshot.robot == RobotState::NotReady);
   REQUIRE(snapshot.err == ErrorCode::RobotNotReady);
@@ -906,25 +1011,20 @@ TEST_CASE("RuntimeControlLoop preparing gate keeps queued work when robot become
   robot.low_state = readyLowState(deploy_config, kExpectedModeMachine, true, 23);
   loop.tick();
   snapshot = store.snapshot();
-  REQUIRE(snapshot.ctrl == ControllerState::Preparing);
-  REQUIRE(snapshot.exec.has_value());
-  REQUIRE(snapshot.exec->id == "prep-stale");
-  REQUIRE(snapshot.queue.ids.empty());
-
-  loop.tick();
-  snapshot = store.snapshot();
-  REQUIRE(snapshot.ctrl == ControllerState::Running);
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Passive);
+  REQUIRE(snapshot.ctrl == ControllerState::Passive);
   REQUIRE(snapshot.ready);
   REQUIRE(snapshot.err == ErrorCode::Ok);
   REQUIRE(snapshot.block.empty());
-  REQUIRE(snapshot.exec.has_value());
-  REQUIRE(snapshot.exec->id == "prep-stale");
-  REQUIRE(snapshot.exec->state == MotionState::Running);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.queue.ids == std::vector<std::string>{"prep-stale"});
+  REQUIRE(store.findRun("prep-stale").run->state == MotionState::Queued);
   REQUIRE(policy.calls == 0);
-  REQUIRE(robot.write_attempts == 0);
+  REQUIRE(robot.write_attempts == 1);
+  requirePassiveDampingFrame(robot.writes.back(), *robot.low_state, passiveConfig());
 }
 
-TEST_CASE("RuntimeControlLoop policy start gate faults on bad orientation and lowcmd occupancy") {
+TEST_CASE("RuntimeControlLoop policy start gate enters Passive except LowCmd occupancy") {
   TempTree tmp;
   const RuntimeConfig config = runtimeConfig();
   const DeployConfig deploy_config = deployConfig();
@@ -933,6 +1033,8 @@ TEST_CASE("RuntimeControlLoop policy start gate faults on bad orientation and lo
     const char* id;
     LowStateSample low_state;
     LowCmdOccupancy occupancy;
+    RuntimeInternalState expected_fsm;
+    ControllerState expected_ctrl;
     ErrorCode err;
     RobotState robot;
     std::string block;
@@ -942,12 +1044,16 @@ TEST_CASE("RuntimeControlLoop policy start gate faults on bad orientation and lo
       {"start-bad-orientation",
        badOrientationLowState(deploy_config, 71),
        {},
+       RuntimeInternalState::Passive,
+       ControllerState::Passive,
        ErrorCode::RobotBadOrientation,
        RobotState::Fault,
        "bad_orientation"},
       {"start-lowcmd-occupied",
        readyLowState(deploy_config, kExpectedModeMachine, true, 72),
        {true, 4},
+       RuntimeInternalState::Fault,
+       ControllerState::Fault,
        ErrorCode::RobotNotReady,
        RobotState::NotReady,
        "lowcmd_occupied"},
@@ -967,7 +1073,8 @@ TEST_CASE("RuntimeControlLoop policy start gate faults on bad orientation and lo
     loop.tick();
 
     const auto snapshot = store.snapshot();
-    REQUIRE(snapshot.ctrl == ControllerState::Fault);
+    REQUIRE(loop.internalStateForTest() == item.expected_fsm);
+    REQUIRE(snapshot.ctrl == item.expected_ctrl);
     REQUIRE_FALSE(snapshot.ready);
     REQUIRE(snapshot.robot == item.robot);
     REQUIRE(snapshot.err == item.err);
@@ -979,6 +1086,155 @@ TEST_CASE("RuntimeControlLoop policy start gate faults on bad orientation and lo
     REQUIRE(policy.calls == 0);
     REQUIRE(robot.write_attempts == 0);
   }
+}
+
+TEST_CASE("RuntimeControlLoop Passive does not auto resume or start queued motion") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeRobotIO robot(badOrientationLowState(deploy_config, 71));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  auto loop = makeControlLoop(config,
+                              bridge,
+                              store,
+                              tmp.trkConfig(),
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              deploy_config,
+                              velocity_config,
+                              fixstand_config,
+                              ControlMode::StandbyVelocity);
+
+  loop.tick();
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Passive);
+  REQUIRE(store.snapshot().ctrl == ControllerState::Passive);
+  REQUIRE(robot.write_attempts == 0);
+
+  const auto path = validTrk(tmp, "passive_queued.trk", 2);
+  REQUIRE(bridge.submitQueue(executeCommand("passive-queued", path)).ok());
+  robot.low_state = readyLowState(deploy_config);
+
+  loop.tick();
+  auto snapshot = store.snapshot();
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Passive);
+  REQUIRE(snapshot.ctrl == ControllerState::Passive);
+  REQUIRE(snapshot.ready);
+  REQUIRE(snapshot.queue.ids == std::vector<std::string>{"passive-queued"});
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(tracker_policy.calls == 0);
+  REQUIRE(velocity_policy.calls == 0);
+  REQUIRE(robot.write_attempts == 1);
+  requirePassiveDampingFrame(robot.writes.back(), *robot.low_state, passiveConfig());
+
+  loop.tick();
+  snapshot = store.snapshot();
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Passive);
+  REQUIRE(snapshot.queue.ids == std::vector<std::string>{"passive-queued"});
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(tracker_policy.calls == 0);
+  REQUIRE(robot.write_attempts == 2);
+}
+
+TEST_CASE("RuntimeControlLoop stop in Passive cancels queued motion without leaving Passive") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeRobotIO robot(badOrientationLowState(deploy_config, 72));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  auto loop = makeControlLoop(config,
+                              bridge,
+                              store,
+                              tmp.trkConfig(),
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              deploy_config,
+                              velocity_config,
+                              fixstand_config,
+                              ControlMode::StandbyVelocity);
+
+  loop.tick();
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Passive);
+
+  const auto path = validTrk(tmp, "passive_stop_queued.trk", 2);
+  REQUIRE(bridge.submitQueue(executeCommand("passive-stop-queued", path)).ok());
+  robot.low_state = readyLowState(deploy_config);
+  loop.tick();
+  REQUIRE(store.snapshot().queue.ids ==
+          std::vector<std::string>{"passive-stop-queued"});
+  REQUIRE(robot.write_attempts == 1);
+
+  REQUIRE(bridge.stop().state == ControllerState::Stopping);
+  loop.tick();
+  auto snapshot = store.snapshot();
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Passive);
+  REQUIRE(snapshot.ctrl == ControllerState::Passive);
+  REQUIRE(snapshot.queue.ids.empty());
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(robot.write_attempts == 1);
+  REQUIRE(tracker_policy.calls == 0);
+  REQUIRE(velocity_policy.calls == 0);
+  REQUIRE(store.findRun("passive-stop-queued").run->state == MotionState::Canceled);
+
+  loop.tick();
+  snapshot = store.snapshot();
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Passive);
+  REQUIRE(snapshot.ctrl == ControllerState::Passive);
+  REQUIRE(snapshot.queue.ids.empty());
+  REQUIRE(robot.write_attempts == 2);
+  REQUIRE(velocity_policy.calls == 0);
+  requirePassiveDampingFrame(robot.writes.back(), *robot.low_state, passiveConfig());
+}
+
+TEST_CASE("RuntimeControlLoop stop in Passive without queued motion is no-op") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeRobotIO robot(badOrientationLowState(deploy_config, 73));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  auto loop = makeControlLoop(config,
+                              bridge,
+                              store,
+                              tmp.trkConfig(),
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              deploy_config,
+                              velocity_config,
+                              fixstand_config,
+                              ControlMode::StandbyVelocity);
+
+  loop.tick();
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Passive);
+  robot.low_state = readyLowState(deploy_config);
+  loop.tick();
+  REQUIRE(robot.write_attempts == 1);
+
+  REQUIRE(bridge.stop().state == ControllerState::Passive);
+  loop.tick();
+  auto snapshot = store.snapshot();
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Passive);
+  REQUIRE(snapshot.ctrl == ControllerState::Passive);
+  REQUIRE(snapshot.queue.ids.empty());
+  REQUIRE(robot.write_attempts == 2);
+  REQUIRE(velocity_policy.calls == 0);
+  requirePassiveDampingFrame(robot.writes.back(), *robot.low_state, passiveConfig());
 }
 
 TEST_CASE("RuntimeControlLoop loader failure in policy mode stays non-fault") {
@@ -1109,7 +1365,7 @@ TEST_CASE("RuntimeControlLoop policy fault latches across stop and readiness ref
   REQUIRE(robot.write_attempts == 0);
 }
 
-TEST_CASE("RuntimeControlLoop running lowstate readiness failure maps to fault") {
+TEST_CASE("RuntimeControlLoop running lowstate readiness failure enters Passive") {
   TempTree tmp;
   const RuntimeConfig config = runtimeConfig();
   const DeployConfig deploy_config = deployConfig();
@@ -1149,7 +1405,8 @@ TEST_CASE("RuntimeControlLoop running lowstate readiness failure maps to fault")
     loop.tick();
 
     const auto snapshot = store.snapshot();
-    REQUIRE(snapshot.ctrl == ControllerState::Fault);
+    REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Passive);
+    REQUIRE(snapshot.ctrl == ControllerState::Passive);
     REQUIRE_FALSE(snapshot.ready);
     REQUIRE(snapshot.err == item.err);
     REQUIRE(snapshot.block == item.block);
@@ -1162,7 +1419,7 @@ TEST_CASE("RuntimeControlLoop running lowstate readiness failure maps to fault")
   }
 }
 
-TEST_CASE("RuntimeControlLoop running bad orientation fails active motion and faults") {
+TEST_CASE("RuntimeControlLoop running bad orientation fails active motion and enters Passive") {
   TempTree tmp;
   const RuntimeConfig config = runtimeConfig();
   RuntimeStatusStore store(config);
@@ -1181,7 +1438,8 @@ TEST_CASE("RuntimeControlLoop running bad orientation fails active motion and fa
   loop.tick();
 
   const auto snapshot = store.snapshot();
-  REQUIRE(snapshot.ctrl == ControllerState::Fault);
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Passive);
+  REQUIRE(snapshot.ctrl == ControllerState::Passive);
   REQUIRE_FALSE(snapshot.ready);
   REQUIRE(snapshot.robot == RobotState::Fault);
   REQUIRE(snapshot.err == ErrorCode::RobotBadOrientation);
@@ -1283,7 +1541,7 @@ TEST_CASE("RuntimeControlLoop LowCmd write failure maps to fault block") {
   REQUIRE(found.run->err == ErrorCode::InternalError);
 }
 
-TEST_CASE("RuntimeControlLoop policy stop writes hold-current frames for configured ticks") {
+TEST_CASE("RuntimeControlLoop policy stop ignores configured hold time and writes no hold-current frame") {
   TempTree tmp;
   RuntimeConfig config = runtimeConfig();
   config.stop_hold_s = 0.06;
@@ -1315,23 +1573,12 @@ TEST_CASE("RuntimeControlLoop policy stop writes hold-current frames for configu
   REQUIRE(found.run->stop_reason == StopReason::Stop);
 
   loop.tick();
-  REQUIRE(robot.write_attempts == 1);
-  REQUIRE(robot.writes.size() == 1);
-  requireHoldFrame(robot.writes.back(), deploy_config, hold_state);
-  REQUIRE(policy.calls == 0);
-
-  loop.tick();
-  REQUIRE(robot.write_attempts == 2);
-  requireHoldFrame(robot.writes.back(), deploy_config, hold_state);
-  REQUIRE(policy.calls == 0);
-
-  loop.tick();
-  REQUIRE(robot.write_attempts == 3);
-  requireHoldFrame(robot.writes.back(), deploy_config, hold_state);
-  REQUIRE(policy.calls == 0);
   snapshot = store.snapshot();
   REQUIRE(snapshot.ctrl == ControllerState::Idle);
   REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(policy.calls == 0);
+  REQUIRE(robot.write_attempts == 0);
+  REQUIRE(robot.writes.empty());
   const auto stopped = store.findRun("policy-stop");
   REQUIRE(stopped.ok());
   REQUIRE(stopped.run->state == MotionState::Stopped);
@@ -1388,9 +1635,10 @@ TEST_CASE("RuntimeControlLoop control startup FixStand waits for readiness then 
                               fixstand_config,
                               ControlMode::FixStand);
 
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::FixStand);
   loop.tick();
   auto snapshot = store.snapshot();
-  REQUIRE(snapshot.ctrl == ControllerState::FixStand);
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Passive);
   REQUIRE_FALSE(snapshot.ready);
   REQUIRE(snapshot.err == ErrorCode::RobotNotReady);
   REQUIRE(snapshot.block == "lowstate_timeout");
@@ -1399,12 +1647,303 @@ TEST_CASE("RuntimeControlLoop control startup FixStand waits for readiness then 
   robot.low_state = ready_state;
   loop.tick();
   snapshot = store.snapshot();
-  REQUIRE(snapshot.ctrl == ControllerState::FixStand);
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Passive);
+  REQUIRE(snapshot.ctrl == ControllerState::Passive);
   REQUIRE(snapshot.ready);
   REQUIRE(robot.write_attempts == 1);
+  requirePassiveDampingFrame(robot.writes.back(), ready_state, passiveConfig());
+
+  REQUIRE(bridge.fixStand().ok());
+  loop.tick();
+  snapshot = store.snapshot();
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::FixStand);
+  REQUIRE(snapshot.ctrl == ControllerState::FixStand);
+  REQUIRE(snapshot.ready);
+  REQUIRE(robot.write_attempts == 2);
   requireFixStandFrameFromCurrentQ(robot.writes.back(), fixstand_config, ready_state);
   REQUIRE(tracker_policy.calls == 0);
   REQUIRE(velocity_policy.calls == 0);
+}
+
+TEST_CASE("RuntimeControlLoop FixStand can recover from Passive bad orientation") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeRobotIO robot(badOrientationLowState(deploy_config, 77));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  auto loop = makeControlLoop(config,
+                              bridge,
+                              store,
+                              tmp.trkConfig(),
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              deploy_config,
+                              velocity_config,
+                              fixstand_config,
+                              ControlMode::StandbyVelocity);
+
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Velocity);
+  loop.tick();
+  auto snapshot = store.snapshot();
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Passive);
+  REQUIRE(snapshot.ctrl == ControllerState::Passive);
+  REQUIRE_FALSE(snapshot.ready);
+  REQUIRE(snapshot.err == ErrorCode::RobotBadOrientation);
+  REQUIRE(snapshot.block == "bad_orientation");
+  REQUIRE(robot.write_attempts == 0);
+
+  loop.tick();
+  snapshot = store.snapshot();
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Passive);
+  REQUIRE(snapshot.ctrl == ControllerState::Passive);
+  REQUIRE_FALSE(snapshot.ready);
+  REQUIRE(robot.write_attempts == 1);
+  requirePassiveDampingFrame(robot.writes.back(), *robot.low_state, passiveConfig());
+
+  REQUIRE(bridge.fixStand().ok());
+  loop.tick();
+  snapshot = store.snapshot();
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::FixStand);
+  REQUIRE(snapshot.ctrl == ControllerState::FixStand);
+  REQUIRE_FALSE(snapshot.ready);
+  REQUIRE(snapshot.robot == RobotState::Fault);
+  REQUIRE(snapshot.err == ErrorCode::RobotBadOrientation);
+  REQUIRE(snapshot.block == "bad_orientation");
+  REQUIRE(snapshot.low_ms == 77);
+  REQUIRE(robot.write_attempts == 2);
+  requireFixStandFrameFromCurrentQ(robot.writes.back(), fixstand_config,
+                                   *robot.low_state);
+
+  const LowStateSample ready_state = readyLowState(deploy_config, kExpectedModeMachine,
+                                                   true, 8);
+  robot.low_state = ready_state;
+  loop.tick();
+  snapshot = store.snapshot();
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::FixStand);
+  REQUIRE(snapshot.ctrl == ControllerState::FixStand);
+  REQUIRE(snapshot.ready);
+  REQUIRE(snapshot.err == ErrorCode::Ok);
+  REQUIRE(snapshot.block.empty());
+  REQUIRE(robot.write_attempts == 3);
+}
+
+TEST_CASE("RuntimeControlLoop lowcmd occupancy overrides bad orientation before control writes") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+
+  auto require_fault_without_write = [&](ControlMode startup_control) {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeRobotIO robot(badOrientationLowState(deploy_config, 88));
+    robot.occupancy = {true, 4};
+    FakePolicy tracker_policy;
+    FakeVelocityPolicy velocity_policy;
+    auto loop = makeControlLoop(config,
+                                bridge,
+                                store,
+                                tmp.trkConfig(),
+                                robot,
+                                tracker_policy,
+                                velocity_policy,
+                                deploy_config,
+                                velocity_config,
+                                fixstand_config,
+                                startup_control);
+
+    loop.tick();
+
+    const auto snapshot = store.snapshot();
+    REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Fault);
+    REQUIRE(snapshot.ctrl == ControllerState::Fault);
+    REQUIRE_FALSE(snapshot.ready);
+    REQUIRE(snapshot.err == ErrorCode::RobotNotReady);
+    REQUIRE(snapshot.block == "lowcmd_occupied");
+    REQUIRE(robot.write_attempts == 0);
+  };
+
+  SECTION("standby velocity preserves queued work and starts it from FixStand") {
+    require_fault_without_write(ControlMode::StandbyVelocity);
+  }
+
+  SECTION("fixstand") {
+    require_fault_without_write(ControlMode::FixStand);
+  }
+
+  SECTION("passive damping") {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeRobotIO robot(badOrientationLowState(deploy_config, 89));
+    FakePolicy tracker_policy;
+    FakeVelocityPolicy velocity_policy;
+    auto loop = makeControlLoop(config,
+                                bridge,
+                                store,
+                                tmp.trkConfig(),
+                                robot,
+                                tracker_policy,
+                                velocity_policy,
+                                deploy_config,
+                                velocity_config,
+                                fixstand_config,
+                                ControlMode::StandbyVelocity);
+
+    loop.tick();
+    REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Passive);
+    REQUIRE(robot.write_attempts == 0);
+
+    robot.occupancy = {true, 5};
+    loop.tick();
+
+    const auto snapshot = store.snapshot();
+    REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Fault);
+    REQUIRE(snapshot.ctrl == ControllerState::Fault);
+    REQUIRE_FALSE(snapshot.ready);
+    REQUIRE(snapshot.err == ErrorCode::RobotNotReady);
+    REQUIRE(snapshot.block == "lowcmd_occupied");
+    REQUIRE(robot.write_attempts == 0);
+  }
+}
+
+TEST_CASE("RuntimeControlLoop Passive treats lowcmd occupancy as fault before stale or mode blocks") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+
+  struct Case {
+    const char* id;
+    LowStateSample low_state;
+  };
+
+  const std::vector<Case> cases{
+      {"stale", readyLowState(deploy_config, kExpectedModeMachine, false, 91)},
+      {"mode-mismatch", readyLowState(deploy_config, kExpectedModeMachine + 1, true, 92)},
+  };
+
+  for (const auto& item : cases) {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeRobotIO robot(badOrientationLowState(deploy_config, 90));
+    FakePolicy tracker_policy;
+    FakeVelocityPolicy velocity_policy;
+    auto loop = makeControlLoop(config,
+                                bridge,
+                                store,
+                                tmp.trkConfig(),
+                                robot,
+                                tracker_policy,
+                                velocity_policy,
+                                deploy_config,
+                                velocity_config,
+                                fixstand_config,
+                                ControlMode::StandbyVelocity);
+
+    loop.tick();
+    REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Passive);
+    REQUIRE(robot.write_attempts == 0);
+
+    robot.low_state = item.low_state;
+    robot.occupancy = {true, 6};
+    loop.tick();
+
+    const auto snapshot = store.snapshot();
+    REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Fault);
+    REQUIRE(snapshot.ctrl == ControllerState::Fault);
+    REQUIRE_FALSE(snapshot.ready);
+    REQUIRE(snapshot.err == ErrorCode::RobotNotReady);
+    REQUIRE(snapshot.block == "lowcmd_occupied");
+    REQUIRE(robot.write_attempts == 0);
+  }
+}
+
+TEST_CASE("RuntimeControlLoop FixStand blocks non-orientation readiness failures") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+
+  struct Case {
+    const char* id;
+    std::optional<LowStateSample> low_state;
+    LowCmdOccupancy occupancy;
+    ControllerState expected_ctrl;
+    RuntimeInternalState expected_fsm;
+    ErrorCode err;
+    std::string block;
+  };
+
+  const std::vector<Case> cases{
+      {"missing",
+       std::nullopt,
+       {},
+       ControllerState::Passive,
+       RuntimeInternalState::Passive,
+       ErrorCode::RobotDisconnected,
+       "lowstate_missing"},
+      {"stale",
+       readyLowState(deploy_config, kExpectedModeMachine, false, 51),
+       {},
+       ControllerState::Passive,
+       RuntimeInternalState::Passive,
+       ErrorCode::RobotNotReady,
+       "lowstate_timeout"},
+      {"mode-mismatch",
+       readyLowState(deploy_config, kExpectedModeMachine + 1, true, 52),
+       {},
+       ControllerState::Passive,
+       RuntimeInternalState::Passive,
+       ErrorCode::RobotNotReady,
+       "mode_machine_mismatch"},
+      {"lowcmd-occupied",
+       readyLowState(deploy_config, kExpectedModeMachine, true, 53),
+       {true, 3},
+       ControllerState::Fault,
+       RuntimeInternalState::Fault,
+       ErrorCode::RobotNotReady,
+       "lowcmd_occupied"},
+  };
+
+  for (const auto& item : cases) {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeRobotIO robot(readyLowState(deploy_config));
+    robot.low_state = item.low_state;
+    robot.occupancy = item.occupancy;
+    FakePolicy tracker_policy;
+    FakeVelocityPolicy velocity_policy;
+    auto loop = makeControlLoop(config,
+                                bridge,
+                                store,
+                                tmp.trkConfig(),
+                                robot,
+                                tracker_policy,
+                                velocity_policy,
+                                deploy_config,
+                                velocity_config,
+                                fixstand_config,
+                                ControlMode::FixStand);
+
+    loop.tick();
+
+    const auto snapshot = store.snapshot();
+    REQUIRE(loop.internalStateForTest() == item.expected_fsm);
+    REQUIRE(snapshot.ctrl == item.expected_ctrl);
+    REQUIRE_FALSE(snapshot.ready);
+    REQUIRE(snapshot.err == item.err);
+    REQUIRE(snapshot.block == item.block);
+    REQUIRE(robot.write_attempts == 0);
+  }
 }
 
 TEST_CASE("RuntimeControlLoop completed track returns to StandbyVelocity") {
@@ -1430,23 +1969,177 @@ TEST_CASE("RuntimeControlLoop completed track returns to StandbyVelocity") {
                               fixstand_config,
                               ControlMode::StandbyVelocity);
 
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Velocity);
   const auto path = validTrk(tmp, "done_to_standby.trk", 1);
   REQUIRE(bridge.submitQueue(executeCommand("done-standby", path, MotionMode::Queue, 1))
               .ok());
   startQueuedRun(loop, store, "done-standby");
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::GeneralTrackerActive);
   loop.tick();
 
   auto snapshot = store.snapshot();
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::GeneralTrackerIdle);
   REQUIRE(snapshot.ctrl == ControllerState::StandbyVelocity);
   REQUIRE_FALSE(snapshot.exec.has_value());
   REQUIRE(store.findRun("done-standby").run->state == MotionState::Done);
+  REQUIRE(robot.writes.size() == 1);
+  const LowCmdFrame tracker_frame = robot.writes.back();
 
   loop.tick();
   snapshot = store.snapshot();
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::GeneralTrackerIdle);
   REQUIRE(snapshot.ctrl == ControllerState::StandbyVelocity);
   REQUIRE(velocity_policy.calls == 1);
   REQUIRE(robot.write_attempts >= 2);
   requireVelocityFrame(robot.writes.back(), velocity_config, velocity_policy.next_raw);
+  REQUIRE(robot.writes.back().motors.at(12).q != tracker_frame.motors.at(12).q);
+  requireFixStandHoldMotor(robot.writes.back(), fixstand_config, 12);
+}
+
+TEST_CASE("RuntimeControlLoop standby velocity overlays latest FixStand LowCmd frame") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.5F));
+  auto loop = makeControlLoop(config,
+                              bridge,
+                              store,
+                              tmp.trkConfig(),
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              deploy_config,
+                              velocity_config,
+                              fixstand_config,
+                              ControlMode::FixStand);
+
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::FixStand);
+  loop.tick();
+  REQUIRE(store.snapshot().ctrl == ControllerState::FixStand);
+  REQUIRE(robot.write_attempts == 1);
+  const LowCmdFrame fixstand_frame = robot.writes.back();
+
+  REQUIRE(bridge.standbyVelocity().ok());
+  loop.tick();
+
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Velocity);
+  REQUIRE(store.snapshot().ctrl == ControllerState::StandbyVelocity);
+  REQUIRE(velocity_policy.calls == 1);
+  REQUIRE(robot.write_attempts == 2);
+  requireVelocityFrame(robot.writes.back(), velocity_config, velocity_policy.next_raw);
+  requireMotorPreserved(robot.writes.back(), fixstand_frame, 12);
+}
+
+TEST_CASE("RuntimeControlLoop standby velocity republishes LowCmd at high rate but throttles policy") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.hz = 1000.0;
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.5F));
+  auto loop = makeControlLoop(config,
+                              bridge,
+                              store,
+                              tmp.trkConfig(),
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              deploy_config,
+                              velocity_config,
+                              fixstand_config,
+                              ControlMode::StandbyVelocity);
+
+  loop.tick();
+  REQUIRE(store.snapshot().ctrl == ControllerState::StandbyVelocity);
+  REQUIRE(velocity_policy.calls == 1);
+  REQUIRE(robot.write_attempts == 1);
+  const LowCmdFrame first_velocity = robot.writes.back();
+
+  for (int i = 0; i < 19; ++i) {
+    loop.tick();
+  }
+  REQUIRE(velocity_policy.calls == 1);
+  REQUIRE(robot.write_attempts == 20);
+  requireMotorPreserved(robot.writes.back(), first_velocity, 12);
+  requireVelocityFrame(robot.writes.back(), velocity_config, velocity_policy.next_raw);
+
+  loop.tick();
+  REQUIRE(velocity_policy.calls == 2);
+  REQUIRE(robot.write_attempts == 21);
+}
+
+TEST_CASE("RuntimeControlLoop active tracker advances one frame per policy period without jitter skips") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.hz = 1000.0;
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  std::vector<std::size_t> frames_at_write;
+  robot.on_write = [&](const LowCmdFrame&) {
+    const auto found = store.findRun("high-rate-track");
+    if (found.ok() && found.run->state == MotionState::Running) {
+      frames_at_write.push_back(found.run->frame);
+    }
+  };
+  auto loop = makeControlLoop(config,
+                              bridge,
+                              store,
+                              tmp.trkConfig(),
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              deploy_config,
+                              velocity_config,
+                              fixstand_config,
+                              ControlMode::StandbyVelocity);
+
+  const auto path = validTrk(tmp, "high_rate_track.trk", 3);
+  REQUIRE(bridge.submitQueue(executeCommand("high-rate-track", path, MotionMode::Queue, 3))
+              .ok());
+  startQueuedRun(loop, store, "high-rate-track");
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::GeneralTrackerActive);
+
+  loop.tick();
+  REQUIRE(tracker_policy.calls == 1);
+  REQUIRE(frames_at_write == std::vector<std::size_t>{0});
+
+  for (int i = 0; i < 19; ++i) {
+    loop.tick();
+  }
+  REQUIRE(tracker_policy.calls == 1);
+  REQUIRE(frames_at_write == std::vector<std::size_t>{0});
+  REQUIRE(store.snapshot().exec->frame == 0);
+
+  loop.tick();
+  REQUIRE(tracker_policy.calls == 2);
+  REQUIRE(frames_at_write == std::vector<std::size_t>{0, 1});
+  REQUIRE(store.snapshot().exec->frame == 1);
+
+  for (int i = 0; i < 20; ++i) {
+    loop.tick();
+  }
+  REQUIRE(tracker_policy.calls == 3);
+  REQUIRE(frames_at_write == std::vector<std::size_t>{0, 1, 2});
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::GeneralTrackerIdle);
+  REQUIRE_FALSE(store.snapshot().exec.has_value());
+  REQUIRE(store.findRun("high-rate-track").run->state == MotionState::Done);
 }
 
 TEST_CASE("RuntimeControlLoop stop transitions active run to StandbyVelocity") {
@@ -1468,18 +2161,23 @@ TEST_CASE("RuntimeControlLoop stop transitions active run to StandbyVelocity") {
                               tracker_policy,
                               velocity_policy,
                               deploy_config,
-                              velocity_config);
+                              velocity_config,
+                              fixStandConfig(),
+                              ControlMode::StandbyVelocity);
 
   const auto path = validTrk(tmp, "stop_to_standby.trk", 5);
   REQUIRE(bridge.submitQueue(executeCommand("active", path)).ok());
   startQueuedRun(loop, store, "active");
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::GeneralTrackerActive);
 
   REQUIRE(bridge.stop().state == ControllerState::Stopping);
   loop.tick();
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Stopping);
   REQUIRE(store.snapshot().ctrl == ControllerState::Stopping);
 
   loop.tick();
   auto snapshot = store.snapshot();
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::GeneralTrackerIdle);
   REQUIRE(snapshot.ctrl == ControllerState::StandbyVelocity);
   REQUIRE_FALSE(snapshot.exec.has_value());
   REQUIRE(store.findRun("active").run->state == MotionState::Stopped);
@@ -1527,6 +2225,61 @@ TEST_CASE("RuntimeControlLoop idle FixStand stop switches to StandbyVelocity") {
   REQUIRE(robot.write_attempts == 0);
 }
 
+TEST_CASE("RuntimeControlLoop queues execute in FixStand until StandbyVelocity event") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  auto loop = makeControlLoop(config,
+                              bridge,
+                              store,
+                              tmp.trkConfig(),
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              deploy_config,
+                              velocity_config,
+                              fixstand_config,
+                              ControlMode::FixStand);
+
+  const auto path = validTrk(tmp, "fixstand_queued.trk", 2);
+  REQUIRE(bridge.submitQueue(executeCommand("fixstand-queued", path)).ok());
+
+  loop.tick();
+  auto snapshot = store.snapshot();
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::FixStand);
+  REQUIRE(snapshot.ctrl == ControllerState::FixStand);
+  REQUIRE(snapshot.queue.ids == std::vector<std::string>{"fixstand-queued"});
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(tracker_policy.calls == 0);
+
+  loop.tick();
+  snapshot = store.snapshot();
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::FixStand);
+  REQUIRE(snapshot.queue.ids == std::vector<std::string>{"fixstand-queued"});
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(tracker_policy.calls == 0);
+
+  REQUIRE(bridge.standbyVelocity().ok());
+  loop.tick();
+  snapshot = store.snapshot();
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::GeneralTrackerActive);
+  REQUIRE(snapshot.ctrl == ControllerState::Preparing);
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->id == "fixstand-queued");
+  REQUIRE(snapshot.queue.ids.empty());
+  REQUIRE(store.findRun("fixstand-queued").run->state == MotionState::Queued);
+
+  loop.tick();
+  REQUIRE(store.snapshot().ctrl == ControllerState::Running);
+}
+
 TEST_CASE("RuntimeControlLoop fixstand and standby commands cancel queued work and target control") {
   TempTree tmp;
   RuntimeConfig config = runtimeConfig();
@@ -1550,7 +2303,8 @@ TEST_CASE("RuntimeControlLoop fixstand and standby commands cancel queued work a
                                 velocity_policy,
                                 deploy_config,
                                 velocity_config,
-                                fixstand_config);
+                                fixstand_config,
+                                ControlMode::StandbyVelocity);
     const auto queued_path = validTrk(tmp, "queued_fixstand.trk", 3);
     REQUIRE(bridge.submitQueue(executeCommand("queued", queued_path)).ok());
     REQUIRE(bridge.fixStand().ok());
@@ -1580,18 +2334,20 @@ TEST_CASE("RuntimeControlLoop fixstand and standby commands cancel queued work a
                                 velocity_policy,
                                 deploy_config,
                                 velocity_config,
-                                fixstand_config);
+                                fixstand_config,
+                                ControlMode::StandbyVelocity);
     const auto queued_path = validTrk(tmp, "queued_standby.trk", 3);
     REQUIRE(bridge.submitQueue(executeCommand("queued", queued_path)).ok());
     REQUIRE(bridge.standbyVelocity().ok());
 
     loop.tick();
 
-    REQUIRE(store.snapshot().ctrl == ControllerState::StandbyVelocity);
+    REQUIRE(store.snapshot().ctrl == ControllerState::Preparing);
     REQUIRE(store.snapshot().queue.ids.empty());
-    REQUIRE(store.findRun("queued").run->state == MotionState::Canceled);
-    REQUIRE(velocity_policy.calls == 1);
-    requireVelocityFrame(robot.writes.back(), velocity_config, velocity_policy.next_raw);
+    REQUIRE(store.snapshot().exec.has_value());
+    REQUIRE(store.snapshot().exec->id == "queued");
+    REQUIRE(store.findRun("queued").run->state == MotionState::Queued);
+    REQUIRE(velocity_policy.calls == 0);
   }
 }
 
@@ -1626,7 +2382,8 @@ TEST_CASE("RuntimeControlLoop control command while running stops active and cle
                                 velocity_policy,
                                 deploy_config,
                                 velocity_config,
-                                fixstand_config);
+                                fixstand_config,
+                                ControlMode::StandbyVelocity);
     const auto active_path =
         validTrk(tmp, toString(item.expected_ctrl) + "_active.trk", 5);
     const auto waiting_path =
@@ -1646,14 +2403,22 @@ TEST_CASE("RuntimeControlLoop control command while running stops active and cle
     REQUIRE(snapshot.ctrl == ControllerState::Stopping);
     REQUIRE(snapshot.exec.has_value());
     REQUIRE(snapshot.exec->state == MotionState::Stopping);
-    REQUIRE(snapshot.queue.ids.empty());
-    REQUIRE(store.findRun("waiting").run->state == MotionState::Canceled);
-    REQUIRE(store.findRun("waiting").run->stop_reason == StopReason::Stop);
+    if (item.mode == ControlMode::FixStand) {
+      REQUIRE(snapshot.queue.ids.empty());
+      REQUIRE(store.findRun("waiting").run->state == MotionState::Canceled);
+      REQUIRE(store.findRun("waiting").run->stop_reason == StopReason::Stop);
+    } else {
+      REQUIRE(snapshot.queue.ids == std::vector<std::string>{"waiting"});
+      REQUIRE(store.findRun("waiting").run->state == MotionState::Queued);
+    }
 
     loop.tick();
     snapshot = store.snapshot();
     REQUIRE(snapshot.ctrl == item.expected_ctrl);
     REQUIRE_FALSE(snapshot.exec.has_value());
+    if (item.mode == ControlMode::StandbyVelocity) {
+      REQUIRE(snapshot.queue.ids == std::vector<std::string>{"waiting"});
+    }
     REQUIRE(store.findRun("active").run->state == MotionState::Stopped);
     REQUIRE(store.findRun("active").run->stop_reason == StopReason::Stop);
   }
@@ -1687,187 +2452,6 @@ TEST_CASE("RuntimeControlLoop policy stop_hold_s zero writes no hold command") {
   const auto found = store.findRun("zero-hold");
   REQUIRE(found.ok());
   REQUIRE(found.run->state == MotionState::Stopped);
-}
-
-TEST_CASE("RuntimeControlLoop policy stop hold readiness failures map to fault without writing") {
-  TempTree tmp;
-  RuntimeConfig config = runtimeConfig();
-  config.stop_hold_s = 0.06;
-  const DeployConfig deploy_config = deployConfig();
-
-  struct Case {
-    const char* id;
-    std::optional<LowStateSample> low_state;
-    ErrorCode err;
-    std::string block;
-  };
-
-  const std::vector<Case> cases{
-      {"hold-missing", std::nullopt, ErrorCode::RobotDisconnected, "lowstate_missing"},
-      {"hold-stale",
-       readyLowState(deploy_config, kExpectedModeMachine, false, 111),
-       ErrorCode::RobotNotReady,
-       "lowstate_timeout"},
-      {"hold-mode-mismatch",
-       readyLowState(deploy_config, kExpectedModeMachine + 1, true, 112),
-       ErrorCode::RobotNotReady,
-       "mode_machine_mismatch"},
-  };
-
-  for (const auto& item : cases) {
-    RuntimeStatusStore store(config);
-    RuntimeBridge bridge(config, store);
-    FakeRobotIO robot(readyLowState(deploy_config));
-    FakePolicy policy;
-    auto loop = makePolicyLoop(config, bridge, store, tmp.trkConfig(), robot, policy,
-                               deploy_config);
-    const auto path = validTrk(tmp, std::string(item.id) + ".trk", 3);
-    REQUIRE(bridge.submitQueue(executeCommand(item.id, path)).ok());
-    startQueuedRun(loop, store, item.id);
-
-    REQUIRE(bridge.stop().state == ControllerState::Stopping);
-    loop.tick();
-    REQUIRE(store.snapshot().ctrl == ControllerState::Stopping);
-    robot.low_state = item.low_state;
-
-    loop.tick();
-
-    const auto snapshot = store.snapshot();
-    REQUIRE(snapshot.ctrl == ControllerState::Fault);
-    REQUIRE_FALSE(snapshot.ready);
-    REQUIRE(snapshot.err == item.err);
-    REQUIRE(snapshot.block == item.block);
-    REQUIRE(policy.calls == 0);
-    REQUIRE(robot.write_attempts == 0);
-    const auto found = store.findRun(item.id);
-    REQUIRE(found.ok());
-    REQUIRE(found.run->state == MotionState::Failed);
-    REQUIRE(found.run->err == item.err);
-
-    loop.tick();
-    REQUIRE(robot.write_attempts == 0);
-  }
-}
-
-TEST_CASE("RuntimeControlLoop policy stop hold bad orientation maps to fault without writing") {
-  TempTree tmp;
-  RuntimeConfig config = runtimeConfig();
-  config.stop_hold_s = 0.06;
-  RuntimeStatusStore store(config);
-  RuntimeBridge bridge(config, store);
-  const DeployConfig deploy_config = deployConfig();
-  FakeRobotIO robot(readyLowState(deploy_config));
-  FakePolicy policy;
-  auto loop = makePolicyLoop(config, bridge, store, tmp.trkConfig(), robot, policy,
-                             deploy_config);
-
-  const auto path = validTrk(tmp, "hold_bad_orientation.trk", 3);
-  REQUIRE(bridge.submitQueue(executeCommand("hold-bad-orientation", path)).ok());
-  startQueuedRun(loop, store, "hold-bad-orientation");
-
-  REQUIRE(bridge.stop().state == ControllerState::Stopping);
-  loop.tick();
-  REQUIRE(store.snapshot().ctrl == ControllerState::Stopping);
-  robot.low_state = badOrientationLowState(deploy_config, 91);
-
-  loop.tick();
-
-  const auto snapshot = store.snapshot();
-  REQUIRE(snapshot.ctrl == ControllerState::Fault);
-  REQUIRE_FALSE(snapshot.ready);
-  REQUIRE(snapshot.robot == RobotState::Fault);
-  REQUIRE(snapshot.err == ErrorCode::RobotBadOrientation);
-  REQUIRE(snapshot.block == "bad_orientation");
-  REQUIRE(snapshot.low_ms == 91);
-  REQUIRE(policy.calls == 0);
-  REQUIRE(robot.write_attempts == 0);
-  const auto found = store.findRun("hold-bad-orientation");
-  REQUIRE(found.ok());
-  REQUIRE(found.run->state == MotionState::Failed);
-  REQUIRE(found.run->err == ErrorCode::RobotBadOrientation);
-}
-
-TEST_CASE("RuntimeControlLoop policy stop hold lowcmd occupancy maps to fault without writing") {
-  TempTree tmp;
-  RuntimeConfig config = runtimeConfig();
-  config.stop_hold_s = 0.06;
-  RuntimeStatusStore store(config);
-  RuntimeBridge bridge(config, store);
-  const DeployConfig deploy_config = deployConfig();
-  FakeRobotIO robot(readyLowState(deploy_config));
-  FakePolicy policy;
-  auto loop = makePolicyLoop(config, bridge, store, tmp.trkConfig(), robot, policy,
-                             deploy_config);
-
-  const auto path = validTrk(tmp, "hold_lowcmd_occupied.trk", 3);
-  REQUIRE(bridge.submitQueue(executeCommand("hold-occupied", path)).ok());
-  startQueuedRun(loop, store, "hold-occupied");
-
-  REQUIRE(bridge.stop().state == ControllerState::Stopping);
-  loop.tick();
-  REQUIRE(store.snapshot().ctrl == ControllerState::Stopping);
-  REQUIRE(robot.write_attempts == 0);
-
-  robot.occupancy = {true, 3};
-  loop.tick();
-
-  const auto snapshot = store.snapshot();
-  REQUIRE(snapshot.ctrl == ControllerState::Fault);
-  REQUIRE_FALSE(snapshot.ready);
-  REQUIRE(snapshot.robot == RobotState::NotReady);
-  REQUIRE(snapshot.err == ErrorCode::RobotNotReady);
-  REQUIRE(snapshot.block == "lowcmd_occupied");
-  REQUIRE(policy.calls == 0);
-  REQUIRE(robot.occupancy_calls == 3);
-  REQUIRE(robot.write_attempts == 0);
-  REQUIRE(robot.writes.empty());
-  const auto found = store.findRun("hold-occupied");
-  REQUIRE(found.ok());
-  REQUIRE(found.run->state == MotionState::Failed);
-  REQUIRE(found.run->err == ErrorCode::RobotNotReady);
-
-  loop.tick();
-  REQUIRE(robot.occupancy_calls == 3);
-  REQUIRE(robot.write_attempts == 0);
-}
-
-TEST_CASE("RuntimeControlLoop policy stop hold write failure maps to fault block") {
-  TempTree tmp;
-  RuntimeConfig config = runtimeConfig();
-  config.stop_hold_s = 0.06;
-  RuntimeStatusStore store(config);
-  RuntimeBridge bridge(config, store);
-  const DeployConfig deploy_config = deployConfig();
-  FakeRobotIO robot(readyLowState(deploy_config));
-  FakePolicy policy;
-  auto loop = makePolicyLoop(config, bridge, store, tmp.trkConfig(), robot, policy,
-                             deploy_config);
-
-  const auto path = validTrk(tmp, "hold_write_fail.trk", 3);
-  REQUIRE(bridge.submitQueue(executeCommand("hold-write-fail", path)).ok());
-  startQueuedRun(loop, store, "hold-write-fail");
-
-  REQUIRE(bridge.stop().state == ControllerState::Stopping);
-  loop.tick();
-  robot.throw_on_write = true;
-
-  loop.tick();
-
-  const auto snapshot = store.snapshot();
-  REQUIRE(snapshot.ctrl == ControllerState::Fault);
-  REQUIRE_FALSE(snapshot.ready);
-  REQUIRE(snapshot.err == ErrorCode::InternalError);
-  REQUIRE(snapshot.block == "lowcmd_write_failed");
-  REQUIRE(policy.calls == 0);
-  REQUIRE(robot.write_attempts == 1);
-  REQUIRE(robot.writes.empty());
-  const auto found = store.findRun("hold-write-fail");
-  REQUIRE(found.ok());
-  REQUIRE(found.run->state == MotionState::Failed);
-  REQUIRE(found.run->err == ErrorCode::InternalError);
-
-  loop.tick();
-  REQUIRE(robot.write_attempts == 1);
 }
 
 TEST_CASE("RuntimeControlLoop stop before consumption cancels queued work on stop tick") {
@@ -1994,146 +2578,6 @@ TEST_CASE("RuntimeControlLoop stop watermark preserves post-stop interrupt reaso
   REQUIRE(store.snapshot().queue.ids == std::vector<std::string>{"urgent"});
 
   startQueuedRun(loop, store, "urgent");
-}
-
-TEST_CASE("RuntimeControlLoop policy stop hold preserves post-stop queue until hold completes") {
-  TempTree tmp;
-  RuntimeConfig config = runtimeConfig();
-  config.stop_hold_s = 0.06;
-  RuntimeStatusStore store(config);
-  RuntimeBridge bridge(config, store);
-  const DeployConfig deploy_config = deployConfig();
-  FakeRobotIO robot(readyLowState(deploy_config));
-  FakePolicy policy;
-  auto loop = makePolicyLoop(config, bridge, store, tmp.trkConfig(), robot, policy,
-                             deploy_config);
-
-  const auto active_path = validTrk(tmp, "policy_hold_active.trk", 5);
-  const auto queued_path = validTrk(tmp, "policy_hold_post_stop_queue.trk", 3);
-
-  REQUIRE(bridge.submitQueue(executeCommand("active", active_path)).ok());
-  startQueuedRun(loop, store, "active");
-
-  REQUIRE(bridge.stop().state == ControllerState::Stopping);
-  loop.tick();
-  REQUIRE(store.snapshot().ctrl == ControllerState::Stopping);
-
-  loop.tick();
-  REQUIRE(robot.write_attempts == 1);
-  REQUIRE(store.snapshot().ctrl == ControllerState::Stopping);
-
-  REQUIRE(bridge.submitQueue(executeCommand("post-stop", queued_path)).ok());
-  REQUIRE(store.snapshot().queue.ids == std::vector<std::string>{"post-stop"});
-
-  loop.tick();
-  REQUIRE(robot.write_attempts == 2);
-  REQUIRE(store.snapshot().queue.ids == std::vector<std::string>{"post-stop"});
-
-  loop.tick();
-  auto snapshot = store.snapshot();
-  REQUIRE(robot.write_attempts == 3);
-  REQUIRE(snapshot.ctrl == ControllerState::Idle);
-  REQUIRE(snapshot.queue.ids == std::vector<std::string>{"post-stop"});
-  REQUIRE(store.findRun("active").run->state == MotionState::Stopped);
-  REQUIRE(store.findRun("active").run->stop_reason == StopReason::Stop);
-  REQUIRE(store.findRun("post-stop").run->state == MotionState::Queued);
-
-  startQueuedRun(loop, store, "post-stop");
-  snapshot = store.snapshot();
-  REQUIRE(snapshot.queue.ids.empty());
-}
-
-TEST_CASE("RuntimeControlLoop policy stop hold repeated stop is idempotent") {
-  TempTree tmp;
-  RuntimeConfig config = runtimeConfig();
-  config.stop_hold_s = 0.06;
-  RuntimeStatusStore store(config);
-  RuntimeBridge bridge(config, store);
-  const DeployConfig deploy_config = deployConfig();
-  FakeRobotIO robot(readyLowState(deploy_config));
-  FakePolicy policy;
-  auto loop = makePolicyLoop(config, bridge, store, tmp.trkConfig(), robot, policy,
-                             deploy_config);
-
-  const auto active_path = validTrk(tmp, "policy_hold_repeated_stop.trk", 5);
-  REQUIRE(bridge.submitQueue(executeCommand("active", active_path)).ok());
-  startQueuedRun(loop, store, "active");
-
-  REQUIRE(bridge.stop().state == ControllerState::Stopping);
-  loop.tick();
-  REQUIRE(store.snapshot().ctrl == ControllerState::Stopping);
-  REQUIRE(store.snapshot().stop_reason == StopReason::Stop);
-
-  loop.tick();
-  REQUIRE(robot.write_attempts == 1);
-  REQUIRE(store.snapshot().ctrl == ControllerState::Stopping);
-
-  REQUIRE(bridge.stop().state == ControllerState::Stopping);
-  loop.tick();
-  REQUIRE(robot.write_attempts == 2);
-  REQUIRE(store.snapshot().ctrl == ControllerState::Stopping);
-  REQUIRE(store.snapshot().stop_reason == StopReason::Stop);
-
-  loop.tick();
-  auto snapshot = store.snapshot();
-  REQUIRE(robot.write_attempts == 3);
-  REQUIRE(snapshot.ctrl == ControllerState::Idle);
-  REQUIRE(snapshot.stop_reason == StopReason::None);
-  REQUIRE_FALSE(snapshot.exec.has_value());
-
-  loop.tick();
-  REQUIRE(robot.write_attempts == 4);
-  requireIdle(store);
-}
-
-TEST_CASE("RuntimeControlLoop policy stop hold preserves post-stop interrupt until hold completes") {
-  TempTree tmp;
-  RuntimeConfig config = runtimeConfig();
-  config.stop_hold_s = 0.06;
-  RuntimeStatusStore store(config);
-  RuntimeBridge bridge(config, store);
-  const DeployConfig deploy_config = deployConfig();
-  FakeRobotIO robot(readyLowState(deploy_config));
-  FakePolicy policy;
-  auto loop = makePolicyLoop(config, bridge, store, tmp.trkConfig(), robot, policy,
-                             deploy_config);
-
-  const auto active_path = validTrk(tmp, "policy_hold_interrupt_active.trk", 5);
-  const auto urgent_path = validTrk(tmp, "policy_hold_urgent.trk", 3);
-
-  REQUIRE(bridge.submitQueue(executeCommand("active", active_path)).ok());
-  startQueuedRun(loop, store, "active");
-
-  REQUIRE(bridge.stop().state == ControllerState::Stopping);
-  loop.tick();
-  REQUIRE(store.snapshot().ctrl == ControllerState::Stopping);
-
-  loop.tick();
-  REQUIRE(robot.write_attempts == 1);
-  REQUIRE(store.snapshot().ctrl == ControllerState::Stopping);
-
-  REQUIRE(bridge.submitInterrupt(
-              executeCommand("urgent", urgent_path, MotionMode::Interrupt))
-              .ok());
-  REQUIRE(store.snapshot().queue.ids == std::vector<std::string>{"urgent"});
-
-  loop.tick();
-  REQUIRE(robot.write_attempts == 2);
-  REQUIRE(store.snapshot().queue.ids == std::vector<std::string>{"urgent"});
-
-  loop.tick();
-  auto snapshot = store.snapshot();
-  REQUIRE(robot.write_attempts == 3);
-  REQUIRE(snapshot.ctrl == ControllerState::Idle);
-  REQUIRE(snapshot.queue.ids == std::vector<std::string>{"urgent"});
-  REQUIRE(store.findRun("active").run->state == MotionState::Stopped);
-  REQUIRE(store.findRun("active").run->stop_reason == StopReason::Stop);
-  REQUIRE(store.findRun("urgent").run->state == MotionState::Queued);
-  REQUIRE(store.findRun("urgent").run->stop_reason == StopReason::None);
-
-  startQueuedRun(loop, store, "urgent");
-  snapshot = store.snapshot();
-  REQUIRE(snapshot.queue.ids.empty());
 }
 
 TEST_CASE("RuntimeControlLoop interrupt stops active, cancels local waiting, then starts urgent") {

@@ -1,5 +1,7 @@
 #include "agentic_et1_tracker/runtime/runtime_control_loop.hpp"
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <exception>
@@ -47,11 +49,6 @@ HealthSnapshot healthFromSnapshot(const StatusSnapshot& snapshot) {
   return health;
 }
 
-ControllerState controlState(ControlMode mode) {
-  return mode == ControlMode::FixStand ? ControllerState::FixStand
-                                       : ControllerState::StandbyVelocity;
-}
-
 }  // namespace
 
 RuntimeControlLoop::RuntimeControlLoop(RuntimeConfig config,
@@ -72,6 +69,7 @@ RuntimeControlLoop::RuntimeControlLoop(RuntimeConfig config,
                                        RobotIO& robot_io,
                                        PolicyInference& policy,
                                        DeployConfig deploy_config,
+                                       PassiveConfig passive_config,
                                        std::uint8_t expected_mode_machine,
                                        RuntimeMode mode)
     : config_(config),
@@ -81,6 +79,7 @@ RuntimeControlLoop::RuntimeControlLoop(RuntimeConfig config,
       robot_io_(&robot_io),
       policy_(&policy),
       deploy_config_(std::move(deploy_config)),
+      passive_config_(std::move(passive_config)),
       expected_mode_machine_(expected_mode_machine),
       mode_(mode) {
   runtime_state_.ready = false;
@@ -100,6 +99,7 @@ RuntimeControlLoop::RuntimeControlLoop(RuntimeConfig config,
                                        VelocityPolicyInference& velocity_policy,
                                        VelocityDeployConfig velocity_deploy_config,
                                        FixStandConfig fixstand_config,
+                                       PassiveConfig passive_config,
                                        ControlMode startup_control,
                                        std::uint8_t expected_mode_machine,
                                        RuntimeMode mode)
@@ -113,10 +113,9 @@ RuntimeControlLoop::RuntimeControlLoop(RuntimeConfig config,
       velocity_policy_(&velocity_policy),
       velocity_deploy_config_(std::move(velocity_deploy_config)),
       fixstand_config_(std::move(fixstand_config)),
+      passive_config_(std::move(passive_config)),
       expected_mode_machine_(expected_mode_machine),
       mode_(mode),
-      ctrl_(startup_control == ControlMode::FixStand ? ControllerState::FixStand
-                                                     : ControllerState::StandbyVelocity),
       post_stop_control_(startup_control) {
   runtime_state_.ready = false;
   runtime_state_.robot = RobotState::Disconnected;
@@ -124,11 +123,20 @@ RuntimeControlLoop::RuntimeControlLoop(RuntimeConfig config,
   runtime_state_.block = "runtime_not_started";
   fixstand_runner_.emplace(*fixstand_config_, expected_mode_machine_, config_.hz);
   velocity_runner_.emplace(*velocity_deploy_config_, expected_mode_machine_);
+  if (startup_control == ControlMode::FixStand) {
+    enterFixStandState();
+  } else {
+    enterVelocityState();
+  }
   publishSnapshot();
 }
 
+RuntimeInternalState RuntimeControlLoop::internalStateForTest() const {
+  return fsm_state_;
+}
+
 void RuntimeControlLoop::tick() {
-  if (ctrl_ == ControllerState::Stopping) {
+  if (fsm_state_ == RuntimeInternalState::Stopping) {
     consumeStoppingCommands();
     if (hasPolicyRuntime() && stopping_hold_ticks_remaining_ > 0) {
       if (!writeStoppingHold()) {
@@ -140,13 +148,13 @@ void RuntimeControlLoop::tick() {
     if (stop_to_idle_pending_ && stopping_hold_ticks_remaining_ == 0) {
       completeStoppingActive(MotionState::Stopped, ErrorCode::Ok);
       stop_to_idle_pending_ = false;
-      ctrl_ = hasControlRuntime() ? controlState(post_stop_control_) : ControllerState::Idle;
       stop_reason_ = StopReason::None;
-      if (ctrl_ == ControllerState::FixStand && fixstand_runner_) {
-        fixstand_runner_->reset();
-      }
-      if (ctrl_ == ControllerState::StandbyVelocity && velocity_runner_) {
-        velocity_runner_->reset();
+      if (!hasControlRuntime()) {
+        enterGeneralTrackerIdleState();
+      } else if (post_stop_control_ == ControlMode::FixStand) {
+        enterFixStandState();
+      } else {
+        enterGeneralTrackerIdleState();
       }
     }
     publishSnapshot();
@@ -158,30 +166,25 @@ void RuntimeControlLoop::tick() {
     return;
   }
 
-  if (ctrl_ == ControllerState::Running) {
-    advanceActive();
+  if (fsm_state_ == RuntimeInternalState::GeneralTrackerActive) {
+    if (ctrl_ == ControllerState::Preparing) {
+      completePreparing();
+    } else {
+      advanceActive();
+    }
     publishSnapshot();
     return;
   }
 
-  if (ctrl_ == ControllerState::Preparing) {
-    completePreparing();
-    publishSnapshot();
-    return;
-  }
-
-  if ((ctrl_ == ControllerState::Idle || ctrl_ == ControllerState::FixStand ||
-       ctrl_ == ControllerState::StandbyVelocity) &&
-      !waiting_.empty()) {
+  if (fsm_state_ == RuntimeInternalState::Passive) {
+    runPassiveState();
+  } else if (isMotionAcceptingState() && !waiting_.empty()) {
     startNext();
     publishSnapshot();
     return;
-  }
-
-  if ((ctrl_ == ControllerState::FixStand || ctrl_ == ControllerState::StandbyVelocity) &&
-      waiting_.empty()) {
+  } else if (hasControlRuntime() && isControlPublishingState() && waiting_.empty()) {
     publishControlIfReady();
-  } else if (ctrl_ == ControllerState::Idle && waiting_.empty()) {
+  } else if (fsm_state_ == RuntimeInternalState::GeneralTrackerIdle && waiting_.empty()) {
     refreshReadinessForPolicyRuntime();
     publishIdleHoldIfReady();
   }
@@ -189,7 +192,6 @@ void RuntimeControlLoop::tick() {
 }
 
 bool RuntimeControlLoop::consumePendingCommands() {
-  bool consumed_motion = false;
   while (auto command = bridge_.consumeNextCommand()) {
     switch (command->kind) {
       case CommandKind::Stop:
@@ -197,22 +199,21 @@ bool RuntimeControlLoop::consumePendingCommands() {
         return true;
       case CommandKind::FixStand:
         handleControl(ControlMode::FixStand);
-        if (ctrl_ == ControllerState::Stopping) {
+        if (fsm_state_ == RuntimeInternalState::Stopping) {
           return true;
         }
         break;
       case CommandKind::StandbyVelocity:
         handleControl(ControlMode::StandbyVelocity);
-        if (ctrl_ == ControllerState::Stopping) {
+        if (fsm_state_ == RuntimeInternalState::Stopping) {
           return true;
         }
         break;
       case CommandKind::Interrupt:
         handleInterrupt(std::move(command->request));
-        return ctrl_ == ControllerState::Stopping;
+        return fsm_state_ == RuntimeInternalState::Stopping;
       case CommandKind::Queue:
         waiting_.push_back(std::move(command->request));
-        consumed_motion = true;
         break;
     }
   }
@@ -247,33 +248,53 @@ void RuntimeControlLoop::consumeStoppingCommands() {
 
 void RuntimeControlLoop::handleStop(std::uint64_t sequence) {
   cancelWaiting(StopReason::Stop, sequence);
-  if (ctrl_ == ControllerState::Fault) {
+  if (fsm_state_ == RuntimeInternalState::Fault) {
+    return;
+  }
+  if (fsm_state_ == RuntimeInternalState::Passive) {
+    stop_reason_ = StopReason::None;
+    stop_to_idle_pending_ = false;
+    stopping_hold_ticks_remaining_ = 0;
     return;
   }
   post_stop_control_ = ControlMode::StandbyVelocity;
   if (active_) {
     markActiveStopping(StopReason::Stop);
-  } else if (ctrl_ == ControllerState::FixStand && waiting_.empty()) {
+  } else if (fsm_state_ == RuntimeInternalState::FixStand && waiting_.empty()) {
     policy_runner_.reset();
-    ctrl_ = ControllerState::StandbyVelocity;
+    handleInternalEvent(RuntimeInternalEvent::Velocity);
     stop_reason_ = StopReason::None;
     stop_to_idle_pending_ = false;
     stopping_hold_ticks_remaining_ = 0;
-    if (velocity_runner_) {
-      velocity_runner_->reset();
-    }
     return;
   }
+  stop_reason_ = StopReason::Stop;
   enterStopping(StopReason::Stop);
 }
 
 void RuntimeControlLoop::handleControl(ControlMode mode) {
-  cancelWaiting(StopReason::Stop);
-  if (ctrl_ == ControllerState::Fault) {
+  if (fsm_state_ == RuntimeInternalState::Fault && mode != ControlMode::FixStand) {
+    return;
+  }
+  if (fsm_state_ == RuntimeInternalState::Passive &&
+      mode != ControlMode::FixStand) {
     return;
   }
 
+  if (mode == ControlMode::FixStand) {
+    cancelWaiting(StopReason::Stop);
+  }
   post_stop_control_ = mode;
+  if (fsm_state_ == RuntimeInternalState::Fault) {
+    active_.reset();
+    policy_runner_.reset();
+    handleInternalEvent(RuntimeInternalEvent::FixStand);
+    stop_reason_ = StopReason::None;
+    stop_to_idle_pending_ = false;
+    stopping_hold_ticks_remaining_ = 0;
+    return;
+  }
+
   if (active_) {
     markActiveStopping(StopReason::Stop);
     enterStopping(StopReason::Stop);
@@ -282,15 +303,9 @@ void RuntimeControlLoop::handleControl(ControlMode mode) {
 
   policy_runner_.reset();
   if (mode == ControlMode::FixStand) {
-    ctrl_ = ControllerState::FixStand;
-    if (fixstand_runner_) {
-      fixstand_runner_->reset();
-    }
+    handleInternalEvent(RuntimeInternalEvent::FixStand);
   } else {
-    ctrl_ = ControllerState::StandbyVelocity;
-    if (velocity_runner_) {
-      velocity_runner_->reset();
-    }
+    handleInternalEvent(RuntimeInternalEvent::Velocity);
   }
   stop_reason_ = StopReason::None;
   stop_to_idle_pending_ = false;
@@ -334,6 +349,161 @@ void RuntimeControlLoop::cancelWaiting(StopReason reason, std::uint64_t sequence
   waiting_ = std::move(remaining);
 }
 
+ControllerState RuntimeControlLoop::controllerStateForInternal(
+    RuntimeInternalState state) const {
+  switch (state) {
+    case RuntimeInternalState::Passive:
+      return ControllerState::Passive;
+    case RuntimeInternalState::FixStand:
+      return ControllerState::FixStand;
+    case RuntimeInternalState::Velocity:
+      return ControllerState::StandbyVelocity;
+    case RuntimeInternalState::GeneralTrackerIdle:
+      return hasControlRuntime() ? ControllerState::StandbyVelocity : ControllerState::Idle;
+    case RuntimeInternalState::GeneralTrackerActive:
+      return ControllerState::Running;
+    case RuntimeInternalState::Stopping:
+      return ControllerState::Stopping;
+    case RuntimeInternalState::Fault:
+      return ControllerState::Fault;
+  }
+  return ControllerState::Fault;
+}
+
+void RuntimeControlLoop::enterInternalState(RuntimeInternalState state) {
+  fsm_state_ = state;
+  ctrl_ = controllerStateForInternal(state);
+  switch (state) {
+    case RuntimeInternalState::Passive:
+      active_policy_ticks_until_next_ = 0;
+      velocity_policy_ticks_until_next_ = 0;
+      break;
+    case RuntimeInternalState::FixStand:
+      active_policy_ticks_until_next_ = 0;
+      velocity_policy_ticks_until_next_ = 0;
+      if (fixstand_runner_) {
+        fixstand_runner_->reset();
+      }
+      break;
+    case RuntimeInternalState::Velocity:
+    case RuntimeInternalState::GeneralTrackerIdle:
+      active_policy_ticks_until_next_ = 0;
+      velocity_policy_ticks_until_next_ = 0;
+      if (velocity_runner_) {
+        velocity_runner_->reset();
+      }
+      break;
+    case RuntimeInternalState::GeneralTrackerActive:
+      active_policy_ticks_until_next_ = 0;
+      active_first_advance_ = true;
+      break;
+    case RuntimeInternalState::Stopping:
+      break;
+    case RuntimeInternalState::Fault:
+      active_policy_ticks_until_next_ = 0;
+      velocity_policy_ticks_until_next_ = 0;
+      break;
+  }
+}
+
+void RuntimeControlLoop::handleInternalEvent(RuntimeInternalEvent event) {
+  switch (event) {
+    case RuntimeInternalEvent::FixStand:
+      enterFixStandState();
+      break;
+    case RuntimeInternalEvent::Velocity:
+      enterVelocityState();
+      break;
+    case RuntimeInternalEvent::MotionRequest:
+      enterTrackPreparingState();
+      break;
+    case RuntimeInternalEvent::SafetyPassive:
+      enterInternalState(RuntimeInternalState::Passive);
+      break;
+    case RuntimeInternalEvent::Fault:
+      enterInternalState(RuntimeInternalState::Fault);
+      break;
+  }
+}
+
+void RuntimeControlLoop::enterPassiveState(const RobotReadinessStatus& readiness) {
+  handleInternalEvent(RuntimeInternalEvent::SafetyPassive);
+  applyReadiness(readiness);
+}
+
+void RuntimeControlLoop::enterFixStandState() {
+  enterInternalState(RuntimeInternalState::FixStand);
+}
+
+void RuntimeControlLoop::enterVelocityState() {
+  enterInternalState(RuntimeInternalState::Velocity);
+}
+
+void RuntimeControlLoop::enterGeneralTrackerIdleState() {
+  enterInternalState(RuntimeInternalState::GeneralTrackerIdle);
+}
+
+void RuntimeControlLoop::enterTrackPreparingState() {
+  enterInternalState(RuntimeInternalState::GeneralTrackerActive);
+  ctrl_ = ControllerState::Preparing;
+}
+
+void RuntimeControlLoop::enterTrackActiveState() {
+  enterInternalState(RuntimeInternalState::GeneralTrackerActive);
+}
+
+bool RuntimeControlLoop::isMotionAcceptingState() const {
+  return fsm_state_ == RuntimeInternalState::Velocity ||
+         fsm_state_ == RuntimeInternalState::GeneralTrackerIdle;
+}
+
+bool RuntimeControlLoop::isControlPublishingState() const {
+  return fsm_state_ == RuntimeInternalState::FixStand ||
+         fsm_state_ == RuntimeInternalState::Velocity ||
+         fsm_state_ == RuntimeInternalState::GeneralTrackerIdle;
+}
+
+void RuntimeControlLoop::runPassiveState() {
+  if (!hasPolicyRuntime()) {
+    return;
+  }
+
+  writePassiveDamping();
+}
+
+bool RuntimeControlLoop::writePassiveDamping() {
+  if (!passive_config_) {
+    return false;
+  }
+
+  const std::optional<LowStateSample> low_state = robot_io_->readLowState();
+  const LowCmdOccupancy occupancy = robot_io_->lowCmdOccupancy();
+  const RobotReadinessStatus readiness =
+      mapRobotReadiness(low_state, occupancy, expected_mode_machine_);
+  if (readinessRequiresFault(readiness)) {
+    enterFault(readiness.err, readiness.robot, readiness.block, readiness.low_ms);
+    return false;
+  }
+  applyReadiness(readiness);
+
+  if (!low_state.has_value()) {
+    return false;
+  }
+
+  try {
+    const LowCmdFrame frame =
+        makePassiveLowCmdFrame(*passive_config_, *low_state, expected_mode_machine_);
+    writeLowCmdFrame(frame);
+  } catch (const std::exception&) {
+    enterFault(ErrorCode::InternalError,
+               RobotState::Fault,
+               "lowcmd_write_failed",
+               readiness.low_ms);
+    return false;
+  }
+  return true;
+}
+
 void RuntimeControlLoop::startNext() {
   std::optional<LowStateSample> entry_low_state;
   std::optional<RobotReadinessStatus> readiness;
@@ -350,6 +520,8 @@ void RuntimeControlLoop::startNext() {
                    readiness->robot,
                    readiness->block,
                    readiness->low_ms);
+      } else {
+        enterPassiveState(*readiness);
       }
       return;
     }
@@ -362,13 +534,13 @@ void RuntimeControlLoop::startNext() {
   request.err = ErrorCode::Ok;
   request.stop_reason = StopReason::None;
   active_ = std::move(request);
-  ctrl_ = ControllerState::Preparing;
+  handleInternalEvent(RuntimeInternalEvent::MotionRequest);
   publishActive();
 }
 
 void RuntimeControlLoop::completePreparing() {
   if (!active_) {
-    ctrl_ = ControllerState::Idle;
+    enterGeneralTrackerIdleState();
     return;
   }
 
@@ -399,7 +571,7 @@ void RuntimeControlLoop::completePreparing() {
       policy_runner_.reset();
       waiting_.push_front(std::move(request));
       status_.publishRunStatus(toStatus(waiting_.front()));
-      ctrl_ = hasControlRuntime() ? controlState(post_stop_control_) : ControllerState::Idle;
+      enterPassiveState(*readiness);
       return;
     }
   }
@@ -414,10 +586,7 @@ void RuntimeControlLoop::completePreparing() {
     status_.publishRunStatus(toStatus(*active_));
     active_.reset();
     post_stop_control_ = ControlMode::StandbyVelocity;
-    ctrl_ = hasControlRuntime() ? ControllerState::StandbyVelocity : ControllerState::Idle;
-    if (ctrl_ == ControllerState::StandbyVelocity && velocity_runner_) {
-      velocity_runner_->reset();
-    }
+    enterGeneralTrackerIdleState();
     return;
   }
 
@@ -442,10 +611,7 @@ void RuntimeControlLoop::completePreparing() {
       active_.reset();
       policy_runner_.reset();
       post_stop_control_ = ControlMode::StandbyVelocity;
-      ctrl_ = hasControlRuntime() ? ControllerState::StandbyVelocity : ControllerState::Idle;
-      if (ctrl_ == ControllerState::StandbyVelocity && velocity_runner_) {
-        velocity_runner_->reset();
-      }
+      enterGeneralTrackerIdleState();
       enterFault(ErrorCode::ModelInferenceFailed,
                  RobotState::Fault,
                  "policy_inference_failed",
@@ -459,8 +625,7 @@ void RuntimeControlLoop::completePreparing() {
   active_->err = ErrorCode::Ok;
   active_->stop_reason = StopReason::None;
   active_->started_at = std::chrono::steady_clock::now();
-  active_first_advance_ = true;
-  ctrl_ = ControllerState::Running;
+  enterTrackActiveState();
   publishActive();
 }
 
@@ -471,23 +636,23 @@ void RuntimeControlLoop::advanceActive() {
   }
 
   if (!active_) {
-    ctrl_ = ControllerState::Idle;
+    enterGeneralTrackerIdleState();
     return;
   }
 
-  const auto now = std::chrono::steady_clock::now();
-  std::size_t frame = active_->frame;
-  if (active_first_advance_) {
-    active_->started_at = now;
-    active_first_advance_ = false;
-    frame = 0;
-  } else {
-    const auto elapsed = std::chrono::duration<double>(now - active_->started_at).count();
-    frame = referenceFrameIndex(elapsed, active_->fps, active_->frames);
+  if (!consumeStepDue(active_policy_ticks_until_next_, activePolicyIntervalTicks())) {
+    return;
   }
 
-  active_->frame = frame;
-  if (active_->frames == 0 || frame + 1 >= active_->frames) {
+  if (active_first_advance_) {
+    active_->started_at = std::chrono::steady_clock::now();
+    active_first_advance_ = false;
+    active_->frame = 0;
+  } else if (active_->frames > 0 && active_->frame + 1 < active_->frames) {
+    ++active_->frame;
+  }
+
+  if (active_->frames == 0 || active_->frame + 1 >= active_->frames) {
     const std::size_t last_frame = active_->frames == 0 ? 0 : active_->frames - 1;
     if (active_->frame < last_frame) {
       active_->frame = last_frame;
@@ -497,10 +662,7 @@ void RuntimeControlLoop::advanceActive() {
     active_->frame = last_frame;
     finishActive(MotionState::Done, StopReason::None, ErrorCode::Ok);
     post_stop_control_ = ControlMode::StandbyVelocity;
-    ctrl_ = hasControlRuntime() ? ControllerState::StandbyVelocity : ControllerState::Idle;
-    if (ctrl_ == ControllerState::StandbyVelocity && velocity_runner_) {
-      velocity_runner_->reset();
-    }
+    enterGeneralTrackerIdleState();
     return;
   }
 
@@ -510,7 +672,7 @@ void RuntimeControlLoop::advanceActive() {
 void RuntimeControlLoop::advanceActiveWithPolicy() {
   if (!active_) {
     policy_runner_.reset();
-    ctrl_ = ControllerState::Idle;
+    enterGeneralTrackerIdleState();
     return;
   }
 
@@ -521,32 +683,39 @@ void RuntimeControlLoop::advanceActiveWithPolicy() {
     return;
   }
 
+  if (!consumeStepDue(active_policy_ticks_until_next_, activePolicyIntervalTicks())) {
+    return;
+  }
+
   const std::optional<LowStateSample> low_state = robot_io_->readLowState();
   const RobotReadinessStatus readiness =
       mapRobotReadiness(low_state, robot_io_->lowCmdOccupancy(), expected_mode_machine_);
   if (readiness.err != ErrorCode::Ok) {
-    failActiveWithFault(readiness.err,
-                        readiness.robot,
-                        readiness.block,
-                        readiness.low_ms);
+    if (readinessRequiresFault(readiness)) {
+      failActiveWithFault(readiness.err,
+                          readiness.robot,
+                          readiness.block,
+                          readiness.low_ms);
+    } else {
+      finishActive(MotionState::Failed, StopReason::None, readiness.err);
+      enterPassiveState(readiness);
+    }
     return;
   }
   applyReadiness(readiness);
 
-  const auto now = std::chrono::steady_clock::now();
   if (active_first_advance_) {
-    active_->started_at = now;
+    active_->started_at = std::chrono::steady_clock::now();
     active_->frame = 0;
     active_first_advance_ = false;
-  } else {
-    const auto elapsed = std::chrono::duration<double>(now - active_->started_at).count();
-    active_->frame = referenceFrameIndex(elapsed, active_->fps, active_->frames);
+  } else if (active_->frames > 0 && active_->frame + 1 < active_->frames) {
+    ++active_->frame;
   }
   publishActive();
 
   PolicyStepResult step;
   try {
-    step = policy_runner_->step(active_->frame, *low_state, *policy_);
+    step = policy_runner_->step(active_->frame, *low_state, *policy_, lowCmdBaseFrame());
   } catch (const std::exception&) {
     failActiveWithFault(ErrorCode::ModelInferenceFailed,
                         RobotState::Fault,
@@ -556,7 +725,7 @@ void RuntimeControlLoop::advanceActiveWithPolicy() {
   }
 
   try {
-    robot_io_->writeLowCmd(step.low_cmd);
+    writeLowCmdFrame(step.low_cmd);
   } catch (const std::exception&) {
     failActiveWithFault(ErrorCode::InternalError,
                         RobotState::Fault,
@@ -570,10 +739,7 @@ void RuntimeControlLoop::advanceActiveWithPolicy() {
     active_->frame = last_frame;
     finishActive(MotionState::Done, StopReason::None, ErrorCode::Ok);
     post_stop_control_ = ControlMode::StandbyVelocity;
-    ctrl_ = hasControlRuntime() ? ControllerState::StandbyVelocity : ControllerState::Idle;
-    if (ctrl_ == ControllerState::StandbyVelocity && velocity_runner_) {
-      velocity_runner_->reset();
-    }
+    enterGeneralTrackerIdleState();
     return;
   }
 
@@ -594,21 +760,32 @@ void RuntimeControlLoop::publishControlIfReady() {
 
 bool RuntimeControlLoop::writeFixStand() {
   const std::optional<LowStateSample> low_state = robot_io_->readLowState();
+  const LowCmdOccupancy occupancy = robot_io_->lowCmdOccupancy();
   const RobotReadinessStatus readiness =
-      mapRobotReadiness(low_state, robot_io_->lowCmdOccupancy(), expected_mode_machine_);
+      mapRobotReadiness(low_state, occupancy, expected_mode_machine_);
   if (readiness.err != ErrorCode::Ok) {
-    if (readinessRequiresFault(readiness)) {
-      enterFault(readiness.err, readiness.robot, readiness.block, readiness.low_ms);
-    } else {
-      applyReadiness(readiness);
+    const bool can_write_bad_orientation =
+        readiness.err == ErrorCode::RobotBadOrientation && low_state.has_value() &&
+        low_state->fresh &&
+        (low_state->mode_machine == 0 ||
+         low_state->mode_machine == expected_mode_machine_) &&
+        !occupancy.occupied;
+    if (!can_write_bad_orientation) {
+      if (readinessRequiresFault(readiness)) {
+        enterFault(readiness.err, readiness.robot, readiness.block, readiness.low_ms);
+      } else {
+        enterPassiveState(readiness);
+      }
+      return false;
     }
-    return false;
+    applyReadiness(readiness);
+  } else {
+    applyReadiness(readiness);
   }
-  applyReadiness(readiness);
 
   LowCmdFrame frame;
   try {
-    frame = fixstand_runner_->step(*low_state);
+    frame = fixstand_runner_->step(*low_state, lowCmdBaseFrame());
   } catch (const std::exception&) {
     enterFault(ErrorCode::InternalError,
                RobotState::Fault,
@@ -618,7 +795,7 @@ bool RuntimeControlLoop::writeFixStand() {
   }
 
   try {
-    robot_io_->writeLowCmd(frame);
+    writeLowCmdFrame(frame);
   } catch (const std::exception&) {
     enterFault(ErrorCode::InternalError,
                RobotState::Fault,
@@ -637,15 +814,22 @@ bool RuntimeControlLoop::writeStandbyVelocity() {
     if (readinessRequiresFault(readiness)) {
       enterFault(readiness.err, readiness.robot, readiness.block, readiness.low_ms);
     } else {
-      applyReadiness(readiness);
+      enterPassiveState(readiness);
     }
     return false;
   }
   applyReadiness(readiness);
 
+  if (!consumeStepDue(velocity_policy_ticks_until_next_, velocityPolicyIntervalTicks())) {
+    return republishLowCmdBuffer();
+  }
+
   VelocityStepResult step;
   try {
-    step = velocity_runner_->step(*low_state, *velocity_policy_);
+    step = velocity_runner_->step(*low_state, *velocity_policy_, lowCmdBaseFrame());
+    if (fsm_state_ == RuntimeInternalState::GeneralTrackerIdle) {
+      applyGeneralTrackerIdleHold(step.low_cmd);
+    }
   } catch (const std::exception&) {
     enterFault(ErrorCode::ModelInferenceFailed,
                RobotState::Fault,
@@ -655,7 +839,7 @@ bool RuntimeControlLoop::writeStandbyVelocity() {
   }
 
   try {
-    robot_io_->writeLowCmd(step.low_cmd);
+    writeLowCmdFrame(step.low_cmd);
   } catch (const std::exception&) {
     enterFault(ErrorCode::InternalError,
                RobotState::Fault,
@@ -679,15 +863,16 @@ void RuntimeControlLoop::publishIdleHoldIfReady() {
     if (readinessRequiresFault(readiness)) {
       enterFault(readiness.err, readiness.robot, readiness.block, readiness.low_ms);
     } else {
-      applyReadiness(readiness);
+      enterPassiveState(readiness);
     }
     return;
   }
   applyReadiness(readiness);
 
   try {
-    robot_io_->writeLowCmd(
-        makeHoldLowCmdFrame(*deploy_config_, *low_state, expected_mode_machine_));
+    const LowCmdFrame frame =
+        makeHoldLowCmdFrame(*deploy_config_, *low_state, expected_mode_machine_);
+    writeLowCmdFrame(frame);
   } catch (const std::exception&) {
     enterFault(ErrorCode::InternalError,
                RobotState::Fault,
@@ -704,14 +889,19 @@ bool RuntimeControlLoop::writeStoppingHold() {
     stopping_hold_ticks_remaining_ = 0;
     stop_to_idle_pending_ = false;
     failStoppingActiveWithFault(readiness.err);
-    enterFault(readiness.err, readiness.robot, readiness.block, readiness.low_ms);
+    if (readinessRequiresFault(readiness)) {
+      enterFault(readiness.err, readiness.robot, readiness.block, readiness.low_ms);
+    } else {
+      enterPassiveState(readiness);
+    }
     return false;
   }
   applyReadiness(readiness);
 
   try {
-    robot_io_->writeLowCmd(
-        makeHoldLowCmdFrame(*deploy_config_, *low_state, expected_mode_machine_));
+    const LowCmdFrame frame =
+        makeHoldLowCmdFrame(*deploy_config_, *low_state, expected_mode_machine_);
+    writeLowCmdFrame(frame);
   } catch (const std::exception&) {
     stopping_hold_ticks_remaining_ = 0;
     stop_to_idle_pending_ = false;
@@ -724,6 +914,76 @@ bool RuntimeControlLoop::writeStoppingHold() {
   }
 
   return true;
+}
+
+void RuntimeControlLoop::applyGeneralTrackerIdleHold(LowCmdFrame& frame) const {
+  if (!fixstand_config_ || !velocity_deploy_config_) {
+    return;
+  }
+
+  std::array<bool, kSdkMotorCount> velocity_controlled{};
+  for (std::size_t i = 0; i < velocity_deploy_config_->joint_ids_map.size(); ++i) {
+    const int logical = velocity_deploy_config_->joint_ids_map.at(i);
+    if (logical < 0) {
+      continue;
+    }
+    int slot = logical;
+    if (!velocity_deploy_config_->sdk_joint_ids_map.empty()) {
+      const auto logical_index = static_cast<std::size_t>(logical);
+      if (logical_index >= velocity_deploy_config_->sdk_joint_ids_map.size()) {
+        continue;
+      }
+      slot = velocity_deploy_config_->sdk_joint_ids_map.at(logical_index);
+    }
+    if (slot >= 0 && slot < static_cast<int>(kSdkMotorCount)) {
+      velocity_controlled.at(static_cast<std::size_t>(slot)) = true;
+    }
+  }
+
+  const std::size_t count =
+      std::min<std::size_t>({kFixStandMotorCount,
+                             kSdkMotorCount,
+                             fixstand_config_->target_q.size(),
+                             fixstand_config_->kp.size(),
+                             fixstand_config_->kd.size()});
+  for (std::size_t slot = 0; slot < count; ++slot) {
+    if (velocity_controlled.at(slot)) {
+      continue;
+    }
+    MotorCommand& motor = frame.motors.at(slot);
+    motor.mode = 1;
+    motor.q = static_cast<float>(fixstand_config_->target_q.at(slot));
+    motor.dq = 0.0F;
+    motor.kp = static_cast<float>(fixstand_config_->kp.at(slot));
+    motor.kd = static_cast<float>(fixstand_config_->kd.at(slot));
+    motor.tau = 0.0F;
+  }
+}
+
+bool RuntimeControlLoop::republishLowCmdBuffer() {
+  if (!lowcmd_buffer_) {
+    return false;
+  }
+
+  try {
+    writeLowCmdFrame(*lowcmd_buffer_);
+  } catch (const std::exception&) {
+    enterFault(ErrorCode::InternalError,
+               RobotState::Fault,
+               "lowcmd_write_failed",
+               runtime_state_.low_ms);
+    return false;
+  }
+  return true;
+}
+
+const LowCmdFrame* RuntimeControlLoop::lowCmdBaseFrame() const {
+  return lowcmd_buffer_ ? &*lowcmd_buffer_ : nullptr;
+}
+
+void RuntimeControlLoop::writeLowCmdFrame(const LowCmdFrame& frame) {
+  robot_io_->writeLowCmd(frame);
+  lowcmd_buffer_ = frame;
 }
 
 void RuntimeControlLoop::markActiveStopping(StopReason reason) {
@@ -769,36 +1029,71 @@ std::optional<MotionRequest> RuntimeControlLoop::finishActive(MotionState state,
 }
 
 void RuntimeControlLoop::enterStopping(StopReason reason) {
-  if (ctrl_ == ControllerState::Stopping) {
+  if (fsm_state_ == RuntimeInternalState::Stopping) {
     return;
   }
 
-  ctrl_ = ControllerState::Stopping;
+  enterInternalState(RuntimeInternalState::Stopping);
   stop_reason_ = reason;
   stop_to_idle_pending_ = true;
   stopping_hold_ticks_remaining_ = hasPolicyRuntime() ? stopHoldTicks() : 0;
 }
 
-std::size_t RuntimeControlLoop::stopHoldTicks() const {
-  if (!std::isfinite(config_.stop_hold_s) || !std::isfinite(config_.hz) ||
-      config_.stop_hold_s <= 0.0 || config_.hz <= 0.0) {
-    return 0;
+std::size_t RuntimeControlLoop::ticksForPeriod(double seconds) const {
+  if (!std::isfinite(seconds) || !std::isfinite(config_.hz) || seconds <= 0.0 ||
+      config_.hz <= 0.0) {
+    return 1;
   }
 
   const double max_ticks =
       static_cast<double>(std::numeric_limits<std::size_t>::max());
-  if (config_.stop_hold_s >= max_ticks / config_.hz) {
-    return std::numeric_limits<std::size_t>::max();
-  }
-
-  const double ticks = std::ceil(config_.stop_hold_s * config_.hz);
-  if (!std::isfinite(ticks) || ticks <= 0.0) {
-    return 0;
+  const double ticks = std::ceil(seconds * config_.hz);
+  if (!std::isfinite(ticks) || ticks <= 1.0) {
+    return 1;
   }
   if (ticks >= max_ticks) {
     return std::numeric_limits<std::size_t>::max();
   }
   return static_cast<std::size_t>(ticks);
+}
+
+std::size_t RuntimeControlLoop::ticksForRate(double rate_hz) const {
+  if (!std::isfinite(rate_hz) || rate_hz <= 0.0) {
+    return 1;
+  }
+  return ticksForPeriod(1.0 / rate_hz);
+}
+
+bool RuntimeControlLoop::consumeStepDue(std::size_t& ticks_until_next,
+                                        std::size_t interval_ticks) {
+  if (interval_ticks <= 1) {
+    ticks_until_next = 0;
+    return true;
+  }
+  if (ticks_until_next > 0) {
+    --ticks_until_next;
+    return false;
+  }
+  ticks_until_next = interval_ticks - 1;
+  return true;
+}
+
+std::size_t RuntimeControlLoop::velocityPolicyIntervalTicks() const {
+  if (!velocity_deploy_config_) {
+    return 1;
+  }
+  return ticksForPeriod(velocity_deploy_config_->step_dt);
+}
+
+std::size_t RuntimeControlLoop::activePolicyIntervalTicks() const {
+  if (!active_) {
+    return 1;
+  }
+  return ticksForRate(active_->fps);
+}
+
+std::size_t RuntimeControlLoop::stopHoldTicks() const {
+  return 0;
 }
 
 void RuntimeControlLoop::publishActive() {
@@ -868,6 +1163,7 @@ bool RuntimeControlLoop::hasPolicyRuntime() const {
 bool RuntimeControlLoop::hasControlRuntime() const {
   return hasPolicyRuntime() && velocity_policy_ != nullptr &&
          velocity_deploy_config_.has_value() && fixstand_config_.has_value() &&
+         passive_config_.has_value() &&
          fixstand_runner_.has_value() && velocity_runner_.has_value();
 }
 
@@ -883,6 +1179,10 @@ void RuntimeControlLoop::refreshReadinessForPolicyRuntime() {
     enterFault(readiness.err, readiness.robot, readiness.block, readiness.low_ms);
     return;
   }
+  if (readiness.err != ErrorCode::Ok) {
+    enterPassiveState(readiness);
+    return;
+  }
   applyReadiness(readiness);
 }
 
@@ -896,15 +1196,14 @@ void RuntimeControlLoop::applyReadiness(const RobotReadinessStatus& readiness) {
 
 bool RuntimeControlLoop::readinessRequiresFault(
     const RobotReadinessStatus& readiness) const {
-  return readiness.err == ErrorCode::RobotBadOrientation ||
-         readiness.block == "lowcmd_occupied";
+  return readiness.block == "lowcmd_occupied";
 }
 
 void RuntimeControlLoop::enterFault(ErrorCode error,
                                     RobotState robot,
                                     std::string block,
                                     std::optional<std::size_t> low_ms) {
-  ctrl_ = ControllerState::Fault;
+  enterInternalState(RuntimeInternalState::Fault);
   runtime_state_.ready = false;
   runtime_state_.robot = robot;
   runtime_state_.low_ms = low_ms.value_or(runtime_state_.low_ms);

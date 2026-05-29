@@ -242,15 +242,17 @@ StopResult RuntimeStatusStore::acceptStop() {
     if (snapshot_.ctrl == ControllerState::FixStand) {
       return {ErrorCode::Ok, ControllerState::Stopping, StopReason::Stop, 0};
     }
-    return {ErrorCode::Ok, ControllerState::Idle, StopReason::None, 0};
+    return {ErrorCode::Ok, snapshot_.ctrl, StopReason::None, 0};
   }
 
   return {ErrorCode::Ok, ControllerState::Stopping, StopReason::Stop, 0};
 }
 
-ControlResult RuntimeStatusStore::acceptControl(ControlMode /*mode*/) {
+ControlResult RuntimeStatusStore::acceptControl(ControlMode mode) {
   std::lock_guard<std::mutex> lock(mutex_);
-  cancelQueuedLocked(StopReason::Stop);
+  if (mode == ControlMode::FixStand) {
+    cancelQueuedLocked(StopReason::Stop);
+  }
   return {ErrorCode::Ok};
 }
 

@@ -479,6 +479,20 @@ TEST_CASE("GET status renders idle nulls and queue short fields") {
   REQUIRE(response.body.at("stop_reason").is_null());
 }
 
+TEST_CASE("GET status renders Passive as an explicit controller state") {
+  Harness h;
+  h.status.snapshot_value.ctrl = ControllerState::Passive;
+  h.status.snapshot_value.ready = false;
+  h.status.snapshot_value.err = ErrorCode::RobotBadOrientation;
+  h.status.snapshot_value.block = "bad_orientation";
+
+  const auto response = h.service.handle({"GET", "/status", ""});
+
+  REQUIRE(response.status == 200);
+  REQUIRE(response.body.at("ctrl") == "passive");
+  REQUIRE(response.body.at("block") == "bad_orientation");
+}
+
 TEST_CASE("GET status renders running progress and top-level stopping reason") {
   Harness h;
   MotionStatus exec = run("active", MotionState::Running);

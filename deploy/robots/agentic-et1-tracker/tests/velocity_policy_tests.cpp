@@ -1,3 +1,4 @@
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
@@ -196,13 +197,16 @@ TEST_CASE("StandbyVelocity runner builds zero-command obs and maps 12 actions to
           kVelocityPolicyObsDim);
 
   REQUIRE(step.raw_action == policy.raw_actions);
+  REQUIRE(step.processed_action.size() == kVelocityPolicyJointDim);
   REQUIRE(step.low_cmd.mode_machine == kExpectedModeMachine);
   for (std::size_t i = 0; i < kVelocityPolicyJointDim; ++i) {
     const auto sdk_slot = static_cast<std::size_t>(config.joint_ids_map.at(i));
+    REQUIRE(step.processed_action.at(i) ==
+            policy.raw_actions.at(i) * 0.25F +
+                static_cast<float>(config.action_offset.at(i)));
     const MotorCommand& motor = step.low_cmd.motors.at(sdk_slot);
     REQUIRE(motor.mode == 1);
-    REQUIRE(motor.q == policy.raw_actions.at(i) * 0.25F +
-                           static_cast<float>(config.action_offset.at(i)));
+    REQUIRE(motor.q == step.processed_action.at(i));
     REQUIRE(motor.dq == 0.0F);
     REQUIRE(motor.kp == static_cast<float>(config.stiffness.at(i)));
     REQUIRE(motor.kd == static_cast<float>(config.damping.at(i)));
@@ -210,6 +214,71 @@ TEST_CASE("StandbyVelocity runner builds zero-command obs and maps 12 actions to
   }
   REQUIRE(step.low_cmd.motors.at(12).kp == 0.0F);
   REQUIRE(step.low_cmd.motors.at(12).kd == 0.0F);
+}
+
+TEST_CASE("StandbyVelocity projected gravity matches ET1 inverse quaternion rotation") {
+  const VelocityDeployConfig config = minimalVelocityConfig();
+  LowStateSample low_state = readyLowState(config);
+  low_state.quat_wxyz = {0.70710677F, 0.70710677F, 0.0F, 0.0F};
+  CaptureVelocityPolicy policy;
+  VelocityStepRunner runner(config, kExpectedModeMachine);
+
+  runner.step(low_state, policy);
+
+  const Vec& obs = policy.inputs_seen.back().obs;
+  const std::size_t offset = kVelocityPolicyHistoryLength * 3;
+  for (std::size_t h = 0; h < kVelocityPolicyHistoryLength; ++h) {
+    REQUIRE(obs.at(offset + h * 3 + 0) == Catch::Approx(0.0F).margin(1.0e-5F));
+    REQUIRE(obs.at(offset + h * 3 + 1) == Catch::Approx(-1.0F).margin(1.0e-5F));
+    REQUIRE(obs.at(offset + h * 3 + 2) == Catch::Approx(0.0F).margin(1.0e-5F));
+  }
+}
+
+TEST_CASE("StandbyVelocity runner overlays policy joints on a base LowCmd frame") {
+  VelocityDeployConfig config = minimalVelocityConfig();
+  const LowStateSample low_state = readyLowState(config);
+  CaptureVelocityPolicy policy;
+  VelocityStepRunner runner(config, kExpectedModeMachine);
+  LowCmdFrame base;
+  base.mode_machine = 3;
+  base.mode_pr = 9;
+  for (std::size_t i = 0; i < base.motors.size(); ++i) {
+    MotorCommand& motor = base.motors.at(i);
+    motor.mode = static_cast<std::uint8_t>(10 + i);
+    motor.q = 100.0F + static_cast<float>(i);
+    motor.dq = 200.0F + static_cast<float>(i);
+    motor.kp = 300.0F + static_cast<float>(i);
+    motor.kd = 400.0F + static_cast<float>(i);
+    motor.tau = 500.0F + static_cast<float>(i);
+  }
+
+  const VelocityStepResult step = runner.step(low_state, policy, &base);
+
+  REQUIRE(step.low_cmd.mode_machine == kExpectedModeMachine);
+  REQUIRE(step.low_cmd.mode_pr == 0);
+  for (std::size_t i = 0; i < kVelocityPolicyJointDim; ++i) {
+    const auto sdk_slot = static_cast<std::size_t>(config.joint_ids_map.at(i));
+    const MotorCommand& motor = step.low_cmd.motors.at(sdk_slot);
+    REQUIRE(motor.mode == 1);
+    REQUIRE(motor.q == policy.raw_actions.at(i) * 0.25F +
+                           static_cast<float>(config.action_offset.at(i)));
+    REQUIRE(motor.kp == static_cast<float>(config.stiffness.at(i)));
+    REQUIRE(motor.kd == static_cast<float>(config.damping.at(i)));
+  }
+
+  const std::size_t unmapped_slot = 12;
+  REQUIRE(step.low_cmd.motors.at(unmapped_slot).mode ==
+          base.motors.at(unmapped_slot).mode);
+  REQUIRE(step.low_cmd.motors.at(unmapped_slot).q ==
+          base.motors.at(unmapped_slot).q);
+  REQUIRE(step.low_cmd.motors.at(unmapped_slot).dq ==
+          base.motors.at(unmapped_slot).dq);
+  REQUIRE(step.low_cmd.motors.at(unmapped_slot).kp ==
+          base.motors.at(unmapped_slot).kp);
+  REQUIRE(step.low_cmd.motors.at(unmapped_slot).kd ==
+          base.motors.at(unmapped_slot).kd);
+  REQUIRE(step.low_cmd.motors.at(unmapped_slot).tau ==
+          base.motors.at(unmapped_slot).tau);
 }
 
 TEST_CASE("StandbyVelocity last_action history keeps previous raw action newest") {

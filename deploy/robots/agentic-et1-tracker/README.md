@@ -57,6 +57,10 @@ the real runtime returns to StandbyVelocity. The app does not automatically
 drive MuJoCo rope timing, keyboard controls, or other simulator-side actions;
 those remain manual operator actions during MuJoCo acceptance.
 
+`/status` may report `ctrl:"passive"` when the internal ET1-like safety sink is
+active. Passive does not automatically execute queued motions; send `/fixstand`
+to leave it after the blocking condition is resolved.
+
 ## App-Owned Release Assets
 
 Release policy/control assets are owned by `agentic-et1-tracker` and live under
@@ -65,6 +69,7 @@ Release policy/control assets are owned by `agentic-et1-tracker` and live under
 - GeneralTracker policy: `config/policy/general_tracker`
 - StandbyVelocity policy: `config/policy/velocity/v0`
 - FixStand posture: `config/posture/fixstand/v0/fixstand.yaml`
+- Passive posture: `config/posture/passive/v0/passive.yaml`
 
 Runtime configuration must point at these app-local release assets. Runtime
 does not fall back to the ET1 app tree under `deploy/robots/et1`.
@@ -129,6 +134,6 @@ curl -X POST http://127.0.0.1:8080/execute \
 curl http://127.0.0.1:8080/status
 curl -X POST http://127.0.0.1:8080/stop
 
-# after done or stop hold, the top-level controller should be standby_velocity
+# after done or stop, the top-level controller should be standby_velocity
 curl http://127.0.0.1:8080/status
 ```

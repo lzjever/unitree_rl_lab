@@ -24,6 +24,7 @@ class VelocityPolicyInference {
 struct VelocityStepResult {
   VelocityPolicyInputs inputs;
   Vec raw_action;
+  Vec processed_action;
   LowCmdFrame low_cmd;
 };
 
@@ -38,7 +39,8 @@ class VelocityStepRunner {
 
   void reset();
   VelocityStepResult step(const LowStateSample& low_state,
-                          VelocityPolicyInference& policy);
+                          VelocityPolicyInference& policy,
+                          const LowCmdFrame* base_frame = nullptr);
 
  private:
   VelocityDeployConfig config_;
@@ -52,6 +54,7 @@ VelocityPolicyInputs makeVelocityPolicyInputs(const VelocityDeployConfig& config
                                               const Vec& last_action);
 LowCmdFrame makeVelocityLowCmdFrame(const VelocityDeployConfig& config,
                                     const Vec& raw_action,
-                                    std::uint8_t expected_mode_machine);
+                                    std::uint8_t expected_mode_machine,
+                                    const LowCmdFrame* base_frame = nullptr);
 
 }  // namespace agentic_et1_tracker

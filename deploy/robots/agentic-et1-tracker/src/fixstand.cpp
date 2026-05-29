@@ -111,13 +111,14 @@ FixStandConfig loadFixStandConfig(const std::filesystem::path& path) {
 
 LowCmdFrame makeFixStandLowCmdFrame(const FixStandConfig& config,
                                     const std::vector<float>& q,
-                                    std::uint8_t expected_mode_machine) {
+                                    std::uint8_t expected_mode_machine,
+                                    const LowCmdFrame* base_frame) {
   validateConfig(config);
   if (q.size() != kFixStandMotorCount) {
     throw error("q must contain 33 entries");
   }
 
-  LowCmdFrame frame;
+  LowCmdFrame frame = base_frame == nullptr ? LowCmdFrame{} : *base_frame;
   frame.mode_machine = expected_mode_machine;
   frame.mode_pr = 0;
   for (std::size_t i = 0; i < kFixStandMotorCount; ++i) {
@@ -149,11 +150,13 @@ void FixStandRunner::reset() {
   initialized_ = false;
 }
 
-LowCmdFrame FixStandRunner::step(const LowStateSample& low_state) {
+LowCmdFrame FixStandRunner::step(const LowStateSample& low_state,
+                                 const LowCmdFrame* base_frame) {
   if (!initialized_) {
     q0_.reserve(kFixStandMotorCount);
     for (std::size_t i = 0; i < kFixStandMotorCount; ++i) {
-      q0_.push_back(low_state.motors.at(i).q);
+      q0_.push_back(base_frame == nullptr ? low_state.motors.at(i).q
+                                          : base_frame->motors.at(i).q);
     }
     initialized_ = true;
     tick_ = 0;
@@ -170,7 +173,7 @@ LowCmdFrame FixStandRunner::step(const LowStateSample& low_state) {
   if (tick_ < static_cast<std::size_t>(duration_ticks)) {
     ++tick_;
   }
-  return makeFixStandLowCmdFrame(config_, q, expected_mode_machine_);
+  return makeFixStandLowCmdFrame(config_, q, expected_mode_machine_, base_frame);
 }
 
 }  // namespace agentic_et1_tracker

@@ -33,7 +33,8 @@ class FixStandRunner {
                  double hz);
 
   void reset();
-  LowCmdFrame step(const LowStateSample& low_state);
+  LowCmdFrame step(const LowStateSample& low_state,
+                   const LowCmdFrame* base_frame = nullptr);
 
  private:
   FixStandConfig config_;
@@ -46,6 +47,7 @@ class FixStandRunner {
 
 LowCmdFrame makeFixStandLowCmdFrame(const FixStandConfig& config,
                                     const std::vector<float>& q,
-                                    std::uint8_t expected_mode_machine);
+                                    std::uint8_t expected_mode_machine,
+                                    const LowCmdFrame* base_frame = nullptr);
 
 }  // namespace agentic_et1_tracker

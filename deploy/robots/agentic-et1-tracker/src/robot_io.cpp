@@ -62,7 +62,8 @@ ModeMachineCheck checkModeMachine(const std::optional<LowStateSample>& low_state
 
   result.connected = true;
   result.observed = low_state->mode_machine;
-  result.ok = low_state->mode_machine == expected_mode_machine;
+  result.ok = low_state->mode_machine == 0 ||
+              low_state->mode_machine == expected_mode_machine;
   return result;
 }
 
@@ -91,6 +92,16 @@ RobotReadinessStatus mapRobotReadiness(const std::optional<LowStateSample>& low_
                                        LowCmdOccupancy occupancy,
                                        std::uint8_t expected_mode_machine) {
   RobotReadinessStatus status;
+
+  if (occupancy.occupied) {
+    status.robot = RobotState::NotReady;
+    status.err = ErrorCode::RobotNotReady;
+    status.block = "lowcmd_occupied";
+    if (low_state.has_value()) {
+      status.low_ms = low_state->age_ms;
+    }
+    return status;
+  }
 
   if (!low_state.has_value()) {
     status.robot = RobotState::Disconnected;
@@ -124,13 +135,6 @@ RobotReadinessStatus mapRobotReadiness(const std::optional<LowStateSample>& low_
     return status;
   }
 
-  if (occupancy.occupied) {
-    status.robot = RobotState::NotReady;
-    status.err = ErrorCode::RobotNotReady;
-    status.block = "lowcmd_occupied";
-    return status;
-  }
-
   status.robot = RobotState::Idle;
   status.err = ErrorCode::Ok;
   status.block.clear();
@@ -139,17 +143,22 @@ RobotReadinessStatus mapRobotReadiness(const std::optional<LowStateSample>& low_
 
 LowCmdFrame makeLowCmdFrame(const DeployConfig& config,
                             const PolicyOutput& output,
-                            std::uint8_t expected_mode_machine) {
-  return makeLowCmdFrame(config.sdk_joint_ids_map, output, expected_mode_machine);
+                            std::uint8_t expected_mode_machine,
+                            const LowCmdFrame* base_frame) {
+  return makeLowCmdFrame(config.sdk_joint_ids_map,
+                         output,
+                         expected_mode_machine,
+                         base_frame);
 }
 
 LowCmdFrame makeLowCmdFrame(const std::vector<int>& sdk_joint_ids_map,
                             const PolicyOutput& output,
-                            std::uint8_t expected_mode_machine) {
+                            std::uint8_t expected_mode_machine,
+                            const LowCmdFrame* base_frame) {
   validateSdkMap(sdk_joint_ids_map);
   validatePolicyOutput(output);
 
-  LowCmdFrame frame;
+  LowCmdFrame frame = base_frame == nullptr ? LowCmdFrame{} : *base_frame;
   frame.mode_machine = expected_mode_machine;
   frame.mode_pr = 0;
 
