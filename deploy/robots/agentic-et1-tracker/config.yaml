@@ -1,0 +1,19 @@
+agentic_et1_tracker:
+  bind: "127.0.0.1"
+  port: 8080
+  network: "lo"
+  domain_id: 0
+  mode_machine: 1
+  motion_dirs:
+    - "/home/galbot/motions"
+  queue_limit: 8
+  recent_limit: 32
+  max_track_duration_s: 120
+  stop_hold_s: 0.5
+  idle_mode: "hold_current"
+  policy:
+    profile: "GeneralTracker"
+    policy_dir: "config/policy/general_tracker"
+    policy_file: "self_collision_footmesh_15k.onnx"
+    deploy: "config/policy/general_tracker/params/deploy.yaml"
+    fps: 50

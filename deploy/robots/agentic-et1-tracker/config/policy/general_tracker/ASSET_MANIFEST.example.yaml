@@ -1,0 +1,19 @@
+# Template only. This is not a validated GA acceptance manifest.
+profile: GeneralTracker
+owner: agentic-et1-tracker
+asset_dir: config/policy/general_tracker
+schema:
+  name: ET1TRK1
+  version: 1
+  app_contract: agentic-et1-tracker GeneralTracker GA
+runtime_contract:
+  fps: 50
+  joint_dim: 26
+required_files:
+  - path: exported/self_collision_footmesh_15k.onnx
+    sha256: "<sha256>"
+    size_bytes: "<size-bytes>"
+  - path: params/deploy.yaml
+    sha256: "<sha256>"
+    size_bytes: "<size-bytes>"
+source_notes: "derived/exported for agentic-et1-tracker release"
