@@ -217,6 +217,23 @@ class AppRunner::Impl {
 
  private:
   void attachRuntimeLoop(AppRuntimeDeps& deps) {
+    if (deps.velocity_policy) {
+      runtime_loop_.emplace(config_.runtime,
+                            bridge_,
+                            status_,
+                            TrkLoader(config_.trk),
+                            *deps.robot_io,
+                            *deps.policy,
+                            deps.deploy_config,
+                            *deps.velocity_policy,
+                            deps.velocity_deploy_config,
+                            deps.fixstand_config,
+                            deps.startup_control,
+                            static_cast<std::uint8_t>(config_.mode_machine),
+                            deps.mode);
+      return;
+    }
+
     runtime_loop_.emplace(config_.runtime,
                           bridge_,
                           status_,

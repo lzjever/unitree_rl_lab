@@ -365,6 +365,52 @@ class FakePolicy final : public PolicyInference {
   std::shared_ptr<std::atomic<int>> destroy_counter_;
 };
 
+class FakeVelocityPolicy final : public VelocityPolicyInference {
+ public:
+  Vec infer(const VelocityPolicyInputs&) override {
+    ++calls;
+    return Vec(kVelocityPolicyJointDim, 0.0F);
+  }
+
+  std::atomic<int> calls{0};
+};
+
+VelocityDeployConfig velocityDeployConfig() {
+  VelocityDeployConfig config;
+  config.joint_dim = kVelocityPolicyJointDim;
+  config.joint_ids_map = {0, 6, 1, 7, 2, 8, 3, 9, 4, 10, 5, 11};
+  config.stiffness = std::vector<double>(kVelocityPolicyJointDim, 20.0);
+  config.damping = std::vector<double>(kVelocityPolicyJointDim, 0.5);
+  config.default_joint_pos = std::vector<double>(kVelocityPolicyJointDim, 0.0);
+  config.action_scale = std::vector<double>(kVelocityPolicyJointDim, 0.25);
+  config.action_offset = std::vector<double>(kVelocityPolicyJointDim, 0.0);
+  config.observation_terms = {
+      {"base_ang_vel", 3, 0, {0.2, 0.2, 0.2}},
+      {"projected_gravity", 3, 3, {1.0, 1.0, 1.0}},
+      {"keyboard_velocity_commands", 3, 6, {1.0, 1.0, 1.0}},
+      {"joint_pos_rel", kVelocityPolicyJointDim, 9,
+       std::vector<double>(kVelocityPolicyJointDim, 1.0)},
+      {"joint_vel_rel", kVelocityPolicyJointDim, 21,
+       std::vector<double>(kVelocityPolicyJointDim, 0.05)},
+      {"last_action", kVelocityPolicyJointDim, 33,
+       std::vector<double>(kVelocityPolicyJointDim, 1.0)},
+  };
+  config.obs_row_width = kVelocityPolicyObsRowWidth;
+  config.obs_history_length = kVelocityPolicyHistoryLength;
+  config.obs_dim = kVelocityPolicyObsDim;
+  config.step_dt = 0.02;
+  return config;
+}
+
+FixStandConfig fixStandConfig() {
+  FixStandConfig config;
+  config.kp = std::vector<double>(kFixStandMotorCount, 20.0);
+  config.kd = std::vector<double>(kFixStandMotorCount, 1.0);
+  config.target_q = std::vector<double>(kFixStandMotorCount, 0.0);
+  config.duration_s = 3.0;
+  return config;
+}
+
 AppRuntimeDeps makeDeps(FakeRobotIO*& robot,
                         FakePolicy*& policy,
                         std::uint8_t mode_machine = kExpectedModeMachine,
@@ -382,7 +428,11 @@ AppRuntimeDeps makeDeps(FakeRobotIO*& robot,
   AppRuntimeDeps deps;
   deps.robot_io = std::move(robot_owner);
   deps.policy = std::move(policy_owner);
+  deps.velocity_policy = std::make_unique<FakeVelocityPolicy>();
   deps.deploy_config = config;
+  deps.velocity_deploy_config = velocityDeployConfig();
+  deps.fixstand_config = fixStandConfig();
+  deps.startup_control = ControlMode::FixStand;
   deps.mode = mode;
   return deps;
 }
@@ -634,7 +684,7 @@ TEST_CASE("AppRunner with fake policy runtime becomes ready") {
     return json.at("ready") == true;
   });
   REQUIRE(status.at("mode") == "sim");
-  REQUIRE(status.at("ctrl") == "idle");
+  REQUIRE(status.at("ctrl") == "fixstand");
   REQUIRE(status.at("err").is_null());
   REQUIRE(status.at("block").is_null());
 

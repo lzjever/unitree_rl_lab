@@ -50,12 +50,20 @@ struct ApiResponse {
   nlohmann::json body;
 };
 
+struct ControlResult {
+  ErrorCode code{ErrorCode::Ok};
+
+  bool ok() const { return code == ErrorCode::Ok; }
+};
+
 class ExecutionCommandSink {
  public:
   virtual ~ExecutionCommandSink() = default;
   virtual ExecuteResult submitQueue(const ExecuteCommand& command) = 0;
   virtual ExecuteResult submitInterrupt(const ExecuteCommand& command) = 0;
   virtual StopResult stop() = 0;
+  virtual ControlResult fixStand() = 0;
+  virtual ControlResult standbyVelocity() = 0;
 };
 
 class StatusReader {
@@ -91,6 +99,8 @@ class AgentApiService {
  private:
   ApiResponse execute(const std::string& body);
   ApiResponse stop(const std::string& body);
+  ApiResponse fixStand(const std::string& body);
+  ApiResponse standbyVelocity(const std::string& body);
   ApiResponse status(const std::string& target);
   ApiResponse health();
   ApiResponse error(ErrorCode code);

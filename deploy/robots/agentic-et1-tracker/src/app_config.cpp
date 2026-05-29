@@ -14,6 +14,8 @@ namespace {
 
 constexpr const char* kRootKey = "agentic_et1_tracker";
 constexpr const char* kPolicyProfile = "GeneralTracker";
+constexpr const char* kStartupFixStand = "FixStand";
+constexpr const char* kStartupStandbyVelocity = "StandbyVelocity";
 constexpr const char* kIdleModeHoldCurrent = "hold_current";
 constexpr int kMinPort = 1;
 constexpr int kMaxPort = 65535;
@@ -167,10 +169,10 @@ std::filesystem::path configDirectory(const std::filesystem::path& config_path) 
   return dir.lexically_normal();
 }
 
-void rejectEt1PolicyPath(const std::string& key, const std::filesystem::path& path) {
-  if (app_internal::referencesEt1PolicyTree(path)) {
+void rejectEt1RuntimeDependency(const std::string& key, const std::filesystem::path& path) {
+  if (app_internal::referencesEt1RuntimeDependency(path)) {
     throw error(std::string(key) +
-                " must not point at the ET1 app deploy/robots/et1/config/policy tree");
+                " must not point at the ET1 app deploy/robots/et1 config.yaml or policy tree");
   }
 }
 
@@ -190,13 +192,13 @@ bool pathIsWithin(const std::filesystem::path& child, const std::filesystem::pat
   return child_it != child_end;
 }
 
-std::string resolvePolicyPath(const char* key,
+std::string resolveConfigPath(const char* key,
                               const std::string& value,
                               const std::filesystem::path& config_dir) {
   const std::filesystem::path path(value);
   const std::filesystem::path resolved =
       (path.is_absolute() ? path : config_dir / path).lexically_normal();
-  rejectEt1PolicyPath(key, resolved);
+  rejectEt1RuntimeDependency(key, resolved);
   return resolved.string();
 }
 
@@ -205,6 +207,13 @@ void validateDeployPath(const std::string& policy_dir, const std::string& deploy
   if (!pathIsWithin(deploy, params_dir)) {
     throw error("deploy must be under policy_dir/params");
   }
+}
+
+void validatePolicyModelPath(const std::string& key,
+                             const std::string& policy_dir,
+                             const std::string& policy_file) {
+  rejectEt1RuntimeDependency(key,
+                             std::filesystem::path(policy_dir) / "exported" / policy_file);
 }
 
 void validateLockPath(const std::string& value) {
@@ -281,11 +290,47 @@ AppConfig loadAppConfig(const std::filesystem::path& path) {
       config.policy.fps = optionalRuntimeRate(policy, "fps", config.policy.fps);
     }
 
+    const YAML::Node control = section["control"];
+    if (control) {
+      if (!control.IsMap()) {
+        throw error("control must be a map");
+      }
+      config.control.startup_control =
+          optionalString(control, "startup_control", config.control.startup_control);
+      config.control.velocity_policy_dir =
+          optionalString(control, "velocity_policy_dir", config.control.velocity_policy_dir);
+      config.control.velocity_policy_file = optionalString(
+          control, "velocity_policy_file", config.control.velocity_policy_file);
+      config.control.velocity_deploy =
+          optionalString(control, "velocity_deploy", config.control.velocity_deploy);
+      config.control.fixstand_config =
+          optionalString(control, "fixstand_config", config.control.fixstand_config);
+    }
+    if (config.control.startup_control != kStartupFixStand &&
+        config.control.startup_control != kStartupStandbyVelocity) {
+      throw error("control.startup_control must be FixStand or StandbyVelocity");
+    }
+
     validatePolicyFile(config.policy.policy_file);
+    validatePolicyFile(config.control.velocity_policy_file);
     config.policy.policy_dir =
-        resolvePolicyPath("policy_dir", config.policy.policy_dir, config_dir);
-    config.policy.deploy = resolvePolicyPath("deploy", config.policy.deploy, config_dir);
+        resolveConfigPath("policy_dir", config.policy.policy_dir, config_dir);
+    config.policy.deploy = resolveConfigPath("deploy", config.policy.deploy, config_dir);
     validateDeployPath(config.policy.policy_dir, config.policy.deploy);
+    validatePolicyModelPath("policy model", config.policy.policy_dir,
+                            config.policy.policy_file);
+
+    config.control.velocity_policy_dir = resolveConfigPath(
+        "control.velocity_policy_dir", config.control.velocity_policy_dir, config_dir);
+    config.control.velocity_deploy =
+        resolveConfigPath("control.velocity_deploy", config.control.velocity_deploy,
+                          config_dir);
+    config.control.fixstand_config =
+        resolveConfigPath("control.fixstand_config", config.control.fixstand_config,
+                          config_dir);
+    validateDeployPath(config.control.velocity_policy_dir, config.control.velocity_deploy);
+    validatePolicyModelPath("control velocity model", config.control.velocity_policy_dir,
+                            config.control.velocity_policy_file);
 
     config.trk.fps = config.policy.fps;
     if (!has_runtime_hz) {

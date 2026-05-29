@@ -102,6 +102,10 @@ class PerfSink final : public ExecutionCommandSink {
     return {ErrorCode::Ok, ControllerState::Stopping, StopReason::Stop, 0};
   }
 
+  ControlResult fixStand() override { return {ErrorCode::Ok}; }
+
+  ControlResult standbyVelocity() override { return {ErrorCode::Ok}; }
+
  private:
   std::atomic<std::size_t> queued_{0};
   std::atomic<std::size_t> interrupted_{0};

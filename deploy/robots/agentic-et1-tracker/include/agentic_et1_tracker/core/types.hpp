@@ -67,10 +67,17 @@ enum class RuntimeMode {
 enum class ControllerState {
   Starting,
   Idle,
+  FixStand,
+  StandbyVelocity,
   Preparing,
   Running,
   Stopping,
   Fault,
+};
+
+enum class ControlMode {
+  FixStand,
+  StandbyVelocity,
 };
 
 enum class RobotState {
@@ -110,6 +117,7 @@ std::string toString(MotionState state);
 std::string toString(MotionMode mode);
 std::string toString(RuntimeMode mode);
 std::string toString(ControllerState state);
+std::string toString(ControlMode mode);
 std::string toString(RobotState state);
 std::string toString(StopReason reason);
 

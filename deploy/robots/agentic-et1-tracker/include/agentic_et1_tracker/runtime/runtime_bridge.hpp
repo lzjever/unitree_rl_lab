@@ -19,6 +19,8 @@ class RuntimeBridge final : public ExecutionCommandSink {
   ExecuteResult submitQueue(const ExecuteCommand& command) override;
   ExecuteResult submitInterrupt(const ExecuteCommand& command) override;
   StopResult stop() override;
+  ControlResult fixStand() override;
+  ControlResult standbyVelocity() override;
 
   std::optional<Command> consumeNextCommand();
 
@@ -28,6 +30,7 @@ class RuntimeBridge final : public ExecutionCommandSink {
   void push(CommandKind kind, MotionRequest request, std::uint64_t sequence);
   std::optional<std::uint64_t> latestPendingStopSequence() const;
   void clearPendingMotions();
+  void clearPendingCommands();
   void clearPendingMotionsAfter(std::uint64_t sequence);
   void clearPendingMotionsThrough(std::uint64_t sequence);
 

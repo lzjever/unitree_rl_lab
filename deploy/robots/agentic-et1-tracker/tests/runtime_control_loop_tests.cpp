@@ -16,6 +16,9 @@
 #include "agentic_et1_tracker/runtime/runtime_bridge.hpp"
 #include "agentic_et1_tracker/runtime/runtime_control_loop.hpp"
 #include "agentic_et1_tracker/runtime/runtime_status_store.hpp"
+#include "agentic_et1_tracker/control/fixstand.hpp"
+#include "agentic_et1_tracker/policy/velocity_deploy_config.hpp"
+#include "agentic_et1_tracker/policy/velocity_policy_runner.hpp"
 #include "agentic_et1_tracker/trk/schema.hpp"
 #include "agentic_et1_tracker/trk/validator.hpp"
 
@@ -330,6 +333,62 @@ class FakePolicy final : public PolicyInference {
   std::vector<PolicyInputs> inputs_seen;
 };
 
+class FakeVelocityPolicy final : public VelocityPolicyInference {
+ public:
+  explicit FakeVelocityPolicy(Vec raw = Vec(kVelocityPolicyJointDim, 0.0F))
+      : next_raw(std::move(raw)) {}
+
+  Vec infer(const VelocityPolicyInputs& inputs) override {
+    ++calls;
+    inputs_seen.push_back(inputs);
+    if (throw_on_infer) {
+      throw std::runtime_error("fake velocity policy failed");
+    }
+    return next_raw;
+  }
+
+  Vec next_raw;
+  bool throw_on_infer{false};
+  int calls{0};
+  std::vector<VelocityPolicyInputs> inputs_seen;
+};
+
+VelocityDeployConfig velocityDeployConfig() {
+  VelocityDeployConfig config;
+  config.joint_dim = kVelocityPolicyJointDim;
+  config.joint_ids_map = {0, 6, 1, 7, 2, 8, 3, 9, 4, 10, 5, 11};
+  config.stiffness = doubleSeq(30.0, 1.0, kVelocityPolicyJointDim);
+  config.damping = doubleSeq(1.0, 0.1, kVelocityPolicyJointDim);
+  config.default_joint_pos = doubleSeq(0.0, 0.05, kVelocityPolicyJointDim);
+  config.action_scale = std::vector<double>(kVelocityPolicyJointDim, 0.25);
+  config.action_offset = doubleSeq(-0.2, 0.02, kVelocityPolicyJointDim);
+  config.observation_terms = {
+      {"base_ang_vel", 3, 0, {0.2, 0.2, 0.2}},
+      {"projected_gravity", 3, 3, {1.0, 1.0, 1.0}},
+      {"keyboard_velocity_commands", 3, 6, {1.0, 1.0, 1.0}},
+      {"joint_pos_rel", kVelocityPolicyJointDim, 9,
+       std::vector<double>(kVelocityPolicyJointDim, 1.0)},
+      {"joint_vel_rel", kVelocityPolicyJointDim, 21,
+       std::vector<double>(kVelocityPolicyJointDim, 0.05)},
+      {"last_action", kVelocityPolicyJointDim, 33,
+       std::vector<double>(kVelocityPolicyJointDim, 1.0)},
+  };
+  config.obs_row_width = kVelocityPolicyObsRowWidth;
+  config.obs_history_length = kVelocityPolicyHistoryLength;
+  config.obs_dim = kVelocityPolicyObsDim;
+  config.step_dt = 0.02;
+  return config;
+}
+
+FixStandConfig fixStandConfig() {
+  FixStandConfig config;
+  config.kp = doubleSeq(20.0, 1.0, kFixStandMotorCount);
+  config.kd = doubleSeq(1.0, 0.1, kFixStandMotorCount);
+  config.target_q = doubleSeq(0.5, 0.05, kFixStandMotorCount);
+  config.duration_s = 3.0;
+  return config;
+}
+
 ExecuteCommand executeCommand(std::string id,
                               const std::filesystem::path& path,
                               MotionMode mode = MotionMode::Queue,
@@ -370,6 +429,33 @@ RuntimeControlLoop makePolicyLoop(RuntimeConfig config,
                             RuntimeMode::Real);
 }
 
+RuntimeControlLoop makeControlLoop(RuntimeConfig config,
+                                   RuntimeBridge& bridge,
+                                   RuntimeStatusStore& store,
+                                   const TrkValidationConfig& trk_config,
+                                   FakeRobotIO& robot,
+                                   FakePolicy& tracker_policy,
+                                   FakeVelocityPolicy& velocity_policy,
+                                   DeployConfig deploy_config = deployConfig(),
+                                   VelocityDeployConfig velocity_deploy_config =
+                                       velocityDeployConfig(),
+                                   FixStandConfig fixstand_config = fixStandConfig(),
+                                   ControlMode startup_control = ControlMode::FixStand) {
+  return RuntimeControlLoop(config,
+                            bridge,
+                            store,
+                            TrkLoader(trk_config),
+                            robot,
+                            tracker_policy,
+                            std::move(deploy_config),
+                            velocity_policy,
+                            std::move(velocity_deploy_config),
+                            std::move(fixstand_config),
+                            startup_control,
+                            kExpectedModeMachine,
+                            RuntimeMode::Real);
+}
+
 void requireIdle(const RuntimeStatusStore& store) {
   const auto snapshot = store.snapshot();
   REQUIRE(snapshot.ctrl == ControllerState::Idle);
@@ -391,6 +477,38 @@ void requireHoldFrame(const LowCmdFrame& frame,
             static_cast<float>(config.policy_kp.at(policy_joint)));
     REQUIRE(frame.motors.at(sdk_slot).kd ==
             static_cast<float>(config.policy_kd.at(policy_joint)));
+    REQUIRE(frame.motors.at(sdk_slot).tau == 0.0F);
+  }
+}
+
+void requireFixStandFrameFromCurrentQ(const LowCmdFrame& frame,
+                                      const FixStandConfig& config,
+                                      const LowStateSample& low_state) {
+  REQUIRE(frame.mode_machine == kExpectedModeMachine);
+  REQUIRE(frame.mode_pr == 0);
+  for (std::size_t i = 0; i < kFixStandMotorCount; ++i) {
+    REQUIRE(frame.motors.at(i).mode == 1);
+    REQUIRE(frame.motors.at(i).q == low_state.motors.at(i).q);
+    REQUIRE(frame.motors.at(i).kp == static_cast<float>(config.kp.at(i)));
+    REQUIRE(frame.motors.at(i).kd == static_cast<float>(config.kd.at(i)));
+    REQUIRE(frame.motors.at(i).tau == 0.0F);
+  }
+}
+
+void requireVelocityFrame(const LowCmdFrame& frame,
+                          const VelocityDeployConfig& config,
+                          const Vec& raw_actions) {
+  REQUIRE(frame.mode_machine == kExpectedModeMachine);
+  REQUIRE(frame.mode_pr == 0);
+  for (std::size_t i = 0; i < kVelocityPolicyJointDim; ++i) {
+    const auto sdk_slot = static_cast<std::size_t>(config.joint_ids_map.at(i));
+    REQUIRE(frame.motors.at(sdk_slot).mode == 1);
+    REQUIRE(frame.motors.at(sdk_slot).q ==
+            raw_actions.at(i) * static_cast<float>(config.action_scale.at(i)) +
+                static_cast<float>(config.action_offset.at(i)));
+    REQUIRE(frame.motors.at(sdk_slot).dq == 0.0F);
+    REQUIRE(frame.motors.at(sdk_slot).kp == static_cast<float>(config.stiffness.at(i)));
+    REQUIRE(frame.motors.at(sdk_slot).kd == static_cast<float>(config.damping.at(i)));
     REQUIRE(frame.motors.at(sdk_slot).tau == 0.0F);
   }
 }
@@ -1243,6 +1361,302 @@ TEST_CASE("RuntimeControlLoop policy idle hold_current writes hold command when 
   REQUIRE(robot.write_attempts == 1);
   REQUIRE(robot.writes.size() == 1);
   requireHoldFrame(robot.writes.back(), deploy_config, hold_state);
+}
+
+TEST_CASE("RuntimeControlLoop control startup FixStand waits for readiness then publishes frame") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+  const LowStateSample ready_state = readyLowState(deploy_config);
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeRobotIO robot(ready_state);
+  robot.low_state = readyLowState(deploy_config, kExpectedModeMachine, false, 123);
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  auto loop = makeControlLoop(config,
+                              bridge,
+                              store,
+                              tmp.trkConfig(),
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              deploy_config,
+                              velocity_config,
+                              fixstand_config,
+                              ControlMode::FixStand);
+
+  loop.tick();
+  auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::FixStand);
+  REQUIRE_FALSE(snapshot.ready);
+  REQUIRE(snapshot.err == ErrorCode::RobotNotReady);
+  REQUIRE(snapshot.block == "lowstate_timeout");
+  REQUIRE(robot.write_attempts == 0);
+
+  robot.low_state = ready_state;
+  loop.tick();
+  snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::FixStand);
+  REQUIRE(snapshot.ready);
+  REQUIRE(robot.write_attempts == 1);
+  requireFixStandFrameFromCurrentQ(robot.writes.back(), fixstand_config, ready_state);
+  REQUIRE(tracker_policy.calls == 0);
+  REQUIRE(velocity_policy.calls == 0);
+}
+
+TEST_CASE("RuntimeControlLoop completed track returns to StandbyVelocity") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  auto loop = makeControlLoop(config,
+                              bridge,
+                              store,
+                              tmp.trkConfig(),
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              deploy_config,
+                              velocity_config,
+                              fixstand_config,
+                              ControlMode::StandbyVelocity);
+
+  const auto path = validTrk(tmp, "done_to_standby.trk", 1);
+  REQUIRE(bridge.submitQueue(executeCommand("done-standby", path, MotionMode::Queue, 1))
+              .ok());
+  startQueuedRun(loop, store, "done-standby");
+  loop.tick();
+
+  auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::StandbyVelocity);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(store.findRun("done-standby").run->state == MotionState::Done);
+
+  loop.tick();
+  snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::StandbyVelocity);
+  REQUIRE(velocity_policy.calls == 1);
+  REQUIRE(robot.write_attempts >= 2);
+  requireVelocityFrame(robot.writes.back(), velocity_config, velocity_policy.next_raw);
+}
+
+TEST_CASE("RuntimeControlLoop stop transitions active run to StandbyVelocity") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.stop_hold_s = 0.0;
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.5F));
+  auto loop = makeControlLoop(config,
+                              bridge,
+                              store,
+                              tmp.trkConfig(),
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              deploy_config,
+                              velocity_config);
+
+  const auto path = validTrk(tmp, "stop_to_standby.trk", 5);
+  REQUIRE(bridge.submitQueue(executeCommand("active", path)).ok());
+  startQueuedRun(loop, store, "active");
+
+  REQUIRE(bridge.stop().state == ControllerState::Stopping);
+  loop.tick();
+  REQUIRE(store.snapshot().ctrl == ControllerState::Stopping);
+
+  loop.tick();
+  auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::StandbyVelocity);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(store.findRun("active").run->state == MotionState::Stopped);
+
+  loop.tick();
+  REQUIRE(velocity_policy.calls == 1);
+  requireVelocityFrame(robot.writes.back(), velocity_config, velocity_policy.next_raw);
+}
+
+TEST_CASE("RuntimeControlLoop idle FixStand stop switches to StandbyVelocity") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.5F));
+  auto loop = makeControlLoop(config,
+                              bridge,
+                              store,
+                              tmp.trkConfig(),
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              deploy_config,
+                              velocity_config,
+                              fixstand_config,
+                              ControlMode::FixStand);
+
+  REQUIRE(store.snapshot().ctrl == ControllerState::FixStand);
+  REQUIRE_FALSE(store.snapshot().exec.has_value());
+  REQUIRE(store.snapshot().queue.ids.empty());
+
+  REQUIRE(bridge.stop().state == ControllerState::Stopping);
+  loop.tick();
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::StandbyVelocity);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.queue.ids.empty());
+  REQUIRE(velocity_policy.calls == 0);
+  REQUIRE(robot.write_attempts == 0);
+}
+
+TEST_CASE("RuntimeControlLoop fixstand and standby commands cancel queued work and target control") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.stop_hold_s = 0.0;
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+
+  SECTION("fixstand") {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeRobotIO robot(readyLowState(deploy_config));
+    FakePolicy tracker_policy;
+    FakeVelocityPolicy velocity_policy;
+    auto loop = makeControlLoop(config,
+                                bridge,
+                                store,
+                                tmp.trkConfig(),
+                                robot,
+                                tracker_policy,
+                                velocity_policy,
+                                deploy_config,
+                                velocity_config,
+                                fixstand_config);
+    const auto queued_path = validTrk(tmp, "queued_fixstand.trk", 3);
+    REQUIRE(bridge.submitQueue(executeCommand("queued", queued_path)).ok());
+    REQUIRE(bridge.fixStand().ok());
+
+    loop.tick();
+
+    REQUIRE(store.snapshot().ctrl == ControllerState::FixStand);
+    REQUIRE(store.snapshot().queue.ids.empty());
+    REQUIRE(store.findRun("queued").run->state == MotionState::Canceled);
+    REQUIRE(robot.write_attempts == 1);
+    requireFixStandFrameFromCurrentQ(robot.writes.back(), fixstand_config,
+                                     *robot.low_state);
+  }
+
+  SECTION("standby velocity") {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeRobotIO robot(readyLowState(deploy_config));
+    FakePolicy tracker_policy;
+    FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.75F));
+    auto loop = makeControlLoop(config,
+                                bridge,
+                                store,
+                                tmp.trkConfig(),
+                                robot,
+                                tracker_policy,
+                                velocity_policy,
+                                deploy_config,
+                                velocity_config,
+                                fixstand_config);
+    const auto queued_path = validTrk(tmp, "queued_standby.trk", 3);
+    REQUIRE(bridge.submitQueue(executeCommand("queued", queued_path)).ok());
+    REQUIRE(bridge.standbyVelocity().ok());
+
+    loop.tick();
+
+    REQUIRE(store.snapshot().ctrl == ControllerState::StandbyVelocity);
+    REQUIRE(store.snapshot().queue.ids.empty());
+    REQUIRE(store.findRun("queued").run->state == MotionState::Canceled);
+    REQUIRE(velocity_policy.calls == 1);
+    requireVelocityFrame(robot.writes.back(), velocity_config, velocity_policy.next_raw);
+  }
+}
+
+TEST_CASE("RuntimeControlLoop control command while running stops active and clears waiting only") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.stop_hold_s = 0.0;
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+
+  struct Case {
+    ControlMode mode;
+    ControllerState expected_ctrl;
+  };
+
+  for (const auto& item : std::vector<Case>{
+           {ControlMode::FixStand, ControllerState::FixStand},
+           {ControlMode::StandbyVelocity, ControllerState::StandbyVelocity},
+       }) {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeRobotIO robot(readyLowState(deploy_config));
+    FakePolicy tracker_policy;
+    FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.5F));
+    auto loop = makeControlLoop(config,
+                                bridge,
+                                store,
+                                tmp.trkConfig(),
+                                robot,
+                                tracker_policy,
+                                velocity_policy,
+                                deploy_config,
+                                velocity_config,
+                                fixstand_config);
+    const auto active_path =
+        validTrk(tmp, toString(item.expected_ctrl) + "_active.trk", 5);
+    const auto waiting_path =
+        validTrk(tmp, toString(item.expected_ctrl) + "_waiting.trk", 3);
+    REQUIRE(bridge.submitQueue(executeCommand("active", active_path)).ok());
+    startQueuedRun(loop, store, "active");
+    REQUIRE(bridge.submitQueue(executeCommand("waiting", waiting_path)).ok());
+
+    if (item.mode == ControlMode::FixStand) {
+      REQUIRE(bridge.fixStand().ok());
+    } else {
+      REQUIRE(bridge.standbyVelocity().ok());
+    }
+
+    loop.tick();
+    auto snapshot = store.snapshot();
+    REQUIRE(snapshot.ctrl == ControllerState::Stopping);
+    REQUIRE(snapshot.exec.has_value());
+    REQUIRE(snapshot.exec->state == MotionState::Stopping);
+    REQUIRE(snapshot.queue.ids.empty());
+    REQUIRE(store.findRun("waiting").run->state == MotionState::Canceled);
+    REQUIRE(store.findRun("waiting").run->stop_reason == StopReason::Stop);
+
+    loop.tick();
+    snapshot = store.snapshot();
+    REQUIRE(snapshot.ctrl == item.expected_ctrl);
+    REQUIRE_FALSE(snapshot.exec.has_value());
+    REQUIRE(store.findRun("active").run->state == MotionState::Stopped);
+    REQUIRE(store.findRun("active").run->stop_reason == StopReason::Stop);
+  }
 }
 
 TEST_CASE("RuntimeControlLoop policy stop_hold_s zero writes no hold command") {

@@ -17,3 +17,9 @@ agentic_et1_tracker:
     policy_file: "self_collision_footmesh_15k.onnx"
     deploy: "config/policy/general_tracker/params/deploy.yaml"
     fps: 50
+  control:
+    startup_control: "FixStand"
+    velocity_policy_dir: "config/policy/velocity/v0"
+    velocity_policy_file: "policy.onnx"
+    velocity_deploy: "config/policy/velocity/v0/params/deploy.yaml"
+    fixstand_config: "config/posture/fixstand/v0/fixstand.yaml"

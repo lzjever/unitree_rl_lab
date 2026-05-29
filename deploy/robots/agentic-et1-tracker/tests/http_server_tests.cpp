@@ -59,12 +59,26 @@ class FakeSink final : public ExecutionCommandSink {
     return stop_result;
   }
 
+  ControlResult fixStand() override {
+    ++fixstand_calls;
+    return fixstand_result;
+  }
+
+  ControlResult standbyVelocity() override {
+    ++standby_velocity_calls;
+    return standby_velocity_result;
+  }
+
   ExecuteResult queue_result{ErrorCode::Ok, "", MotionState::Queued, 1};
   ExecuteResult interrupt_result{ErrorCode::Ok, "", MotionState::Queued, 1};
   StopResult stop_result{ErrorCode::Ok, ControllerState::Stopping, StopReason::Stop, 0};
+  ControlResult fixstand_result{ErrorCode::Ok};
+  ControlResult standby_velocity_result{ErrorCode::Ok};
   int queue_calls{0};
   int interrupt_calls{0};
   int stop_calls{0};
+  int fixstand_calls{0};
+  int standby_velocity_calls{0};
   std::vector<ExecuteCommand> queue_commands;
   std::vector<ExecuteCommand> interrupt_commands;
 };
@@ -318,6 +332,45 @@ TEST_CASE("POST /stop empty body stops and non-empty body is rejected") {
   REQUIRE(body.at("ok") == false);
   REQUIRE(body.at("error").at("code") == "REQUEST_INVALID");
   REQUIRE(r.h.sink.stop_calls == 1);
+}
+
+TEST_CASE("POST control routes are installed and reject non-empty bodies") {
+  RunningHarness r;
+  httplib::Client client("127.0.0.1", r.h.server.boundPort());
+
+  auto result = client.Post("/fixstand", "", "application/json");
+  r.requireJson(result, 200);
+  auto body = r.parse(result);
+  REQUIRE(body.size() == 2);
+  REQUIRE(body.at("ok") == true);
+  REQUIRE(body.at("state") == "accepted");
+  REQUIRE(r.h.sink.fixstand_calls == 1);
+  REQUIRE(r.h.validator.calls == 0);
+  REQUIRE(r.h.ids.calls == 0);
+
+  result = client.Post("/standby_velocity", "", "application/json");
+  r.requireJson(result, 200);
+  body = r.parse(result);
+  REQUIRE(body.size() == 2);
+  REQUIRE(body.at("ok") == true);
+  REQUIRE(body.at("state") == "accepted");
+  REQUIRE(r.h.sink.standby_velocity_calls == 1);
+  REQUIRE(r.h.validator.calls == 0);
+  REQUIRE(r.h.ids.calls == 0);
+
+  result = client.Post("/fixstand", R"({})", "application/json");
+  r.requireJson(result, 400);
+  body = r.parse(result);
+  REQUIRE(body.at("ok") == false);
+  REQUIRE(body.at("error").at("code") == "REQUEST_INVALID");
+  REQUIRE(r.h.sink.fixstand_calls == 1);
+
+  result = client.Post("/standby_velocity", R"({})", "application/json");
+  r.requireJson(result, 400);
+  body = r.parse(result);
+  REQUIRE(body.at("ok") == false);
+  REQUIRE(body.at("error").at("code") == "REQUEST_INVALID");
+  REQUIRE(r.h.sink.standby_velocity_calls == 1);
 }
 
 TEST_CASE("invalid method or unknown route returns JSON request invalid") {

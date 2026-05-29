@@ -65,6 +65,30 @@ AppConfig loadYaml(const std::string& yaml) {
   return tmp.load();
 }
 
+std::filesystem::path appRoot() {
+  return std::filesystem::absolute(std::filesystem::path(__FILE__).parent_path().parent_path())
+      .lexically_normal();
+}
+
+bool pathIsAtOrWithin(const std::filesystem::path& child, const std::filesystem::path& parent) {
+  const std::filesystem::path normalized_child = child.lexically_normal();
+  const std::filesystem::path normalized_parent = parent.lexically_normal();
+  if (normalized_child == normalized_parent) {
+    return true;
+  }
+  auto child_it = normalized_child.begin();
+  const auto child_end = normalized_child.end();
+  auto parent_it = normalized_parent.begin();
+  const auto parent_end = normalized_parent.end();
+
+  for (; parent_it != parent_end; ++parent_it, ++child_it) {
+    if (child_it == child_end || *child_it != *parent_it) {
+      return false;
+    }
+  }
+  return child_it != child_end;
+}
+
 }  // namespace
 
 TEST_CASE("AppConfig loads PRD defaults from agentic_et1_tracker section") {
@@ -96,6 +120,34 @@ agentic_et1_tracker:
           (config_dir / "config/policy/general_tracker/params/deploy.yaml")
               .lexically_normal()
               .string());
+  REQUIRE(config.control.startup_control == "FixStand");
+  REQUIRE(config.control.velocity_policy_dir ==
+          (config_dir / "config/policy/velocity/v0").lexically_normal().string());
+  REQUIRE(config.control.velocity_policy_file == "policy.onnx");
+  REQUIRE(config.control.velocity_deploy ==
+          (config_dir / "config/policy/velocity/v0/params/deploy.yaml")
+              .lexically_normal()
+              .string());
+  REQUIRE(config.control.fixstand_config ==
+          (config_dir / "config/posture/fixstand/v0/fixstand.yaml")
+              .lexically_normal()
+              .string());
+}
+
+TEST_CASE("AppConfig default file keeps StandbyVelocity and FixStand app-owned") {
+  const auto root = appRoot();
+  const auto config = loadAppConfig(root / "config.yaml");
+
+  REQUIRE(pathIsAtOrWithin(config.control.velocity_policy_dir,
+                           root / "config/policy/velocity/v0"));
+  REQUIRE(config.control.velocity_policy_file == "policy.onnx");
+  REQUIRE(config.control.velocity_deploy ==
+          (root / "config/policy/velocity/v0/params/deploy.yaml")
+              .lexically_normal()
+              .string());
+  REQUIRE(pathIsAtOrWithin(config.control.fixstand_config,
+                           root / "config/posture/fixstand/v0"));
+  REQUIRE(config.control.startup_control == "FixStand");
 }
 
 TEST_CASE("AppConfig maps complete PRD YAML into component configs") {
@@ -121,6 +173,12 @@ agentic_et1_tracker:
     policy_file: "custom.onnx"
     deploy: "config/policy/custom/params/deploy.yaml"
     fps: 60
+  control:
+    startup_control: "StandbyVelocity"
+    velocity_policy_dir: "config/policy/velocity/custom"
+    velocity_policy_file: "standby.onnx"
+    velocity_deploy: "config/policy/velocity/custom/params/deploy.yaml"
+    fixstand_config: "config/posture/fixstand/custom/fixstand.yaml"
 )yaml");
   const auto config = tmp.load();
   const auto config_dir = tmp.path.parent_path();
@@ -146,6 +204,18 @@ agentic_et1_tracker:
   REQUIRE(config.policy.policy_file == "custom.onnx");
   REQUIRE(config.policy.deploy ==
           (config_dir / "config/policy/custom/params/deploy.yaml")
+              .lexically_normal()
+              .string());
+  REQUIRE(config.control.startup_control == "StandbyVelocity");
+  REQUIRE(config.control.velocity_policy_dir ==
+          (config_dir / "config/policy/velocity/custom").lexically_normal().string());
+  REQUIRE(config.control.velocity_policy_file == "standby.onnx");
+  REQUIRE(config.control.velocity_deploy ==
+          (config_dir / "config/policy/velocity/custom/params/deploy.yaml")
+              .lexically_normal()
+              .string());
+  REQUIRE(config.control.fixstand_config ==
+          (config_dir / "config/posture/fixstand/custom/fixstand.yaml")
               .lexically_normal()
               .string());
 }
@@ -423,6 +493,72 @@ agentic_et1_tracker:
 )yaml"),
                         ContainsSubstring("ET1"));
   }
+
+  SECTION("deploy to ET1 config") {
+    REQUIRE_THROWS_WITH(loadYaml(R"yaml(
+agentic_et1_tracker:
+  motion_dirs: ["/tmp/motions"]
+  policy:
+    deploy: "/home/galbot/works/et1/unitree_rl_lab/deploy/robots/et1/config/config.yaml"
+)yaml"),
+                        ContainsSubstring("ET1"));
+  }
+}
+
+TEST_CASE("AppConfig rejects ET1 app policy and config paths for standby control") {
+  SECTION("velocity_policy_dir") {
+    REQUIRE_THROWS_WITH(loadYaml(R"yaml(
+agentic_et1_tracker:
+  motion_dirs: ["/tmp/motions"]
+  control:
+    velocity_policy_dir: "unitree_rl_lab/deploy/robots/et1/config/policy/velocity/v0"
+)yaml"),
+                        ContainsSubstring("ET1"));
+  }
+
+  SECTION("velocity model") {
+    TempConfigTree tmp;
+    const auto et1_model =
+        tmp.root / "unitree_rl_lab/deploy/robots/et1/config/policy/velocity/v0/exported/policy.onnx";
+    std::filesystem::create_directories(et1_model.parent_path());
+    std::ofstream(et1_model).put('\0');
+
+    const auto velocity_dir = tmp.root / "config/policy/velocity/v0";
+    std::filesystem::create_directories(velocity_dir / "exported");
+    std::filesystem::create_directories(velocity_dir / "params");
+    std::error_code ec;
+    std::filesystem::create_symlink(et1_model, velocity_dir / "exported/policy.onnx", ec);
+    if (ec) {
+      SUCCEED("file symlinks are not supported on this platform");
+      return;
+    }
+
+    REQUIRE_THROWS_WITH(tmp.load(R"yaml(
+agentic_et1_tracker:
+  motion_dirs: ["/tmp/motions"]
+)yaml"),
+                        ContainsSubstring("ET1"));
+  }
+
+  SECTION("velocity_deploy") {
+    REQUIRE_THROWS_WITH(loadYaml(R"yaml(
+agentic_et1_tracker:
+  motion_dirs: ["/tmp/motions"]
+  control:
+    velocity_deploy: "/home/galbot/works/et1/unitree_rl_lab/deploy/robots/et1/config/policy/velocity/v0/params/deploy.yaml"
+)yaml"),
+                        ContainsSubstring("ET1"));
+  }
+
+  SECTION("fixstand_config") {
+    REQUIRE_THROWS_WITH(loadYaml(R"yaml(
+agentic_et1_tracker:
+  motion_dirs: ["/tmp/motions"]
+  control:
+    fixstand_config: "/home/galbot/works/et1/unitree_rl_lab/deploy/robots/et1/config/config.yaml"
+)yaml"),
+                        ContainsSubstring("ET1"));
+  }
 }
 
 TEST_CASE("AppConfig rejects policy paths that symlink into the ET1 app policy tree") {
@@ -458,6 +594,97 @@ agentic_et1_tracker:
   motion_dirs: ["/tmp/motions"]
   policy:
     deploy: "policy_link/params/deploy.yaml"
+)yaml"),
+                        ContainsSubstring("ET1"));
+  }
+}
+
+TEST_CASE("AppConfig rejects deploy paths that symlink into the ET1 app config file") {
+  TempConfigTree tmp;
+  const auto app_dir = appRoot();
+  auto et1_config = app_dir.parent_path() / "et1/config/config.yaml";
+  if (!std::filesystem::exists(et1_config)) {
+    et1_config = tmp.root / "unitree_rl_lab/deploy/robots/et1/config/config.yaml";
+    std::filesystem::create_directories(et1_config.parent_path());
+    std::ofstream(et1_config).put('\n');
+  }
+
+  const auto params_dir = tmp.root / "policy/params";
+  std::filesystem::create_directories(params_dir);
+  std::error_code ec;
+  std::filesystem::create_symlink(et1_config, params_dir / "deploy.yaml", ec);
+  if (ec) {
+    SUCCEED("file symlinks are not supported on this platform");
+    return;
+  }
+
+  REQUIRE_THROWS_WITH(tmp.load(R"yaml(
+agentic_et1_tracker:
+  motion_dirs: ["/tmp/motions"]
+  policy:
+    policy_dir: "policy"
+    deploy: "policy/params/deploy.yaml"
+)yaml"),
+                      ContainsSubstring("ET1"));
+}
+
+TEST_CASE("AppConfig rejects control paths that symlink into ET1 app assets") {
+  TempConfigTree tmp;
+  const auto app_dir = appRoot();
+  auto et1_policy = app_dir.parent_path() / "et1/config/policy/velocity/v0";
+  if (!std::filesystem::exists(et1_policy)) {
+    et1_policy = tmp.root / "unitree_rl_lab/deploy/robots/et1/config/policy/velocity/v0";
+    std::filesystem::create_directories(et1_policy / "params");
+  }
+
+  auto et1_config = app_dir.parent_path() / "et1/config/config.yaml";
+  if (!std::filesystem::exists(et1_config)) {
+    et1_config = tmp.root / "unitree_rl_lab/deploy/robots/et1/config/config.yaml";
+    std::filesystem::create_directories(et1_config.parent_path());
+    std::ofstream(et1_config).put('\n');
+  }
+
+  const auto policy_link = tmp.root / "velocity_link";
+  const auto posture_link = tmp.root / "fixstand_link.yaml";
+  std::error_code ec;
+  std::filesystem::create_directory_symlink(et1_policy, policy_link, ec);
+  if (ec) {
+    SUCCEED("directory symlinks are not supported on this platform");
+    return;
+  }
+  std::filesystem::create_symlink(et1_config, posture_link, ec);
+  if (ec) {
+    SUCCEED("file symlinks are not supported on this platform");
+    return;
+  }
+
+  SECTION("velocity_policy_dir") {
+    REQUIRE_THROWS_WITH(tmp.load(R"yaml(
+agentic_et1_tracker:
+  motion_dirs: ["/tmp/motions"]
+  control:
+    velocity_policy_dir: "velocity_link"
+    velocity_deploy: "velocity_link/params/deploy.yaml"
+)yaml"),
+                        ContainsSubstring("ET1"));
+  }
+
+  SECTION("velocity_deploy") {
+    REQUIRE_THROWS_WITH(tmp.load(R"yaml(
+agentic_et1_tracker:
+  motion_dirs: ["/tmp/motions"]
+  control:
+    velocity_deploy: "velocity_link/params/deploy.yaml"
+)yaml"),
+                        ContainsSubstring("ET1"));
+  }
+
+  SECTION("fixstand_config") {
+    REQUIRE_THROWS_WITH(tmp.load(R"yaml(
+agentic_et1_tracker:
+  motion_dirs: ["/tmp/motions"]
+  control:
+    fixstand_config: "fixstand_link.yaml"
 )yaml"),
                         ContainsSubstring("ET1"));
   }

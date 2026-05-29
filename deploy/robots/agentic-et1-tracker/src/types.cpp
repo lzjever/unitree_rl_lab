@@ -108,6 +108,10 @@ std::string toString(ControllerState state) {
       return "starting";
     case ControllerState::Idle:
       return "idle";
+    case ControllerState::FixStand:
+      return "fixstand";
+    case ControllerState::StandbyVelocity:
+      return "standby_velocity";
     case ControllerState::Preparing:
       return "preparing";
     case ControllerState::Running:
@@ -118,6 +122,16 @@ std::string toString(ControllerState state) {
       return "fault";
   }
   return "fault";
+}
+
+std::string toString(ControlMode mode) {
+  switch (mode) {
+    case ControlMode::FixStand:
+      return "fixstand";
+    case ControlMode::StandbyVelocity:
+      return "standby_velocity";
+  }
+  return "standby_velocity";
 }
 
 std::string toString(RobotState state) {

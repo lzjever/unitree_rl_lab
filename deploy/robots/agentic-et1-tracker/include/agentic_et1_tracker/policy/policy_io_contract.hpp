@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "agentic_et1_tracker/policy/policy_math.hpp"
+#include "agentic_et1_tracker/policy/velocity_deploy_config.hpp"
 
 namespace agentic_et1_tracker {
 
@@ -41,5 +42,9 @@ void validateGaDeployConfig(const DeployConfig& config);
 void validateGaPolicyIoContract(const DeployConfig& config,
                                 const PolicyModelMetadata& metadata);
 void validateGaPolicyInputs(const PolicyInputs& inputs);
+void validateVelocityDeployConfig(const VelocityDeployConfig& config);
+void validateVelocityPolicyIoContract(const VelocityDeployConfig& config,
+                                      const PolicyModelMetadata& metadata);
+void validateVelocityPolicyInputs(const Vec& obs);
 
 }  // namespace agentic_et1_tracker

@@ -12,12 +12,15 @@ enum class CommandKind {
   Queue,
   Interrupt,
   Stop,
+  FixStand,
+  StandbyVelocity,
 };
 
 struct Command {
   CommandKind kind{CommandKind::Queue};
   MotionRequest request;
   std::uint64_t sequence{0};
+  ControlMode control{ControlMode::StandbyVelocity};
 };
 
 class CommandMailbox {

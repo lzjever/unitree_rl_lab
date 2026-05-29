@@ -280,4 +280,30 @@ TEST_CASE("AppRuntimeFactory real factory blocks final model symlink into ET1 po
 #endif
 }
 
+TEST_CASE("AppRuntimeFactory real factory blocks final model symlink into ET1 config file") {
+#if AGENTIC_ET1_TRACKER_REAL_FACTORY
+  TempTree tmp;
+  AppConfig config = factoryConfig(tmp);
+  config.policy.policy_file = "model.onnx";
+  writeText(config.policy.deploy, validDeployYaml());
+
+  const auto et1_config = tmp.root / "unitree_rl_lab/deploy/robots/et1/config/config.yaml";
+  std::filesystem::create_directories(et1_config.parent_path());
+  writeMinimalGaOnnx(et1_config);
+
+  std::error_code ec;
+  std::filesystem::create_symlink(et1_config, tmp.exported_dir / config.policy.policy_file, ec);
+  if (ec) {
+    SUCCEED("file symlinks are not supported on this platform");
+    return;
+  }
+
+  const AppRuntimeFactoryResult result = createAppRuntimeDeps(config);
+
+  requireModelNotReady(result);
+#else
+  SUCCEED("real factory is not compiled in this build");
+#endif
+}
+
 }  // namespace agentic_et1_tracker

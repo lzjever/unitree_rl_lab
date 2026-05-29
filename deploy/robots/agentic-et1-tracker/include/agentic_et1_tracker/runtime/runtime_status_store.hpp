@@ -31,6 +31,7 @@ class RuntimeStatusStore final : public StatusReader {
                                          std::uint64_t sequence,
                                          std::uint64_t stop_sequence);
   StopResult acceptStop();
+  ControlResult acceptControl(ControlMode mode);
   std::size_t cancelQueuedForStop(std::uint64_t sequence);
   std::vector<std::string> queuedIdsLocked() const;
   std::size_t cancelQueuedLocked(StopReason reason);

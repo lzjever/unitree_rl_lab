@@ -146,6 +146,12 @@ ApiResponse AgentApiService::handle(const ApiRequest& request) {
     if (request.method == "POST" && target.path == "/stop") {
       return stop(request.body);
     }
+    if (request.method == "POST" && target.path == "/fixstand") {
+      return fixStand(request.body);
+    }
+    if (request.method == "POST" && target.path == "/standby_velocity") {
+      return standbyVelocity(request.body);
+    }
     if (request.method == "GET" && target.path == "/status") {
       return status(request.target);
     }
@@ -219,6 +225,36 @@ ApiResponse AgentApiService::stop(const std::string& body) {
   }
 
   const StopResult result = commands_.stop();
+  if (!result.ok()) {
+    return error(result.code);
+  }
+
+  auto out = successBase();
+  out["state"] = "accepted";
+  return {200, out};
+}
+
+ApiResponse AgentApiService::fixStand(const std::string& body) {
+  if (!blank(body)) {
+    return error(ErrorCode::RequestInvalid);
+  }
+
+  const ControlResult result = commands_.fixStand();
+  if (!result.ok()) {
+    return error(result.code);
+  }
+
+  auto out = successBase();
+  out["state"] = "accepted";
+  return {200, out};
+}
+
+ApiResponse AgentApiService::standbyVelocity(const std::string& body) {
+  if (!blank(body)) {
+    return error(ErrorCode::RequestInvalid);
+  }
+
+  const ControlResult result = commands_.standbyVelocity();
   if (!result.ok()) {
     return error(result.code);
   }

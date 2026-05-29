@@ -105,7 +105,7 @@ PolicyModelMetadata readMetadata(const Ort::Session& session,
   return metadata;
 }
 
-void requireOutputTensor(const Ort::Value& value) {
+void requireOutputTensor(const Ort::Value& value, std::size_t expected_actions) {
   if (!value.IsTensor()) {
     throw error("actions output is not a tensor");
   }
@@ -114,9 +114,9 @@ void requireOutputTensor(const Ort::Value& value) {
   if (info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
     throw error("actions output dtype is not float32");
   }
-  if (info.GetElementCount() != kGaPolicyJointDim) {
+  if (info.GetElementCount() != expected_actions) {
     std::ostringstream out;
-    out << "actions output size must be " << kGaPolicyJointDim << ", got "
+    out << "actions output size must be " << expected_actions << ", got "
         << info.GetElementCount();
     throw error(out.str());
   }
@@ -206,10 +206,94 @@ Vec OnnxPolicyRuntime::infer(const PolicyInputs& inputs) {
     if (outputs.size() != 1) {
       throw error("ORT returned wrong output count");
     }
-    requireOutputTensor(outputs[0]);
+    requireOutputTensor(outputs[0], kGaPolicyJointDim);
 
     const float* data = outputs[0].GetTensorData<float>();
     Vec actions(data, data + kGaPolicyJointDim);
+    requireFiniteActions(actions);
+    return actions;
+  } catch (const PolicyRuntimeError&) {
+    throw;
+  } catch (const PolicyIoContractError& err) {
+    throw error(err.what());
+  } catch (const Ort::Exception& err) {
+    throw error(std::string("ORT run failed: ") + err.what());
+  } catch (const std::exception& err) {
+    throw error(std::string("infer failed: ") + err.what());
+  }
+}
+
+struct OnnxVelocityPolicyRuntime::Impl {
+  Impl(const std::filesystem::path& model_path,
+       const VelocityDeployConfig& deploy_config)
+      : env(ORT_LOGGING_LEVEL_WARNING, "agentic_et1_velocity_policy_runtime") {
+    session_options.SetIntraOpNumThreads(1);
+    session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+    session = std::make_unique<Ort::Session>(
+        env, model_path.c_str(), session_options);
+
+    const PolicyModelMetadata metadata = readMetadata(*session, allocator);
+    validateVelocityPolicyIoContract(deploy_config, metadata);
+  }
+
+  Ort::Env env;
+  Ort::SessionOptions session_options;
+  Ort::AllocatorWithDefaultOptions allocator;
+  std::unique_ptr<Ort::Session> session;
+};
+
+OnnxVelocityPolicyRuntime::OnnxVelocityPolicyRuntime(
+    OnnxVelocityPolicyRuntimeConfig config) {
+  try {
+    validateModelFile(config.model_path);
+    validateVelocityDeployConfig(config.deploy_config);
+    impl_ = std::make_unique<Impl>(config.model_path, config.deploy_config);
+  } catch (const PolicyRuntimeError&) {
+    throw;
+  } catch (const PolicyIoContractError& err) {
+    throw error(err.what());
+  } catch (const Ort::Exception& err) {
+    throw error(std::string("ORT session init failed: ") + err.what());
+  } catch (const std::exception& err) {
+    throw error(std::string("init failed: ") + err.what());
+  }
+}
+
+OnnxVelocityPolicyRuntime::~OnnxVelocityPolicyRuntime() = default;
+OnnxVelocityPolicyRuntime::OnnxVelocityPolicyRuntime(
+    OnnxVelocityPolicyRuntime&&) noexcept = default;
+OnnxVelocityPolicyRuntime& OnnxVelocityPolicyRuntime::operator=(
+    OnnxVelocityPolicyRuntime&&) noexcept = default;
+
+Vec OnnxVelocityPolicyRuntime::infer(const VelocityPolicyInputs& inputs) {
+  try {
+    validateVelocityPolicyInputs(inputs.obs);
+
+    Vec obs = inputs.obs;
+    const std::array<std::int64_t, 2> obs_shape{
+        1, static_cast<std::int64_t>(kVelocityPolicyObsDim)};
+
+    Ort::MemoryInfo memory_info =
+        Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+    std::array<Ort::Value, 1> input_tensors{
+        Ort::Value::CreateTensor<float>(
+            memory_info, obs.data(), obs.size(), obs_shape.data(), obs_shape.size()),
+    };
+
+    const std::array<const char*, 1> input_names{"obs"};
+    const std::array<const char*, 1> output_names{"actions"};
+
+    std::vector<Ort::Value> outputs = impl_->session->Run(
+        Ort::RunOptions{nullptr}, input_names.data(), input_tensors.data(),
+        input_tensors.size(), output_names.data(), output_names.size());
+
+    if (outputs.size() != 1) {
+      throw error("ORT returned wrong output count");
+    }
+    requireOutputTensor(outputs[0], kVelocityPolicyJointDim);
+
+    const float* data = outputs[0].GetTensorData<float>();
+    Vec actions(data, data + kVelocityPolicyJointDim);
     requireFiniteActions(actions);
     return actions;
   } catch (const PolicyRuntimeError&) {

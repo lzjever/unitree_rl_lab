@@ -28,6 +28,8 @@ class FakeSink final : public ExecutionCommandSink {
   ExecuteResult queue_result{ErrorCode::Ok, "", MotionState::Queued, 1};
   ExecuteResult interrupt_result{ErrorCode::Ok, "", MotionState::Queued, 1};
   StopResult stop_result{ErrorCode::Ok, ControllerState::Stopping, StopReason::Stop, 0};
+  ControlResult fixstand_result{ErrorCode::Ok};
+  ControlResult standby_velocity_result{ErrorCode::Ok};
 
   ExecuteResult submitQueue(const ExecuteCommand& command) override {
     ++queue_calls;
@@ -53,9 +55,21 @@ class FakeSink final : public ExecutionCommandSink {
     return stop_result;
   }
 
+  ControlResult fixStand() override {
+    ++fixstand_calls;
+    return fixstand_result;
+  }
+
+  ControlResult standbyVelocity() override {
+    ++standby_velocity_calls;
+    return standby_velocity_result;
+  }
+
   int queue_calls{0};
   int interrupt_calls{0};
   int stop_calls{0};
+  int fixstand_calls{0};
+  int standby_velocity_calls{0};
   bool throw_stop{false};
   std::vector<ExecuteCommand> queue_commands;
   std::vector<ExecuteCommand> interrupt_commands;
@@ -370,6 +384,61 @@ TEST_CASE("POST stop with no body only submits stop even when not ready") {
   REQUIRE(h.sink.interrupt_calls == 0);
   REQUIRE(h.validator.calls == 0);
   REQUIRE(h.ids.calls == 0);
+}
+
+TEST_CASE("POST control endpoints accept empty body without validator or id generator") {
+  SECTION("fixstand") {
+    Harness h;
+
+    const auto response = h.service.handle({"POST", "/fixstand", ""});
+
+    REQUIRE(response.status == 200);
+    requireFields(response.body, {"ok", "state"});
+    REQUIRE(response.body.at("ok") == true);
+    REQUIRE(response.body.at("state") == "accepted");
+    REQUIRE(h.sink.fixstand_calls == 1);
+    REQUIRE(h.sink.standby_velocity_calls == 0);
+    REQUIRE(h.sink.stop_calls == 0);
+    REQUIRE(h.sink.queue_calls == 0);
+    REQUIRE(h.sink.interrupt_calls == 0);
+    REQUIRE(h.validator.calls == 0);
+    REQUIRE(h.ids.calls == 0);
+  }
+
+  SECTION("standby velocity") {
+    Harness h;
+
+    const auto response = h.service.handle({"POST", "/standby_velocity", ""});
+
+    REQUIRE(response.status == 200);
+    requireFields(response.body, {"ok", "state"});
+    REQUIRE(response.body.at("ok") == true);
+    REQUIRE(response.body.at("state") == "accepted");
+    REQUIRE(h.sink.fixstand_calls == 0);
+    REQUIRE(h.sink.standby_velocity_calls == 1);
+    REQUIRE(h.sink.stop_calls == 0);
+    REQUIRE(h.sink.queue_calls == 0);
+    REQUIRE(h.sink.interrupt_calls == 0);
+    REQUIRE(h.validator.calls == 0);
+    REQUIRE(h.ids.calls == 0);
+  }
+}
+
+TEST_CASE("POST control endpoints reject non-empty bodies before ports") {
+  for (const auto& target : {"/fixstand", "/standby_velocity"}) {
+    Harness h;
+
+    const auto response = h.service.handle({"POST", target, R"({})"});
+
+    CAPTURE(target);
+    REQUIRE(response.status == 400);
+    requireFailure(response, "REQUEST_INVALID");
+    REQUIRE(h.sink.fixstand_calls == 0);
+    REQUIRE(h.sink.standby_velocity_calls == 0);
+    REQUIRE(h.sink.stop_calls == 0);
+    REQUIRE(h.validator.calls == 0);
+    REQUIRE(h.ids.calls == 0);
+  }
 }
 
 TEST_CASE("API handle converts std exceptions from ports to internal error envelopes") {

@@ -18,6 +18,14 @@ struct PolicyConfig {
   double fps{50.0};
 };
 
+struct ControlConfig {
+  std::string startup_control{"FixStand"};
+  std::string velocity_policy_dir{"config/policy/velocity/v0"};
+  std::string velocity_policy_file{"policy.onnx"};
+  std::string velocity_deploy{"config/policy/velocity/v0/params/deploy.yaml"};
+  std::string fixstand_config{"config/posture/fixstand/v0/fixstand.yaml"};
+};
+
 struct AppConfig {
   HttpServerConfig http;
   RuntimeConfig runtime;
@@ -29,6 +37,7 @@ struct AppConfig {
   std::string idle_mode{"hold_current"};
   std::string lock_path;
   PolicyConfig policy;
+  ControlConfig control;
 };
 
 class ConfigError final : public std::runtime_error {

@@ -69,6 +69,36 @@ StopResult RuntimeBridge::stop() {
   return result;
 }
 
+ControlResult RuntimeBridge::fixStand() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const std::uint64_t sequence = next_sequence_++;
+  const ControlResult result = status_.acceptControl(ControlMode::FixStand);
+  if (!result.ok()) {
+    return result;
+  }
+
+  clearPendingCommands();
+  MotionRequest request;
+  request.sequence = sequence;
+  push(CommandKind::FixStand, request, sequence);
+  return result;
+}
+
+ControlResult RuntimeBridge::standbyVelocity() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const std::uint64_t sequence = next_sequence_++;
+  const ControlResult result = status_.acceptControl(ControlMode::StandbyVelocity);
+  if (!result.ok()) {
+    return result;
+  }
+
+  clearPendingCommands();
+  MotionRequest request;
+  request.sequence = sequence;
+  push(CommandKind::StandbyVelocity, request, sequence);
+  return result;
+}
+
 std::optional<Command> RuntimeBridge::consumeNextCommand() {
   std::lock_guard<std::mutex> lock(mutex_);
   if (pending_.empty()) {
@@ -97,6 +127,8 @@ std::optional<Command> RuntimeBridge::consumeNextCommand() {
 int RuntimeBridge::priority(CommandKind kind) {
   switch (kind) {
     case CommandKind::Stop:
+    case CommandKind::FixStand:
+    case CommandKind::StandbyVelocity:
       return 3;
     case CommandKind::Interrupt:
       return 2;
@@ -107,7 +139,9 @@ int RuntimeBridge::priority(CommandKind kind) {
 }
 
 void RuntimeBridge::push(CommandKind kind, MotionRequest request, std::uint64_t sequence) {
-  pending_.push_back({kind, std::move(request), sequence});
+  const ControlMode control = kind == CommandKind::FixStand ? ControlMode::FixStand
+                                                            : ControlMode::StandbyVelocity;
+  pending_.push_back({kind, std::move(request), sequence, control});
 }
 
 std::optional<std::uint64_t> RuntimeBridge::latestPendingStopSequence() const {
@@ -129,6 +163,10 @@ void RuntimeBridge::clearPendingMotions() {
                                          command.kind == CommandKind::Interrupt;
                                 }),
                  pending_.end());
+}
+
+void RuntimeBridge::clearPendingCommands() {
+  pending_.clear();
 }
 
 void RuntimeBridge::clearPendingMotionsAfter(std::uint64_t sequence) {

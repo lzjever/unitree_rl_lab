@@ -36,6 +36,39 @@ ctest --test-dir build-agentic-et1-tracker-perf-smoke -L perf --output-on-failur
 Default core tests must remain hermetic: they use fake/stub dependencies and do
 not require MuJoCo, Unitree SDK2, or ONNX Runtime.
 
+## HTTP Contract
+
+`agentic-et1-tracker` exposes a small local HTTP contract:
+
+- `GET /health`: service readiness.
+- `GET /status`: current runtime status. `GET /status?id=<run-id>` returns one
+  run status.
+- `POST /execute`: JSON body `{"path":"/absolute/local/file.trk"}` with
+  optional `"mode":"queue"` or `"mode":"interrupt"`. The default is queue.
+- `POST /stop`: empty body; stops active track work and cancels queued work.
+- `POST /fixstand`: empty body; switches control to FixStand.
+- `POST /standby_velocity`: empty body; switches control to StandbyVelocity.
+
+`/execute` accepts local `.trk` paths allowed by configured `motion_dirs` only.
+It does not accept uploads, non-`.trk` formats, or embedded motion payloads.
+
+Startup defaults to FixStand. After a `.trk` run finishes or `/stop` completes,
+the real runtime returns to StandbyVelocity. The app does not automatically
+drive MuJoCo rope timing, keyboard controls, or other simulator-side actions;
+those remain manual operator actions during MuJoCo acceptance.
+
+## App-Owned Release Assets
+
+Release policy/control assets are owned by `agentic-et1-tracker` and live under
+`deploy/robots/agentic-et1-tracker/config`:
+
+- GeneralTracker policy: `config/policy/general_tracker`
+- StandbyVelocity policy: `config/policy/velocity/v0`
+- FixStand posture: `config/posture/fixstand/v0/fixstand.yaml`
+
+Runtime configuration must point at these app-local release assets. Runtime
+does not fall back to the ET1 app tree under `deploy/robots/et1`.
+
 For manual or integration simulation testing in this workspace, the installed
 Unitree MuJoCo simulator under `/home/galbot/works/et1` can be used. Test
 `.trk` files are available under `/home/galbot/works/et1/generated/`.
@@ -49,7 +82,8 @@ only, not uploads or other motion formats.
 This is a manual integration acceptance skeleton, not a complete GA simulation
 evidence script and not evidence that acceptance has already been completed.
 Complete GA simulation evidence still needs recorded queue FIFO, interrupt,
-stop-to-idle, fault/disconnect, and performance results.
+stop-to-standby_velocity, `/fixstand`, `/standby_velocity`, fault/disconnect,
+and performance results.
 
 Prerequisites:
 
@@ -58,15 +92,17 @@ Prerequisites:
   DDS `network` and `domain_id`. Existing control processes on a different DDS
   domain must be recorded as isolation conditions, not treated as same-domain
   owners.
-- Install app-owned frozen assets under this app directory or an external asset
-  directory. Do not point the new app at the ET1 app policy tree.
+- Use the app-owned release assets under
+  `deploy/robots/agentic-et1-tracker/config`. Do not point the new app at the
+  ET1 app policy tree.
 - `policy.deploy` must live under `policy.policy_dir/params`, and `lock_path`
   must be absolute when explicitly configured.
 - Use a simulation config with `mode_machine: 0`, `network: "lo"`, tracker
   `domain_id` matching the MuJoCo `domain_id`, `motion_dirs` including
-  `/home/galbot/works/et1/generated`, and policy paths pointing to real
-  app-owned ONNX/deploy assets.
-- Start the Unitree MuJoCo simulator only after the Preflight is clear.
+  `/home/galbot/works/et1/generated`, `control.startup_control: "FixStand"`,
+  and policy/control paths pointing to real app-owned release assets.
+- Start the Unitree MuJoCo simulator only after the Preflight is clear. The
+  operator controls MuJoCo rope timing and keyboard actions manually.
 
 Command skeleton:
 
@@ -81,11 +117,18 @@ agentic-et1-tracker --config /path/to/agentic-et1-tracker-sim.yaml
 TRK=$(find /home/galbot/works/et1/generated -maxdepth 1 -name '*.trk' | head -n 1)
 curl http://127.0.0.1:8080/health
 curl http://127.0.0.1:8080/status
+curl -X POST http://127.0.0.1:8080/fixstand
+curl -X POST http://127.0.0.1:8080/standby_velocity
 curl -X POST http://127.0.0.1:8080/execute \
   -H 'Content-Type: application/json' \
   -d "{\"path\":\"$TRK\"}"
 
+# manually control MuJoCo rope/keyboard timing as needed for the scenario
+
 # poll status until frame progress is visible, then stop
 curl http://127.0.0.1:8080/status
 curl -X POST http://127.0.0.1:8080/stop
+
+# after done or stop hold, the top-level controller should be standby_velocity
+curl http://127.0.0.1:8080/status
 ```

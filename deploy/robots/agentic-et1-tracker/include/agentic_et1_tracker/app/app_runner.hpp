@@ -4,8 +4,11 @@
 #include <memory>
 
 #include "agentic_et1_tracker/app/app_config.hpp"
+#include "agentic_et1_tracker/control/fixstand.hpp"
 #include "agentic_et1_tracker/policy/deploy_config.hpp"
 #include "agentic_et1_tracker/policy/policy_step_runner.hpp"
+#include "agentic_et1_tracker/policy/velocity_deploy_config.hpp"
+#include "agentic_et1_tracker/policy/velocity_policy_runner.hpp"
 #include "agentic_et1_tracker/robot/robot_io.hpp"
 
 namespace agentic_et1_tracker {
@@ -13,7 +16,11 @@ namespace agentic_et1_tracker {
 struct AppRuntimeDeps {
   std::unique_ptr<RobotIO> robot_io;
   std::unique_ptr<PolicyInference> policy;
+  std::unique_ptr<VelocityPolicyInference> velocity_policy;
   DeployConfig deploy_config;
+  VelocityDeployConfig velocity_deploy_config;
+  FixStandConfig fixstand_config;
+  ControlMode startup_control{ControlMode::FixStand};
   RuntimeMode mode{RuntimeMode::Sim};
 };
 

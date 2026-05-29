@@ -47,6 +47,11 @@ HealthSnapshot healthFromSnapshot(const StatusSnapshot& snapshot) {
   return health;
 }
 
+ControllerState controlState(ControlMode mode) {
+  return mode == ControlMode::FixStand ? ControllerState::FixStand
+                                       : ControllerState::StandbyVelocity;
+}
+
 }  // namespace
 
 RuntimeControlLoop::RuntimeControlLoop(RuntimeConfig config,
@@ -85,6 +90,43 @@ RuntimeControlLoop::RuntimeControlLoop(RuntimeConfig config,
   publishSnapshot();
 }
 
+RuntimeControlLoop::RuntimeControlLoop(RuntimeConfig config,
+                                       RuntimeBridge& bridge,
+                                       RuntimeStatusStore& status,
+                                       TrkLoader loader,
+                                       RobotIO& robot_io,
+                                       PolicyInference& policy,
+                                       DeployConfig deploy_config,
+                                       VelocityPolicyInference& velocity_policy,
+                                       VelocityDeployConfig velocity_deploy_config,
+                                       FixStandConfig fixstand_config,
+                                       ControlMode startup_control,
+                                       std::uint8_t expected_mode_machine,
+                                       RuntimeMode mode)
+    : config_(config),
+      bridge_(bridge),
+      status_(status),
+      loader_(std::move(loader)),
+      robot_io_(&robot_io),
+      policy_(&policy),
+      deploy_config_(std::move(deploy_config)),
+      velocity_policy_(&velocity_policy),
+      velocity_deploy_config_(std::move(velocity_deploy_config)),
+      fixstand_config_(std::move(fixstand_config)),
+      expected_mode_machine_(expected_mode_machine),
+      mode_(mode),
+      ctrl_(startup_control == ControlMode::FixStand ? ControllerState::FixStand
+                                                     : ControllerState::StandbyVelocity),
+      post_stop_control_(startup_control) {
+  runtime_state_.ready = false;
+  runtime_state_.robot = RobotState::Disconnected;
+  runtime_state_.err = ErrorCode::ServiceNotReady;
+  runtime_state_.block = "runtime_not_started";
+  fixstand_runner_.emplace(*fixstand_config_, expected_mode_machine_, config_.hz);
+  velocity_runner_.emplace(*velocity_deploy_config_, expected_mode_machine_);
+  publishSnapshot();
+}
+
 void RuntimeControlLoop::tick() {
   if (ctrl_ == ControllerState::Stopping) {
     consumeStoppingCommands();
@@ -98,8 +140,14 @@ void RuntimeControlLoop::tick() {
     if (stop_to_idle_pending_ && stopping_hold_ticks_remaining_ == 0) {
       completeStoppingActive(MotionState::Stopped, ErrorCode::Ok);
       stop_to_idle_pending_ = false;
-      ctrl_ = ControllerState::Idle;
+      ctrl_ = hasControlRuntime() ? controlState(post_stop_control_) : ControllerState::Idle;
       stop_reason_ = StopReason::None;
+      if (ctrl_ == ControllerState::FixStand && fixstand_runner_) {
+        fixstand_runner_->reset();
+      }
+      if (ctrl_ == ControllerState::StandbyVelocity && velocity_runner_) {
+        velocity_runner_->reset();
+      }
     }
     publishSnapshot();
     return;
@@ -122,13 +170,18 @@ void RuntimeControlLoop::tick() {
     return;
   }
 
-  if (ctrl_ == ControllerState::Idle && !waiting_.empty()) {
+  if ((ctrl_ == ControllerState::Idle || ctrl_ == ControllerState::FixStand ||
+       ctrl_ == ControllerState::StandbyVelocity) &&
+      !waiting_.empty()) {
     startNext();
     publishSnapshot();
     return;
   }
 
-  if (ctrl_ == ControllerState::Idle && waiting_.empty()) {
+  if ((ctrl_ == ControllerState::FixStand || ctrl_ == ControllerState::StandbyVelocity) &&
+      waiting_.empty()) {
+    publishControlIfReady();
+  } else if (ctrl_ == ControllerState::Idle && waiting_.empty()) {
     refreshReadinessForPolicyRuntime();
     publishIdleHoldIfReady();
   }
@@ -142,6 +195,18 @@ bool RuntimeControlLoop::consumePendingCommands() {
       case CommandKind::Stop:
         handleStop(command->sequence);
         return true;
+      case CommandKind::FixStand:
+        handleControl(ControlMode::FixStand);
+        if (ctrl_ == ControllerState::Stopping) {
+          return true;
+        }
+        break;
+      case CommandKind::StandbyVelocity:
+        handleControl(ControlMode::StandbyVelocity);
+        if (ctrl_ == ControllerState::Stopping) {
+          return true;
+        }
+        break;
       case CommandKind::Interrupt:
         handleInterrupt(std::move(command->request));
         return ctrl_ == ControllerState::Stopping;
@@ -159,6 +224,15 @@ void RuntimeControlLoop::consumeStoppingCommands() {
     switch (command->kind) {
       case CommandKind::Stop:
         cancelWaiting(StopReason::Stop, command->sequence);
+        post_stop_control_ = ControlMode::StandbyVelocity;
+        break;
+      case CommandKind::FixStand:
+        cancelWaiting(StopReason::Stop, command->sequence);
+        post_stop_control_ = ControlMode::FixStand;
+        break;
+      case CommandKind::StandbyVelocity:
+        cancelWaiting(StopReason::Stop, command->sequence);
+        post_stop_control_ = ControlMode::StandbyVelocity;
         break;
       case CommandKind::Interrupt:
         cancelWaiting(StopReason::Interrupt, command->sequence);
@@ -176,10 +250,50 @@ void RuntimeControlLoop::handleStop(std::uint64_t sequence) {
   if (ctrl_ == ControllerState::Fault) {
     return;
   }
+  post_stop_control_ = ControlMode::StandbyVelocity;
   if (active_) {
     markActiveStopping(StopReason::Stop);
+  } else if (ctrl_ == ControllerState::FixStand && waiting_.empty()) {
+    policy_runner_.reset();
+    ctrl_ = ControllerState::StandbyVelocity;
+    stop_reason_ = StopReason::None;
+    stop_to_idle_pending_ = false;
+    stopping_hold_ticks_remaining_ = 0;
+    if (velocity_runner_) {
+      velocity_runner_->reset();
+    }
+    return;
   }
   enterStopping(StopReason::Stop);
+}
+
+void RuntimeControlLoop::handleControl(ControlMode mode) {
+  cancelWaiting(StopReason::Stop);
+  if (ctrl_ == ControllerState::Fault) {
+    return;
+  }
+
+  post_stop_control_ = mode;
+  if (active_) {
+    markActiveStopping(StopReason::Stop);
+    enterStopping(StopReason::Stop);
+    return;
+  }
+
+  policy_runner_.reset();
+  if (mode == ControlMode::FixStand) {
+    ctrl_ = ControllerState::FixStand;
+    if (fixstand_runner_) {
+      fixstand_runner_->reset();
+    }
+  } else {
+    ctrl_ = ControllerState::StandbyVelocity;
+    if (velocity_runner_) {
+      velocity_runner_->reset();
+    }
+  }
+  stop_reason_ = StopReason::None;
+  stop_to_idle_pending_ = false;
 }
 
 void RuntimeControlLoop::handleInterrupt(MotionRequest request) {
@@ -187,6 +301,7 @@ void RuntimeControlLoop::handleInterrupt(MotionRequest request) {
   waiting_.push_back(std::move(request));
   if (active_) {
     markActiveStopping(StopReason::Interrupt);
+    post_stop_control_ = ControlMode::StandbyVelocity;
     enterStopping(StopReason::Interrupt);
   }
 }
@@ -284,7 +399,7 @@ void RuntimeControlLoop::completePreparing() {
       policy_runner_.reset();
       waiting_.push_front(std::move(request));
       status_.publishRunStatus(toStatus(waiting_.front()));
-      ctrl_ = ControllerState::Idle;
+      ctrl_ = hasControlRuntime() ? controlState(post_stop_control_) : ControllerState::Idle;
       return;
     }
   }
@@ -298,7 +413,11 @@ void RuntimeControlLoop::completePreparing() {
     active_->ended_at = std::chrono::steady_clock::now();
     status_.publishRunStatus(toStatus(*active_));
     active_.reset();
-    ctrl_ = ControllerState::Idle;
+    post_stop_control_ = ControlMode::StandbyVelocity;
+    ctrl_ = hasControlRuntime() ? ControllerState::StandbyVelocity : ControllerState::Idle;
+    if (ctrl_ == ControllerState::StandbyVelocity && velocity_runner_) {
+      velocity_runner_->reset();
+    }
     return;
   }
 
@@ -322,6 +441,11 @@ void RuntimeControlLoop::completePreparing() {
       status_.publishRunStatus(toStatus(*active_));
       active_.reset();
       policy_runner_.reset();
+      post_stop_control_ = ControlMode::StandbyVelocity;
+      ctrl_ = hasControlRuntime() ? ControllerState::StandbyVelocity : ControllerState::Idle;
+      if (ctrl_ == ControllerState::StandbyVelocity && velocity_runner_) {
+        velocity_runner_->reset();
+      }
       enterFault(ErrorCode::ModelInferenceFailed,
                  RobotState::Fault,
                  "policy_inference_failed",
@@ -372,7 +496,11 @@ void RuntimeControlLoop::advanceActive() {
     }
     active_->frame = last_frame;
     finishActive(MotionState::Done, StopReason::None, ErrorCode::Ok);
-    ctrl_ = ControllerState::Idle;
+    post_stop_control_ = ControlMode::StandbyVelocity;
+    ctrl_ = hasControlRuntime() ? ControllerState::StandbyVelocity : ControllerState::Idle;
+    if (ctrl_ == ControllerState::StandbyVelocity && velocity_runner_) {
+      velocity_runner_->reset();
+    }
     return;
   }
 
@@ -441,11 +569,101 @@ void RuntimeControlLoop::advanceActiveWithPolicy() {
     const std::size_t last_frame = active_->frames == 0 ? 0 : active_->frames - 1;
     active_->frame = last_frame;
     finishActive(MotionState::Done, StopReason::None, ErrorCode::Ok);
-    ctrl_ = ControllerState::Idle;
+    post_stop_control_ = ControlMode::StandbyVelocity;
+    ctrl_ = hasControlRuntime() ? ControllerState::StandbyVelocity : ControllerState::Idle;
+    if (ctrl_ == ControllerState::StandbyVelocity && velocity_runner_) {
+      velocity_runner_->reset();
+    }
     return;
   }
 
   publishActive();
+}
+
+void RuntimeControlLoop::publishControlIfReady() {
+  if (!hasControlRuntime() || active_ || !waiting_.empty()) {
+    return;
+  }
+
+  if (ctrl_ == ControllerState::FixStand) {
+    writeFixStand();
+  } else if (ctrl_ == ControllerState::StandbyVelocity) {
+    writeStandbyVelocity();
+  }
+}
+
+bool RuntimeControlLoop::writeFixStand() {
+  const std::optional<LowStateSample> low_state = robot_io_->readLowState();
+  const RobotReadinessStatus readiness =
+      mapRobotReadiness(low_state, robot_io_->lowCmdOccupancy(), expected_mode_machine_);
+  if (readiness.err != ErrorCode::Ok) {
+    if (readinessRequiresFault(readiness)) {
+      enterFault(readiness.err, readiness.robot, readiness.block, readiness.low_ms);
+    } else {
+      applyReadiness(readiness);
+    }
+    return false;
+  }
+  applyReadiness(readiness);
+
+  LowCmdFrame frame;
+  try {
+    frame = fixstand_runner_->step(*low_state);
+  } catch (const std::exception&) {
+    enterFault(ErrorCode::InternalError,
+               RobotState::Fault,
+               "lowcmd_write_failed",
+               readiness.low_ms);
+    return false;
+  }
+
+  try {
+    robot_io_->writeLowCmd(frame);
+  } catch (const std::exception&) {
+    enterFault(ErrorCode::InternalError,
+               RobotState::Fault,
+               "lowcmd_write_failed",
+               readiness.low_ms);
+    return false;
+  }
+  return true;
+}
+
+bool RuntimeControlLoop::writeStandbyVelocity() {
+  const std::optional<LowStateSample> low_state = robot_io_->readLowState();
+  const RobotReadinessStatus readiness =
+      mapRobotReadiness(low_state, robot_io_->lowCmdOccupancy(), expected_mode_machine_);
+  if (readiness.err != ErrorCode::Ok) {
+    if (readinessRequiresFault(readiness)) {
+      enterFault(readiness.err, readiness.robot, readiness.block, readiness.low_ms);
+    } else {
+      applyReadiness(readiness);
+    }
+    return false;
+  }
+  applyReadiness(readiness);
+
+  VelocityStepResult step;
+  try {
+    step = velocity_runner_->step(*low_state, *velocity_policy_);
+  } catch (const std::exception&) {
+    enterFault(ErrorCode::ModelInferenceFailed,
+               RobotState::Fault,
+               "policy_inference_failed",
+               readiness.low_ms);
+    return false;
+  }
+
+  try {
+    robot_io_->writeLowCmd(step.low_cmd);
+  } catch (const std::exception&) {
+    enterFault(ErrorCode::InternalError,
+               RobotState::Fault,
+               "lowcmd_write_failed",
+               readiness.low_ms);
+    return false;
+  }
+  return true;
 }
 
 void RuntimeControlLoop::publishIdleHoldIfReady() {
@@ -645,6 +863,12 @@ RobotState RuntimeControlLoop::robotState() const {
 
 bool RuntimeControlLoop::hasPolicyRuntime() const {
   return robot_io_ != nullptr && policy_ != nullptr && deploy_config_.has_value();
+}
+
+bool RuntimeControlLoop::hasControlRuntime() const {
+  return hasPolicyRuntime() && velocity_policy_ != nullptr &&
+         velocity_deploy_config_.has_value() && fixstand_config_.has_value() &&
+         fixstand_runner_.has_value() && velocity_runner_.has_value();
 }
 
 void RuntimeControlLoop::refreshReadinessForPolicyRuntime() {

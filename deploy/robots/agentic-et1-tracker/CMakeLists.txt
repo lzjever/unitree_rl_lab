@@ -122,6 +122,40 @@ target_link_libraries(agentic_et1_tracker_policy_io_contract
     agentic_et1_tracker_policy_math
 )
 
+add_library(agentic_et1_tracker_control
+  src/fixstand.cpp
+)
+
+target_compile_features(agentic_et1_tracker_control PUBLIC cxx_std_17)
+target_include_directories(agentic_et1_tracker_control
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+target_link_libraries(agentic_et1_tracker_control
+  PUBLIC
+    agentic_et1_tracker_robot_core
+  PRIVATE
+    ${AGENTIC_ET1_YAML_TARGET}
+)
+
+add_library(agentic_et1_tracker_velocity_policy
+  src/velocity_deploy_config.cpp
+  src/velocity_policy_runner.cpp
+)
+
+target_compile_features(agentic_et1_tracker_velocity_policy PUBLIC cxx_std_17)
+target_include_directories(agentic_et1_tracker_velocity_policy
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+target_link_libraries(agentic_et1_tracker_velocity_policy
+  PUBLIC
+    agentic_et1_tracker_policy_math
+    agentic_et1_tracker_robot_core
+  PRIVATE
+    ${AGENTIC_ET1_YAML_TARGET}
+)
+
 add_library(agentic_et1_tracker_policy_step_runner
   src/policy_step_runner.cpp
 )
@@ -140,7 +174,9 @@ target_link_libraries(agentic_et1_tracker_policy_step_runner
 
 target_link_libraries(agentic_et1_tracker_runtime
   PUBLIC
+    agentic_et1_tracker_control
     agentic_et1_tracker_policy_step_runner
+    agentic_et1_tracker_velocity_policy
 )
 
 add_library(agentic_et1_tracker_policy
@@ -264,6 +300,7 @@ if(AGENTIC_ET1_BUILD_ONNX)
   target_link_libraries(agentic_et1_tracker_policy_onnx
     PUBLIC
       agentic_et1_tracker_policy_step_runner
+      agentic_et1_tracker_velocity_policy
     PRIVATE
       agentic_et1_tracker_policy_io_contract
       agentic_et1_tracker_onnxruntime
@@ -355,16 +392,30 @@ if(AGENTIC_ET1_BUILD_TESTS)
     tests/observation_builder_tests.cpp
     tests/policy_io_contract_tests.cpp
     tests/policy_math_tests.cpp
+    tests/velocity_policy_tests.cpp
   )
   target_link_libraries(agentic_et1_tracker_policy_tests
     PRIVATE
       agentic_et1_tracker_policy
       agentic_et1_tracker_policy_io_contract
       agentic_et1_tracker_policy_math
+      agentic_et1_tracker_velocity_policy
       Catch2::Catch2WithMain
   )
 
   add_test(NAME agentic_et1_tracker_policy_tests COMMAND agentic_et1_tracker_policy_tests)
+
+  add_executable(agentic_et1_tracker_control_tests
+    tests/fixstand_tests.cpp
+  )
+  target_link_libraries(agentic_et1_tracker_control_tests
+    PRIVATE
+      agentic_et1_tracker_control
+      Catch2::Catch2WithMain
+  )
+
+  add_test(NAME agentic_et1_tracker_control_tests
+           COMMAND agentic_et1_tracker_control_tests)
 
   add_executable(agentic_et1_tracker_http_tests
     tests/http_server_tests.cpp

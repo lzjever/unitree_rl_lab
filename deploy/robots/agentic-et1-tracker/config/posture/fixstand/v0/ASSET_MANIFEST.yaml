@@ -1,0 +1,14 @@
+profile: FixStand
+owner: agentic-et1-tracker
+asset_dir: config/posture/fixstand/v0
+purpose: release/package audit only
+runtime_use: "not a runtime fallback, downloader config, or registry"
+runtime_contract:
+  source_state: FSM.FixStand
+  frequency_hz: 50
+  joint_order: ET1 motor_cmd order
+required_files:
+  - path: fixstand.yaml
+    sha256: "5307ca354df1f0443f765bc8877098770a545269f52833e9f8146f3810c7382e"
+    size_bytes: 611
+source_notes: "numeric FixStand posture snapshot copied into app-owned release assets; runtime fallback to ET1 config.yaml is forbidden"

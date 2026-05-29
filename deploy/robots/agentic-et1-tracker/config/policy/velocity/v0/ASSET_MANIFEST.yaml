@@ -1,0 +1,21 @@
+profile: StandbyVelocity
+owner: agentic-et1-tracker
+asset_dir: config/policy/velocity/v0
+purpose: release/package audit only
+runtime_use: "not a runtime fallback, downloader config, or registry"
+runtime_contract:
+  input:
+    name: obs
+    dim: 225
+  output:
+    name: actions
+    dim: 12
+  frequency_hz: 50
+required_files:
+  - path: exported/policy.onnx
+    sha256: "5b62ae5cd31f342f34cb67f9710acae316bc4ab56f48814987cc26e409ecb29f"
+    size_bytes: 1129233
+  - path: params/deploy.yaml
+    sha256: "8cfccf6596902f08664d8db31a3d71e7ecdccc09afd46837fac7fb1ad677e742"
+    size_bytes: 1783
+source_notes: "copied into app-owned release assets; runtime fallback to ET1 is forbidden"

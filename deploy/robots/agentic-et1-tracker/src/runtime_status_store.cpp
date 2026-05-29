@@ -239,10 +239,19 @@ StopResult RuntimeStatusStore::acceptStop() {
 
   if (waiting == 0 && !hasActiveOrStopping(snapshot_) &&
       !hasActivePublishedRun(accepted_) && !hasActivePublishedRun(recent_)) {
+    if (snapshot_.ctrl == ControllerState::FixStand) {
+      return {ErrorCode::Ok, ControllerState::Stopping, StopReason::Stop, 0};
+    }
     return {ErrorCode::Ok, ControllerState::Idle, StopReason::None, 0};
   }
 
   return {ErrorCode::Ok, ControllerState::Stopping, StopReason::Stop, 0};
+}
+
+ControlResult RuntimeStatusStore::acceptControl(ControlMode /*mode*/) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  cancelQueuedLocked(StopReason::Stop);
+  return {ErrorCode::Ok};
 }
 
 std::size_t RuntimeStatusStore::cancelQueuedForStop(std::uint64_t sequence) {

@@ -8,7 +8,9 @@
 
 #include "agentic_et1_tracker/core/command_mailbox.hpp"
 #include "agentic_et1_tracker/core/types.hpp"
+#include "agentic_et1_tracker/control/fixstand.hpp"
 #include "agentic_et1_tracker/policy/policy_step_runner.hpp"
+#include "agentic_et1_tracker/policy/velocity_policy_runner.hpp"
 #include "agentic_et1_tracker/runtime/runtime_bridge.hpp"
 #include "agentic_et1_tracker/runtime/runtime_config.hpp"
 #include "agentic_et1_tracker/runtime/runtime_status_store.hpp"
@@ -31,6 +33,19 @@ class RuntimeControlLoop final {
                      DeployConfig deploy_config,
                      std::uint8_t expected_mode_machine,
                      RuntimeMode mode = RuntimeMode::Real);
+  RuntimeControlLoop(RuntimeConfig config,
+                     RuntimeBridge& bridge,
+                     RuntimeStatusStore& status,
+                     TrkLoader loader,
+                     RobotIO& robot_io,
+                     PolicyInference& policy,
+                     DeployConfig deploy_config,
+                     VelocityPolicyInference& velocity_policy,
+                     VelocityDeployConfig velocity_deploy_config,
+                     FixStandConfig fixstand_config,
+                     ControlMode startup_control,
+                     std::uint8_t expected_mode_machine,
+                     RuntimeMode mode = RuntimeMode::Real);
 
   void tick();
 
@@ -46,6 +61,7 @@ class RuntimeControlLoop final {
   bool consumePendingCommands();
   void consumeStoppingCommands();
   void handleStop(std::uint64_t sequence);
+  void handleControl(ControlMode mode);
   void handleInterrupt(MotionRequest request);
   void cancelWaiting(StopReason reason);
   void cancelWaiting(StopReason reason, std::uint64_t sequence);
@@ -54,6 +70,9 @@ class RuntimeControlLoop final {
   void advanceActive();
   void advanceActiveWithPolicy();
   void publishIdleHoldIfReady();
+  void publishControlIfReady();
+  bool writeFixStand();
+  bool writeStandbyVelocity();
   bool writeStoppingHold();
   void markActiveStopping(StopReason reason);
   void completeStoppingActive(MotionState state, ErrorCode error);
@@ -68,6 +87,7 @@ class RuntimeControlLoop final {
   std::vector<std::string> waitingIds() const;
   RobotState robotState() const;
   bool hasPolicyRuntime() const;
+  bool hasControlRuntime() const;
   void refreshReadinessForPolicyRuntime();
   void applyReadiness(const RobotReadinessStatus& readiness);
   bool readinessRequiresFault(const RobotReadinessStatus& readiness) const;
@@ -88,6 +108,11 @@ class RuntimeControlLoop final {
   RobotIO* robot_io_{nullptr};
   PolicyInference* policy_{nullptr};
   std::optional<DeployConfig> deploy_config_;
+  VelocityPolicyInference* velocity_policy_{nullptr};
+  std::optional<VelocityDeployConfig> velocity_deploy_config_;
+  std::optional<FixStandConfig> fixstand_config_;
+  std::optional<FixStandRunner> fixstand_runner_;
+  std::optional<VelocityStepRunner> velocity_runner_;
   std::uint8_t expected_mode_machine_{0};
   RuntimeMode mode_{RuntimeMode::Sim};
   std::deque<MotionRequest> waiting_;
@@ -97,6 +122,7 @@ class RuntimeControlLoop final {
   ControllerState ctrl_{ControllerState::Idle};
   StopReason stop_reason_{StopReason::None};
   bool stop_to_idle_pending_{false};
+  ControlMode post_stop_control_{ControlMode::StandbyVelocity};
   bool active_first_advance_{false};
   std::size_t stopping_hold_ticks_remaining_{0};
 };
