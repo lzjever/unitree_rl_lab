@@ -110,7 +110,9 @@ LowCmdFrame makePassiveLowCmdFrame(const PassiveConfig& config,
     MotorCommand& motor = frame.motors.at(i);
     motor.q = low_state.motors.at(i).q;
     motor.dq = 0.0F;
+    motor.mode = 0;
     motor.kp = 0.0F;
+    motor.kd = 0.0F;
     motor.tau = 0.0F;
     if (i < kFixStandMotorCount) {
       motor.mode = static_cast<std::uint8_t>(config.mode.at(i));

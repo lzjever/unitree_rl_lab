@@ -38,28 +38,102 @@ not require MuJoCo, Unitree SDK2, or ONNX Runtime.
 
 ## HTTP Contract
 
-`agentic-et1-tracker` exposes a small local HTTP contract:
+`agentic-et1-tracker` is a local HTTP API for LLM agents. Keep calls short.
 
-- `GET /health`: service readiness.
-- `GET /status`: current runtime status. `GET /status?id=<run-id>` returns one
-  run status.
-- `POST /execute`: JSON body `{"path":"/absolute/local/file.trk"}` with
-  optional `"mode":"queue"` or `"mode":"interrupt"`. The default is queue.
-- `POST /stop`: empty body; stops active track work and cancels queued work.
-- `POST /fixstand`: empty body; switches control to FixStand.
-- `POST /standby_velocity`: empty body; switches control to StandbyVelocity.
+Commands:
 
-`/execute` accepts local `.trk` paths allowed by configured `motion_dirs` only.
-It does not accept uploads, non-`.trk` formats, or embedded motion payloads.
+- `GET /health`: `{"ok":bool,"state":"starting|ready|error","mode":"sim|real|unknown"}`
+- `GET /status`: full runtime state.
+- `GET /status?id=<id>`: one run plus compact runtime context.
+- `POST /execute`: `{"path":"/absolute/file.trk","mode":"queue|interrupt"}`.
+  `mode` is optional and defaults to `queue`.
+- `POST /stop`: empty body; stops active work and cancels queued work.
+- `POST /fixstand`: empty body; enter FixStand.
+- `POST /standby_velocity`: empty body; enter StandbyVelocity.
+
+`/execute` accepts local `.trk` paths allowed by `motion_dirs` only. It does not
+accept uploads, non-`.trk` files, or embedded motion payloads.
+Control-changing routes return the current `/status.err` readiness error before
+claiming success when the runtime is unavailable or not ready. `/fixstand`
+remains available from `passive` and `fault` recovery states; `/standby_velocity`
+returns `CONTROL_STATE_CONFLICT` from those states.
+
+Startup safety:
+
+- Real Unitree SDK startup subscribes to `rt/lowcmd` on the configured
+  `network/domain_id`, waits `lowcmd_startup_preflight_ms` (default `200`), and
+  refuses to start the writing runtime if a fresh external LowCmd owner exists.
+- Startup owner conflict status is compact: `ready:false`,
+  `block:"lowcmd_occupied"`, `err.code:"ROBOT_NOT_READY"`.
+
+Error envelope:
+
+```json
+{"ok":false,"error":{"code":"CONTROL_STATE_CONFLICT","message":"ctrl=fixstand; /standby_velocity","retryable":false},"next":"standby_velocity"}
+```
+
+`next` is one token-level action: `status`, `retry`, `wait_robot`, `fix`,
+`fixstand`, `standby_velocity`, `stop`, or `manual`.
+
+Common error handling:
+
+| code | next | agent action |
+| --- | --- | --- |
+| `REQUEST_INVALID` | `fix` | Fix JSON/body/path/mode and retry. |
+| `SERVICE_NOT_READY` | `status` | Poll `/status`. |
+| `ROBOT_DISCONNECTED` | `wait_robot` | Wait; poll `/status`. |
+| `ROBOT_NOT_READY` | `wait_robot` | Wait or operator action; poll `/status`. |
+| `ROBOT_BAD_ORIENTATION` | `manual` | Operator fixes pose, then `/fixstand`. |
+| `MODEL_NOT_READY` | `status` | Poll `/health` or `/status`. |
+| `TRK_*` | `fix` | Use an allowed existing `.trk`. |
+| `QUEUE_FULL` | `status` | Poll `/status`; retry after queue drains. |
+| `RUN_NOT_FOUND` | `status` | Use a valid id or full `/status`. |
+| `CONTROL_STATE_CONFLICT` | varies | Follow `error.message`; it names the current `ctrl` and the next route. |
+| `SAFETY_LIMIT_TRIGGERED` | `manual` | Operator resolves; then `/fixstand`. |
+| `INTERNAL_ERROR` | `manual` | Inspect service logs. |
+
+Status schemas:
+
+```json
+// GET /status
+{"ok":true,"ready":true,"mode":"sim","robot":"idle","ctrl":"standby_velocity","stop_reason":null,"hz":1000,"exec":null,"queue":{"n":0,"limit":8,"ids":[]},"low_ms":0,"block":null,"err":null,"pose":{"q":[1,0,0,0],"g":[0,0,0],"p":null,"v":null}}
+
+// GET /status?id=<id>
+{"ok":true,"id":"a7K3p9Qx","state":"queued","frame":0,"frames":120,"time_s":0,"duration_s":2.4,"progress":0,"stop_reason":null,"err":null,"path":"/absolute/file.trk","robot":"holding","ctrl":"fixstand","ready":false,"block":"operator_wait","queue_pos":1,"top_err":"ROBOT_NOT_READY"}
+```
+
+`queue_pos` is 1-based and `null` when the run is not queued. `top_err` is the
+full `/status.err` code or `null`.
+`pose` is intentionally small for frequent polling: `q` is lowstate quaternion
+`[w,x,y,z]`, `g` is lowstate gyro `[x,y,z]`, `p` is highstate position or
+`null`, and `v` is highstate linear velocity or `null`.
+
+Controller states:
+
+| ctrl | robot behavior | accepts | rejects/notes |
+| --- | --- | --- | --- |
+| `starting` | Runtime is initializing. | `/status`, `/health` | Control routes return readiness errors such as `SERVICE_NOT_READY` or `MODEL_NOT_READY`; wait for `ready:true`. |
+| `passive` | Safety sink; publishes passive damping command. | `/fixstand`, `/stop` | `/execute` and `/standby_velocity` return `CONTROL_STATE_CONFLICT`. |
+| `fixstand` | Holds configured stand posture. | `/standby_velocity`, `/stop`, `/fixstand` | `/execute` returns conflict; call `/standby_velocity` first. |
+| `standby_velocity` | Velocity policy with zero command; robot stands idle. | `/execute`, `/fixstand`, `/stop` | Normal state for starting `.trk`. |
+| `idle` | Tracker idle without full velocity runtime, mainly tests/stubs. | `/execute`, `/fixstand`, `/stop` | Real GA runtime normally uses `standby_velocity`. |
+| `preparing` | Runtime is preparing a run. | `/stop`, `/execute` queue/interrupt | Poll `/status?id=<id>`. |
+| `running` | Executing a `.trk` through GeneralTracker. | `/stop`, `/execute` queue/interrupt | `queue` waits; `interrupt` preempts current run. |
+| `stopping` | Stop/interrupt transition to StandbyVelocity. | `/status`, `/stop` | `/execute` returns conflict; wait for `ctrl:"standby_velocity"`. |
+| `fault` | Hard safety fault; no normal track execution. | `/fixstand`, `/stop` | `/execute` and `/standby_velocity` return conflict until resolved. |
+
+`/execute` checks request shape, then readiness, then controller state. If
+`starting` is not ready it returns the readiness error, not
+`CONTROL_STATE_CONFLICT`. `/execute` does not enqueue in `passive`, `fixstand`,
+`stopping`, or `fault`; those ready controller states return
+`CONTROL_STATE_CONFLICT`. In `running` and `preparing`, queue and interrupt
+requests are accepted because the runtime can process them without manual
+control-state steps.
 
 Startup defaults to FixStand. After a `.trk` run finishes or `/stop` completes,
 the real runtime returns to StandbyVelocity. The app does not automatically
 drive MuJoCo rope timing, keyboard controls, or other simulator-side actions;
 those remain manual operator actions during MuJoCo acceptance.
-
-`/status` may report `ctrl:"passive"` when the internal ET1-like safety sink is
-active. Passive does not automatically execute queued motions; send `/fixstand`
-to leave it after the blocking condition is resolved.
 
 ## App-Owned Release Assets
 
@@ -102,10 +176,11 @@ Prerequisites:
   ET1 app policy tree.
 - `policy.deploy` must live under `policy.policy_dir/params`, and `lock_path`
   must be absolute when explicitly configured.
-- Use a simulation config with `mode_machine: 0`, `network: "lo"`, tracker
-  `domain_id` matching the MuJoCo `domain_id`, `motion_dirs` including
-  `/home/galbot/works/et1/generated`, `control.startup_control: "FixStand"`,
-  and policy/control paths pointing to real app-owned release assets.
+- Use `config.sim.yaml.example` for local MuJoCo acceptance. It sets
+  `mode_machine: 0`, `network: "lo"`,
+  `motion_dirs: ["/home/galbot/works/et1/generated"]`, and app-owned assets.
+  It also keeps `lowcmd_startup_preflight_ms: 200`. Adjust only `domain_id` or
+  `port` when the local simulator requires it.
 - Start the Unitree MuJoCo simulator only after the Preflight is clear. The
   operator controls MuJoCo rope timing and keyboard actions manually.
 
@@ -116,7 +191,8 @@ Command skeleton:
 /home/galbot/works/et1/unitree_mujoco/simulate/build/unitree_mujoco
 
 # terminal 2: start the new app with the simulation config
-agentic-et1-tracker --config /path/to/agentic-et1-tracker-sim.yaml
+agentic-et1-tracker \
+  --config deploy/robots/agentic-et1-tracker/config.sim.yaml.example
 
 # terminal 3: exercise the HTTP contract
 TRK=$(find /home/galbot/works/et1/generated -maxdepth 1 -name '*.trk' | head -n 1)

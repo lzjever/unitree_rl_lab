@@ -37,6 +37,7 @@ static_assert(std::is_nothrow_destructible_v<UnitreeSdkRobotIO>,
 TEST_CASE("UnitreeSdkRobotIOConfig defaults to DDS domain 0") {
   const UnitreeSdkRobotIOConfig config;
   REQUIRE(config.domain_id == 0);
+  REQUIRE(config.lowcmd_startup_preflight_ms == 200);
 }
 
 TEST_CASE("UnitreeSdkRobotIO maps SDK2 LowState into RobotIO low state samples") {
@@ -164,6 +165,50 @@ TEST_CASE("Unitree LowCmd ownership flags fresh commands outside own-write windo
   const LowCmdOccupancy occupancy = tracker.occupancy(t0 + 60ms);
   REQUIRE(occupancy.occupied);
   REQUIRE(occupancy.sample_age_ms == 0);
+}
+
+TEST_CASE("Unitree LowCmd startup preflight blocks only fresh external owners") {
+  using Clock = LowCmdOwnershipTracker::Clock;
+  using namespace std::chrono_literals;
+
+  const auto own = unitreeLowCmdFromFrame(lowCmdFrame());
+  LowCmdFrame external_frame = lowCmdFrame();
+  external_frame.motors[0].q += 3.0F;
+  const auto external = unitreeLowCmdFromFrame(external_frame);
+  const auto t0 = Clock::time_point(3000ms);
+
+  SECTION("no observed owner passes after the wait window") {
+    LowCmdOwnershipTracker tracker(200, 4);
+    const LowCmdStartupPreflightResult result =
+        checkLowCmdStartupPreflight(tracker, t0 + 200ms);
+    REQUIRE(result.ok);
+    REQUIRE_FALSE(result.occupancy.occupied);
+  }
+
+  SECTION("fresh external owner is blocked") {
+    LowCmdOwnershipTracker tracker(200, 4);
+    tracker.observe(external, t0 + 50ms);
+
+    const LowCmdStartupPreflightResult result =
+        checkLowCmdStartupPreflight(tracker, t0 + 200ms);
+
+    REQUIRE_FALSE(result.ok);
+    REQUIRE(result.occupancy.occupied);
+    REQUIRE(result.occupancy.sample_age_ms == 150);
+  }
+
+  SECTION("recent own echo is not blocked") {
+    LowCmdOwnershipTracker tracker(200, 4);
+    tracker.recordOwnWrite(own, t0 + 10ms);
+    tracker.observe(own, t0 + 20ms);
+
+    const LowCmdStartupPreflightResult result =
+        checkLowCmdStartupPreflight(tracker, t0 + 200ms);
+
+    REQUIRE(result.ok);
+    REQUIRE_FALSE(result.occupancy.occupied);
+    REQUIRE(result.occupancy.sample_age_ms == 180);
+  }
 }
 
 }  // namespace agentic_et1_tracker

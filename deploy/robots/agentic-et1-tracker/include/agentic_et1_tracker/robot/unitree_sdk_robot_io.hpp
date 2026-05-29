@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 
 #include "agentic_et1_tracker/robot/robot_io.hpp"
@@ -24,6 +25,7 @@ struct UnitreeSdkRobotIOConfig {
   std::size_t low_timeout_ms{200};
   std::size_t high_timeout_ms{200};
   std::size_t lowcmd_occupancy_window_ms{200};
+  std::size_t lowcmd_startup_preflight_ms{200};
   std::size_t lowcmd_own_write_history_size{512};
   bool init_channel_factory{true};
 };
@@ -69,6 +71,20 @@ class LowCmdOwnershipTracker final {
   std::deque<StampedCommand> recent_own_writes_;
 };
 
+struct LowCmdStartupPreflightResult {
+  bool ok{true};
+  LowCmdOccupancy occupancy;
+};
+
+LowCmdStartupPreflightResult checkLowCmdStartupPreflight(
+    const LowCmdOwnershipTracker& tracker,
+    LowCmdOwnershipTracker::Clock::time_point now);
+
+class LowCmdStartupPreflightError final : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
 class UnitreeSdkRobotIO final : public RobotIO {
  public:
   explicit UnitreeSdkRobotIO(UnitreeSdkRobotIOConfig config = {});
@@ -86,6 +102,7 @@ class UnitreeSdkRobotIO final : public RobotIO {
   using HighStateMsg = unitree_go::msg::dds_::SportModeState_;
 
   void closeChannels() noexcept;
+  void runStartupPreflight();
   void onLowCmd(const void* message);
   void onLowState(const void* message);
   void onHighState(const void* message);

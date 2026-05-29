@@ -54,6 +54,10 @@ std::string toString(NextAction next) {
       return "wait_robot";
     case NextAction::Fix:
       return "fix";
+    case NextAction::FixStand:
+      return "fixstand";
+    case NextAction::StandbyVelocity:
+      return "standby_velocity";
     case NextAction::Stop:
       return "stop";
     case NextAction::Manual:
@@ -201,10 +205,7 @@ ErrorInfo errorInfo(ErrorCode code) {
     case ErrorCode::RunStateConflict:
       return {code, "run state conflicts with the requested action", true, NextAction::Stop};
     case ErrorCode::ControlStateConflict:
-      return {code,
-              "controller state conflicts with the requested control",
-              false,
-              NextAction::Fix};
+      return {code, "wrong ctrl; check /status", false, NextAction::Status};
     case ErrorCode::SafetyLimitTriggered:
       return {code, "safety limit triggered", false, NextAction::Manual};
     case ErrorCode::InternalError:

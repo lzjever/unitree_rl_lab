@@ -847,6 +847,44 @@ TEST_CASE("RuntimeControlLoop policy idle readiness maps safety sink and LowCmd 
   }
 }
 
+TEST_CASE("RuntimeControlLoop publishes compact pose from latest low and high state") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  const DeployConfig deploy_config = deployConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  LowStateSample low = readyLowState(deploy_config, kExpectedModeMachine, true, 12);
+  low.quat_wxyz = {0.9F, 0.1F, 0.2F, 0.3F};
+  low.gyro = {1.0F, 2.0F, 3.0F};
+  FakeRobotIO robot(low);
+  HighStateSample high;
+  high.fresh = true;
+  high.age_ms = 8;
+  high.position = {4.0F, 5.0F, 6.0F};
+  high.linear_velocity = {7.0F, 8.0F, 9.0F};
+  robot.high_state = high;
+  FakePolicy policy;
+  auto loop = makePolicyLoop(config, bridge, store, tmp.trkConfig(), robot, policy,
+                             deploy_config);
+
+  loop.tick();
+
+  const StatusSnapshot snapshot = store.snapshot();
+  REQUIRE(snapshot.pose.q_wxyz == std::array<float, 4>{{0.9F, 0.1F, 0.2F, 0.3F}});
+  REQUIRE(snapshot.pose.gyro_xyz == std::array<float, 3>{{1.0F, 2.0F, 3.0F}});
+  REQUIRE(snapshot.pose.position_xyz == std::array<float, 3>{{4.0F, 5.0F, 6.0F}});
+  REQUIRE(snapshot.pose.velocity_xyz == std::array<float, 3>{{7.0F, 8.0F, 9.0F}});
+
+  robot.high_state->fresh = false;
+  loop.tick();
+
+  const StatusSnapshot stale_high = store.snapshot();
+  REQUIRE(stale_high.pose.q_wxyz.has_value());
+  REQUIRE(stale_high.pose.gyro_xyz.has_value());
+  REQUIRE_FALSE(stale_high.pose.position_xyz.has_value());
+  REQUIRE_FALSE(stale_high.pose.velocity_xyz.has_value());
+}
+
 TEST_CASE("RuntimeControlLoop policy integration starts then steps fake runtime") {
   TempTree tmp;
   const RuntimeConfig config = runtimeConfig();

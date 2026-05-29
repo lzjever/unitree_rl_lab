@@ -102,6 +102,64 @@ bool parseMode(const nlohmann::json& input, MotionMode& mode) {
   return false;
 }
 
+bool executeBlockedByController(ControllerState ctrl) {
+  return ctrl == ControllerState::Starting || ctrl == ControllerState::Passive ||
+         ctrl == ControllerState::FixStand || ctrl == ControllerState::Stopping ||
+         ctrl == ControllerState::Fault;
+}
+
+bool fixStandRecoveryState(ControllerState ctrl) {
+  return ctrl == ControllerState::Passive || ctrl == ControllerState::Fault;
+}
+
+ErrorInfo controlStateConflictInfo(ControllerState ctrl) {
+  switch (ctrl) {
+    case ControllerState::Starting:
+      return {ErrorCode::ControlStateConflict,
+              "ctrl=starting; wait /status",
+              false,
+              NextAction::Status};
+    case ControllerState::Passive:
+      return {ErrorCode::ControlStateConflict,
+              "ctrl=passive; /fixstand then /standby_velocity",
+              false,
+              NextAction::FixStand};
+    case ControllerState::FixStand:
+      return {ErrorCode::ControlStateConflict,
+              "ctrl=fixstand; /standby_velocity",
+              false,
+              NextAction::StandbyVelocity};
+    case ControllerState::Stopping:
+      return {ErrorCode::ControlStateConflict,
+              "ctrl=stopping; wait /status",
+              false,
+              NextAction::Status};
+    case ControllerState::Fault:
+      return {ErrorCode::ControlStateConflict,
+              "ctrl=fault; /fixstand",
+              false,
+              NextAction::FixStand};
+    case ControllerState::Idle:
+    case ControllerState::StandbyVelocity:
+    case ControllerState::Preparing:
+    case ControllerState::Running:
+      break;
+  }
+  return errorInfo(ErrorCode::ControlStateConflict);
+}
+
+nlohmann::json queuePositionJson(const QueueStatus& queue, const std::string& id) {
+  const auto it = std::find(queue.ids.begin(), queue.ids.end(), id);
+  if (it == queue.ids.end()) {
+    return nullptr;
+  }
+  return static_cast<std::size_t>(std::distance(queue.ids.begin(), it)) + 1;
+}
+
+nlohmann::json topErrorCodeJson(ErrorCode code) {
+  return code == ErrorCode::Ok ? nlohmann::json(nullptr) : nlohmann::json(toString(code));
+}
+
 nlohmann::json successBase() {
   return {{"ok", true}};
 }
@@ -193,6 +251,9 @@ ApiResponse AgentApiService::execute(const std::string& body) {
   if (readiness != ErrorCode::Ok) {
     return error(readiness);
   }
+  if (executeBlockedByController(snapshot.ctrl)) {
+    return controlStateConflict(snapshot.ctrl);
+  }
 
   const std::string path = *path_it;
   const TrackValidation validation = validator_.validate(path);
@@ -240,6 +301,12 @@ ApiResponse AgentApiService::fixStand(const std::string& body) {
     return error(ErrorCode::RequestInvalid);
   }
 
+  const StatusSnapshot snapshot = status_.snapshot();
+  const ErrorCode readiness = readinessError(snapshot);
+  if (readiness != ErrorCode::Ok && !fixStandRecoveryState(snapshot.ctrl)) {
+    return error(readiness);
+  }
+
   const ControlResult result = commands_.fixStand();
   if (!result.ok()) {
     return error(result.code);
@@ -253,6 +320,16 @@ ApiResponse AgentApiService::fixStand(const std::string& body) {
 ApiResponse AgentApiService::standbyVelocity(const std::string& body) {
   if (!blank(body)) {
     return error(ErrorCode::RequestInvalid);
+  }
+
+  const StatusSnapshot snapshot = status_.snapshot();
+  if (snapshot.ctrl == ControllerState::Passive ||
+      snapshot.ctrl == ControllerState::Fault) {
+    return controlStateConflict(snapshot.ctrl);
+  }
+  const ErrorCode readiness = readinessError(snapshot);
+  if (readiness != ErrorCode::Ok) {
+    return error(readiness);
   }
 
   const ControlResult result = commands_.standbyVelocity();
@@ -287,9 +364,16 @@ ApiResponse AgentApiService::status(const std::string& target) {
     return error(ErrorCode::RunNotFound);
   }
 
+  const StatusSnapshot snapshot = status_.snapshot();
   auto out = motionStatusJson(*result.run);
   out["ok"] = true;
-  out["robot"] = toString(status_.snapshot().robot);
+  out["robot"] = toString(snapshot.robot);
+  out["ctrl"] = toString(snapshot.ctrl);
+  out["ready"] = snapshot.ready;
+  out["block"] = snapshot.block.empty() ? nlohmann::json(nullptr)
+                                        : nlohmann::json(snapshot.block);
+  out["queue_pos"] = queuePositionJson(snapshot.queue, result.run->id);
+  out["top_err"] = topErrorCodeJson(snapshot.err);
   return {200, out};
 }
 
@@ -307,12 +391,25 @@ ApiResponse AgentApiService::health() {
 
 ApiResponse AgentApiService::error(ErrorCode code) {
   const auto info = apiErrorInfo(code);
-  return {httpStatus(code),
+  return error(info);
+}
+
+ApiResponse AgentApiService::error(ErrorInfo info) {
+  return {httpStatus(info.code),
           {
               {"ok", false},
-              {"error", errorJson(code)},
+              {"error",
+               {
+                   {"code", toString(info.code)},
+                   {"message", info.message},
+                   {"retryable", info.retryable},
+               }},
               {"next", toString(info.next)},
           }};
+}
+
+ApiResponse AgentApiService::controlStateConflict(ControllerState ctrl) {
+  return error(controlStateConflictInfo(ctrl));
 }
 
 ErrorCode AgentApiService::readinessError(const StatusSnapshot& snapshot) const {

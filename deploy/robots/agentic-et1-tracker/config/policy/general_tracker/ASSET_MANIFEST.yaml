@@ -15,6 +15,6 @@ required_files:
     sha256: "33ba3c2aedbfa296a4ac5c1b851eda4d34a21a8026e2f5bbcef2ef688188ccaa"
     size_bytes: 3831179
   - path: params/deploy.yaml
-    sha256: "af5caf7f18a98beacdc8ed9f74105ba85a25a96870066f7f235d6d8c984cfb7a"
-    size_bytes: 4403
+    sha256: "db95841f8376cb37510d5f638b9807b7d3c6fee591b7d0e6633bedf0ea9eec61"
+    size_bytes: 4432
 source_notes: "frozen GeneralTracker profile released as agentic-et1-tracker-owned app-local assets"

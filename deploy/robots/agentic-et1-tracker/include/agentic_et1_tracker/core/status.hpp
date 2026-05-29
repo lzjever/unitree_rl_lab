@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -36,6 +37,13 @@ struct MotionStatus {
   ErrorCode err{ErrorCode::Ok};
 };
 
+struct PoseSnapshot {
+  std::optional<std::array<float, 4>> q_wxyz;
+  std::optional<std::array<float, 3>> gyro_xyz;
+  std::optional<std::array<float, 3>> position_xyz;
+  std::optional<std::array<float, 3>> velocity_xyz;
+};
+
 struct StatusSnapshot {
   bool ready{false};
   RuntimeMode mode{RuntimeMode::Unknown};
@@ -48,6 +56,7 @@ struct StatusSnapshot {
   std::size_t low_ms{0};
   std::string block;
   ErrorCode err{ErrorCode::Ok};
+  PoseSnapshot pose;
 };
 
 double computeProgress(std::size_t frame, std::size_t frames, MotionState state);

@@ -33,6 +33,8 @@ enum class NextAction {
   Retry,
   WaitRobot,
   Fix,
+  FixStand,
+  StandbyVelocity,
   Stop,
   Manual,
 };

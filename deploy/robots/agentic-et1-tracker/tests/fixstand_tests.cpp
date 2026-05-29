@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "agentic_et1_tracker/control/fixstand.hpp"
+#include "agentic_et1_tracker/control/passive.hpp"
 
 namespace agentic_et1_tracker {
 namespace {
@@ -172,6 +173,26 @@ TEST_CASE("FixStandRunner starts from base LowCmd q and preserves unmapped motor
   REQUIRE(first.motors.at(33).q == base.motors.at(33).q);
   REQUIRE(first.motors.at(33).kp == base.motors.at(33).kp);
   REQUIRE(first.motors.at(33).kd == base.motors.at(33).kd);
+}
+
+TEST_CASE("Passive LowCmd explicitly disables SDK slots without passive config entries") {
+  PassiveConfig config;
+  config.mode = std::vector<int>(kFixStandMotorCount, 1);
+  config.kd = std::vector<double>(kFixStandMotorCount, 2.0);
+  const LowStateSample low = lowState();
+
+  const LowCmdFrame frame = makePassiveLowCmdFrame(config, low, kExpectedModeMachine);
+
+  REQUIRE(frame.motors.at(32).mode == 1);
+  REQUIRE(frame.motors.at(32).kd == 2.0F);
+  for (const std::size_t sdk_slot : {33UL, 34UL}) {
+    REQUIRE(frame.motors.at(sdk_slot).mode == 0);
+    REQUIRE(frame.motors.at(sdk_slot).q == low.motors.at(sdk_slot).q);
+    REQUIRE(frame.motors.at(sdk_slot).dq == 0.0F);
+    REQUIRE(frame.motors.at(sdk_slot).kp == 0.0F);
+    REQUIRE(frame.motors.at(sdk_slot).kd == 0.0F);
+    REQUIRE(frame.motors.at(sdk_slot).tau == 0.0F);
+  }
 }
 
 }  // namespace agentic_et1_tracker

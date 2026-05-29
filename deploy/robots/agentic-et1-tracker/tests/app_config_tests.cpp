@@ -111,6 +111,7 @@ agentic_et1_tracker:
   REQUIRE(config.trk.max_duration_s == 120.0);
   REQUIRE(config.trk.allowlist_dirs == std::vector<std::filesystem::path>{"/home/galbot/motions"});
   REQUIRE(config.domain_id == 0);
+  REQUIRE(config.lowcmd_startup_preflight_ms == 200);
   REQUIRE(config.lock_path.empty());
   REQUIRE(config.policy.profile == "GeneralTracker");
   REQUIRE(config.policy.policy_dir ==
@@ -158,6 +159,28 @@ TEST_CASE("AppConfig default file keeps StandbyVelocity and posture assets app-o
   REQUIRE(config.runtime.stop_hold_s == 0.0);
 }
 
+TEST_CASE("AppConfig simulation example is ready for local MuJoCo acceptance") {
+  const auto root = appRoot();
+  const auto config = loadAppConfig(root / "config.sim.yaml.example");
+
+  REQUIRE(config.http.host == "127.0.0.1");
+  REQUIRE(config.network == "lo");
+  REQUIRE(config.domain_id == 0);
+  REQUIRE(config.mode_machine == 0);
+  REQUIRE(config.trk.allowlist_dirs ==
+          std::vector<std::filesystem::path>{"/home/galbot/works/et1/generated"});
+  REQUIRE(pathIsAtOrWithin(config.policy.policy_dir,
+                           root / "config/policy/general_tracker"));
+  REQUIRE(pathIsAtOrWithin(config.control.velocity_policy_dir,
+                           root / "config/policy/velocity/v0"));
+  REQUIRE(pathIsAtOrWithin(config.control.fixstand_config,
+                           root / "config/posture/fixstand/v0"));
+  REQUIRE(pathIsAtOrWithin(config.control.passive_config,
+                           root / "config/posture/passive/v0"));
+  REQUIRE(config.control.startup_control == "FixStand");
+  REQUIRE(config.stop_hold_s == 0.0);
+}
+
 TEST_CASE("AppConfig maps complete PRD YAML into component configs") {
   TempConfig tmp(R"yaml(
 agentic_et1_tracker:
@@ -165,6 +188,7 @@ agentic_et1_tracker:
   port: 18080
   network: "eth0"
   domain_id: 7
+  lowcmd_startup_preflight_ms: 25
   mode_machine: 0
   motion_dirs:
     - "/srv/motions/a"
@@ -204,6 +228,7 @@ agentic_et1_tracker:
   REQUIRE(config.trk.fps == 60.0);
   REQUIRE(config.network == "eth0");
   REQUIRE(config.domain_id == 7);
+  REQUIRE(config.lowcmd_startup_preflight_ms == 25);
   REQUIRE(config.mode_machine == 0);
   REQUIRE(config.stop_hold_s == 0.0);
   REQUIRE(config.idle_mode == "hold_current");

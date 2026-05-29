@@ -514,6 +514,27 @@ TEST_CASE("Default AppRunner rejects execute before TRK validation when not read
   REQUIRE(body.at("next") == "status");
 }
 
+TEST_CASE("Default AppRunner rejects control changes while publishing static not-ready status") {
+  RunningApp app;
+  auto client = app.client();
+
+  for (const auto* target : {"/fixstand", "/standby_velocity"}) {
+    const auto response = body(client.Post(target, "", "application/json"), 503);
+
+    CAPTURE(target);
+    REQUIRE(response.at("ok") == false);
+    REQUIRE(response.at("error").at("code") == "MODEL_NOT_READY");
+    REQUIRE(response.at("error").at("message") == "policy model is not ready");
+    REQUIRE(response.at("error").at("retryable") == true);
+    REQUIRE(response.at("next") == "status");
+  }
+
+  const auto status = body(client.Get("/status"), 200);
+  REQUIRE(status.at("ready") == false);
+  REQUIRE(status.at("ctrl") == "starting");
+  REQUIRE(status.at("err").at("code") == "MODEL_NOT_READY");
+}
+
 TEST_CASE("AppRunner rejects concurrent start with same process lock and releases on stop") {
   TempTree tmp;
   const auto lock_path = tmp.root / "tracker.lock";
@@ -719,6 +740,9 @@ TEST_CASE("HTTP execute reaches RuntimeControlLoop policy write") {
   });
 
   body(client.Post("/standby_velocity", "", "application/json"), 200);
+  pollJson(client, "/status", [](const nlohmann::json& json) {
+    return json.at("ctrl") == "standby_velocity";
+  });
 
   const auto execute =
       body(client.Post("/execute",
@@ -754,6 +778,9 @@ TEST_CASE("AppRunner passes sim mode_machine through to RuntimeControlLoop LowCm
   });
 
   body(client.Post("/standby_velocity", "", "application/json"), 200);
+  pollJson(client, "/status", [](const nlohmann::json& json) {
+    return json.at("ctrl") == "standby_velocity";
+  });
 
   const auto execute =
       body(client.Post("/execute",
@@ -782,6 +809,10 @@ TEST_CASE("Ready AppRunner rejects invalid trk before enqueue") {
 
   pollJson(client, "/status", [](const nlohmann::json& json) {
     return json.at("ready") == true;
+  });
+  body(client.Post("/standby_velocity", "", "application/json"), 200);
+  pollJson(client, "/status", [](const nlohmann::json& json) {
+    return json.at("ctrl") == "standby_velocity";
   });
 
   const auto relative =

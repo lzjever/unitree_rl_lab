@@ -226,6 +226,12 @@ TEST_CASE("GET /status forwards to the API service") {
 
 TEST_CASE("GET /status?id preserves query and returns JSON run errors") {
   RunningHarness r;
+  r.h.status.snapshot_value.ready = false;
+  r.h.status.snapshot_value.ctrl = ControllerState::FixStand;
+  r.h.status.snapshot_value.robot = RobotState::Holding;
+  r.h.status.snapshot_value.block = "operator_wait";
+  r.h.status.snapshot_value.err = ErrorCode::RobotNotReady;
+  r.h.status.snapshot_value.queue = {1, 8, {"done"}};
   r.h.status.runs.emplace("done", run("done", MotionState::Done));
   httplib::Client client("127.0.0.1", r.h.server.boundPort());
 
@@ -234,6 +240,11 @@ TEST_CASE("GET /status?id preserves query and returns JSON run errors") {
   auto body = r.parse(result);
   REQUIRE(body.at("ok") == true);
   REQUIRE(body.at("id") == "done");
+  REQUIRE(body.at("ctrl") == "fixstand");
+  REQUIRE(body.at("ready") == false);
+  REQUIRE(body.at("block") == "operator_wait");
+  REQUIRE(body.at("top_err") == "ROBOT_NOT_READY");
+  REQUIRE(body.at("queue_pos") == 1);
   REQUIRE(r.h.status.find_ids.back() == "done");
 
   result = client.Get("/status?id=missing");
@@ -370,6 +381,23 @@ TEST_CASE("POST control routes are installed and reject non-empty bodies") {
   body = r.parse(result);
   REQUIRE(body.at("ok") == false);
   REQUIRE(body.at("error").at("code") == "REQUEST_INVALID");
+  REQUIRE(r.h.sink.standby_velocity_calls == 1);
+}
+
+TEST_CASE("POST standby_velocity conflict returns compact next action") {
+  RunningHarness r;
+  r.h.sink.standby_velocity_result = {ErrorCode::ControlStateConflict};
+  httplib::Client client("127.0.0.1", r.h.server.boundPort());
+
+  const auto result = client.Post("/standby_velocity", "", "application/json");
+
+  r.requireJson(result, 409);
+  const auto body = r.parse(result);
+  REQUIRE(body.at("ok") == false);
+  REQUIRE(body.at("error").at("code") == "CONTROL_STATE_CONFLICT");
+  REQUIRE(body.at("error").at("message") == "wrong ctrl; check /status");
+  REQUIRE(body.at("error").at("retryable") == false);
+  REQUIRE(body.at("next") == "status");
   REQUIRE(r.h.sink.standby_velocity_calls == 1);
 }
 

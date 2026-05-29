@@ -4,9 +4,9 @@ agentic_et1_tracker:
   network: "lo"
   domain_id: 0
   lowcmd_startup_preflight_ms: 200
-  mode_machine: 1
+  mode_machine: 0
   motion_dirs:
-    - "/home/galbot/motions"
+    - "/home/galbot/works/et1/generated"
   queue_limit: 8
   recent_limit: 32
   max_track_duration_s: 120

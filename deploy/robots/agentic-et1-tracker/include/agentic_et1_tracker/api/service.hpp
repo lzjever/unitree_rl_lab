@@ -104,6 +104,8 @@ class AgentApiService {
   ApiResponse status(const std::string& target);
   ApiResponse health();
   ApiResponse error(ErrorCode code);
+  ApiResponse error(ErrorInfo info);
+  ApiResponse controlStateConflict(ControllerState ctrl);
 
   ErrorCode readinessError(const StatusSnapshot& snapshot) const;
 

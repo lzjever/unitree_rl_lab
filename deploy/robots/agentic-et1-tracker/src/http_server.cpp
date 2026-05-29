@@ -82,7 +82,15 @@ void AgentHttpServer::installHandler() {
   server_->Post("/stop", handler);
   server_->Post("/fixstand", handler);
   server_->Post("/standby_velocity", handler);
-  server_->set_error_handler(handler);
+  server_->set_error_handler(
+      [this](const httplib::Request& request, httplib::Response& response) {
+        if (!response.body.empty()) {
+          return;
+        }
+        const ApiResponse api =
+            service_.handle({request.method, request.target, request.body});
+        writeResponse(api, response);
+      });
 }
 
 void AgentHttpServer::writeResponse(const ApiResponse& api, httplib::Response& response) const {

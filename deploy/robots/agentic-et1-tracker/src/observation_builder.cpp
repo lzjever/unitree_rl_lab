@@ -214,19 +214,39 @@ Vec baseAngularVelocity(const LowStateSample& low_state) {
   return {low_state.gyro[0], low_state.gyro[1], low_state.gyro[2]};
 }
 
+std::array<bool, kJointDim> overrideJointMask(const DeployConfig& config) {
+  std::array<bool, kJointDim> mask{};
+  for (const int joint_id : config.override_joint_ids) {
+    if (joint_id < 0 || joint_id >= static_cast<int>(kJointDim)) {
+      throw error("DeployConfig.override_joint_ids contains an id outside policy order");
+    }
+    const auto index = static_cast<std::size_t>(joint_id);
+    if (mask[index]) {
+      throw error("DeployConfig.override_joint_ids contains duplicate ids");
+    }
+    mask[index] = true;
+  }
+  return mask;
+}
+
 void fillJointObservations(const DeployConfig& config,
                            const LowStateSample& low_state,
+                           const Vec& reference_joint_pos,
                            Vec& joint_pos_rel,
                            Vec& joint_vel_rel) {
   joint_pos_rel.clear();
   joint_vel_rel.clear();
   joint_pos_rel.reserve(kJointDim);
   joint_vel_rel.reserve(kJointDim);
+  requireExactSize("reference_joint_pos", reference_joint_pos.size(), kJointDim);
+  const auto override_mask = overrideJointMask(config);
 
   for (std::size_t policy_index = 0; policy_index < kJointDim; ++policy_index) {
     const auto sdk_index = static_cast<std::size_t>(config.sdk_joint_ids_map[policy_index]);
     const MotorStateSample& motor = low_state.motors[sdk_index];
-    joint_pos_rel.push_back(motor.q -
+    const float q = override_mask[policy_index] ? reference_joint_pos[policy_index]
+                                                : motor.q;
+    joint_pos_rel.push_back(q -
                             static_cast<float>(config.default_joint_pos[policy_index]));
     joint_vel_rel.push_back(motor.dq);
   }
@@ -294,7 +314,8 @@ PolicyObservationParts buildObservationParts(
   parts.command_jnt_pos = copyView("joint_pos", frame.joint_pos, kJointDim);
   parts.projected_gravity = projectedGravity(robot_q);
   parts.base_ang_vel = baseAngularVelocity(low_state);
-  fillJointObservations(config, low_state, parts.joint_pos_rel, parts.joint_vel_rel);
+  fillJointObservations(config, low_state, parts.command_jnt_pos, parts.joint_pos_rel,
+                        parts.joint_vel_rel);
   parts.last_action = last_action;
   parts.command_foot_support_state = supportState(frame);
   parts.ref_com_rel_navi = copyView("ref_com_rel_navi", frame.ref_com_rel_navi, 3);

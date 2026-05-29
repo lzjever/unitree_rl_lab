@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <map>
 #include <regex>
 #include <set>
@@ -144,6 +145,10 @@ std::string errorCode(const ApiResponse& response) {
 
 std::string nextAction(const ApiResponse& response) {
   return response.body.at("next").get<std::string>();
+}
+
+std::string errorMessage(const ApiResponse& response) {
+  return response.body.at("error").at("message").get<std::string>();
 }
 
 void requireFields(const nlohmann::json& body, std::set<std::string> expected) {
@@ -365,6 +370,46 @@ TEST_CASE("POST execute gates service robot model and fault readiness before val
   }
 }
 
+TEST_CASE("POST execute rejects controller states that cannot execute queued motion") {
+  for (const ControllerState ctrl :
+       {ControllerState::Starting,
+        ControllerState::Passive,
+        ControllerState::FixStand,
+        ControllerState::Stopping,
+        ControllerState::Fault}) {
+    Harness h;
+    h.status.snapshot_value.ready = true;
+    h.status.snapshot_value.ctrl = ctrl;
+    h.status.snapshot_value.robot = RobotState::Holding;
+
+    const auto response =
+        h.service.handle({"POST", "/execute", R"({"path":"/tracks/a.trk"})"});
+
+    CAPTURE(toString(ctrl));
+    REQUIRE(response.status == 409);
+    requireFailure(response, "CONTROL_STATE_CONFLICT");
+    if (ctrl == ControllerState::FixStand) {
+      REQUIRE(nextAction(response) == "standby_velocity");
+      REQUIRE(errorMessage(response) == "ctrl=fixstand; /standby_velocity");
+    } else if (ctrl == ControllerState::Passive) {
+      REQUIRE(nextAction(response) == "fixstand");
+      REQUIRE(errorMessage(response) ==
+              "ctrl=passive; /fixstand then /standby_velocity");
+    } else if (ctrl == ControllerState::Fault) {
+      REQUIRE(nextAction(response) == "fixstand");
+      REQUIRE(errorMessage(response) == "ctrl=fault; /fixstand");
+    } else {
+      REQUIRE(nextAction(response) == "status");
+      REQUIRE(errorMessage(response) ==
+              "ctrl=" + toString(ctrl) + "; wait /status");
+    }
+    REQUIRE(h.validator.calls == 0);
+    REQUIRE(h.sink.queue_calls == 0);
+    REQUIRE(h.sink.interrupt_calls == 0);
+    REQUIRE(h.ids.calls == 0);
+  }
+}
+
 TEST_CASE("POST stop with no body only submits stop even when not ready") {
   Harness h;
   h.status.snapshot_value.ready = false;
@@ -424,6 +469,63 @@ TEST_CASE("POST control endpoints accept empty body without validator or id gene
   }
 }
 
+TEST_CASE("POST control endpoints reject static not-ready snapshots before sink") {
+  for (const auto& target : {"/fixstand", "/standby_velocity"}) {
+    Harness h;
+    h.status.snapshot_value.ready = false;
+    h.status.snapshot_value.ctrl = ControllerState::Starting;
+    h.status.snapshot_value.robot = RobotState::NotReady;
+    h.status.snapshot_value.err = ErrorCode::ModelNotReady;
+    h.status.snapshot_value.block = "policy_not_loaded";
+
+    const auto response = h.service.handle({"POST", target, ""});
+
+    CAPTURE(target);
+    REQUIRE(response.status == 503);
+    requireFailure(response, "MODEL_NOT_READY");
+    REQUIRE(nextAction(response) == "status");
+    REQUIRE(errorMessage(response) == "policy model is not ready");
+    REQUIRE(h.sink.fixstand_calls == 0);
+    REQUIRE(h.sink.standby_velocity_calls == 0);
+    REQUIRE(h.sink.stop_calls == 0);
+    REQUIRE(h.sink.queue_calls == 0);
+    REQUIRE(h.sink.interrupt_calls == 0);
+    REQUIRE(h.validator.calls == 0);
+    REQUIRE(h.ids.calls == 0);
+  }
+}
+
+TEST_CASE("POST fixstand remains available from passive and fault recovery states") {
+  struct Case {
+    ControllerState ctrl;
+    RobotState robot;
+    ErrorCode err;
+  };
+
+  for (const auto& item : std::vector<Case>{
+           {ControllerState::Passive, RobotState::NotReady,
+            ErrorCode::RobotBadOrientation},
+           {ControllerState::Fault, RobotState::Fault,
+            ErrorCode::SafetyLimitTriggered},
+       }) {
+    Harness h;
+    h.status.snapshot_value.ready = false;
+    h.status.snapshot_value.ctrl = item.ctrl;
+    h.status.snapshot_value.robot = item.robot;
+    h.status.snapshot_value.err = item.err;
+
+    const auto response = h.service.handle({"POST", "/fixstand", ""});
+
+    CAPTURE(toString(item.ctrl));
+    REQUIRE(response.status == 200);
+    requireFields(response.body, {"ok", "state"});
+    REQUIRE(response.body.at("ok") == true);
+    REQUIRE(response.body.at("state") == "accepted");
+    REQUIRE(h.sink.fixstand_calls == 1);
+    REQUIRE(h.sink.standby_velocity_calls == 0);
+  }
+}
+
 TEST_CASE("POST control endpoints reject non-empty bodies before ports") {
   for (const auto& target : {"/fixstand", "/standby_velocity"}) {
     Harness h;
@@ -449,10 +551,35 @@ TEST_CASE("POST standby_velocity returns conflict when controller state rejects 
 
   REQUIRE(response.status == 409);
   requireFailure(response, "CONTROL_STATE_CONFLICT");
+  REQUIRE(nextAction(response) == "status");
+  REQUIRE(errorMessage(response) == "wrong ctrl; check /status");
   REQUIRE(h.sink.standby_velocity_calls == 1);
   REQUIRE(h.sink.fixstand_calls == 0);
   REQUIRE(h.validator.calls == 0);
   REQUIRE(h.ids.calls == 0);
+}
+
+TEST_CASE("POST standby_velocity rejects Passive and Fault before command sink") {
+  for (const ControllerState ctrl : {ControllerState::Passive, ControllerState::Fault}) {
+    Harness h;
+    h.status.snapshot_value.ready = true;
+    h.status.snapshot_value.ctrl = ctrl;
+
+    const auto response = h.service.handle({"POST", "/standby_velocity", ""});
+
+    CAPTURE(toString(ctrl));
+    REQUIRE(response.status == 409);
+    requireFailure(response, "CONTROL_STATE_CONFLICT");
+    REQUIRE(nextAction(response) == "fixstand");
+    if (ctrl == ControllerState::Passive) {
+      REQUIRE(errorMessage(response) ==
+              "ctrl=passive; /fixstand then /standby_velocity");
+    } else {
+      REQUIRE(errorMessage(response) == "ctrl=fault; /fixstand");
+    }
+    REQUIRE(h.sink.standby_velocity_calls == 0);
+    REQUIRE(h.sink.fixstand_calls == 0);
+  }
 }
 
 TEST_CASE("API handle converts std exceptions from ports to internal error envelopes") {
@@ -491,6 +618,31 @@ TEST_CASE("GET status renders idle nulls and queue short fields") {
   REQUIRE(response.body.at("queue").at("ids").at(0) == "a");
   REQUIRE(response.body.at("err").is_null());
   REQUIRE(response.body.at("stop_reason").is_null());
+}
+
+TEST_CASE("GET status renders compact pose for high-rate agent polling") {
+  Harness h;
+  h.status.snapshot_value.pose.q_wxyz = std::array<float, 4>{{1.0F, 0.1F, 0.2F, 0.3F}};
+  h.status.snapshot_value.pose.gyro_xyz = std::array<float, 3>{{0.4F, 0.5F, 0.6F}};
+  h.status.snapshot_value.pose.position_xyz = std::array<float, 3>{{1.1F, 1.2F, 1.3F}};
+  h.status.snapshot_value.pose.velocity_xyz = std::array<float, 3>{{2.1F, 2.2F, 2.3F}};
+
+  const auto response = h.service.handle({"GET", "/status", ""});
+
+  REQUIRE(response.status == 200);
+  const auto& pose = response.body.at("pose");
+  REQUIRE(pose.at("q") == nlohmann::json::array({1.0F, 0.1F, 0.2F, 0.3F}));
+  REQUIRE(pose.at("g") == nlohmann::json::array({0.4F, 0.5F, 0.6F}));
+  REQUIRE(pose.at("p") == nlohmann::json::array({1.1F, 1.2F, 1.3F}));
+  REQUIRE(pose.at("v") == nlohmann::json::array({2.1F, 2.2F, 2.3F}));
+
+  h.status.snapshot_value.pose.position_xyz.reset();
+  h.status.snapshot_value.pose.velocity_xyz.reset();
+  const auto low_only = h.service.handle({"GET", "/status", ""});
+  REQUIRE(low_only.body.at("pose").at("q").is_array());
+  REQUIRE(low_only.body.at("pose").at("g").is_array());
+  REQUIRE(low_only.body.at("pose").at("p").is_null());
+  REQUIRE(low_only.body.at("pose").at("v").is_null());
 }
 
 TEST_CASE("GET status renders Passive as an explicit controller state") {
@@ -539,6 +691,12 @@ TEST_CASE("GET status renders running progress and top-level stopping reason") {
 
 TEST_CASE("GET status by id covers active queued and recent run states") {
   Harness h;
+  h.status.snapshot_value.ready = false;
+  h.status.snapshot_value.ctrl = ControllerState::FixStand;
+  h.status.snapshot_value.robot = RobotState::Holding;
+  h.status.snapshot_value.block = "operator_wait";
+  h.status.snapshot_value.err = ErrorCode::RobotNotReady;
+  h.status.snapshot_value.queue = {2, 8, {"queued", "later"}};
   h.status.runs.emplace("active", run("active", MotionState::Running));
   h.status.runs.emplace("queued", run("queued", MotionState::Queued));
   h.status.runs.emplace("done", run("done", MotionState::Done));
@@ -554,7 +712,16 @@ TEST_CASE("GET status by id covers active queued and recent run states") {
     REQUIRE(response.body.at("ok") == true);
     REQUIRE(response.body.at("id") == id);
     REQUIRE(response.body.at("path") == std::string("/tracks/") + id + ".trk");
-    REQUIRE(response.body.at("robot") == "idle");
+    REQUIRE(response.body.at("robot") == "holding");
+    REQUIRE(response.body.at("ctrl") == "fixstand");
+    REQUIRE(response.body.at("ready") == false);
+    REQUIRE(response.body.at("block") == "operator_wait");
+    REQUIRE(response.body.at("top_err") == "ROBOT_NOT_READY");
+    if (std::string(id) == "queued") {
+      REQUIRE(response.body.at("queue_pos") == 1);
+    } else {
+      REQUIRE(response.body.at("queue_pos").is_null());
+    }
   }
 
   const auto missing = h.service.handle({"GET", "/status?id=missing", ""});

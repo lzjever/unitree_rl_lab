@@ -78,6 +78,27 @@ nlohmann::json queueStatusJson(const QueueStatus& status) {
   };
 }
 
+template <std::size_t N>
+nlohmann::json optionalArrayJson(const std::optional<std::array<float, N>>& value) {
+  if (!value) {
+    return nullptr;
+  }
+  nlohmann::json out = nlohmann::json::array();
+  for (const float item : *value) {
+    out.push_back(item);
+  }
+  return out;
+}
+
+nlohmann::json poseSnapshotJson(const PoseSnapshot& pose) {
+  return {
+      {"q", optionalArrayJson(pose.q_wxyz)},
+      {"g", optionalArrayJson(pose.gyro_xyz)},
+      {"p", optionalArrayJson(pose.position_xyz)},
+      {"v", optionalArrayJson(pose.velocity_xyz)},
+  };
+}
+
 nlohmann::json statusSnapshotJson(const StatusSnapshot& snapshot) {
   return {
       {"ok", true},
@@ -93,6 +114,7 @@ nlohmann::json statusSnapshotJson(const StatusSnapshot& snapshot) {
       {"low_ms", snapshot.low_ms},
       {"block", nullableString(snapshot.block)},
       {"err", nullableErrorJson(snapshot.err)},
+      {"pose", poseSnapshotJson(snapshot.pose)},
   };
 }
 

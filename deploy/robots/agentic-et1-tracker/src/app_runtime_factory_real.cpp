@@ -59,6 +59,11 @@ AppRuntimeFactoryResult robotDisconnected(const AppConfig& config) {
                   kRobotDisconnectedBlock, runtimeMode(config));
 }
 
+AppRuntimeFactoryResult lowCmdOccupied(const AppConfig& config) {
+  return notReady(config, ErrorCode::RobotNotReady, RobotState::NotReady,
+                  "lowcmd_occupied", runtimeMode(config));
+}
+
 std::filesystem::path modelPath(const PolicyConfig& config) {
   return std::filesystem::path(config.policy_dir) / "exported" / config.policy_file;
 }
@@ -108,6 +113,7 @@ AppRuntimeFactoryResult createAppRuntimeDeps(const AppConfig& config) {
     UnitreeSdkRobotIOConfig robot_config;
     robot_config.network = config.network;
     robot_config.domain_id = config.domain_id;
+    robot_config.lowcmd_startup_preflight_ms = config.lowcmd_startup_preflight_ms;
     auto robot_io = std::make_unique<UnitreeSdkRobotIO>(std::move(robot_config));
 
     AppRuntimeDeps deps;
@@ -134,6 +140,8 @@ AppRuntimeFactoryResult createAppRuntimeDeps(const AppConfig& config) {
     return modelNotReady(config);
   } catch (const PolicyRuntimeError&) {
     return modelNotReady(config);
+  } catch (const LowCmdStartupPreflightError&) {
+    return lowCmdOccupied(config);
   } catch (const RobotIOError&) {
     return robotDisconnected(config);
   } catch (const std::exception&) {

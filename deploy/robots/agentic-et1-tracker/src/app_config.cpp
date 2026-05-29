@@ -98,6 +98,20 @@ std::size_t optionalPositiveSize(const YAML::Node& section,
   return static_cast<std::size_t>(value);
 }
 
+std::size_t optionalNonNegativeSize(const YAML::Node& section,
+                                    const char* key,
+                                    std::size_t current) {
+  const YAML::Node node = section[key];
+  if (!node) {
+    return current;
+  }
+  const long long value = scalarAs<long long>(node, key);
+  if (value < 0) {
+    throw error(std::string(key) + " must be non-negative");
+  }
+  return static_cast<std::size_t>(value);
+}
+
 double optionalPositiveDouble(const YAML::Node& section, const char* key, double current) {
   const YAML::Node node = section[key];
   if (!node) {
@@ -247,6 +261,10 @@ AppConfig loadAppConfig(const std::filesystem::path& path) {
 
     config.network = optionalString(section, "network", config.network);
     config.domain_id = optionalDomainId(section, "domain_id", config.domain_id);
+    config.lowcmd_startup_preflight_ms =
+        optionalNonNegativeSize(section,
+                                "lowcmd_startup_preflight_ms",
+                                config.lowcmd_startup_preflight_ms);
     if (const YAML::Node mode_machine = section["mode_machine"]) {
       config.mode_machine = scalarAs<int>(mode_machine, "mode_machine");
     }

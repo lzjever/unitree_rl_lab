@@ -28,25 +28,48 @@ fallback to the ET1 app tree:
 
 ## Manual MuJoCo acceptance
 
-No fresh MuJoCo visual acceptance was run for this document update. Earlier
-MuJoCo evidence in this file predated the FixStand/StandbyVelocity behavior and
-must be treated as historical, not acceptance of the current control-mode
-transitions.
+No fresh MuJoCo visual acceptance has been recorded for the current revision.
+Earlier MuJoCo evidence predated the current FixStand/StandbyVelocity/FSM
+semantics and is historical only.
 
-Pending manual acceptance should record:
+Use `config.sim.yaml.example` for local MuJoCo acceptance. It sets
+`mode_machine: 0`, `network: "lo"`, app-owned policy/control assets, and
+`motion_dirs: ["/home/galbot/works/et1/generated"]`. It keeps the startup
+LowCmd owner preflight at the default `200` ms.
 
-- Preflight LowCmd ownership scoped to the same DDS `network` and `domain_id`.
+Pending MuJoCo evidence must record:
+
+- Startup LowCmd owner preflight scoped to the same DDS `network` and
+  `domain_id`; `lowcmd_occupied` must prevent any writing runtime from
+  starting.
 - Startup `/status` with `ctrl:"fixstand"` when using default config.
-- Manual `/fixstand` and `/standby_velocity` requests accepted with empty body.
+- `/status.pose` with compact `q/g/p/v` fields during idle and running states.
+- Manual `/fixstand` and `/standby_velocity` requests accepted with empty body
+  only when `/status` shows a ready runtime that can consume them.
+- Static not-ready startup/model-load failure snapshots reject `/fixstand` and
+  `/standby_velocity` with compact readiness errors and no queued control
+  command.
 - Operator-controlled MuJoCo rope/keyboard timing for track scenarios.
 - `/execute` with a local allowed `.trk` path only; no uploads or other formats.
 - Queue FIFO, interrupt, and stop/cancel behavior.
 - After `.trk` done or `/stop`, top-level `ctrl:"standby_velocity"`.
 - Fault/disconnect handling and latency/performance evidence.
 
+## GA gates
+
+| gate | status | required evidence |
+| --- | --- | --- |
+| Build and hermetic tests | recorded above | Keep all default tests passing. |
+| ROBOT/ONNX integration build | recorded above | Keep app and robot integration tests passing. |
+| MuJoCo visual acceptance | pending | Record scenarios listed above with `config.sim.yaml.example`. |
+| Real robot acceptance | pending | ET1 hardware/operator validation. |
+
+Do not mark GA until the two pending external gates are complete.
+
 ## Remaining external pending
 
-True real-robot validation is still pending and requires ET1 hardware and an operator window. Do not mark GA runtime solely from this document.
+True real-robot validation is still pending and requires ET1 hardware and an
+operator window.
 
 ## Worktree note
 

@@ -476,7 +476,7 @@ bool RuntimeControlLoop::writePassiveDamping() {
     return false;
   }
 
-  const std::optional<LowStateSample> low_state = robot_io_->readLowState();
+  const std::optional<LowStateSample> low_state = readLowStateForStatus();
   const LowCmdOccupancy occupancy = robot_io_->lowCmdOccupancy();
   const RobotReadinessStatus readiness =
       mapRobotReadiness(low_state, occupancy, expected_mode_machine_);
@@ -508,7 +508,7 @@ void RuntimeControlLoop::startNext() {
   std::optional<LowStateSample> entry_low_state;
   std::optional<RobotReadinessStatus> readiness;
   if (hasPolicyRuntime()) {
-    entry_low_state = robot_io_->readLowState();
+    entry_low_state = readLowStateForStatus();
     readiness =
         mapRobotReadiness(entry_low_state,
                           robot_io_->lowCmdOccupancy(),
@@ -547,7 +547,7 @@ void RuntimeControlLoop::completePreparing() {
   std::optional<LowStateSample> entry_low_state;
   std::optional<RobotReadinessStatus> readiness;
   if (hasPolicyRuntime()) {
-    entry_low_state = robot_io_->readLowState();
+    entry_low_state = readLowStateForStatus();
     readiness =
         mapRobotReadiness(entry_low_state,
                           robot_io_->lowCmdOccupancy(),
@@ -687,7 +687,7 @@ void RuntimeControlLoop::advanceActiveWithPolicy() {
     return;
   }
 
-  const std::optional<LowStateSample> low_state = robot_io_->readLowState();
+  const std::optional<LowStateSample> low_state = readLowStateForStatus();
   const RobotReadinessStatus readiness =
       mapRobotReadiness(low_state,
                         robot_io_->lowCmdOccupancy(),
@@ -762,7 +762,7 @@ void RuntimeControlLoop::publishControlIfReady() {
 }
 
 bool RuntimeControlLoop::writeFixStand() {
-  const std::optional<LowStateSample> low_state = robot_io_->readLowState();
+  const std::optional<LowStateSample> low_state = readLowStateForStatus();
   const LowCmdOccupancy occupancy = robot_io_->lowCmdOccupancy();
   const RobotReadinessStatus readiness =
       mapRobotReadiness(low_state, occupancy, expected_mode_machine_);
@@ -810,7 +810,7 @@ bool RuntimeControlLoop::writeFixStand() {
 }
 
 bool RuntimeControlLoop::writeStandbyVelocity() {
-  const std::optional<LowStateSample> low_state = robot_io_->readLowState();
+  const std::optional<LowStateSample> low_state = readLowStateForStatus();
   const RobotReadinessStatus readiness =
       mapRobotReadiness(low_state, robot_io_->lowCmdOccupancy(), expected_mode_machine_);
   if (readiness.err != ErrorCode::Ok) {
@@ -859,7 +859,7 @@ void RuntimeControlLoop::publishIdleHoldIfReady() {
     return;
   }
 
-  const std::optional<LowStateSample> low_state = robot_io_->readLowState();
+  const std::optional<LowStateSample> low_state = readLowStateForStatus();
   const RobotReadinessStatus readiness =
       mapRobotReadiness(low_state, robot_io_->lowCmdOccupancy(), expected_mode_machine_);
   if (readiness.err != ErrorCode::Ok) {
@@ -885,7 +885,7 @@ void RuntimeControlLoop::publishIdleHoldIfReady() {
 }
 
 bool RuntimeControlLoop::writeStoppingHold() {
-  const std::optional<LowStateSample> low_state = robot_io_->readLowState();
+  const std::optional<LowStateSample> low_state = readLowStateForStatus();
   const RobotReadinessStatus readiness =
       mapRobotReadiness(low_state, robot_io_->lowCmdOccupancy(), expected_mode_machine_);
   if (readiness.err != ErrorCode::Ok) {
@@ -1128,9 +1128,44 @@ void RuntimeControlLoop::publishSnapshot() {
   if (active_) {
     snapshot.exec = toStatus(*active_);
   }
+  fillSnapshotPose(snapshot);
   const HealthSnapshot health = healthFromSnapshot(snapshot);
   status_.publishSnapshot(std::move(snapshot));
   status_.publishHealthSnapshot(health);
+}
+
+std::optional<LowStateSample> RuntimeControlLoop::readLowStateForStatus() {
+  if (robot_io_ == nullptr) {
+    latest_low_state_.reset();
+    return std::nullopt;
+  }
+  latest_low_state_ = robot_io_->readLowState();
+  return latest_low_state_;
+}
+
+std::optional<HighStateSample> RuntimeControlLoop::readHighStateForStatus() {
+  if (robot_io_ == nullptr) {
+    latest_high_state_.reset();
+    return std::nullopt;
+  }
+  latest_high_state_ = robot_io_->readHighState();
+  return latest_high_state_;
+}
+
+void RuntimeControlLoop::fillSnapshotPose(StatusSnapshot& snapshot) {
+  if (!hasPolicyRuntime()) {
+    return;
+  }
+
+  readHighStateForStatus();
+  if (latest_low_state_) {
+    snapshot.pose.q_wxyz = latest_low_state_->quat_wxyz;
+    snapshot.pose.gyro_xyz = latest_low_state_->gyro;
+  }
+  if (latest_high_state_ && latest_high_state_->fresh) {
+    snapshot.pose.position_xyz = latest_high_state_->position;
+    snapshot.pose.velocity_xyz = latest_high_state_->linear_velocity;
+  }
 }
 
 MotionStatus RuntimeControlLoop::toStatus(const MotionRequest& request) const {
@@ -1175,7 +1210,7 @@ void RuntimeControlLoop::refreshReadinessForPolicyRuntime() {
     return;
   }
 
-  const std::optional<LowStateSample> low_state = robot_io_->readLowState();
+  const std::optional<LowStateSample> low_state = readLowStateForStatus();
   const RobotReadinessStatus readiness =
       mapRobotReadiness(low_state, robot_io_->lowCmdOccupancy(), expected_mode_machine_);
   if (readinessRequiresFault(readiness)) {

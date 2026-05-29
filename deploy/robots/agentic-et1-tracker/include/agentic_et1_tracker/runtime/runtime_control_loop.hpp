@@ -127,6 +127,9 @@ class RuntimeControlLoop final {
   std::size_t stopHoldTicks() const;
   void publishActive();
   void publishSnapshot();
+  std::optional<LowStateSample> readLowStateForStatus();
+  std::optional<HighStateSample> readHighStateForStatus();
+  void fillSnapshotPose(StatusSnapshot& snapshot);
   MotionStatus toStatus(const MotionRequest& request) const;
   std::vector<std::string> waitingIds() const;
   RobotState robotState() const;
@@ -174,6 +177,8 @@ class RuntimeControlLoop final {
   std::size_t active_policy_ticks_until_next_{0};
   std::size_t velocity_policy_ticks_until_next_{0};
   std::optional<LowCmdFrame> lowcmd_buffer_;
+  std::optional<LowStateSample> latest_low_state_;
+  std::optional<HighStateSample> latest_high_state_;
 };
 
 }  // namespace agentic_et1_tracker

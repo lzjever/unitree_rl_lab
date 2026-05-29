@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <sstream>
+#include <thread>
 #include <utility>
 
 #include "unitree/dds_wrapper/common/crc.h"
@@ -148,6 +149,15 @@ void LowCmdOwnershipTracker::pruneOldWrites(Clock::time_point now) {
   }
 }
 
+LowCmdStartupPreflightResult checkLowCmdStartupPreflight(
+    const LowCmdOwnershipTracker& tracker,
+    LowCmdOwnershipTracker::Clock::time_point now) {
+  LowCmdStartupPreflightResult result;
+  result.occupancy = tracker.occupancy(now);
+  result.ok = !result.occupancy.occupied;
+  return result;
+}
+
 UnitreeSdkRobotIO::UnitreeSdkRobotIO(UnitreeSdkRobotIOConfig config)
     : config_(std::move(config)),
       lowcmd_ownership_(config_.lowcmd_occupancy_window_ms,
@@ -156,13 +166,14 @@ UnitreeSdkRobotIO::UnitreeSdkRobotIO(UnitreeSdkRobotIOConfig config)
     unitree::robot::ChannelFactory::Instance()->Init(config_.domain_id, config_.network);
   }
 
-  lowcmd_publisher_ =
-      std::make_unique<unitree::robot::ChannelPublisher<LowCmdMsg>>(kLowCmdTopic);
-  lowcmd_publisher_->InitChannel();
-
   lowcmd_subscriber_ = std::make_unique<unitree::robot::ChannelSubscriber<LowCmdMsg>>(
       kLowCmdTopic, [this](const void* message) { onLowCmd(message); }, 1);
   lowcmd_subscriber_->InitChannel();
+  runStartupPreflight();
+
+  lowcmd_publisher_ =
+      std::make_unique<unitree::robot::ChannelPublisher<LowCmdMsg>>(kLowCmdTopic);
+  lowcmd_publisher_->InitChannel();
 
   lowstate_subscriber_ = std::make_unique<unitree::robot::ChannelSubscriber<LowStateMsg>>(
       kLowStateTopic, [this](const void* message) { onLowState(message); }, 1);
@@ -196,6 +207,30 @@ void UnitreeSdkRobotIO::closeChannels() noexcept {
       lowcmd_publisher_.reset();
     }
   } catch (...) {
+  }
+}
+
+void UnitreeSdkRobotIO::runStartupPreflight() {
+  if (config_.lowcmd_startup_preflight_ms == 0) {
+    return;
+  }
+
+  std::this_thread::sleep_for(
+      std::chrono::milliseconds(config_.lowcmd_startup_preflight_ms));
+
+  LowCmdStartupPreflightResult result;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    result = checkLowCmdStartupPreflight(lowcmd_ownership_, Clock::now());
+  }
+  if (!result.ok) {
+    closeChannels();
+    std::ostringstream out;
+    out << "lowcmd owner present at startup";
+    if (result.occupancy.sample_age_ms > 0) {
+      out << " age_ms=" << result.occupancy.sample_age_ms;
+    }
+    throw LowCmdStartupPreflightError(out.str());
   }
 }
 
