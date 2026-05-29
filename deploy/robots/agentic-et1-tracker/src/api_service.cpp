@@ -45,6 +45,7 @@ int httpStatus(ErrorCode code) {
     case ErrorCode::RobotDisconnected:
     case ErrorCode::RobotNotReady:
     case ErrorCode::RobotBadOrientation:
+    case ErrorCode::ControlStateConflict:
     case ErrorCode::SafetyLimitTriggered:
       return 409;
     case ErrorCode::ServiceNotReady:

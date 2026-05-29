@@ -2,6 +2,8 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -22,6 +24,7 @@ struct UnitreeSdkRobotIOConfig {
   std::size_t low_timeout_ms{200};
   std::size_t high_timeout_ms{200};
   std::size_t lowcmd_occupancy_window_ms{200};
+  std::size_t lowcmd_own_write_history_size{512};
   bool init_channel_factory{true};
 };
 
@@ -34,6 +37,37 @@ HighStateSample unitreeHighStateToSample(const unitree_go::msg::dds_::SportModeS
                                          std::size_t timeout_ms);
 
 unitree_hg::msg::dds_::LowCmd_ unitreeLowCmdFromFrame(const LowCmdFrame& frame);
+
+class LowCmdOwnershipTracker final {
+ public:
+  using Clock = std::chrono::steady_clock;
+  using LowCmdMsg = unitree_hg::msg::dds_::LowCmd_;
+
+  explicit LowCmdOwnershipTracker(std::size_t window_ms = 200,
+                                  std::size_t max_recent_writes = 512);
+
+  void observe(const LowCmdMsg& command, Clock::time_point now);
+  void recordOwnWrite(const LowCmdMsg& command, Clock::time_point now);
+  LowCmdOccupancy occupancy(Clock::time_point now) const;
+
+ private:
+  struct StampedCommand {
+    LowCmdMsg command;
+    Clock::time_point written_at;
+    std::uint32_t crc{0};
+  };
+
+  bool isRecentOwnObserved(const LowCmdMsg& observed,
+                           Clock::time_point observed_at,
+                           Clock::time_point now) const;
+  void pruneOldWrites(Clock::time_point now);
+
+  std::size_t window_ms_{200};
+  std::size_t max_recent_writes_{512};
+  std::optional<LowCmdMsg> last_observed_;
+  std::optional<Clock::time_point> last_observed_at_;
+  std::deque<StampedCommand> recent_own_writes_;
+};
 
 class UnitreeSdkRobotIO final : public RobotIO {
  public:
@@ -57,11 +91,8 @@ class UnitreeSdkRobotIO final : public RobotIO {
   void onHighState(const void* message);
 
   UnitreeSdkRobotIOConfig config_;
+  LowCmdOwnershipTracker lowcmd_ownership_;
   mutable std::mutex mutex_;
-  std::optional<LowCmdMsg> last_observed_lowcmd_;
-  std::optional<Clock::time_point> last_observed_lowcmd_time_;
-  std::optional<LowCmdMsg> last_written_lowcmd_;
-  std::optional<Clock::time_point> last_written_lowcmd_time_;
   std::optional<LowStateMsg> latest_low_state_;
   std::optional<Clock::time_point> latest_low_state_time_;
   std::optional<HighStateMsg> latest_high_state_;

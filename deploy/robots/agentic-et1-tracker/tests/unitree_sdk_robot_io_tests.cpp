@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
@@ -117,6 +118,52 @@ TEST_CASE("UnitreeSdkRobotIO maps RobotIO low command frames into SDK2 LowCmd wi
       crc32_core(reinterpret_cast<std::uint32_t*>(&cmd), (sizeof(cmd) >> 2) - 1);
   REQUIRE(cmd.crc() == expected_crc);
   REQUIRE(cmd.crc() != 0);
+}
+
+TEST_CASE("Unitree LowCmd ownership accepts delayed echo of recent own writes") {
+  using Clock = LowCmdOwnershipTracker::Clock;
+  using namespace std::chrono_literals;
+
+  LowCmdFrame first_frame = lowCmdFrame();
+  LowCmdFrame second_frame = lowCmdFrame();
+  second_frame.motors[0].q += 1.0F;
+  const auto first = unitreeLowCmdFromFrame(first_frame);
+  const auto second = unitreeLowCmdFromFrame(second_frame);
+  const auto t0 = Clock::time_point(1000ms);
+
+  LowCmdOwnershipTracker tracker(200, 8);
+  tracker.recordOwnWrite(first, t0);
+  tracker.observe(first, t0 + 1ms);
+  REQUIRE_FALSE(tracker.occupancy(t0 + 1ms).occupied);
+
+  tracker.recordOwnWrite(second, t0 + 2ms);
+  tracker.observe(first, t0 + 3ms);
+
+  const LowCmdOccupancy occupancy = tracker.occupancy(t0 + 3ms);
+  REQUIRE_FALSE(occupancy.occupied);
+  REQUIRE(occupancy.sample_age_ms == 0);
+}
+
+TEST_CASE("Unitree LowCmd ownership flags fresh commands outside own-write window") {
+  using Clock = LowCmdOwnershipTracker::Clock;
+  using namespace std::chrono_literals;
+
+  const auto own = unitreeLowCmdFromFrame(lowCmdFrame());
+  LowCmdFrame external_frame = lowCmdFrame();
+  external_frame.motors[0].q += 5.0F;
+  const auto external = unitreeLowCmdFromFrame(external_frame);
+  const auto t0 = Clock::time_point(2000ms);
+
+  LowCmdOwnershipTracker tracker(50, 4);
+  tracker.observe(external, t0);
+  REQUIRE(tracker.occupancy(t0).occupied);
+
+  tracker.recordOwnWrite(own, t0);
+  tracker.observe(own, t0 + 60ms);
+
+  const LowCmdOccupancy occupancy = tracker.occupancy(t0 + 60ms);
+  REQUIRE(occupancy.occupied);
+  REQUIRE(occupancy.sample_age_ms == 0);
 }
 
 }  // namespace agentic_et1_tracker

@@ -441,6 +441,20 @@ TEST_CASE("POST control endpoints reject non-empty bodies before ports") {
   }
 }
 
+TEST_CASE("POST standby_velocity returns conflict when controller state rejects it") {
+  Harness h;
+  h.sink.standby_velocity_result = {ErrorCode::ControlStateConflict};
+
+  const auto response = h.service.handle({"POST", "/standby_velocity", ""});
+
+  REQUIRE(response.status == 409);
+  requireFailure(response, "CONTROL_STATE_CONFLICT");
+  REQUIRE(h.sink.standby_velocity_calls == 1);
+  REQUIRE(h.sink.fixstand_calls == 0);
+  REQUIRE(h.validator.calls == 0);
+  REQUIRE(h.ids.calls == 0);
+}
+
 TEST_CASE("API handle converts std exceptions from ports to internal error envelopes") {
   Harness h;
   h.sink.throw_stop = true;

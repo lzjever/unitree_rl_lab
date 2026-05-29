@@ -62,6 +62,11 @@ struct LowCmdOccupancy {
   std::size_t sample_age_ms{0};
 };
 
+enum class OrientationSafety {
+  Enforce,
+  Skip,
+};
+
 struct ModeMachineCheck {
   bool connected{false};
   bool ok{false};
@@ -101,7 +106,9 @@ bool hasSafeBodyOrientation(const LowStateSample& low_state);
 
 RobotReadinessStatus mapRobotReadiness(const std::optional<LowStateSample>& low_state,
                                        LowCmdOccupancy occupancy,
-                                       std::uint8_t expected_mode_machine);
+                                       std::uint8_t expected_mode_machine,
+                                       OrientationSafety orientation_safety =
+                                           OrientationSafety::Enforce);
 
 LowCmdFrame makeLowCmdFrame(const DeployConfig& config,
                             const PolicyOutput& output,

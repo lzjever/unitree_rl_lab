@@ -1419,7 +1419,7 @@ TEST_CASE("RuntimeControlLoop running lowstate readiness failure enters Passive"
   }
 }
 
-TEST_CASE("RuntimeControlLoop running bad orientation fails active motion and enters Passive") {
+TEST_CASE("RuntimeControlLoop running bad orientation keeps active track policy running") {
   TempTree tmp;
   const RuntimeConfig config = runtimeConfig();
   RuntimeStatusStore store(config);
@@ -1438,19 +1438,19 @@ TEST_CASE("RuntimeControlLoop running bad orientation fails active motion and en
   loop.tick();
 
   const auto snapshot = store.snapshot();
-  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Passive);
-  REQUIRE(snapshot.ctrl == ControllerState::Passive);
-  REQUIRE_FALSE(snapshot.ready);
-  REQUIRE(snapshot.robot == RobotState::Fault);
-  REQUIRE(snapshot.err == ErrorCode::RobotBadOrientation);
-  REQUIRE(snapshot.block == "bad_orientation");
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::GeneralTrackerActive);
+  REQUIRE(snapshot.ctrl == ControllerState::Running);
+  REQUIRE(snapshot.ready);
+  REQUIRE(snapshot.robot == RobotState::Running);
+  REQUIRE(snapshot.err == ErrorCode::Ok);
+  REQUIRE(snapshot.block.empty());
   REQUIRE(snapshot.low_ms == 81);
-  REQUIRE(policy.calls == 0);
-  REQUIRE(robot.write_attempts == 0);
+  REQUIRE(policy.calls == 1);
+  REQUIRE(robot.write_attempts == 1);
   const auto found = store.findRun("running-bad-orientation");
   REQUIRE(found.ok());
-  REQUIRE(found.run->state == MotionState::Failed);
-  REQUIRE(found.run->err == ErrorCode::RobotBadOrientation);
+  REQUIRE(found.run->state == MotionState::Running);
+  REQUIRE(found.run->err == ErrorCode::Ok);
 }
 
 TEST_CASE("RuntimeControlLoop running LowCmd occupancy fails before policy write") {

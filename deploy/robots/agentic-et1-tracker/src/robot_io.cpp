@@ -90,7 +90,8 @@ bool hasSafeBodyOrientation(const LowStateSample& low_state) {
 
 RobotReadinessStatus mapRobotReadiness(const std::optional<LowStateSample>& low_state,
                                        LowCmdOccupancy occupancy,
-                                       std::uint8_t expected_mode_machine) {
+                                       std::uint8_t expected_mode_machine,
+                                       OrientationSafety orientation_safety) {
   RobotReadinessStatus status;
 
   if (occupancy.occupied) {
@@ -128,7 +129,8 @@ RobotReadinessStatus mapRobotReadiness(const std::optional<LowStateSample>& low_
     return status;
   }
 
-  if (!hasSafeBodyOrientation(*low_state)) {
+  if (orientation_safety == OrientationSafety::Enforce &&
+      !hasSafeBodyOrientation(*low_state)) {
     status.robot = RobotState::Fault;
     status.err = ErrorCode::RobotBadOrientation;
     status.block = "bad_orientation";

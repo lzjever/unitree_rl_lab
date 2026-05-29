@@ -23,6 +23,7 @@ enum class ErrorCode {
   QueueFull,
   RunNotFound,
   RunStateConflict,
+  ControlStateConflict,
   SafetyLimitTriggered,
   InternalError,
 };

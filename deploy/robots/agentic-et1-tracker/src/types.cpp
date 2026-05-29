@@ -34,6 +34,8 @@ std::string toString(ErrorCode code) {
       return "RUN_NOT_FOUND";
     case ErrorCode::RunStateConflict:
       return "RUN_STATE_CONFLICT";
+    case ErrorCode::ControlStateConflict:
+      return "CONTROL_STATE_CONFLICT";
     case ErrorCode::SafetyLimitTriggered:
       return "SAFETY_LIMIT_TRIGGERED";
     case ErrorCode::InternalError:
@@ -198,6 +200,11 @@ ErrorInfo errorInfo(ErrorCode code) {
       return {code, "run id was not found", false, NextAction::Status};
     case ErrorCode::RunStateConflict:
       return {code, "run state conflicts with the requested action", true, NextAction::Stop};
+    case ErrorCode::ControlStateConflict:
+      return {code,
+              "controller state conflicts with the requested control",
+              false,
+              NextAction::Fix};
     case ErrorCode::SafetyLimitTriggered:
       return {code, "safety limit triggered", false, NextAction::Manual};
     case ErrorCode::InternalError:

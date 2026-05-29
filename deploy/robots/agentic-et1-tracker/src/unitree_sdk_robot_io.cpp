@@ -87,8 +87,71 @@ unitree_hg::msg::dds_::LowCmd_ unitreeLowCmdFromFrame(const LowCmdFrame& frame) 
   return cmd;
 }
 
+LowCmdOwnershipTracker::LowCmdOwnershipTracker(std::size_t window_ms,
+                                               std::size_t max_recent_writes)
+    : window_ms_(window_ms),
+      max_recent_writes_(std::max<std::size_t>(1, max_recent_writes)) {}
+
+void LowCmdOwnershipTracker::observe(const LowCmdMsg& command, Clock::time_point now) {
+  last_observed_ = command;
+  last_observed_at_ = now;
+}
+
+void LowCmdOwnershipTracker::recordOwnWrite(const LowCmdMsg& command,
+                                            Clock::time_point now) {
+  recent_own_writes_.push_back({command, now, command.crc()});
+  pruneOldWrites(now);
+  while (recent_own_writes_.size() > max_recent_writes_) {
+    recent_own_writes_.pop_front();
+  }
+}
+
+LowCmdOccupancy LowCmdOwnershipTracker::occupancy(Clock::time_point now) const {
+  LowCmdOccupancy occupancy;
+  if (!last_observed_ || !last_observed_at_) {
+    return occupancy;
+  }
+
+  const std::size_t observed_age = ageMs(*last_observed_at_, now);
+  occupancy.sample_age_ms = observed_age;
+  if (observed_age > window_ms_) {
+    return occupancy;
+  }
+
+  occupancy.occupied =
+      !isRecentOwnObserved(*last_observed_, *last_observed_at_, now);
+  return occupancy;
+}
+
+bool LowCmdOwnershipTracker::isRecentOwnObserved(const LowCmdMsg& observed,
+                                                 Clock::time_point observed_at,
+                                                 Clock::time_point now) const {
+  const std::uint32_t observed_crc = observed.crc();
+  for (auto it = recent_own_writes_.rbegin(); it != recent_own_writes_.rend(); ++it) {
+    if (observed_at < it->written_at) {
+      continue;
+    }
+    if (ageMs(it->written_at, now) > window_ms_) {
+      continue;
+    }
+    if (it->crc == observed_crc && it->command == observed) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void LowCmdOwnershipTracker::pruneOldWrites(Clock::time_point now) {
+  while (!recent_own_writes_.empty() &&
+         ageMs(recent_own_writes_.front().written_at, now) > window_ms_) {
+    recent_own_writes_.pop_front();
+  }
+}
+
 UnitreeSdkRobotIO::UnitreeSdkRobotIO(UnitreeSdkRobotIOConfig config)
-    : config_(std::move(config)) {
+    : config_(std::move(config)),
+      lowcmd_ownership_(config_.lowcmd_occupancy_window_ms,
+                        config_.lowcmd_own_write_history_size) {
   if (config_.init_channel_factory) {
     unitree::robot::ChannelFactory::Instance()->Init(config_.domain_id, config_.network);
   }
@@ -168,25 +231,8 @@ std::optional<HighStateSample> UnitreeSdkRobotIO::readHighState() const {
 }
 
 LowCmdOccupancy UnitreeSdkRobotIO::lowCmdOccupancy() const {
-  LowCmdOccupancy occupancy;
-
   std::lock_guard<std::mutex> lock(mutex_);
-  if (!last_observed_lowcmd_ || !last_observed_lowcmd_time_) {
-    return occupancy;
-  }
-
-  const std::size_t observed_age = ageMs(*last_observed_lowcmd_time_, Clock::now());
-  occupancy.sample_age_ms = observed_age;
-  if (observed_age > config_.lowcmd_occupancy_window_ms) {
-    return occupancy;
-  }
-
-  const bool observed_own_write =
-      last_written_lowcmd_ && last_written_lowcmd_time_ &&
-      *last_observed_lowcmd_ == *last_written_lowcmd_ &&
-      *last_observed_lowcmd_time_ >= *last_written_lowcmd_time_;
-  occupancy.occupied = !observed_own_write;
-  return occupancy;
+  return lowcmd_ownership_.occupancy(Clock::now());
 }
 
 void UnitreeSdkRobotIO::writeLowCmd(const LowCmdFrame& frame) {
@@ -201,8 +247,7 @@ void UnitreeSdkRobotIO::writeLowCmd(const LowCmdFrame& frame) {
   }
 
   std::lock_guard<std::mutex> lock(mutex_);
-  last_written_lowcmd_ = cmd;
-  last_written_lowcmd_time_ = write_started;
+  lowcmd_ownership_.recordOwnWrite(cmd, write_started);
 }
 
 void UnitreeSdkRobotIO::onLowCmd(const void* message) {
@@ -211,8 +256,7 @@ void UnitreeSdkRobotIO::onLowCmd(const void* message) {
   }
 
   std::lock_guard<std::mutex> lock(mutex_);
-  last_observed_lowcmd_ = *static_cast<const LowCmdMsg*>(message);
-  last_observed_lowcmd_time_ = Clock::now();
+  lowcmd_ownership_.observe(*static_cast<const LowCmdMsg*>(message), Clock::now());
 }
 
 void UnitreeSdkRobotIO::onLowState(const void* message) {

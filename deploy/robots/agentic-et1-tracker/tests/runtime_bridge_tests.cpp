@@ -476,6 +476,39 @@ TEST_CASE("RuntimeBridge stop no-op returns current passive and standby state") 
   }
 }
 
+TEST_CASE("RuntimeBridge rejects standby velocity from Passive and Fault without enqueuing") {
+  const RuntimeConfig config = runtimeConfig(8);
+
+  for (const ControllerState state : {ControllerState::Passive, ControllerState::Fault}) {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    store.publishSnapshot(readySnapshot(state));
+
+    const auto result = bridge.standbyVelocity();
+
+    REQUIRE(result.code == ErrorCode::ControlStateConflict);
+    REQUIRE_FALSE(bridge.consumeNextCommand().has_value());
+  }
+}
+
+TEST_CASE("RuntimeBridge accepts FixStand from Passive and Fault") {
+  const RuntimeConfig config = runtimeConfig(8);
+
+  for (const ControllerState state : {ControllerState::Passive, ControllerState::Fault}) {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    store.publishSnapshot(readySnapshot(state));
+
+    const auto result = bridge.fixStand();
+
+    REQUIRE(result.code == ErrorCode::Ok);
+    auto command = bridge.consumeNextCommand();
+    REQUIRE(command.has_value());
+    REQUIRE(command->kind == CommandKind::FixStand);
+    REQUIRE_FALSE(bridge.consumeNextCommand().has_value());
+  }
+}
+
 TEST_CASE("RuntimeBridge stop is accepted for run status published before snapshot exec") {
   const RuntimeConfig config = runtimeConfig(8);
   RuntimeStatusStore store(config);

@@ -212,6 +212,19 @@ TEST_CASE("RobotIO readiness maps lowstate and lowcmd occupancy to stable status
     REQUIRE(status.low_ms == 11);
   }
 
+  SECTION("bad orientation can be skipped for active track readiness") {
+    LowStateSample low = lowState(1, true, 11);
+    low.quat_wxyz = {0.70710677F, 0.70710677F, 0.0F, 0.0F};
+
+    const RobotReadinessStatus status =
+        mapRobotReadiness(low, {}, 1, OrientationSafety::Skip);
+
+    REQUIRE(status.robot == RobotState::Idle);
+    REQUIRE(status.err == ErrorCode::Ok);
+    REQUIRE(status.block.empty());
+    REQUIRE(status.low_ms == 11);
+  }
+
   SECTION("lowcmd occupancy overrides bad orientation") {
     LowStateSample low = lowState(1, true, 12);
     low.quat_wxyz = {0.70710677F, 0.70710677F, 0.0F, 0.0F};

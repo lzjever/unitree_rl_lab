@@ -689,7 +689,10 @@ void RuntimeControlLoop::advanceActiveWithPolicy() {
 
   const std::optional<LowStateSample> low_state = robot_io_->readLowState();
   const RobotReadinessStatus readiness =
-      mapRobotReadiness(low_state, robot_io_->lowCmdOccupancy(), expected_mode_machine_);
+      mapRobotReadiness(low_state,
+                        robot_io_->lowCmdOccupancy(),
+                        expected_mode_machine_,
+                        OrientationSafety::Skip);
   if (readiness.err != ErrorCode::Ok) {
     if (readinessRequiresFault(readiness)) {
       failActiveWithFault(readiness.err,

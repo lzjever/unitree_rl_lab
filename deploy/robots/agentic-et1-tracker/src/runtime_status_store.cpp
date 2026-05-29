@@ -250,6 +250,11 @@ StopResult RuntimeStatusStore::acceptStop() {
 
 ControlResult RuntimeStatusStore::acceptControl(ControlMode mode) {
   std::lock_guard<std::mutex> lock(mutex_);
+  if (mode == ControlMode::StandbyVelocity &&
+      (snapshot_.ctrl == ControllerState::Passive ||
+       snapshot_.ctrl == ControllerState::Fault)) {
+    return {ErrorCode::ControlStateConflict};
+  }
   if (mode == ControlMode::FixStand) {
     cancelQueuedLocked(StopReason::Stop);
   }
