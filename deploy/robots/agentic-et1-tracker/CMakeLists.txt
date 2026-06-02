@@ -69,6 +69,23 @@ target_link_libraries(agentic_et1_tracker_api
     agentic_et1_tracker_core
 )
 
+add_library(agentic_et1_tracker_reference
+  src/reference_frame.cpp
+  src/reference_frame_json.cpp
+  src/reference_frame_store.cpp
+)
+
+target_compile_features(agentic_et1_tracker_reference PUBLIC cxx_std_17)
+target_include_directories(agentic_et1_tracker_reference
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann_json/include
+)
+target_link_libraries(agentic_et1_tracker_reference
+  PUBLIC
+    agentic_et1_tracker_trk
+)
+
 add_library(agentic_et1_tracker_runtime
   src/runtime_bridge.cpp
   src/runtime_control_loop.cpp
@@ -83,6 +100,7 @@ target_include_directories(agentic_et1_tracker_runtime
 target_link_libraries(agentic_et1_tracker_runtime
   PUBLIC
     agentic_et1_tracker_api
+    agentic_et1_tracker_reference
     agentic_et1_tracker_trk
 )
 
@@ -212,6 +230,7 @@ target_include_directories(agentic_et1_tracker_http
 target_link_libraries(agentic_et1_tracker_http
   PUBLIC
     agentic_et1_tracker_api
+    agentic_et1_tracker_reference
   PRIVATE
     agentic_et1_tracker_httplib
     Threads::Threads
@@ -355,10 +374,12 @@ if(AGENTIC_ET1_BUILD_TESTS)
 
   add_executable(agentic_et1_tracker_api_tests
     tests/api_tests.cpp
+    tests/reference_frame_tests.cpp
   )
   target_link_libraries(agentic_et1_tracker_api_tests
     PRIVATE
       agentic_et1_tracker_api
+      agentic_et1_tracker_reference
       Catch2::Catch2WithMain
   )
 

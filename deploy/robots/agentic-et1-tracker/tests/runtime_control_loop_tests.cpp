@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -353,6 +354,33 @@ class FakeVelocityPolicy final : public VelocityPolicyInference {
   std::vector<VelocityPolicyInputs> inputs_seen;
 };
 
+class FakeReferenceSink final : public ReferenceFrameSink {
+ public:
+  void publish(ReferenceFrameSnapshot snapshot) override {
+    ++publish_calls;
+    if (throw_on_publish) {
+      throw std::runtime_error("fake reference publish failed");
+    }
+    latest = snapshot;
+    published.push_back(std::move(snapshot));
+  }
+
+  void clear() override {
+    ++clear_calls;
+    if (throw_on_clear) {
+      throw std::runtime_error("fake reference clear failed");
+    }
+    latest = ReferenceFrameSnapshot{};
+  }
+
+  int publish_calls{0};
+  int clear_calls{0};
+  bool throw_on_publish{false};
+  bool throw_on_clear{false};
+  ReferenceFrameSnapshot latest;
+  std::vector<ReferenceFrameSnapshot> published;
+};
+
 VelocityDeployConfig velocityDeployConfig() {
   VelocityDeployConfig config;
   config.joint_dim = kVelocityPolicyJointDim;
@@ -687,6 +715,137 @@ TEST_CASE("RuntimeControlLoop loads queued trk and publishes deterministic progr
   REQUIRE(found.run->frame == 2);
   REQUIRE(found.run->time_s == 0.08);
   REQUIRE(found.run->progress == 1.0);
+}
+
+TEST_CASE("RuntimeControlLoop publishes active raw reference frames then clears") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  RuntimeControlLoop loop(config, bridge, store, TrkLoader(tmp.trkConfig()), &reference);
+
+  const auto path = validTrk(tmp, "reference_frames.trk", 3);
+  REQUIRE(bridge.submitQueue(executeCommand("ref-run", path)).ok());
+
+  loop.tick();
+  REQUIRE(store.snapshot().ctrl == ControllerState::Preparing);
+  loop.tick();
+  REQUIRE(store.snapshot().ctrl == ControllerState::Running);
+  REQUIRE(reference.latest.active);
+  REQUIRE(reference.latest.id == "ref-run");
+  REQUIRE(reference.latest.frame == 0);
+  REQUIRE(reference.latest.frames == 3);
+  REQUIRE(reference.latest.p.at(0) == std::array<float, 3>{{0.0F, 0.25F, 0.5F}});
+  REQUIRE(reference.latest.q.at(0) == std::array<float, 4>{{0.0F, 0.25F, 0.5F, 0.75F}});
+  REQUIRE(reference.latest.c == std::array<std::int64_t, 2>{{0, 0}});
+  REQUIRE(reference.latest.com == std::array<float, 3>{{0.0F, 0.25F, 0.5F}});
+  REQUIRE(reference.latest.comv == std::array<float, 3>{{0.0F, 0.25F, 0.5F}});
+
+  loop.tick();
+  loop.tick();
+  REQUIRE(reference.latest.frame == 1);
+  REQUIRE(reference.latest.p.at(0) == std::array<float, 3>{{20.25F, 20.5F, 20.75F}});
+  REQUIRE(reference.latest.c == std::array<std::int64_t, 2>{{1, 1}});
+
+  loop.tick();
+  REQUIRE_FALSE(reference.latest.active);
+  const auto found = store.findRun("ref-run");
+  REQUIRE(found.ok());
+  REQUIRE(found.run->state == MotionState::Done);
+  REQUIRE(reference.published.size() >= 3);
+  REQUIRE(reference.published.at(reference.published.size() - 1).frame == 2);
+  REQUIRE(reference.published.at(reference.published.size() - 1).p.at(0) ==
+          std::array<float, 3>{{40.5F, 40.75F, 41.0F}});
+}
+
+TEST_CASE("RuntimeControlLoop clears reference on stop interrupt and loader failure") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+
+  auto started_loop = [&](RuntimeStatusStore& store,
+                          RuntimeBridge& bridge,
+                          FakeReferenceSink& reference,
+                          const std::string& id) {
+    auto loop =
+        RuntimeControlLoop(config, bridge, store, TrkLoader(tmp.trkConfig()), &reference);
+    const auto path = validTrk(tmp, id + ".trk", 4);
+    REQUIRE(bridge.submitQueue(executeCommand(id, path, MotionMode::Queue, 4)).ok());
+    loop.tick();
+    loop.tick();
+    REQUIRE(reference.latest.active);
+    return loop;
+  };
+
+  SECTION("stop clears active reference") {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeReferenceSink reference;
+    auto loop = started_loop(store, bridge, reference, "ref-stop");
+
+    REQUIRE(bridge.stop().ok());
+    loop.tick();
+
+    REQUIRE_FALSE(reference.latest.active);
+    REQUIRE(store.snapshot().ctrl == ControllerState::Stopping);
+  }
+
+  SECTION("interrupt clears active reference") {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeReferenceSink reference;
+    auto loop = started_loop(store, bridge, reference, "ref-interrupt");
+    const auto next_path = validTrk(tmp, "ref-next.trk", 2);
+
+    REQUIRE(bridge.submitInterrupt(
+                executeCommand("ref-next", next_path, MotionMode::Interrupt, 2))
+                .ok());
+    loop.tick();
+
+    REQUIRE_FALSE(reference.latest.active);
+    REQUIRE(store.snapshot().ctrl == ControllerState::Stopping);
+  }
+
+  SECTION("loader failure clears reference") {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeReferenceSink reference;
+    RuntimeControlLoop loop(config, bridge, store, TrkLoader(tmp.trkConfig()), &reference);
+    const auto path = invalidContactTrk(tmp, "reference_invalid.trk");
+
+    REQUIRE(bridge.submitQueue(executeCommand("ref-bad", path)).ok());
+    loop.tick();
+    loop.tick();
+
+    REQUIRE_FALSE(reference.latest.active);
+    REQUIRE(store.findRun("ref-bad").run->state == MotionState::Failed);
+  }
+}
+
+TEST_CASE("RuntimeControlLoop reference sink failures do not change motion state") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  reference.throw_on_publish = true;
+  reference.throw_on_clear = true;
+  RuntimeControlLoop loop(config, bridge, store, TrkLoader(tmp.trkConfig()), &reference);
+
+  const auto path = validTrk(tmp, "reference_throw.trk", 2);
+  REQUIRE(bridge.submitQueue(executeCommand("ref-throw", path, MotionMode::Queue, 2))
+              .ok());
+
+  loop.tick();
+  loop.tick();
+  REQUIRE(store.snapshot().ctrl == ControllerState::Running);
+  loop.tick();
+  loop.tick();
+
+  const auto found = store.findRun("ref-throw");
+  REQUIRE(found.ok());
+  REQUIRE(found.run->state == MotionState::Done);
+  REQUIRE(found.run->err == ErrorCode::Ok);
 }
 
 TEST_CASE("RuntimeControlLoop records loader validation failure without entering fault") {

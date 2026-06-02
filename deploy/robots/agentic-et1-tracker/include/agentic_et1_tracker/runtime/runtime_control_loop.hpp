@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -12,6 +13,7 @@
 #include "agentic_et1_tracker/control/passive.hpp"
 #include "agentic_et1_tracker/policy/policy_step_runner.hpp"
 #include "agentic_et1_tracker/policy/velocity_policy_runner.hpp"
+#include "agentic_et1_tracker/reference/reference_frame.hpp"
 #include "agentic_et1_tracker/runtime/runtime_bridge.hpp"
 #include "agentic_et1_tracker/runtime/runtime_config.hpp"
 #include "agentic_et1_tracker/runtime/runtime_status_store.hpp"
@@ -42,7 +44,8 @@ class RuntimeControlLoop final {
   RuntimeControlLoop(RuntimeConfig config,
                      RuntimeBridge& bridge,
                      RuntimeStatusStore& status,
-                     TrkLoader loader);
+                     TrkLoader loader,
+                     ReferenceFrameSink* reference_sink = nullptr);
   RuntimeControlLoop(RuntimeConfig config,
                      RuntimeBridge& bridge,
                      RuntimeStatusStore& status,
@@ -52,7 +55,8 @@ class RuntimeControlLoop final {
                      DeployConfig deploy_config,
                      PassiveConfig passive_config,
                      std::uint8_t expected_mode_machine,
-                     RuntimeMode mode = RuntimeMode::Real);
+                     RuntimeMode mode = RuntimeMode::Real,
+                     ReferenceFrameSink* reference_sink = nullptr);
   RuntimeControlLoop(RuntimeConfig config,
                      RuntimeBridge& bridge,
                      RuntimeStatusStore& status,
@@ -66,7 +70,8 @@ class RuntimeControlLoop final {
                      PassiveConfig passive_config,
                      ControlMode startup_control,
                      std::uint8_t expected_mode_machine,
-                     RuntimeMode mode = RuntimeMode::Real);
+                     RuntimeMode mode = RuntimeMode::Real,
+                     ReferenceFrameSink* reference_sink = nullptr);
 
   void tick();
   RuntimeInternalState internalStateForTest() const;
@@ -126,6 +131,8 @@ class RuntimeControlLoop final {
   std::size_t activePolicyIntervalTicks() const;
   std::size_t stopHoldTicks() const;
   void publishActive();
+  void publishReferenceActive();
+  void clearReference();
   void publishSnapshot();
   std::optional<LowStateSample> readLowStateForStatus();
   std::optional<HighStateSample> readHighStateForStatus();
@@ -152,6 +159,7 @@ class RuntimeControlLoop final {
   RuntimeBridge& bridge_;
   RuntimeStatusStore& status_;
   TrkLoader loader_;
+  ReferenceFrameSink* reference_sink_{nullptr};
   RobotIO* robot_io_{nullptr};
   PolicyInference* policy_{nullptr};
   std::optional<DeployConfig> deploy_config_;
@@ -165,6 +173,7 @@ class RuntimeControlLoop final {
   RuntimeMode mode_{RuntimeMode::Sim};
   std::deque<MotionRequest> waiting_;
   std::optional<MotionRequest> active_;
+  std::shared_ptr<const TrkTrack> active_track_;
   std::optional<PolicyStepRunner> policy_runner_;
   SnapshotRuntimeState runtime_state_;
   RuntimeInternalState fsm_state_{RuntimeInternalState::GeneralTrackerIdle};

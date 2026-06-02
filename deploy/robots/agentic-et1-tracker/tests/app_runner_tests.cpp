@@ -499,6 +499,24 @@ TEST_CASE("Default AppRunner starts HTTP as not-ready until policy runtime is at
   REQUIRE(status.at("ctrl") == "starting");
   REQUIRE(status.at("block") == "policy_not_loaded");
   REQUIRE(status.at("err").at("code") == "MODEL_NOT_READY");
+
+  const auto hidden = RunningApp::body(client.Get("/_sim/reference_frame"), 404);
+  REQUIRE(hidden.at("ok") == false);
+}
+
+TEST_CASE("AppRunner enables hidden reference endpoint only for sim config") {
+  auto config = productionTestConfig();
+  config.mode_machine = 0;
+  config.reference.enabled = true;
+  AppRunner runner(config);
+  REQUIRE(runner.start());
+  auto client = httplib::Client("127.0.0.1", runner.boundPort());
+
+  const auto body = RunningApp::body(client.Get("/_sim/reference_frame"), 200);
+  REQUIRE(body.at("ok") == true);
+  REQUIRE(body.at("active") == false);
+
+  runner.stop();
 }
 
 TEST_CASE("Default AppRunner rejects execute before TRK validation when not ready") {

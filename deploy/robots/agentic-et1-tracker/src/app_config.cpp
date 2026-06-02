@@ -138,6 +138,14 @@ double optionalRuntimeRate(const YAML::Node& section, const char* key, double cu
   return value;
 }
 
+bool optionalBool(const YAML::Node& section, const char* key, bool current) {
+  const YAML::Node node = section[key];
+  if (!node) {
+    return current;
+  }
+  return scalarAs<bool>(node, key);
+}
+
 double optionalNonNegativeDouble(const YAML::Node& section, const char* key, double current) {
   const YAML::Node node = section[key];
   if (!node) {
@@ -244,6 +252,15 @@ void validatePolicyFile(const std::string& value) {
   }
 }
 
+void validateReferenceKeys(const YAML::Node& reference) {
+  for (const auto& item : reference) {
+    const std::string key = scalarAs<std::string>(item.first, "reference key");
+    if (key != "enabled") {
+      throw error("reference." + key + " is unsupported");
+    }
+  }
+}
+
 }  // namespace
 
 AppConfig loadAppConfig(const std::filesystem::path& path) {
@@ -271,6 +288,20 @@ AppConfig loadAppConfig(const std::filesystem::path& path) {
     if (config.mode_machine != 0 && config.mode_machine != 1) {
       throw error("mode_machine must be 0 or 1");
     }
+
+    const YAML::Node reference = section["reference"];
+    if (reference) {
+      if (!reference.IsMap()) {
+        throw error("reference must be a map");
+      }
+      validateReferenceKeys(reference);
+      config.reference.enabled =
+          optionalBool(reference, "enabled", config.reference.enabled);
+    }
+    if (config.reference.enabled && config.mode_machine != 0) {
+      throw error("reference.enabled requires mode_machine 0");
+    }
+
     config.stop_hold_s = optionalNonNegativeDouble(section, "stop_hold_s", config.stop_hold_s);
     if (config.stop_hold_s != 0.0) {
       throw error("stop_hold_s must be 0.0");

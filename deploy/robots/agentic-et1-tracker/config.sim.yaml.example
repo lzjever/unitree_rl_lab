@@ -1,6 +1,6 @@
 agentic_et1_tracker:
   bind: "127.0.0.1"
-  port: 8080
+  port: 8083
   network: "lo"
   domain_id: 0
   lowcmd_startup_preflight_ms: 200
@@ -12,6 +12,8 @@ agentic_et1_tracker:
   max_track_duration_s: 120
   stop_hold_s: 0.0
   idle_mode: "hold_current"
+  reference:
+    enabled: true
   policy:
     profile: "GeneralTracker"
     policy_dir: "config/policy/general_tracker"

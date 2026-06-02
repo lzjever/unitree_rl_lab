@@ -6,6 +6,7 @@
 #include <cmath>
 #include <exception>
 #include <limits>
+#include <memory>
 #include <utility>
 
 #include "agentic_et1_tracker/policy/observation_builder.hpp"
@@ -54,11 +55,14 @@ HealthSnapshot healthFromSnapshot(const StatusSnapshot& snapshot) {
 RuntimeControlLoop::RuntimeControlLoop(RuntimeConfig config,
                                        RuntimeBridge& bridge,
                                        RuntimeStatusStore& status,
-                                       TrkLoader loader)
+                                       TrkLoader loader,
+                                       ReferenceFrameSink* reference_sink)
     : config_(config),
       bridge_(bridge),
       status_(status),
-      loader_(std::move(loader)) {
+      loader_(std::move(loader)),
+      reference_sink_(reference_sink) {
+  clearReference();
   publishSnapshot();
 }
 
@@ -71,11 +75,13 @@ RuntimeControlLoop::RuntimeControlLoop(RuntimeConfig config,
                                        DeployConfig deploy_config,
                                        PassiveConfig passive_config,
                                        std::uint8_t expected_mode_machine,
-                                       RuntimeMode mode)
+                                       RuntimeMode mode,
+                                       ReferenceFrameSink* reference_sink)
     : config_(config),
       bridge_(bridge),
       status_(status),
       loader_(std::move(loader)),
+      reference_sink_(reference_sink),
       robot_io_(&robot_io),
       policy_(&policy),
       deploy_config_(std::move(deploy_config)),
@@ -86,6 +92,7 @@ RuntimeControlLoop::RuntimeControlLoop(RuntimeConfig config,
   runtime_state_.robot = RobotState::Disconnected;
   runtime_state_.err = ErrorCode::ServiceNotReady;
   runtime_state_.block = "runtime_not_started";
+  clearReference();
   publishSnapshot();
 }
 
@@ -102,11 +109,13 @@ RuntimeControlLoop::RuntimeControlLoop(RuntimeConfig config,
                                        PassiveConfig passive_config,
                                        ControlMode startup_control,
                                        std::uint8_t expected_mode_machine,
-                                       RuntimeMode mode)
+                                       RuntimeMode mode,
+                                       ReferenceFrameSink* reference_sink)
     : config_(config),
       bridge_(bridge),
       status_(status),
       loader_(std::move(loader)),
+      reference_sink_(reference_sink),
       robot_io_(&robot_io),
       policy_(&policy),
       deploy_config_(std::move(deploy_config)),
@@ -128,6 +137,7 @@ RuntimeControlLoop::RuntimeControlLoop(RuntimeConfig config,
   } else {
     enterVelocityState();
   }
+  clearReference();
   publishSnapshot();
 }
 
@@ -287,7 +297,9 @@ void RuntimeControlLoop::handleControl(ControlMode mode) {
   post_stop_control_ = mode;
   if (fsm_state_ == RuntimeInternalState::Fault) {
     active_.reset();
+    active_track_.reset();
     policy_runner_.reset();
+    clearReference();
     handleInternalEvent(RuntimeInternalEvent::FixStand);
     stop_reason_ = StopReason::None;
     stop_to_idle_pending_ = false;
@@ -540,6 +552,8 @@ void RuntimeControlLoop::startNext() {
 
 void RuntimeControlLoop::completePreparing() {
   if (!active_) {
+    active_track_.reset();
+    clearReference();
     enterGeneralTrackerIdleState();
     return;
   }
@@ -568,7 +582,9 @@ void RuntimeControlLoop::completePreparing() {
       request.err = ErrorCode::Ok;
       request.stop_reason = StopReason::None;
       active_.reset();
+      active_track_.reset();
       policy_runner_.reset();
+      clearReference();
       waiting_.push_front(std::move(request));
       status_.publishRunStatus(toStatus(waiting_.front()));
       enterPassiveState(*readiness);
@@ -585,6 +601,8 @@ void RuntimeControlLoop::completePreparing() {
     active_->ended_at = std::chrono::steady_clock::now();
     status_.publishRunStatus(toStatus(*active_));
     active_.reset();
+    active_track_.reset();
+    clearReference();
     post_stop_control_ = ControlMode::StandbyVelocity;
     enterGeneralTrackerIdleState();
     return;
@@ -595,10 +613,12 @@ void RuntimeControlLoop::completePreparing() {
   active_->frames = loaded_frames;
   active_->fps = loaded.track->metadata.fps;
   active_->duration_s = loaded_duration_s;
+  auto track = std::make_shared<TrkTrack>(std::move(*loaded.track));
+  active_track_ = track;
   if (hasPolicyRuntime()) {
     try {
       policy_runner_.emplace(*deploy_config_,
-                             std::move(*loaded.track),
+                             track,
                              *entry_low_state,
                              expected_mode_machine_);
     } catch (const std::exception&) {
@@ -609,7 +629,9 @@ void RuntimeControlLoop::completePreparing() {
       active_->ended_at = std::chrono::steady_clock::now();
       status_.publishRunStatus(toStatus(*active_));
       active_.reset();
+      active_track_.reset();
       policy_runner_.reset();
+      clearReference();
       post_stop_control_ = ControlMode::StandbyVelocity;
       enterGeneralTrackerIdleState();
       enterFault(ErrorCode::ModelInferenceFailed,
@@ -626,6 +648,7 @@ void RuntimeControlLoop::completePreparing() {
   active_->stop_reason = StopReason::None;
   active_->started_at = std::chrono::steady_clock::now();
   enterTrackActiveState();
+  publishReferenceActive();
   publishActive();
 }
 
@@ -636,6 +659,8 @@ void RuntimeControlLoop::advanceActive() {
   }
 
   if (!active_) {
+    active_track_.reset();
+    clearReference();
     enterGeneralTrackerIdleState();
     return;
   }
@@ -656,10 +681,12 @@ void RuntimeControlLoop::advanceActive() {
     const std::size_t last_frame = active_->frames == 0 ? 0 : active_->frames - 1;
     if (active_->frame < last_frame) {
       active_->frame = last_frame;
+      publishReferenceActive();
       publishActive();
       return;
     }
     active_->frame = last_frame;
+    publishReferenceActive();
     finishActive(MotionState::Done, StopReason::None, ErrorCode::Ok);
     post_stop_control_ = ControlMode::StandbyVelocity;
     enterGeneralTrackerIdleState();
@@ -667,11 +694,14 @@ void RuntimeControlLoop::advanceActive() {
   }
 
   publishActive();
+  publishReferenceActive();
 }
 
 void RuntimeControlLoop::advanceActiveWithPolicy() {
   if (!active_) {
+    active_track_.reset();
     policy_runner_.reset();
+    clearReference();
     enterGeneralTrackerIdleState();
     return;
   }
@@ -715,6 +745,7 @@ void RuntimeControlLoop::advanceActiveWithPolicy() {
     ++active_->frame;
   }
   publishActive();
+  publishReferenceActive();
 
   PolicyStepResult step;
   try {
@@ -740,6 +771,7 @@ void RuntimeControlLoop::advanceActiveWithPolicy() {
   if (active_->frames == 0 || active_->frame + 1 >= active_->frames) {
     const std::size_t last_frame = active_->frames == 0 ? 0 : active_->frames - 1;
     active_->frame = last_frame;
+    publishReferenceActive();
     finishActive(MotionState::Done, StopReason::None, ErrorCode::Ok);
     post_stop_control_ = ControlMode::StandbyVelocity;
     enterGeneralTrackerIdleState();
@@ -998,7 +1030,9 @@ void RuntimeControlLoop::markActiveStopping(StopReason reason) {
   active_->stop_reason = reason;
   active_->err = ErrorCode::Ok;
   status_.publishRunStatus(toStatus(*active_));
+  active_track_.reset();
   policy_runner_.reset();
+  clearReference();
 }
 
 void RuntimeControlLoop::completeStoppingActive(MotionState state, ErrorCode error) {
@@ -1011,6 +1045,8 @@ void RuntimeControlLoop::completeStoppingActive(MotionState state, ErrorCode err
   active_->ended_at = std::chrono::steady_clock::now();
   status_.publishRunStatus(toStatus(*active_));
   active_.reset();
+  active_track_.reset();
+  clearReference();
 }
 
 std::optional<MotionRequest> RuntimeControlLoop::finishActive(MotionState state,
@@ -1027,7 +1063,9 @@ std::optional<MotionRequest> RuntimeControlLoop::finishActive(MotionState state,
   MotionRequest completed = *active_;
   status_.publishRunStatus(toStatus(completed));
   active_.reset();
+  active_track_.reset();
   policy_runner_.reset();
+  clearReference();
   return completed;
 }
 
@@ -1102,6 +1140,32 @@ std::size_t RuntimeControlLoop::stopHoldTicks() const {
 void RuntimeControlLoop::publishActive() {
   if (active_) {
     status_.publishRunStatus(toStatus(*active_));
+  }
+}
+
+void RuntimeControlLoop::publishReferenceActive() {
+  if (reference_sink_ == nullptr || !active_ || !active_track_) {
+    return;
+  }
+  try {
+    const auto snapshot =
+        makeReferenceFrameSnapshot(active_->id, *active_track_, active_->frame);
+    if (snapshot) {
+      reference_sink_->publish(*snapshot);
+    } else {
+      reference_sink_->clear();
+    }
+  } catch (...) {
+  }
+}
+
+void RuntimeControlLoop::clearReference() {
+  if (reference_sink_ == nullptr) {
+    return;
+  }
+  try {
+    reference_sink_->clear();
+  } catch (...) {
   }
 }
 

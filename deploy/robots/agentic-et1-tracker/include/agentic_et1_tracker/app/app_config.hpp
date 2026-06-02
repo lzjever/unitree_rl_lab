@@ -28,6 +28,10 @@ struct ControlConfig {
   std::string passive_config{"config/posture/passive/v0/passive.yaml"};
 };
 
+struct ReferenceConfig {
+  bool enabled{false};
+};
+
 struct AppConfig {
   HttpServerConfig http;
   RuntimeConfig runtime;
@@ -41,6 +45,7 @@ struct AppConfig {
   std::string lock_path;
   PolicyConfig policy;
   ControlConfig control;
+  ReferenceConfig reference;
 };
 
 class ConfigError final : public std::runtime_error {

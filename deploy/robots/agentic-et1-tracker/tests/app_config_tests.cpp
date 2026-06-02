@@ -101,7 +101,7 @@ agentic_et1_tracker:
   const auto config_dir = tmp.path.parent_path();
 
   REQUIRE(config.http.host == "127.0.0.1");
-  REQUIRE(config.http.port == 8080);
+  REQUIRE(config.http.port == 8083);
   REQUIRE(config.http.thread_pool_size == kHttpServerDefaultThreadPoolSize);
   REQUIRE(config.runtime.queue_limit == 8);
   REQUIRE(config.runtime.recent_limit == 32);
@@ -137,6 +137,7 @@ agentic_et1_tracker:
           (config_dir / "config/posture/passive/v0/passive.yaml")
               .lexically_normal()
               .string());
+  REQUIRE_FALSE(config.reference.enabled);
 }
 
 TEST_CASE("AppConfig default file keeps StandbyVelocity and posture assets app-owned") {
@@ -157,6 +158,7 @@ TEST_CASE("AppConfig default file keeps StandbyVelocity and posture assets app-o
   REQUIRE(config.control.startup_control == "FixStand");
   REQUIRE(config.stop_hold_s == 0.0);
   REQUIRE(config.runtime.stop_hold_s == 0.0);
+  REQUIRE_FALSE(config.reference.enabled);
 }
 
 TEST_CASE("AppConfig simulation example is ready for local MuJoCo acceptance") {
@@ -179,6 +181,7 @@ TEST_CASE("AppConfig simulation example is ready for local MuJoCo acceptance") {
                            root / "config/posture/passive/v0"));
   REQUIRE(config.control.startup_control == "FixStand");
   REQUIRE(config.stop_hold_s == 0.0);
+  REQUIRE(config.reference.enabled);
 }
 
 TEST_CASE("AppConfig maps complete PRD YAML into component configs") {
@@ -212,6 +215,8 @@ agentic_et1_tracker:
     velocity_deploy: "config/policy/velocity/custom/params/deploy.yaml"
     fixstand_config: "config/posture/fixstand/custom/fixstand.yaml"
     passive_config: "config/posture/passive/custom/passive.yaml"
+  reference:
+    enabled: true
 )yaml");
   const auto config = tmp.load();
   const auto config_dir = tmp.path.parent_path();
@@ -256,6 +261,7 @@ agentic_et1_tracker:
           (config_dir / "config/posture/passive/custom/passive.yaml")
               .lexically_normal()
               .string());
+  REQUIRE(config.reference.enabled);
 }
 
 TEST_CASE("AppConfig resolves relative policy paths from config file directory") {
@@ -438,6 +444,16 @@ agentic_et1_tracker:
     fps: 1000.1
 )yaml"),
                         ContainsSubstring("fps"));
+  }
+
+  SECTION("reference max_rate_hz is unsupported because sim poller owns rate") {
+    REQUIRE_THROWS_WITH(loadYaml(R"yaml(
+agentic_et1_tracker:
+  motion_dirs: ["/tmp/motions"]
+  reference:
+    max_rate_hz: 60
+)yaml"),
+                        ContainsSubstring("max_rate_hz"));
   }
 }
 
@@ -801,6 +817,17 @@ agentic_et1_tracker:
   stop_hold_s: 0.01
 )yaml"),
                         ContainsSubstring("stop_hold_s"));
+  }
+
+  SECTION("reference endpoint is sim-only") {
+    REQUIRE_THROWS_WITH(loadYaml(R"yaml(
+agentic_et1_tracker:
+  mode_machine: 1
+  motion_dirs: ["/tmp/motions"]
+  reference:
+    enabled: true
+)yaml"),
+                        ContainsSubstring("reference.enabled"));
   }
 }
 

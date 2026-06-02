@@ -5,6 +5,8 @@
 
 #include <httplib.h>
 
+#include "agentic_et1_tracker/reference/reference_frame_json.hpp"
+
 namespace agentic_et1_tracker {
 namespace {
 
@@ -19,9 +21,12 @@ HttpServerConfig normalizeHttpServerConfig(HttpServerConfig config) {
   return config;
 }
 
-AgentHttpServer::AgentHttpServer(HttpServerConfig config, AgentApiService& service)
+AgentHttpServer::AgentHttpServer(HttpServerConfig config,
+                                 AgentApiService& service,
+                                 ReferenceFrameStore* reference_store)
     : config_(normalizeHttpServerConfig(std::move(config))),
       service_(service),
+      reference_store_(reference_store),
       server_(std::make_unique<httplib::Server>()) {
   server_->new_task_queue = [threads = config_.thread_pool_size] {
     return new httplib::ThreadPool(threads);
@@ -78,6 +83,22 @@ void AgentHttpServer::installHandler() {
 
   server_->Get("/health", handler);
   server_->Get("/status", handler);
+  server_->Get("/_sim/reference_frame",
+               [this](const httplib::Request&, httplib::Response& response) {
+                 if (reference_store_ == nullptr) {
+                   response.status = 404;
+                   response.set_content(
+                       nlohmann::json{{"ok", false},
+                                      {"error", {{"code", "NOT_FOUND"}}}}
+                           .dump(),
+                       kJsonContentType);
+                   return;
+                 }
+                 response.status = 200;
+                 response.set_content(
+                     referenceFrameSnapshotJson(reference_store_->snapshot()).dump(),
+                     kJsonContentType);
+               });
   server_->Post("/execute", handler);
   server_->Post("/stop", handler);
   server_->Post("/fixstand", handler);

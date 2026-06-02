@@ -156,6 +156,13 @@ These paths are environment notes for simulation acceptance only. They do not
 change the HTTP input contract: `agentic-et1-tracker` accepts local `.trk` paths
 only, not uploads or other motion formats.
 
+Simulation configs may enable the hidden debug endpoint
+`GET /_sim/reference_frame` with `reference.enabled: true` and
+`mode_machine: 0`. It returns the latest raw `.trk` reference frame held in
+memory for MuJoCo/debug consumers, or `{"ok":true,"active":false}` when no
+track is active. This endpoint is sim-only, default-off, and intentionally not
+part of the agent-facing command contract.
+
 ## Manual MuJoCo Acceptance
 
 This is a manual integration acceptance skeleton, not a complete GA simulation
@@ -179,8 +186,9 @@ Prerequisites:
 - Use `config.sim.yaml.example` for local MuJoCo acceptance. It sets
   `mode_machine: 0`, `network: "lo"`,
   `motion_dirs: ["/home/galbot/works/et1/generated"]`, and app-owned assets.
-  It also keeps `lowcmd_startup_preflight_ms: 200`. Adjust only `domain_id` or
-  `port` when the local simulator requires it.
+  It also keeps `lowcmd_startup_preflight_ms: 200` and enables the hidden
+  sim-only reference endpoint. Adjust only `domain_id` or `port` when the local
+  simulator requires it.
 - Start the Unitree MuJoCo simulator only after the Preflight is clear. The
   operator controls MuJoCo rope timing and keyboard actions manually.
 
@@ -196,20 +204,20 @@ agentic-et1-tracker \
 
 # terminal 3: exercise the HTTP contract
 TRK=$(find /home/galbot/works/et1/generated -maxdepth 1 -name '*.trk' | head -n 1)
-curl http://127.0.0.1:8080/health
-curl http://127.0.0.1:8080/status
-curl -X POST http://127.0.0.1:8080/fixstand
-curl -X POST http://127.0.0.1:8080/standby_velocity
-curl -X POST http://127.0.0.1:8080/execute \
+curl http://127.0.0.1:8083/health
+curl http://127.0.0.1:8083/status
+curl -X POST http://127.0.0.1:8083/fixstand
+curl -X POST http://127.0.0.1:8083/standby_velocity
+curl -X POST http://127.0.0.1:8083/execute \
   -H 'Content-Type: application/json' \
   -d "{\"path\":\"$TRK\"}"
 
 # manually control MuJoCo rope/keyboard timing as needed for the scenario
 
 # poll status until frame progress is visible, then stop
-curl http://127.0.0.1:8080/status
-curl -X POST http://127.0.0.1:8080/stop
+curl http://127.0.0.1:8083/status
+curl -X POST http://127.0.0.1:8083/stop
 
 # after done or stop, the top-level controller should be standby_velocity
-curl http://127.0.0.1:8080/status
+curl http://127.0.0.1:8083/status
 ```

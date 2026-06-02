@@ -1,6 +1,7 @@
 #include "agentic_et1_tracker/policy/policy_step_runner.hpp"
 
 #include <optional>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -32,12 +33,26 @@ PolicyStepRunner::PolicyStepRunner(const DeployConfig& config,
                                    TrkTrack track,
                                    const LowStateSample& entry_low_state,
                                    std::uint8_t expected_mode_machine,
+                                   ObservationBuilderConfig builder_config)
+    : PolicyStepRunner(config,
+                       std::make_shared<TrkTrack>(std::move(track)),
+                       entry_low_state,
+                       expected_mode_machine,
+                       builder_config) {}
+
+PolicyStepRunner::PolicyStepRunner(const DeployConfig& config,
+                                   std::shared_ptr<const TrkTrack> track,
+                                   const LowStateSample& entry_low_state,
+                                   std::uint8_t expected_mode_machine,
                                    ObservationBuilderConfig builder_config) try
     : config_(config),
       track_(std::move(track)),
       expected_mode_machine_(expected_mode_machine),
       builder_config_(builder_config),
       history_(config_) {
+  if (!track_) {
+    throw error("missing track");
+  }
   reset(entry_low_state);
 } catch (const PolicyStepError&) {
   throw;
@@ -47,7 +62,7 @@ PolicyStepRunner::PolicyStepRunner(const DeployConfig& config,
 
 void PolicyStepRunner::reset(const LowStateSample& entry_low_state) {
   try {
-    const std::optional<TrkFrameView> first_frame = track_.frame(0);
+    const std::optional<TrkFrameView> first_frame = track_->frame(0);
     if (!first_frame.has_value()) {
       throw error("missing first frame");
     }
@@ -69,7 +84,7 @@ PolicyStepResult PolicyStepRunner::step(std::size_t frame_index,
                                         PolicyInference& policy,
                                         const LowCmdFrame* base_frame) {
   try {
-    const TrkFrameView frame = requireFrame(track_, frame_index);
+    const TrkFrameView frame = requireFrame(*track_, frame_index);
     const PolicyObservationParts parts =
         buildObservationParts(config_, frame, low_state, last_action_, builder_state_,
                               builder_config_);

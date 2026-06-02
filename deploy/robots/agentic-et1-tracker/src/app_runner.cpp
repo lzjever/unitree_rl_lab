@@ -17,6 +17,7 @@
 #include "agentic_et1_tracker/app/process_lock.hpp"
 #include "agentic_et1_tracker/core/id_generator.hpp"
 #include "agentic_et1_tracker/http/server.hpp"
+#include "agentic_et1_tracker/reference/reference_frame_store.hpp"
 #include "agentic_et1_tracker/runtime/runtime_bridge.hpp"
 #include "agentic_et1_tracker/runtime/runtime_control_loop.hpp"
 #include "agentic_et1_tracker/runtime/runtime_status_store.hpp"
@@ -126,7 +127,9 @@ class AppRunner::Impl {
              status_,
              validator_,
              ids_),
-        server_(config_.http, api_) {}
+        reference_store_(config_.reference.enabled ? std::make_unique<ReferenceFrameStore>()
+                                                   : nullptr),
+        server_(config_.http, api_, reference_store_.get()) {}
 
   Impl(AppConfig config, AppRuntimeDeps deps)
       : config_(std::move(config)),
@@ -140,7 +143,9 @@ class AppRunner::Impl {
              status_,
              validator_,
              ids_),
-        server_(config_.http, api_) {
+        reference_store_(config_.reference.enabled ? std::make_unique<ReferenceFrameStore>()
+                                                   : nullptr),
+        server_(config_.http, api_, reference_store_.get()) {
     attachRuntimeLoop(*factory_result_.deps);
   }
 
@@ -231,7 +236,8 @@ class AppRunner::Impl {
                             deps.passive_config,
                             deps.startup_control,
                             static_cast<std::uint8_t>(config_.mode_machine),
-                            deps.mode);
+                            deps.mode,
+                            reference_store_.get());
       return;
     }
 
@@ -244,7 +250,8 @@ class AppRunner::Impl {
                           deps.deploy_config,
                           deps.passive_config,
                           static_cast<std::uint8_t>(config_.mode_machine),
-                          deps.mode);
+                          deps.mode,
+                          reference_store_.get());
   }
 
   void runtimeLoop() {
@@ -281,6 +288,7 @@ class AppRunner::Impl {
   AppTrackValidator validator_;
   AppRunIdGenerator ids_;
   AgentApiService api_;
+  std::unique_ptr<ReferenceFrameStore> reference_store_;
   AgentHttpServer server_;
   std::optional<RuntimeControlLoop> runtime_loop_;
   std::optional<ProcessLock> process_lock_;

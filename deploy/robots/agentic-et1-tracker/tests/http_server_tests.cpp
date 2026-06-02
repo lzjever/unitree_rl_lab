@@ -11,6 +11,7 @@
 
 #include "agentic_et1_tracker/api/service.hpp"
 #include "agentic_et1_tracker/http/server.hpp"
+#include "agentic_et1_tracker/reference/reference_frame_store.hpp"
 
 namespace agentic_et1_tracker {
 namespace {
@@ -222,6 +223,105 @@ TEST_CASE("GET /status forwards to the API service") {
   REQUIRE(body.at("mode") == "sim");
   REQUIRE(body.at("queue").at("n") == 2);
   REQUIRE(body.at("queue").at("ids").at(1) == "b");
+}
+
+TEST_CASE("GET /_sim/reference_frame disabled returns 404 without affecting routes") {
+  RunningHarness r;
+  httplib::Client client("127.0.0.1", r.h.server.boundPort());
+
+  const auto hidden = client.Get("/_sim/reference_frame");
+  r.requireJson(hidden, 404);
+  REQUIRE(r.parse(hidden).at("ok") == false);
+
+  const auto status = client.Get("/status");
+  r.requireJson(status, 200);
+  REQUIRE(r.parse(status).at("ok") == true);
+}
+
+TEST_CASE("GET /_sim/reference_frame enabled returns inactive and active snapshots") {
+  Harness h;
+  ReferenceFrameStore reference_store;
+  AgentHttpServer server({"127.0.0.1", 0}, h.service, &reference_store);
+  REQUIRE(server.start());
+  httplib::Client client("127.0.0.1", server.boundPort());
+
+  auto result = client.Get("/_sim/reference_frame");
+  REQUIRE(result);
+  REQUIRE(result->status == 200);
+  REQUIRE(result->get_header_value("Content-Type") == "application/json");
+  auto body = nlohmann::json::parse(result->body);
+  REQUIRE(body.at("ok") == true);
+  REQUIRE(body.at("active") == false);
+
+  ReferenceFrameSnapshot snapshot;
+  snapshot.active = true;
+  snapshot.id = "http-ref";
+  snapshot.frame = 2;
+  snapshot.frames = 5;
+  snapshot.time_s = 0.04;
+  snapshot.fps = 50.0;
+  snapshot.p.at(0) = {1.0F, 2.0F, 3.0F};
+  snapshot.q.at(0) = {1.0F, 0.0F, 0.0F, 0.0F};
+  snapshot.c = {1, 0};
+  snapshot.com = {4.0F, 5.0F, 6.0F};
+  snapshot.comv = {7.0F, 8.0F, 9.0F};
+  reference_store.publish(snapshot);
+
+  result = client.Get("/_sim/reference_frame");
+  REQUIRE(result);
+  REQUIRE(result->status == 200);
+  body = nlohmann::json::parse(result->body);
+  REQUIRE(body.at("ok") == true);
+  REQUIRE(body.at("active") == true);
+  REQUIRE(body.at("schema") == "ET1REF1");
+  REQUIRE(body.at("body_order") == "et1_27_v1");
+  REQUIRE(body.at("id") == "http-ref");
+  REQUIRE(body.at("frame") == 2);
+  REQUIRE(body.at("p").at(0).at(1) == 2.0F);
+  REQUIRE(body.at("q").at(0).at(0) == 1.0F);
+  REQUIRE(body.at("c").at(0) == 1);
+  REQUIRE(body.at("comv").at(2) == 9.0F);
+
+  server.stop();
+}
+
+TEST_CASE("ReferenceFrameStore publishes snapshots and clear resets to inactive") {
+  ReferenceFrameStore reference_store;
+
+  REQUIRE_FALSE(reference_store.snapshot().active);
+
+  ReferenceFrameSnapshot first;
+  first.active = true;
+  first.id = "first";
+  first.frame = 1;
+  first.frames = 3;
+  first.p.at(0) = {1.0F, 2.0F, 3.0F};
+  reference_store.publish(first);
+
+  auto snapshot = reference_store.snapshot();
+  REQUIRE(snapshot.active);
+  REQUIRE(snapshot.id == "first");
+  REQUIRE(snapshot.frame == 1);
+  REQUIRE(snapshot.p.at(0).at(2) == 3.0F);
+
+  ReferenceFrameSnapshot second;
+  second.active = true;
+  second.id = "second";
+  second.frame = 2;
+  second.frames = 4;
+  second.comv = {4.0F, 5.0F, 6.0F};
+  reference_store.publish(second);
+
+  snapshot = reference_store.snapshot();
+  REQUIRE(snapshot.active);
+  REQUIRE(snapshot.id == "second");
+  REQUIRE(snapshot.frame == 2);
+  REQUIRE(snapshot.comv.at(2) == 6.0F);
+
+  reference_store.clear();
+  snapshot = reference_store.snapshot();
+  REQUIRE_FALSE(snapshot.active);
+  REQUIRE(snapshot.id.empty());
 }
 
 TEST_CASE("GET /status?id preserves query and returns JSON run errors") {

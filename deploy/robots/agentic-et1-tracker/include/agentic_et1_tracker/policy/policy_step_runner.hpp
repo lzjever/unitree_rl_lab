@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <stdexcept>
 
 #include "agentic_et1_tracker/policy/observation_builder.hpp"
@@ -37,6 +38,11 @@ class PolicyStepRunner {
                    const LowStateSample& entry_low_state,
                    std::uint8_t expected_mode_machine,
                    ObservationBuilderConfig builder_config = {});
+  PolicyStepRunner(const DeployConfig& config,
+                   std::shared_ptr<const TrkTrack> track,
+                   const LowStateSample& entry_low_state,
+                   std::uint8_t expected_mode_machine,
+                   ObservationBuilderConfig builder_config = {});
 
   void reset(const LowStateSample& entry_low_state);
 
@@ -47,7 +53,7 @@ class PolicyStepRunner {
 
  private:
   DeployConfig config_;
-  TrkTrack track_;
+  std::shared_ptr<const TrkTrack> track_;
   std::uint8_t expected_mode_machine_{0};
   ObservationBuilderConfig builder_config_;
   ObservationBuilderState builder_state_;
