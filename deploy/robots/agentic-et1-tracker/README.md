@@ -2,23 +2,26 @@
 
 ## Build Matrix
 
-The real integration server binary requires both integration options
-(`BUILD_ONNX=ON` / `BUILD_ROBOT=ON` in shorthand):
+The default build is the real integration server binary. It links the ONNX
+policy runtime and Unitree SDK robot I/O unless explicitly disabled:
 
 ```sh
 cmake -S unitree_rl_lab/deploy/robots/agentic-et1-tracker \
-  -B build-agentic-et1-tracker-onnx-robot \
-  -DAGENTIC_ET1_BUILD_ONNX=ON \
-  -DAGENTIC_ET1_BUILD_ROBOT=ON
+  -B build-agentic-et1-tracker
 ```
 
-Only this `ONNX=ON` and `ROBOT=ON` combination links the real runtime factory,
-ONNX policy runtime, and Unitree SDK robot I/O into `agentic-et1-tracker`.
+Use the stub/test runtime only when requested explicitly:
 
-`AGENTIC_ET1_BUILD_ONNX=ON` by itself builds ONNX policy integration targets.
-`AGENTIC_ET1_BUILD_ROBOT=ON` by itself builds robot I/O integration targets.
-Either single-option build is useful for integration testing, but it is not a
-ready real integration server binary.
+```sh
+cmake -S unitree_rl_lab/deploy/robots/agentic-et1-tracker \
+  -B build-agentic-et1-tracker-stub \
+  -DAGENTIC_ET1_BUILD_ONNX=OFF \
+  -DAGENTIC_ET1_BUILD_ROBOT=OFF
+```
+
+Single-option builds remain available for narrow integration work:
+`AGENTIC_ET1_BUILD_ONNX=OFF` uses the policy stub, and
+`AGENTIC_ET1_BUILD_ROBOT=OFF` uses the robot I/O stub.
 
 Opt-in performance smoke tests are excluded from default builds:
 
@@ -33,8 +36,8 @@ ctest --test-dir build-agentic-et1-tracker-perf-smoke -L perf --output-on-failur
 
 ## Testing Notes
 
-Default core tests must remain hermetic: they use fake/stub dependencies and do
-not require MuJoCo, Unitree SDK2, or ONNX Runtime.
+Hermetic core tests must use the explicit stub/test runtime flags shown above;
+that build does not require MuJoCo, Unitree SDK2, or ONNX Runtime.
 
 ## HTTP Contract
 

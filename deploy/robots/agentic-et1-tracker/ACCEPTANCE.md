@@ -5,12 +5,14 @@ Environment: local workspace `/home/galbot/works/et1`
 
 ## Build/test evidence
 
-- `/tmp/agentic-et1-tracker-verify`: 10/10 passed,
-  default `ONNX=OFF ROBOT=OFF`.
-- `/tmp/agentic-et1-tracker-verify-onnx`: 11/11 passed,
-  `ONNX=ON ROBOT=OFF`.
-- `/tmp/agentic-et1-tracker-verify-robot`: 12/12 passed,
-  `ONNX=ON ROBOT=ON`.
+- Default configure/build is the real integration path:
+  `AGENTIC_ET1_BUILD_ONNX=ON` and `AGENTIC_ET1_BUILD_ROBOT=ON`.
+- Hermetic stub/test configure/build must be requested explicitly:
+  `-DAGENTIC_ET1_BUILD_ONNX=OFF` and `-DAGENTIC_ET1_BUILD_ROBOT=OFF`.
+- Single-option integration builds remain valid for narrow integration checks,
+  but they are not the GA default server build.
+- `/tmp/agentic-et1-tracker-verify-robot`: 12/12 passed with the real
+  integration build.
 - `/tmp/agentic-et1-tracker-verify-perf`: perf smoke target compiled
   successfully.
 - `git diff --check`: passed.
@@ -104,8 +106,8 @@ Pending MuJoCo evidence must record:
 
 | gate | status | required evidence |
 | --- | --- | --- |
-| Build and hermetic tests | recorded above | Keep all default tests passing. |
-| ROBOT/ONNX integration build | recorded above | Keep app and robot integration tests passing. |
+| Default ROBOT/ONNX build | recorded above | Keep default configure/build on the real integration path. |
+| Hermetic stub tests | recorded above | Keep explicit stub/test configure and tests passing. |
 | Docs/skill CLI contract | recorded above | Keep packaged and installed skill tests/diffs passing. |
 | MuJoCo visual acceptance | pending | Record scenarios listed above with `config.sim.yaml.example`. |
 | Real robot acceptance | pending | ET1 hardware/operator validation. |

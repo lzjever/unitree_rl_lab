@@ -3,8 +3,8 @@ cmake_minimum_required(VERSION 3.16)
 project(agentic_et1_tracker LANGUAGES CXX)
 
 option(AGENTIC_ET1_BUILD_TESTS "Build pure core unit tests" ON)
-option(AGENTIC_ET1_BUILD_ROBOT "Build robot integration target" OFF)
-option(AGENTIC_ET1_BUILD_ONNX "Build ONNX policy runtime target" OFF)
+option(AGENTIC_ET1_BUILD_ROBOT "Build robot integration target" ON)
+option(AGENTIC_ET1_BUILD_ONNX "Build ONNX policy runtime target" ON)
 option(AGENTIC_ET1_BUILD_PERF_SMOKE "Build opt-in performance smoke tests" OFF)
 
 add_library(agentic_et1_tracker_core
