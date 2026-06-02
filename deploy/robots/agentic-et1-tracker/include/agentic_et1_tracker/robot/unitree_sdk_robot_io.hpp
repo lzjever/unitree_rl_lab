@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -27,6 +28,10 @@ struct UnitreeSdkRobotIOConfig {
   std::size_t lowcmd_occupancy_window_ms{200};
   std::size_t lowcmd_startup_preflight_ms{200};
   std::size_t lowcmd_own_write_history_size{512};
+  bool release_motion_mode_on_startup{true};
+  double release_motion_mode_timeout_s{3.0};
+  std::size_t release_motion_mode_max_attempts{3};
+  std::size_t release_motion_mode_retry_interval_ms{500};
   bool init_channel_factory{true};
 };
 
@@ -84,6 +89,38 @@ class LowCmdStartupPreflightError final : public std::runtime_error {
  public:
   using std::runtime_error::runtime_error;
 };
+
+class MotionModeReleaseError final : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
+struct MotionModeReleaseOptions {
+  std::size_t max_release_attempts{3};
+  std::size_t retry_interval_ms{500};
+};
+
+struct MotionModeReleaseResult {
+  bool released{false};
+  std::size_t checks{0};
+  std::size_t releases{0};
+  std::string last_name;
+};
+
+class MotionSwitcherPort {
+ public:
+  virtual ~MotionSwitcherPort() = default;
+  virtual int checkMode(std::string& form, std::string& name) = 0;
+  virtual int releaseMode() = 0;
+};
+
+using MotionModeReleaseSleeper =
+    std::function<void(std::chrono::milliseconds)>;
+
+MotionModeReleaseResult releaseMotionModeForStartup(
+    MotionSwitcherPort& switcher,
+    MotionModeReleaseOptions options,
+    MotionModeReleaseSleeper sleep_for = {});
 
 class UnitreeSdkRobotIO final : public RobotIO {
  public:

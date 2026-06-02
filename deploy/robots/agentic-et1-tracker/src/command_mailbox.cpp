@@ -55,6 +55,7 @@ void CommandMailbox::clear() {
 int CommandMailbox::priority(CommandKind kind) {
   switch (kind) {
     case CommandKind::Stop:
+    case CommandKind::Passive:
     case CommandKind::FixStand:
     case CommandKind::StandbyVelocity:
       return 3;

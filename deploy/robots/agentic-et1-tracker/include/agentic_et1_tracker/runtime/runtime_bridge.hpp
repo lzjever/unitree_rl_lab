@@ -19,6 +19,7 @@ class RuntimeBridge final : public ExecutionCommandSink {
   ExecuteResult submitQueue(const ExecuteCommand& command) override;
   ExecuteResult submitInterrupt(const ExecuteCommand& command) override;
   StopResult stop() override;
+  ControlResult passive() override;
   ControlResult fixStand() override;
   ControlResult standbyVelocity() override;
   IdleResult configureIdle(std::vector<IdleMotion> motions) override;

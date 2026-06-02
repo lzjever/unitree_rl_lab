@@ -575,6 +575,33 @@ TEST_CASE("RuntimeBridge accepts FixStand from Passive and Fault") {
   }
 }
 
+TEST_CASE("RuntimeBridge passive cancels queued motions and enqueues Passive control") {
+  const RuntimeConfig config = runtimeConfig(8);
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  store.publishSnapshot(readySnapshot(ControllerState::StandbyVelocity));
+
+  REQUIRE(bridge.submitQueue(executeCommand("queued-a")).ok());
+  REQUIRE(bridge.submitQueue(executeCommand("queued-b")).ok());
+
+  const auto result = bridge.passive();
+
+  REQUIRE(result.code == ErrorCode::Ok);
+  REQUIRE(store.snapshot().queue.ids.empty());
+  for (const auto& id : {"queued-a", "queued-b"}) {
+    const auto found = store.findRun(id);
+    REQUIRE(found.code == ErrorCode::Ok);
+    REQUIRE(found.run->state == MotionState::Canceled);
+    REQUIRE(found.run->stop_reason == StopReason::Stop);
+  }
+
+  auto command = bridge.consumeNextCommand();
+  REQUIRE(command.has_value());
+  REQUIRE(command->kind == CommandKind::Passive);
+  REQUIRE(command->control == ControlMode::Passive);
+  REQUIRE_FALSE(bridge.consumeNextCommand().has_value());
+}
+
 TEST_CASE("RuntimeBridge stop is accepted for run status published before snapshot exec") {
   const RuntimeConfig config = runtimeConfig(8);
   RuntimeStatusStore store(config);

@@ -146,6 +146,8 @@ std::string toString(ControllerState state) {
 
 std::string toString(ControlMode mode) {
   switch (mode) {
+    case ControlMode::Passive:
+      return "passive";
     case ControlMode::FixStand:
       return "fixstand";
     case ControlMode::StandbyVelocity:

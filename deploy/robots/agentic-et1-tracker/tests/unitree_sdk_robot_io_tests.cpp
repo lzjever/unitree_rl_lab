@@ -3,7 +3,10 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 #include "agentic_et1_tracker/robot/unitree_sdk_robot_io.hpp"
 #include "unitree/dds_wrapper/common/crc.h"
@@ -29,6 +32,40 @@ LowCmdFrame lowCmdFrame() {
   return frame;
 }
 
+class FakeMotionSwitcher final : public MotionSwitcherPort {
+ public:
+  explicit FakeMotionSwitcher(std::vector<std::string> modes,
+                              int check_code = 0,
+                              int release_code = 0)
+      : modes_(std::move(modes)),
+        check_code_(check_code),
+        release_code_(release_code) {}
+
+  int checkMode(std::string& form, std::string& name) override {
+    (void)form;
+    if (checks < modes_.size()) {
+      name = modes_.at(checks);
+    } else {
+      name = modes_.empty() ? "" : modes_.back();
+    }
+    ++checks;
+    return check_code_;
+  }
+
+  int releaseMode() override {
+    ++releases;
+    return release_code_;
+  }
+
+  std::size_t checks{0};
+  std::size_t releases{0};
+
+ private:
+  std::vector<std::string> modes_;
+  int check_code_{0};
+  int release_code_{0};
+};
+
 }  // namespace
 
 static_assert(std::is_nothrow_destructible_v<UnitreeSdkRobotIO>,
@@ -38,6 +75,69 @@ TEST_CASE("UnitreeSdkRobotIOConfig defaults to DDS domain 0") {
   const UnitreeSdkRobotIOConfig config;
   REQUIRE(config.domain_id == 0);
   REQUIRE(config.lowcmd_startup_preflight_ms == 200);
+  REQUIRE(config.release_motion_mode_on_startup);
+  REQUIRE(config.release_motion_mode_timeout_s == 3.0);
+  REQUIRE(config.release_motion_mode_max_attempts == 3);
+  REQUIRE(config.release_motion_mode_retry_interval_ms == 500);
+}
+
+TEST_CASE("Unitree MotionSwitcher startup release is a bounded explicit handoff") {
+  SECTION("no active mode returns without release") {
+    FakeMotionSwitcher switcher({""});
+
+    const MotionModeReleaseResult result =
+        releaseMotionModeForStartup(switcher, {3, 0});
+
+    REQUIRE_FALSE(result.released);
+    REQUIRE(result.checks == 1);
+    REQUIRE(result.releases == 0);
+    REQUIRE(switcher.releases == 0);
+  }
+
+  SECTION("active mode is released then rechecked until empty") {
+    FakeMotionSwitcher switcher({"sport", ""});
+    std::size_t sleeps = 0;
+
+    const MotionModeReleaseResult result =
+        releaseMotionModeForStartup(
+            switcher,
+            {3, 10},
+            [&](std::chrono::milliseconds duration) {
+              REQUIRE(duration == std::chrono::milliseconds(10));
+              ++sleeps;
+            });
+
+    REQUIRE(result.released);
+    REQUIRE(result.checks == 2);
+    REQUIRE(result.releases == 1);
+    REQUIRE(switcher.releases == 1);
+    REQUIRE(sleeps == 1);
+  }
+
+  SECTION("mode still active after max release attempts and final check throws") {
+    FakeMotionSwitcher switcher({"sport", "sport", "sport"});
+
+    REQUIRE_THROWS_AS(releaseMotionModeForStartup(switcher, {2, 0}),
+                      MotionModeReleaseError);
+    REQUIRE(switcher.checks == 3);
+    REQUIRE(switcher.releases == 2);
+  }
+
+  SECTION("check failure throws without release") {
+    FakeMotionSwitcher switcher({"sport"}, 7, 0);
+
+    REQUIRE_THROWS_AS(releaseMotionModeForStartup(switcher, {3, 0}),
+                      MotionModeReleaseError);
+    REQUIRE(switcher.releases == 0);
+  }
+
+  SECTION("release failure throws immediately") {
+    FakeMotionSwitcher switcher({"sport", ""}, 0, 5);
+
+    REQUIRE_THROWS_AS(releaseMotionModeForStartup(switcher, {3, 0}),
+                      MotionModeReleaseError);
+    REQUIRE(switcher.releases == 1);
+  }
 }
 
 TEST_CASE("UnitreeSdkRobotIO maps SDK2 LowState into RobotIO low state samples") {

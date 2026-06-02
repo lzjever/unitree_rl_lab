@@ -102,6 +102,8 @@ class PerfSink final : public ExecutionCommandSink {
     return {ErrorCode::Ok, ControllerState::Stopping, StopReason::Stop, 0};
   }
 
+  ControlResult passive() override { return {ErrorCode::Ok}; }
+
   ControlResult fixStand() override { return {ErrorCode::Ok}; }
 
   ControlResult standbyVelocity() override { return {ErrorCode::Ok}; }

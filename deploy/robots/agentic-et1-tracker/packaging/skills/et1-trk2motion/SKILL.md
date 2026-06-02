@@ -17,6 +17,7 @@ Default tracker: `http://127.0.0.1:8083`; override with `ET1_TRACKER_URL`.
 <skill-dir>/scripts/et1-trk2motion idle set /abs/idle-a.trk /abs/idle-b.trk
 <skill-dir>/scripts/et1-trk2motion idle clear
 <skill-dir>/scripts/et1-trk2motion stop
+<skill-dir>/scripts/et1-trk2motion passive
 <skill-dir>/scripts/et1-trk2motion fixstand
 <skill-dir>/scripts/et1-trk2motion standby
 ```

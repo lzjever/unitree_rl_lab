@@ -214,6 +214,9 @@ bool RuntimeControlLoop::consumePendingCommands() {
       case CommandKind::Stop:
         handleStop(command->sequence, command->stop_requires_stopping);
         return true;
+      case CommandKind::Passive:
+        handleControl(ControlMode::Passive);
+        return true;
       case CommandKind::FixStand:
         handleControl(ControlMode::FixStand);
         if (fsm_state_ == RuntimeInternalState::Stopping) {
@@ -249,6 +252,11 @@ void RuntimeControlLoop::consumeStoppingCommands() {
       case CommandKind::Stop:
         cancelWaiting(StopReason::Stop, command->sequence);
         post_stop_control_ = ControlMode::StandbyVelocity;
+        break;
+      case CommandKind::Passive:
+        cancelWaiting(StopReason::Stop, command->sequence);
+        post_stop_control_ = ControlMode::Passive;
+        handleControl(ControlMode::Passive);
         break;
       case CommandKind::FixStand:
         cancelWaiting(StopReason::Stop, command->sequence);
@@ -319,6 +327,24 @@ void RuntimeControlLoop::handleStop(std::uint64_t sequence, bool requires_stoppi
 }
 
 void RuntimeControlLoop::handleControl(ControlMode mode) {
+  if (mode == ControlMode::Passive) {
+    cancelWaiting(StopReason::Stop);
+    if (active_kind_ == ActiveKind::Idle) {
+      stopIdleActive();
+    } else if (active_) {
+      finishActive(MotionState::Stopped, StopReason::Stop, ErrorCode::Ok);
+    }
+    active_.reset();
+    active_track_.reset();
+    policy_runner_.reset();
+    clearReference();
+    post_stop_control_ = ControlMode::Passive;
+    stop_reason_ = StopReason::None;
+    stop_to_idle_pending_ = false;
+    stopping_hold_ticks_remaining_ = 0;
+    handleInternalEvent(RuntimeInternalEvent::SafetyPassive);
+    return;
+  }
   if (fsm_state_ == RuntimeInternalState::Fault && mode != ControlMode::FixStand) {
     return;
   }

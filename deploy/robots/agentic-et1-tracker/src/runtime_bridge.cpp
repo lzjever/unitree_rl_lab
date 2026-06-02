@@ -72,6 +72,21 @@ StopResult RuntimeBridge::stop() {
   return result;
 }
 
+ControlResult RuntimeBridge::passive() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const std::uint64_t sequence = next_sequence_++;
+  const ControlResult result = status_.acceptControl(ControlMode::Passive);
+  if (!result.ok()) {
+    return result;
+  }
+
+  clearPendingCommands();
+  MotionRequest request;
+  request.sequence = sequence;
+  push(CommandKind::Passive, request, sequence);
+  return result;
+}
+
 ControlResult RuntimeBridge::fixStand() {
   std::lock_guard<std::mutex> lock(mutex_);
   const std::uint64_t sequence = next_sequence_++;
@@ -152,6 +167,7 @@ int RuntimeBridge::priority(CommandKind kind) {
   switch (kind) {
     case CommandKind::Stop:
       return 4;
+    case CommandKind::Passive:
     case CommandKind::FixStand:
     case CommandKind::StandbyVelocity:
       return 3;
@@ -164,17 +180,32 @@ int RuntimeBridge::priority(CommandKind kind) {
   return 0;
 }
 
+ControlMode controlModeForCommandKind(CommandKind kind) {
+  switch (kind) {
+    case CommandKind::Passive:
+      return ControlMode::Passive;
+    case CommandKind::FixStand:
+      return ControlMode::FixStand;
+    case CommandKind::StandbyVelocity:
+      return ControlMode::StandbyVelocity;
+    case CommandKind::Queue:
+    case CommandKind::Interrupt:
+    case CommandKind::Stop:
+    case CommandKind::IdleConfig:
+      break;
+  }
+  return ControlMode::StandbyVelocity;
+}
+
 void RuntimeBridge::push(CommandKind kind,
                          MotionRequest request,
                          std::uint64_t sequence,
                          bool stop_requires_stopping) {
-  const ControlMode control = kind == CommandKind::FixStand ? ControlMode::FixStand
-                                                            : ControlMode::StandbyVelocity;
   Command command;
   command.kind = kind;
   command.request = std::move(request);
   command.sequence = sequence;
-  command.control = control;
+  command.control = controlModeForCommandKind(kind);
   command.stop_requires_stopping = stop_requires_stopping;
   pending_.push_back(std::move(command));
 }
@@ -223,6 +254,7 @@ void RuntimeBridge::clearPendingControlsAfter(std::uint64_t sequence) {
                                 pending_.end(),
                                 [sequence](const Command& command) {
                                   return (command.kind == CommandKind::FixStand ||
+                                          command.kind == CommandKind::Passive ||
                                           command.kind == CommandKind::StandbyVelocity) &&
                                          command.sequence > sequence;
                                 }),

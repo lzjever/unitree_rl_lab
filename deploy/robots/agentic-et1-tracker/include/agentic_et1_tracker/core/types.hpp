@@ -86,6 +86,7 @@ enum class ControllerState {
 };
 
 enum class ControlMode {
+  Passive,
   FixStand,
   StandbyVelocity,
 };

@@ -136,6 +136,11 @@ bool fixStandRecoveryAllowed(const StatusSnapshot& snapshot, ErrorCode readiness
          snapshot.block == "bad_orientation";
 }
 
+bool passiveSafetyAllowed(const StatusSnapshot& snapshot, ErrorCode readiness) {
+  return readiness == ErrorCode::RobotBadOrientation &&
+         snapshot.block == "bad_orientation";
+}
+
 ErrorInfo controlStateConflictInfo(ControllerState ctrl) {
   switch (ctrl) {
     case ControllerState::Starting:
@@ -246,6 +251,9 @@ ApiResponse AgentApiService::handle(const ApiRequest& request) {
     }
     if (request.method == "POST" && target.path == "/stop") {
       return stop(request.body);
+    }
+    if (request.method == "POST" && target.path == "/passive") {
+      return passive(request.body);
     }
     if (request.method == "POST" && target.path == "/fixstand") {
       return fixStand(request.body);
@@ -379,6 +387,30 @@ ApiResponse AgentApiService::stop(const std::string& body) {
   }
 
   const StopResult result = commands_.stop();
+  if (!result.ok()) {
+    return error(result.code);
+  }
+
+  auto out = successBase();
+  out["state"] = "accepted";
+  return {200, out};
+}
+
+ApiResponse AgentApiService::passive(const std::string& body) {
+  if (!blank(body)) {
+    return error(ErrorCode::RequestInvalid);
+  }
+
+  const StatusSnapshot snapshot = status_.snapshot();
+  const ErrorCode readiness = readinessError(snapshot);
+  if (lowCmdOccupied(snapshot)) {
+    return error(manualReadinessInfo(lowCmdOccupiedReadiness(readiness)));
+  }
+  if (readiness != ErrorCode::Ok && !passiveSafetyAllowed(snapshot, readiness)) {
+    return error(readiness);
+  }
+
+  const ControlResult result = commands_.passive();
   if (!result.ok()) {
     return error(result.code);
   }

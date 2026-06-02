@@ -112,6 +112,10 @@ agentic_et1_tracker:
   REQUIRE(config.trk.allowlist_dirs == std::vector<std::filesystem::path>{"/home/galbot/motions"});
   REQUIRE(config.domain_id == 0);
   REQUIRE(config.lowcmd_startup_preflight_ms == 200);
+  REQUIRE(config.release_motion_mode_on_startup);
+  REQUIRE(config.release_motion_mode_timeout_s == 3.0);
+  REQUIRE(config.release_motion_mode_max_attempts == 3);
+  REQUIRE(config.release_motion_mode_retry_interval_ms == 500);
   REQUIRE(config.lock_path.empty());
   REQUIRE(config.policy.profile == "GeneralTracker");
   REQUIRE(config.policy.policy_dir ==
@@ -169,6 +173,7 @@ TEST_CASE("AppConfig simulation example is ready for local MuJoCo acceptance") {
   REQUIRE(config.network == "lo");
   REQUIRE(config.domain_id == 0);
   REQUIRE(config.mode_machine == 0);
+  REQUIRE_FALSE(config.release_motion_mode_on_startup);
   REQUIRE(config.trk.allowlist_dirs ==
           std::vector<std::filesystem::path>{"/home/galbot/works/et1/generated"});
   REQUIRE(pathIsAtOrWithin(config.policy.policy_dir,
@@ -192,6 +197,10 @@ agentic_et1_tracker:
   network: "eth0"
   domain_id: 7
   lowcmd_startup_preflight_ms: 25
+  release_motion_mode_on_startup: false
+  release_motion_mode_timeout_s: 1.5
+  release_motion_mode_max_attempts: 2
+  release_motion_mode_retry_interval_ms: 10
   mode_machine: 0
   motion_dirs:
     - "/srv/motions/a"
@@ -234,6 +243,10 @@ agentic_et1_tracker:
   REQUIRE(config.network == "eth0");
   REQUIRE(config.domain_id == 7);
   REQUIRE(config.lowcmd_startup_preflight_ms == 25);
+  REQUIRE_FALSE(config.release_motion_mode_on_startup);
+  REQUIRE(config.release_motion_mode_timeout_s == 1.5);
+  REQUIRE(config.release_motion_mode_max_attempts == 2);
+  REQUIRE(config.release_motion_mode_retry_interval_ms == 10);
   REQUIRE(config.mode_machine == 0);
   REQUIRE(config.stop_hold_s == 0.0);
   REQUIRE(config.idle_mode == "hold_current");
@@ -444,6 +457,24 @@ agentic_et1_tracker:
     fps: 1000.1
 )yaml"),
                         ContainsSubstring("fps"));
+  }
+
+  SECTION("release motion mode timeout must be positive") {
+    REQUIRE_THROWS_WITH(loadYaml(R"yaml(
+agentic_et1_tracker:
+  motion_dirs: ["/tmp/motions"]
+  release_motion_mode_timeout_s: 0
+)yaml"),
+                        ContainsSubstring("release_motion_mode_timeout_s"));
+  }
+
+  SECTION("release motion mode max attempts must be positive") {
+    REQUIRE_THROWS_WITH(loadYaml(R"yaml(
+agentic_et1_tracker:
+  motion_dirs: ["/tmp/motions"]
+  release_motion_mode_max_attempts: 0
+)yaml"),
+                        ContainsSubstring("release_motion_mode_max_attempts"));
   }
 
   SECTION("reference max_rate_hz is unsupported because sim poller owns rate") {

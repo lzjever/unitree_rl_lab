@@ -350,6 +350,9 @@ def parse(argv):
     pf = sub.add_parser("fixstand")
     add_timing(pf)
 
+    pp = sub.add_parser("passive")
+    add_timing(pp)
+
     psv = sub.add_parser("standby")
     add_timing(psv)
 
@@ -420,6 +423,8 @@ def main(argv):
             out = ready_cmd(base, timeout)
         elif args.cmd == "fixstand":
             out = control_cmd(base, "/fixstand", timeout)
+        elif args.cmd == "passive":
+            out = control_cmd(base, "/passive", timeout)
         elif args.cmd == "standby":
             out = control_cmd(base, "/standby_velocity", timeout)
         elif args.cmd == "stop":

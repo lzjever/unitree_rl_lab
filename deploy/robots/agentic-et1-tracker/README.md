@@ -53,6 +53,7 @@ Commands:
 - `POST /idle`: `{"paths":["/absolute/idle-a.trk","/absolute/idle-b.trk"]}`.
 - `POST /idle`: `{"paths":[]}` clears the idle pool.
 - `POST /stop`: empty body; stops active work and cancels queued work.
+- `POST /passive`: empty body; enter Passive safety sink when LowCmd is free.
 - `POST /fixstand`: empty body; enter FixStand.
 - `POST /standby_velocity`: empty body; enter StandbyVelocity.
 
@@ -73,18 +74,23 @@ idle config. It preserves the stop watermark: user queue/interrupt requests
 accepted after a pending stop are not canceled by that older stop.
 
 Control-changing routes return the current `/status.err` readiness error before
-claiming success when the runtime is unavailable or not ready. `FixStand` is the
-only software recovery exception for `block:"bad_orientation"` when LowCmd is
-not externally occupied; it does not bypass `lowcmd_occupied`. `/standby_velocity`
-returns `CONTROL_STATE_CONFLICT` from `passive` and `fault`.
+claiming success when the runtime is unavailable or not ready. `/passive` and
+`/fixstand` are the software exceptions for `block:"bad_orientation"` when
+LowCmd is not externally occupied; neither bypasses `lowcmd_occupied`.
+`/standby_velocity` returns `CONTROL_STATE_CONFLICT` from `passive` and `fault`.
 
 Startup safety:
 
-- Real Unitree SDK startup subscribes to `rt/lowcmd` on the configured
+- Real Unitree SDK startup calls Unitree MotionSwitcher release first when
+  `mode_machine: 1` and `release_motion_mode_on_startup: true` (default for
+  robot config). It is not called for `mode_machine: 0` sim config.
+- After that handoff, startup subscribes to `rt/lowcmd` on the configured
   `network/domain_id`, waits `lowcmd_startup_preflight_ms` (default `200`), and
   refuses to start the writing runtime if a fresh external LowCmd owner exists.
 - Startup owner conflict status is compact: `ready:false`,
   `block:"lowcmd_occupied"`, `err.code:"ROBOT_NOT_READY"`.
+- MotionSwitcher release failure status is compact: `ready:false`,
+  `block:"motion_mode_release_failed"`, `err.code:"ROBOT_NOT_READY"`.
 - Any API response caused by `block:"lowcmd_occupied"` uses `next:"manual"`;
   agents must not wait/retry to auto-reclaim LowCmd.
 
@@ -105,7 +111,7 @@ Common error handling:
 | `SERVICE_NOT_READY` | `status` | Poll `/status`. |
 | `ROBOT_DISCONNECTED` | `wait_robot` | Wait; poll `/status`. |
 | `ROBOT_NOT_READY` | `wait_robot` or `manual` | If `block:"lowcmd_occupied"`, operator/manual only; otherwise wait and poll `/status`. |
-| `ROBOT_BAD_ORIENTATION` | `manual` | `/fixstand` is the software recovery route only when `block:"bad_orientation"` and LowCmd is free; otherwise operator action. |
+| `ROBOT_BAD_ORIENTATION` | `manual` | `/passive` and `/fixstand` are software recovery routes only when `block:"bad_orientation"` and LowCmd is free; otherwise operator action. |
 | `MODEL_NOT_READY` | `status` | Poll `/health` or `/status`. |
 | `TRK_*` | `fix` | Use an allowed existing `.trk`. |
 | `QUEUE_FULL` | `status` | Poll `/status`; retry after queue drains. |
@@ -141,13 +147,13 @@ Controller states:
 | ctrl | robot behavior | accepts | rejects/notes |
 | --- | --- | --- | --- |
 | `starting` | Runtime is initializing. | `/status`, `/health` | Control routes return readiness errors such as `SERVICE_NOT_READY` or `MODEL_NOT_READY`; wait for `ready:true`. |
-| `passive` | Safety sink; publishes passive damping command. | `/fixstand`, `/stop`, `/idle` config/clear | `/execute` and `/standby_velocity` return `CONTROL_STATE_CONFLICT`. If `block:"lowcmd_occupied"`, next action is `manual`. |
-| `fixstand` | Holds configured stand posture. | `/standby_velocity`, `/stop`, `/fixstand`, `/idle` config/clear | `/execute` returns conflict; call `/standby_velocity` first. `/fixstand` is only the `bad_orientation` software recovery exception. |
-| `standby_velocity` | Velocity policy with zero command; robot stands idle. | `/execute`, `/idle`, `/fixstand`, `/stop` | Normal state for starting user `.trk`; idle auto-play may start only when ready/safe and no user active/queue exists. |
-| idle active (`active.kind:"idle"`) | GeneralTracker plays an idle pool motion without a user id. | `/execute`, `/stop`, `/idle`, `/fixstand`, `/standby_velocity` | `exec:null`, user `queue` unchanged. User `/execute` preempts idle. |
-| `preparing`/`running` with `active.kind:"user"` | Preparing or executing a user `.trk`. | `/stop`, `/execute` queue/interrupt, `/idle` config/clear | `queue` waits; `interrupt` preempts current user run. Poll `/status?id=<id>`. |
-| `stopping` | Stop/interrupt transition to StandbyVelocity or a safety state. | `/status`, `/stop`, `/idle` clear/config | `/execute` returns conflict at the HTTP API; wait for `ctrl:"standby_velocity"`. |
-| `fault` | Safety/manual state; no normal track execution. | `/fixstand`, `/stop`, `/idle` config/clear | `/execute` and `/standby_velocity` return conflict until resolved. `lowcmd_occupied` remains manual/operator. |
+| `passive` | Safety sink; publishes passive damping command. | `/fixstand`, `/passive`, `/stop`, `/idle` config/clear | `/execute` and `/standby_velocity` return `CONTROL_STATE_CONFLICT`. If `block:"lowcmd_occupied"`, next action is `manual`. |
+| `fixstand` | Holds configured stand posture. | `/standby_velocity`, `/passive`, `/stop`, `/fixstand`, `/idle` config/clear | `/execute` returns conflict; call `/standby_velocity` first. `/passive` and `/fixstand` are the `bad_orientation` software recovery exceptions. |
+| `standby_velocity` | Velocity policy with zero command; robot stands idle. | `/execute`, `/idle`, `/passive`, `/fixstand`, `/stop` | Normal state for starting user `.trk`; idle auto-play may start only when ready/safe and no user active/queue exists. |
+| idle active (`active.kind:"idle"`) | GeneralTracker plays an idle pool motion without a user id. | `/execute`, `/stop`, `/idle`, `/passive`, `/fixstand`, `/standby_velocity` | `exec:null`, user `queue` unchanged. User `/execute` preempts idle. |
+| `preparing`/`running` with `active.kind:"user"` | Preparing or executing a user `.trk`. | `/stop`, `/passive`, `/execute` queue/interrupt, `/idle` config/clear | `queue` waits; `interrupt` preempts current user run. Poll `/status?id=<id>`. |
+| `stopping` | Stop/interrupt transition to StandbyVelocity or a safety state. | `/status`, `/passive`, `/stop`, `/idle` clear/config | `/execute` returns conflict at the HTTP API; wait for `ctrl:"standby_velocity"`. |
+| `fault` | Safety/manual state; no normal track execution. | `/passive` only for `bad_orientation`, `/fixstand`, `/stop`, `/idle` config/clear | `/execute` and `/standby_velocity` return conflict until resolved. `lowcmd_occupied` remains manual/operator. |
 
 `/execute` checks request shape, then readiness, then controller state. If
 `starting` is not ready it returns the readiness error, not
@@ -213,8 +219,9 @@ Prerequisites:
 - Use `config.sim.yaml.example` for local MuJoCo acceptance. It sets
   `mode_machine: 0`, `network: "lo"`,
   `motion_dirs: ["/home/galbot/works/et1/generated"]`, and app-owned assets.
-  It also keeps `lowcmd_startup_preflight_ms: 200` and enables the hidden
-  sim-only reference endpoint. Adjust only `domain_id` or `port` when the local
+  It also keeps `lowcmd_startup_preflight_ms: 200`, sets
+  `release_motion_mode_on_startup: false`, and enables the hidden sim-only
+  reference endpoint. Adjust only `domain_id` or `port` when the local
   simulator requires it.
 - Start the Unitree MuJoCo simulator only after the Preflight is clear. The
   operator controls MuJoCo rope timing and keyboard actions manually.

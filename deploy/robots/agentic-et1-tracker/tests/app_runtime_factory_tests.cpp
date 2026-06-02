@@ -306,4 +306,19 @@ TEST_CASE("AppRuntimeFactory real factory blocks final model symlink into ET1 co
 #endif
 }
 
+TEST_CASE("AppRuntimeFactory releases Unitree motion mode only for real mode_machine") {
+  AppConfig config;
+  config.release_motion_mode_on_startup = true;
+
+  config.mode_machine = 1;
+  REQUIRE(shouldReleaseMotionModeOnStartup(config));
+
+  config.mode_machine = 0;
+  REQUIRE_FALSE(shouldReleaseMotionModeOnStartup(config));
+
+  config.mode_machine = 1;
+  config.release_motion_mode_on_startup = false;
+  REQUIRE_FALSE(shouldReleaseMotionModeOnStartup(config));
+}
+
 }  // namespace agentic_et1_tracker

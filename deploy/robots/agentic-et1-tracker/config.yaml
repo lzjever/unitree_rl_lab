@@ -4,6 +4,10 @@ agentic_et1_tracker:
   network: "lo"
   domain_id: 0
   lowcmd_startup_preflight_ms: 200
+  release_motion_mode_on_startup: true
+  release_motion_mode_timeout_s: 3.0
+  release_motion_mode_max_attempts: 3
+  release_motion_mode_retry_interval_ms: 500
   mode_machine: 1
   motion_dirs:
     - "/home/galbot/motions"

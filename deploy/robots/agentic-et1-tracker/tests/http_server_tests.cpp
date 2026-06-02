@@ -60,6 +60,8 @@ class FakeSink final : public ExecutionCommandSink {
     return stop_result;
   }
 
+  ControlResult passive() override { return {ErrorCode::Ok}; }
+
   ControlResult fixStand() override {
     ++fixstand_calls;
     return fixstand_result;

@@ -4,6 +4,7 @@ agentic_et1_tracker:
   network: "lo"
   domain_id: 0
   lowcmd_startup_preflight_ms: 200
+  release_motion_mode_on_startup: false
   mode_machine: 0
   motion_dirs:
     - "/home/galbot/works/et1/generated"

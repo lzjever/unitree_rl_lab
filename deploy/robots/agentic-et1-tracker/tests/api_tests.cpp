@@ -29,6 +29,7 @@ class FakeSink final : public ExecutionCommandSink {
   ExecuteResult queue_result{ErrorCode::Ok, "", MotionState::Queued, 1};
   ExecuteResult interrupt_result{ErrorCode::Ok, "", MotionState::Queued, 1};
   StopResult stop_result{ErrorCode::Ok, ControllerState::Stopping, StopReason::Stop, 0};
+  ControlResult passive_result{ErrorCode::Ok};
   ControlResult fixstand_result{ErrorCode::Ok};
   ControlResult standby_velocity_result{ErrorCode::Ok};
   IdleResult idle_result{ErrorCode::Ok, IdleStatus{}};
@@ -57,6 +58,11 @@ class FakeSink final : public ExecutionCommandSink {
     return stop_result;
   }
 
+  ControlResult passive() override {
+    ++passive_calls;
+    return passive_result;
+  }
+
   ControlResult fixStand() override {
     ++fixstand_calls;
     return fixstand_result;
@@ -80,6 +86,7 @@ class FakeSink final : public ExecutionCommandSink {
   int queue_calls{0};
   int interrupt_calls{0};
   int stop_calls{0};
+  int passive_calls{0};
   int fixstand_calls{0};
   int standby_velocity_calls{0};
   int idle_calls{0};
@@ -511,7 +518,7 @@ TEST_CASE("POST execute reports lowcmd occupancy as manual next action") {
 }
 
 TEST_CASE("POST control endpoints report lowcmd occupancy as manual before sink") {
-  for (const auto& target : {"/fixstand", "/standby_velocity"}) {
+  for (const auto& target : {"/passive", "/fixstand", "/standby_velocity"}) {
     for (const ControllerState ctrl :
          {ControllerState::Passive, ControllerState::Fault}) {
       Harness h;
@@ -528,6 +535,7 @@ TEST_CASE("POST control endpoints report lowcmd occupancy as manual before sink"
       REQUIRE(response.status == 409);
       requireFailure(response, "ROBOT_NOT_READY");
       REQUIRE(nextAction(response) == "manual");
+      REQUIRE(h.sink.passive_calls == 0);
       REQUIRE(h.sink.fixstand_calls == 0);
       REQUIRE(h.sink.standby_velocity_calls == 0);
       REQUIRE(h.validator.calls == 0);
@@ -598,6 +606,25 @@ TEST_CASE("POST stop with no body only submits stop even when not ready") {
 }
 
 TEST_CASE("POST control endpoints accept empty body without validator or id generator") {
+  SECTION("passive") {
+    Harness h;
+
+    const auto response = h.service.handle({"POST", "/passive", ""});
+
+    REQUIRE(response.status == 200);
+    requireFields(response.body, {"ok", "state"});
+    REQUIRE(response.body.at("ok") == true);
+    REQUIRE(response.body.at("state") == "accepted");
+    REQUIRE(h.sink.passive_calls == 1);
+    REQUIRE(h.sink.fixstand_calls == 0);
+    REQUIRE(h.sink.standby_velocity_calls == 0);
+    REQUIRE(h.sink.stop_calls == 0);
+    REQUIRE(h.sink.queue_calls == 0);
+    REQUIRE(h.sink.interrupt_calls == 0);
+    REQUIRE(h.validator.calls == 0);
+    REQUIRE(h.ids.calls == 0);
+  }
+
   SECTION("fixstand") {
     Harness h;
 
@@ -607,6 +634,7 @@ TEST_CASE("POST control endpoints accept empty body without validator or id gene
     requireFields(response.body, {"ok", "state"});
     REQUIRE(response.body.at("ok") == true);
     REQUIRE(response.body.at("state") == "accepted");
+    REQUIRE(h.sink.passive_calls == 0);
     REQUIRE(h.sink.fixstand_calls == 1);
     REQUIRE(h.sink.standby_velocity_calls == 0);
     REQUIRE(h.sink.stop_calls == 0);
@@ -625,6 +653,7 @@ TEST_CASE("POST control endpoints accept empty body without validator or id gene
     requireFields(response.body, {"ok", "state"});
     REQUIRE(response.body.at("ok") == true);
     REQUIRE(response.body.at("state") == "accepted");
+    REQUIRE(h.sink.passive_calls == 0);
     REQUIRE(h.sink.fixstand_calls == 0);
     REQUIRE(h.sink.standby_velocity_calls == 1);
     REQUIRE(h.sink.stop_calls == 0);
@@ -636,7 +665,7 @@ TEST_CASE("POST control endpoints accept empty body without validator or id gene
 }
 
 TEST_CASE("POST control endpoints reject static not-ready snapshots before sink") {
-  for (const auto& target : {"/fixstand", "/standby_velocity"}) {
+  for (const auto& target : {"/passive", "/fixstand", "/standby_velocity"}) {
     Harness h;
     h.status.snapshot_value.ready = false;
     h.status.snapshot_value.ctrl = ControllerState::Starting;
@@ -651,6 +680,7 @@ TEST_CASE("POST control endpoints reject static not-ready snapshots before sink"
     requireFailure(response, "MODEL_NOT_READY");
     REQUIRE(nextAction(response) == "status");
     REQUIRE(errorMessage(response) == "policy model is not ready");
+    REQUIRE(h.sink.passive_calls == 0);
     REQUIRE(h.sink.fixstand_calls == 0);
     REQUIRE(h.sink.standby_velocity_calls == 0);
     REQUIRE(h.sink.stop_calls == 0);
@@ -693,6 +723,30 @@ TEST_CASE("POST fixstand remains available from passive and fault recovery state
   }
 }
 
+TEST_CASE("POST passive remains available as bad-orientation safety sink") {
+  for (const ControllerState ctrl :
+       {ControllerState::Passive, ControllerState::Fault,
+        ControllerState::Running}) {
+    Harness h;
+    h.status.snapshot_value.ready = false;
+    h.status.snapshot_value.ctrl = ctrl;
+    h.status.snapshot_value.robot = RobotState::Fault;
+    h.status.snapshot_value.err = ErrorCode::RobotBadOrientation;
+    h.status.snapshot_value.block = "bad_orientation";
+
+    const auto response = h.service.handle({"POST", "/passive", ""});
+
+    CAPTURE(toString(ctrl));
+    REQUIRE(response.status == 200);
+    requireFields(response.body, {"ok", "state"});
+    REQUIRE(response.body.at("ok") == true);
+    REQUIRE(response.body.at("state") == "accepted");
+    REQUIRE(h.sink.passive_calls == 1);
+    REQUIRE(h.sink.fixstand_calls == 0);
+    REQUIRE(h.sink.standby_velocity_calls == 0);
+  }
+}
+
 TEST_CASE("POST fixstand rejects non-orientation recovery faults before sink") {
   for (const ErrorCode err :
        {ErrorCode::RobotNotReady, ErrorCode::SafetyLimitTriggered}) {
@@ -714,7 +768,7 @@ TEST_CASE("POST fixstand rejects non-orientation recovery faults before sink") {
 }
 
 TEST_CASE("POST control endpoints reject non-empty bodies before ports") {
-  for (const auto& target : {"/fixstand", "/standby_velocity"}) {
+  for (const auto& target : {"/passive", "/fixstand", "/standby_velocity"}) {
     Harness h;
 
     const auto response = h.service.handle({"POST", target, R"({})"});
@@ -722,6 +776,7 @@ TEST_CASE("POST control endpoints reject non-empty bodies before ports") {
     CAPTURE(target);
     REQUIRE(response.status == 400);
     requireFailure(response, "REQUEST_INVALID");
+    REQUIRE(h.sink.passive_calls == 0);
     REQUIRE(h.sink.fixstand_calls == 0);
     REQUIRE(h.sink.standby_velocity_calls == 0);
     REQUIRE(h.sink.stop_calls == 0);

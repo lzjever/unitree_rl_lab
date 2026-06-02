@@ -282,6 +282,22 @@ AppConfig loadAppConfig(const std::filesystem::path& path) {
         optionalNonNegativeSize(section,
                                 "lowcmd_startup_preflight_ms",
                                 config.lowcmd_startup_preflight_ms);
+    config.release_motion_mode_on_startup =
+        optionalBool(section,
+                     "release_motion_mode_on_startup",
+                     config.release_motion_mode_on_startup);
+    config.release_motion_mode_timeout_s =
+        optionalPositiveDouble(section,
+                               "release_motion_mode_timeout_s",
+                               config.release_motion_mode_timeout_s);
+    config.release_motion_mode_max_attempts =
+        optionalPositiveSize(section,
+                             "release_motion_mode_max_attempts",
+                             config.release_motion_mode_max_attempts);
+    config.release_motion_mode_retry_interval_ms =
+        optionalNonNegativeSize(section,
+                                "release_motion_mode_retry_interval_ms",
+                                config.release_motion_mode_retry_interval_ms);
     if (const YAML::Node mode_machine = section["mode_machine"]) {
       config.mode_machine = scalarAs<int>(mode_machine, "mode_machine");
     }

@@ -60,8 +60,11 @@ Contract-level GA evidence must cover:
   so work accepted after the stop is not canceled by the older stop.
 - `block:"lowcmd_occupied"` maps to manual/operator action and must not imply
   automatic wait/retry recovery.
-- `bad_orientation` enters the safety path; `/fixstand` is only the software
-  recovery exception when LowCmd is free.
+- `bad_orientation` enters the safety path; `/passive` and `/fixstand` are the
+  software recovery exceptions when LowCmd is free.
+- Real `mode_machine: 1` startup may release Unitree MotionSwitcher default
+  mode before LowCmd preflight. Sim `mode_machine: 0` startup must not call
+  MotionSwitcher.
 
 ## Manual MuJoCo acceptance
 
@@ -73,17 +76,21 @@ been recorded in this docs/skill pass.
 Use `config.sim.yaml.example` for local MuJoCo acceptance. It sets
 `mode_machine: 0`, `network: "lo"`, app-owned policy/control assets, and
 `motion_dirs: ["/home/galbot/works/et1/generated"]`. It keeps the startup
-LowCmd owner preflight at the default `200` ms.
+LowCmd owner preflight at the default `200` ms and disables MotionSwitcher
+release.
 
 Pending MuJoCo evidence must record:
 
 - Startup LowCmd owner preflight scoped to the same DDS `network` and
   `domain_id`; `lowcmd_occupied` must prevent any writing runtime from
   starting.
+- Sim config must not call MotionSwitcher. Real config should release Unitree
+  default motion mode before LowCmd preflight and report
+  `motion_mode_release_failed` if release fails.
 - Startup `/status` with `ctrl:"fixstand"` when using default config.
 - `/status.pose` with compact `q/g/p/v` fields during idle and running states.
-- Manual `/fixstand` and `/standby_velocity` requests accepted with empty body
-  only when `/status` shows a ready runtime that can consume them.
+- Manual `/passive`, `/fixstand`, and `/standby_velocity` requests accepted
+  with empty body only when `/status` shows a runtime that can consume them.
 - Static not-ready startup/model-load failure snapshots reject `/fixstand` and
   `/standby_velocity` with compact readiness errors and no queued control
   command.

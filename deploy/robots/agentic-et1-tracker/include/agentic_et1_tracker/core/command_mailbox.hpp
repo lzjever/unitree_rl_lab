@@ -13,6 +13,7 @@ enum class CommandKind {
   Queue,
   Interrupt,
   Stop,
+  Passive,
   FixStand,
   StandbyVelocity,
   IdleConfig,

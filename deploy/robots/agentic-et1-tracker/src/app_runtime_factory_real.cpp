@@ -64,6 +64,11 @@ AppRuntimeFactoryResult lowCmdOccupied(const AppConfig& config) {
                   "lowcmd_occupied", runtimeMode(config));
 }
 
+AppRuntimeFactoryResult motionModeReleaseFailed(const AppConfig& config) {
+  return notReady(config, ErrorCode::RobotNotReady, RobotState::NotReady,
+                  "motion_mode_release_failed", runtimeMode(config));
+}
+
 std::filesystem::path modelPath(const PolicyConfig& config) {
   return std::filesystem::path(config.policy_dir) / "exported" / config.policy_file;
 }
@@ -84,6 +89,10 @@ ControlMode startupControl(const ControlConfig& config) {
 }
 
 }  // namespace
+
+bool shouldReleaseMotionModeOnStartup(const AppConfig& config) {
+  return config.mode_machine != 0 && config.release_motion_mode_on_startup;
+}
 
 AppRuntimeFactoryResult createAppRuntimeDeps(const AppConfig& config) {
   FactoryPhase phase = FactoryPhase::Deploy;
@@ -114,6 +123,13 @@ AppRuntimeFactoryResult createAppRuntimeDeps(const AppConfig& config) {
     robot_config.network = config.network;
     robot_config.domain_id = config.domain_id;
     robot_config.lowcmd_startup_preflight_ms = config.lowcmd_startup_preflight_ms;
+    robot_config.release_motion_mode_on_startup =
+        shouldReleaseMotionModeOnStartup(config);
+    robot_config.release_motion_mode_timeout_s = config.release_motion_mode_timeout_s;
+    robot_config.release_motion_mode_max_attempts =
+        config.release_motion_mode_max_attempts;
+    robot_config.release_motion_mode_retry_interval_ms =
+        config.release_motion_mode_retry_interval_ms;
     auto robot_io = std::make_unique<UnitreeSdkRobotIO>(std::move(robot_config));
 
     AppRuntimeDeps deps;
@@ -140,6 +156,8 @@ AppRuntimeFactoryResult createAppRuntimeDeps(const AppConfig& config) {
     return modelNotReady(config);
   } catch (const PolicyRuntimeError&) {
     return modelNotReady(config);
+  } catch (const MotionModeReleaseError&) {
+    return motionModeReleaseFailed(config);
   } catch (const LowCmdStartupPreflightError&) {
     return lowCmdOccupied(config);
   } catch (const RobotIOError&) {

@@ -110,6 +110,10 @@ class Handler(BaseHTTPRequestHandler):
             state.ctrl = "fixstand"
             state.ready = False
             self.send_json(state.response({"ok": True}, state.large_control))
+        elif self.path == "/passive":
+            state.ctrl = "passive"
+            state.ready = False
+            self.send_json(state.response({"ok": True}, state.large_control))
         elif self.path == "/standby_velocity":
             state.ctrl = "standby_velocity"
             state.ready = True
@@ -306,7 +310,7 @@ class ServerCase(unittest.TestCase):
     def test_health_control_commands_omit_large_fields(self):
         self.state.large_health = True
         self.state.large_control = True
-        for command in ("health", "fixstand", "standby", "stop"):
+        for command in ("health", "passive", "fixstand", "standby", "stop"):
             with self.subTest(command=command):
                 proc, out = self.cli(command)
                 self.assertEqual(proc.returncode, 0)

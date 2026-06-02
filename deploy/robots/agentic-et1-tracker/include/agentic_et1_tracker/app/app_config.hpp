@@ -39,6 +39,10 @@ struct AppConfig {
   std::string network{"lo"};
   int domain_id{0};
   std::size_t lowcmd_startup_preflight_ms{200};
+  bool release_motion_mode_on_startup{true};
+  double release_motion_mode_timeout_s{3.0};
+  std::size_t release_motion_mode_max_attempts{3};
+  std::size_t release_motion_mode_retry_interval_ms{500};
   int mode_machine{1};
   double stop_hold_s{0.0};
   std::string idle_mode{"hold_current"};

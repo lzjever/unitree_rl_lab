@@ -22,6 +22,10 @@ AppRuntimeFactoryResult notReady(const AppConfig& config) {
 
 }  // namespace
 
+bool shouldReleaseMotionModeOnStartup(const AppConfig& config) {
+  return config.mode_machine != 0 && config.release_motion_mode_on_startup;
+}
+
 AppRuntimeFactoryResult createAppRuntimeDeps(const AppConfig& config) {
   return notReady(config);
 }

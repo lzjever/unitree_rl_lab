@@ -7,6 +7,7 @@ scripts/et1-trk2motion raw GET /status
 scripts/et1-trk2motion raw POST /execute '{"path":"/abs/file.trk","mode":"interrupt"}'
 scripts/et1-trk2motion raw POST /idle '{"paths":["/abs/idle.trk"]}'
 scripts/et1-trk2motion raw POST /idle '{"paths":[]}'
+scripts/et1-trk2motion raw POST /passive
 scripts/et1-trk2motion raw POST /stop
 ```
 
@@ -15,6 +16,7 @@ Tracker endpoints used by the CLI:
 - `GET /health`
 - `GET /status`
 - `GET /status?id=RUN_ID`
+- `POST /passive`
 - `POST /fixstand`
 - `POST /standby_velocity`
 - `POST /stop`

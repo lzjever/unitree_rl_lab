@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "unitree/dds_wrapper/common/crc.h"
+#include "unitree/robot/b2/motion_switcher/motion_switcher_client.hpp"
 #include "unitree/robot/channel/channel_factory.hpp"
 
 namespace agentic_et1_tracker {
@@ -20,11 +21,32 @@ RobotIOError unitreeError(const std::string& message) {
   return RobotIOError("unitree sdk robot io error: " + message);
 }
 
+MotionModeReleaseError motionModeReleaseError(const std::string& message) {
+  return MotionModeReleaseError("motion mode release error: " + message);
+}
+
 std::size_t ageMs(std::chrono::steady_clock::time_point sample_time,
                   std::chrono::steady_clock::time_point now) {
   const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - sample_time);
   return static_cast<std::size_t>(std::max<std::int64_t>(0, elapsed.count()));
 }
+
+class UnitreeMotionSwitcher final : public MotionSwitcherPort {
+ public:
+  explicit UnitreeMotionSwitcher(double timeout_s) {
+    client_.SetTimeout(static_cast<float>(timeout_s));
+    client_.Init();
+  }
+
+  int checkMode(std::string& form, std::string& name) override {
+    return client_.CheckMode(form, name);
+  }
+
+  int releaseMode() override { return client_.ReleaseMode(); }
+
+ private:
+  unitree::robot::b2::MotionSwitcherClient client_;
+};
 
 }  // namespace
 
@@ -158,12 +180,68 @@ LowCmdStartupPreflightResult checkLowCmdStartupPreflight(
   return result;
 }
 
+MotionModeReleaseResult releaseMotionModeForStartup(
+    MotionSwitcherPort& switcher,
+    MotionModeReleaseOptions options,
+    MotionModeReleaseSleeper sleep_for) {
+  if (!sleep_for) {
+    sleep_for = [](std::chrono::milliseconds duration) {
+      std::this_thread::sleep_for(duration);
+    };
+  }
+
+  MotionModeReleaseResult result;
+  for (std::size_t release_attempt = 0;
+       release_attempt <= options.max_release_attempts;
+       ++release_attempt) {
+    std::string form;
+    std::string name;
+    const int check_code = switcher.checkMode(form, name);
+    ++result.checks;
+    result.last_name = name;
+    if (check_code != 0) {
+      std::ostringstream out;
+      out << "check_failed rc=" << check_code;
+      throw motionModeReleaseError(out.str());
+    }
+    if (name.empty()) {
+      return result;
+    }
+    if (release_attempt == options.max_release_attempts) {
+      std::ostringstream out;
+      out << "still_active name=" << name;
+      throw motionModeReleaseError(out.str());
+    }
+
+    const int release_code = switcher.releaseMode();
+    ++result.releases;
+    result.released = true;
+    if (release_code != 0) {
+      std::ostringstream out;
+      out << "release_failed rc=" << release_code << " name=" << name;
+      throw motionModeReleaseError(out.str());
+    }
+    if (options.retry_interval_ms > 0) {
+      sleep_for(std::chrono::milliseconds(options.retry_interval_ms));
+    }
+  }
+  return result;
+}
+
 UnitreeSdkRobotIO::UnitreeSdkRobotIO(UnitreeSdkRobotIOConfig config)
     : config_(std::move(config)),
       lowcmd_ownership_(config_.lowcmd_occupancy_window_ms,
                         config_.lowcmd_own_write_history_size) {
   if (config_.init_channel_factory) {
     unitree::robot::ChannelFactory::Instance()->Init(config_.domain_id, config_.network);
+  }
+
+  if (config_.release_motion_mode_on_startup) {
+    UnitreeMotionSwitcher switcher(config_.release_motion_mode_timeout_s);
+    releaseMotionModeForStartup(
+        switcher,
+        MotionModeReleaseOptions{config_.release_motion_mode_max_attempts,
+                                 config_.release_motion_mode_retry_interval_ms});
   }
 
   lowcmd_subscriber_ = std::make_unique<unitree::robot::ChannelSubscriber<LowCmdMsg>>(

@@ -16,5 +16,6 @@ struct AppRuntimeFactoryResult {
 };
 
 AppRuntimeFactoryResult createAppRuntimeDeps(const AppConfig& config);
+bool shouldReleaseMotionModeOnStartup(const AppConfig& config);
 
 }  // namespace agentic_et1_tracker
