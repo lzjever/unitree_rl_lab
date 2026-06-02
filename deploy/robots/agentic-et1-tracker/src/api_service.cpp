@@ -4,6 +4,7 @@
 #include <cctype>
 #include <exception>
 #include <string>
+#include <vector>
 
 namespace agentic_et1_tracker {
 namespace {
@@ -102,6 +103,15 @@ bool parseMode(const nlohmann::json& input, MotionMode& mode) {
   return false;
 }
 
+bool hasOnlyKeys(const nlohmann::json& input, const std::vector<std::string>& allowed) {
+  for (const auto& item : input.items()) {
+    if (std::find(allowed.begin(), allowed.end(), item.key()) == allowed.end()) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool executeBlockedByController(ControllerState ctrl) {
   return ctrl == ControllerState::Starting || ctrl == ControllerState::Passive ||
          ctrl == ControllerState::FixStand || ctrl == ControllerState::Stopping ||
@@ -110,6 +120,20 @@ bool executeBlockedByController(ControllerState ctrl) {
 
 bool fixStandRecoveryState(ControllerState ctrl) {
   return ctrl == ControllerState::Passive || ctrl == ControllerState::Fault;
+}
+
+ErrorCode lowCmdOccupiedReadiness(ErrorCode readiness) {
+  return readiness == ErrorCode::Ok ? ErrorCode::RobotNotReady : readiness;
+}
+
+bool lowCmdOccupied(const StatusSnapshot& snapshot) {
+  return snapshot.block == "lowcmd_occupied";
+}
+
+bool fixStandRecoveryAllowed(const StatusSnapshot& snapshot, ErrorCode readiness) {
+  return fixStandRecoveryState(snapshot.ctrl) &&
+         readiness == ErrorCode::RobotBadOrientation &&
+         snapshot.block == "bad_orientation";
 }
 
 ErrorInfo controlStateConflictInfo(ControllerState ctrl) {
@@ -164,6 +188,21 @@ nlohmann::json successBase() {
   return {{"ok", true}};
 }
 
+ErrorInfo manualReadinessInfo(ErrorCode code) {
+  ErrorInfo info = apiErrorInfo(code);
+  info.retryable = false;
+  info.next = NextAction::Manual;
+  return info;
+}
+
+nlohmann::json idleSummaryJson(const IdleStatus& idle) {
+  return {
+      {"enabled", idle.enabled},
+      {"n", idle.n},
+      {"active", idle.active},
+  };
+}
+
 ServiceHealth projectedHealthState(const HealthSnapshot& health) {
   if (health.state != ServiceHealth::Ready) {
     return health.state;
@@ -202,6 +241,9 @@ ApiResponse AgentApiService::handle(const ApiRequest& request) {
     if (request.method == "POST" && target.path == "/execute") {
       return execute(request.body);
     }
+    if (request.method == "POST" && target.path == "/idle") {
+      return idle(request.body);
+    }
     if (request.method == "POST" && target.path == "/stop") {
       return stop(request.body);
     }
@@ -234,6 +276,9 @@ ApiResponse AgentApiService::execute(const std::string& body) {
   if (input.is_discarded() || !input.is_object()) {
     return error(ErrorCode::RequestInvalid);
   }
+  if (!hasOnlyKeys(input, {"path", "mode"})) {
+    return error(ErrorCode::RequestInvalid);
+  }
 
   const auto path_it = input.find("path");
   if (path_it == input.end() || !path_it->is_string() ||
@@ -249,6 +294,9 @@ ApiResponse AgentApiService::execute(const std::string& body) {
   const auto snapshot = status_.snapshot();
   const ErrorCode readiness = readinessError(snapshot);
   if (readiness != ErrorCode::Ok) {
+    if (snapshot.block == "lowcmd_occupied") {
+      return error(manualReadinessInfo(readiness));
+    }
     return error(readiness);
   }
   if (executeBlockedByController(snapshot.ctrl)) {
@@ -281,6 +329,50 @@ ApiResponse AgentApiService::execute(const std::string& body) {
   return {200, out};
 }
 
+ApiResponse AgentApiService::idle(const std::string& body) {
+  if (blank(body)) {
+    return error(ErrorCode::RequestInvalid);
+  }
+
+  auto input = nlohmann::json::parse(body, nullptr, false);
+  if (input.is_discarded() || !input.is_object()) {
+    return error(ErrorCode::RequestInvalid);
+  }
+  if (!hasOnlyKeys(input, {"paths"})) {
+    return error(ErrorCode::RequestInvalid);
+  }
+
+  const auto paths_it = input.find("paths");
+  if (paths_it == input.end() || !paths_it->is_array()) {
+    return error(ErrorCode::RequestInvalid);
+  }
+
+  std::vector<IdleMotion> motions;
+  motions.reserve(paths_it->size());
+  for (const auto& item : *paths_it) {
+    if (!item.is_string()) {
+      return error(ErrorCode::RequestInvalid);
+    }
+    const TrackValidation validation = validator_.validate(item.get<std::string>());
+    if (!validation.ok()) {
+      return error(validation.code);
+    }
+    IdleMotion motion;
+    motion.path = validation.metadata.canonical_path;
+    motion.track = validation.metadata;
+    motions.push_back(std::move(motion));
+  }
+
+  const IdleResult result = commands_.configureIdle(std::move(motions));
+  if (!result.ok()) {
+    return error(result.code);
+  }
+
+  auto out = successBase();
+  out["idle"] = idleSummaryJson(result.idle);
+  return {200, out};
+}
+
 ApiResponse AgentApiService::stop(const std::string& body) {
   if (!blank(body)) {
     return error(ErrorCode::RequestInvalid);
@@ -303,7 +395,11 @@ ApiResponse AgentApiService::fixStand(const std::string& body) {
 
   const StatusSnapshot snapshot = status_.snapshot();
   const ErrorCode readiness = readinessError(snapshot);
-  if (readiness != ErrorCode::Ok && !fixStandRecoveryState(snapshot.ctrl)) {
+  if (lowCmdOccupied(snapshot)) {
+    return error(manualReadinessInfo(lowCmdOccupiedReadiness(readiness)));
+  }
+  if (readiness != ErrorCode::Ok &&
+      !fixStandRecoveryAllowed(snapshot, readiness)) {
     return error(readiness);
   }
 
@@ -323,11 +419,14 @@ ApiResponse AgentApiService::standbyVelocity(const std::string& body) {
   }
 
   const StatusSnapshot snapshot = status_.snapshot();
+  const ErrorCode readiness = readinessError(snapshot);
+  if (lowCmdOccupied(snapshot)) {
+    return error(manualReadinessInfo(lowCmdOccupiedReadiness(readiness)));
+  }
   if (snapshot.ctrl == ControllerState::Passive ||
       snapshot.ctrl == ControllerState::Fault) {
     return controlStateConflict(snapshot.ctrl);
   }
-  const ErrorCode readiness = readinessError(snapshot);
   if (readiness != ErrorCode::Ok) {
     return error(readiness);
   }

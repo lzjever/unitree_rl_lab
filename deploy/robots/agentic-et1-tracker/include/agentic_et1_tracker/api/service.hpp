@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -56,6 +57,13 @@ struct ControlResult {
   bool ok() const { return code == ErrorCode::Ok; }
 };
 
+struct IdleResult {
+  ErrorCode code{ErrorCode::Ok};
+  IdleStatus idle;
+
+  bool ok() const { return code == ErrorCode::Ok; }
+};
+
 class ExecutionCommandSink {
  public:
   virtual ~ExecutionCommandSink() = default;
@@ -64,6 +72,7 @@ class ExecutionCommandSink {
   virtual StopResult stop() = 0;
   virtual ControlResult fixStand() = 0;
   virtual ControlResult standbyVelocity() = 0;
+  virtual IdleResult configureIdle(std::vector<IdleMotion> motions) = 0;
 };
 
 class StatusReader {
@@ -98,6 +107,7 @@ class AgentApiService {
 
  private:
   ApiResponse execute(const std::string& body);
+  ApiResponse idle(const std::string& body);
   ApiResponse stop(const std::string& body);
   ApiResponse fixStand(const std::string& body);
   ApiResponse standbyVelocity(const std::string& body);

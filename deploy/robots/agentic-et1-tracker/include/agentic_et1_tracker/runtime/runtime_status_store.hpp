@@ -31,7 +31,9 @@ class RuntimeStatusStore final : public StatusReader {
                                          std::uint64_t sequence,
                                          std::uint64_t stop_sequence);
   StopResult acceptStop();
-  ControlResult acceptControl(ControlMode mode);
+  ControlResult acceptControl(ControlMode mode, bool preserve_queued = false);
+  IdleResult acceptIdleConfig(std::vector<IdleMotion> motions);
+  bool clearIdleConfig();
   std::size_t cancelQueuedForStop(std::uint64_t sequence);
   std::vector<std::string> queuedIdsLocked() const;
   std::size_t cancelQueuedLocked(StopReason reason);
@@ -43,6 +45,8 @@ class RuntimeStatusStore final : public StatusReader {
   HealthSnapshot health_;
   std::deque<MotionStatus> accepted_;
   std::deque<MotionStatus> recent_;
+  std::vector<IdleMotion> idle_config_;
+  IdleStatus idle_status_;
 };
 
 }  // namespace agentic_et1_tracker

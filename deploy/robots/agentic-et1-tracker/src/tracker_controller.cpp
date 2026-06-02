@@ -113,6 +113,7 @@ StatusSnapshot TrackerController::status() const {
   snapshot.block = block();
   snapshot.err = statusError();
   if (active_) {
+    snapshot.active = {ActiveKind::User, active_->id};
     snapshot.exec = toStatus(*active_);
   }
   return snapshot;

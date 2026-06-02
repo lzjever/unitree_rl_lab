@@ -98,11 +98,28 @@ def full_status(base, run_id=None, timeout=5.0):
     return request(base, "GET", "/status", timeout=timeout)
 
 
+def short_active(active):
+    if not isinstance(active, dict):
+        return active
+    return {key: active.get(key) for key in ("kind", "id") if key in active}
+
+
+def short_idle(idle):
+    if not isinstance(idle, dict):
+        return idle
+    keys = ("enabled", "n", "active", "current", "frame", "frames", "progress")
+    return {key: idle.get(key) for key in keys if key in idle}
+
+
 def short_status(doc, extra=None):
     out = {"ok": bool(doc.get("ok", False))}
     for key in ("id", "state", "ctrl", "ready", "err", "next"):
         if key in doc:
             out[key] = doc.get(key)
+    if "active" in doc:
+        out["active"] = short_active(doc["active"])
+    if "idle" in doc:
+        out["idle"] = short_idle(doc["idle"])
     if "error" in doc:
         out["error"] = doc["error"]
     if extra:
@@ -169,6 +186,14 @@ def with_top_fields(out, top):
 def execute_once(base, path, mode, timeout):
     validate_path(path)
     return request(base, "POST", "/execute", {"path": path, "mode": mode}, timeout=timeout)
+
+
+def idle_cmd(base, action, paths, timeout):
+    if action == "clear":
+        return request(base, "POST", "/idle", {"paths": []}, timeout=timeout)
+    for path in paths:
+        validate_path(path)
+    return request(base, "POST", "/idle", {"paths": paths}, timeout=timeout)
 
 
 def missing_id_error(base, timeout):
@@ -331,6 +356,14 @@ def parse(argv):
     pstop = sub.add_parser("stop")
     add_timing(pstop)
 
+    pidle = sub.add_parser("idle")
+    idle_sub = pidle.add_subparsers(dest="idle_cmd", required=True)
+    pidle_clear = idle_sub.add_parser("clear")
+    add_timing(pidle_clear)
+    pidle_set = idle_sub.add_parser("set")
+    pidle_set.add_argument("paths", nargs="+")
+    add_timing(pidle_set)
+
     pe = sub.add_parser("exec")
     pe.add_argument("path")
     pe.add_argument("--mode", choices=("queue", "interrupt"), default="interrupt")
@@ -391,6 +424,8 @@ def main(argv):
             out = control_cmd(base, "/standby_velocity", timeout)
         elif args.cmd == "stop":
             out = control_cmd(base, "/stop", timeout)
+        elif args.cmd == "idle":
+            out = idle_cmd(base, args.idle_cmd, getattr(args, "paths", []), timeout)
         elif args.cmd == "exec":
             started = execute_once(base, args.path, args.mode, timeout)
             if args.wait and started.get("ok") and not started.get("id"):

@@ -14,6 +14,8 @@ Default tracker: `http://127.0.0.1:8083`; override with `ET1_TRACKER_URL`.
 <skill-dir>/scripts/et1-trk2motion ready
 <skill-dir>/scripts/et1-trk2motion run /abs/file.trk --wait
 <skill-dir>/scripts/et1-trk2motion repeat /abs/file.trk -n 3
+<skill-dir>/scripts/et1-trk2motion idle set /abs/idle-a.trk /abs/idle-b.trk
+<skill-dir>/scripts/et1-trk2motion idle clear
 <skill-dir>/scripts/et1-trk2motion stop
 <skill-dir>/scripts/et1-trk2motion fixstand
 <skill-dir>/scripts/et1-trk2motion standby
@@ -22,13 +24,18 @@ Default tracker: `http://127.0.0.1:8083`; override with `ET1_TRACKER_URL`.
 `ready` handles `passive -> fixstand -> standby` and `fixstand -> standby`.
 `run` defaults to `ready` first, then execute. Use `--recover off` only when
 the caller intentionally manages control state.
+`idle set` configures the idle pool only; it returns no run id. `idle clear`
+posts `{"paths":[]}`. Idle never appears in user `exec/queue` or `status?id=`.
 
 Useful options:
 `run PATH --mode interrupt|queue --wait --timeout S --poll S`
 `repeat PATH -n N --verbose`
 
 All CLI output is one compact JSON line. Prefer short output; do not paste full
-pose/status arrays unless asked.
+pose/status arrays unless asked. Short `state/status` includes compact
+`active.kind/id` and `idle.enabled/n/active/current/frame/frames/progress`.
+Treat `active.kind=="user"` plus `id` as the only waitable run; `idle` has
+`id:null`.
 
 Final user reply after live control: action taken, run id if any, terminal state
 if waited, and current `ctrl/ready/err`.

@@ -87,8 +87,9 @@ class RuntimeControlLoop final {
 
   bool consumePendingCommands();
   void consumeStoppingCommands();
-  void handleStop(std::uint64_t sequence);
+  void handleStop(std::uint64_t sequence, bool requires_stopping);
   void handleControl(ControlMode mode);
+  void handleIdleConfig(std::vector<IdleMotion> motions);
   void handleInterrupt(MotionRequest request);
   void cancelWaiting(StopReason reason);
   void cancelWaiting(StopReason reason, std::uint64_t sequence);
@@ -105,6 +106,9 @@ class RuntimeControlLoop final {
   bool isControlPublishingState() const;
   void runPassiveState();
   void startNext();
+  bool hasIdleStartCandidate() const;
+  bool canStartIdle() const;
+  void startIdle();
   void completePreparing();
   void advanceActive();
   void advanceActiveWithPolicy();
@@ -123,6 +127,7 @@ class RuntimeControlLoop final {
   std::optional<MotionRequest> finishActive(MotionState state,
                                             StopReason reason,
                                             ErrorCode error);
+  void stopIdleActive();
   void enterStopping(StopReason reason);
   std::size_t ticksForPeriod(double seconds) const;
   std::size_t ticksForRate(double rate_hz) const;
@@ -139,6 +144,7 @@ class RuntimeControlLoop final {
   void fillSnapshotPose(StatusSnapshot& snapshot);
   MotionStatus toStatus(const MotionRequest& request) const;
   std::vector<std::string> waitingIds() const;
+  IdleStatus idleStatus() const;
   RobotState robotState() const;
   bool hasPolicyRuntime() const;
   bool hasControlRuntime() const;
@@ -173,8 +179,12 @@ class RuntimeControlLoop final {
   RuntimeMode mode_{RuntimeMode::Sim};
   std::deque<MotionRequest> waiting_;
   std::optional<MotionRequest> active_;
+  ActiveKind active_kind_{ActiveKind::None};
   std::shared_ptr<const TrkTrack> active_track_;
   std::optional<PolicyStepRunner> policy_runner_;
+  std::vector<IdleMotion> idle_config_;
+  std::size_t idle_next_index_{0};
+  std::optional<std::size_t> idle_current_index_;
   SnapshotRuntimeState runtime_state_;
   RuntimeInternalState fsm_state_{RuntimeInternalState::GeneralTrackerIdle};
   ControllerState ctrl_{ControllerState::Idle};

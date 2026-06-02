@@ -61,6 +61,12 @@ enum class MotionMode {
   Interrupt,
 };
 
+enum class ActiveKind {
+  None,
+  User,
+  Idle,
+};
+
 enum class RuntimeMode {
   Unknown,
   Sim,
@@ -115,10 +121,23 @@ struct MotionRequest {
   std::chrono::steady_clock::time_point ended_at{};
 };
 
+struct TrackMetadata {
+  std::size_t frames{0};
+  double duration_s{0.0};
+  double fps{50.0};
+  std::string canonical_path;
+};
+
+struct IdleMotion {
+  std::string path;
+  TrackMetadata track;
+};
+
 std::string toString(ErrorCode code);
 std::string toString(NextAction next);
 std::string toString(MotionState state);
 std::string toString(MotionMode mode);
+std::string toString(ActiveKind kind);
 std::string toString(RuntimeMode mode);
 std::string toString(ControllerState state);
 std::string toString(ControlMode mode);

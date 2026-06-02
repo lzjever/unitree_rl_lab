@@ -130,6 +130,24 @@ bool hasActivePublishedRun(const std::deque<MotionStatus>& statuses) {
   });
 }
 
+IdleStatus idleStatusForConfig(const std::vector<IdleMotion>& motions) {
+  IdleStatus status;
+  status.enabled = !motions.empty();
+  status.n = motions.size();
+  status.active = false;
+  return status;
+}
+
+bool sameIdleConfig(const IdleStatus& lhs, const IdleStatus& rhs) {
+  return lhs.enabled == rhs.enabled && lhs.n == rhs.n;
+}
+
+void normalizeActive(StatusSnapshot& snapshot) {
+  if (snapshot.active.kind == ActiveKind::None && snapshot.exec) {
+    snapshot.active = {ActiveKind::User, snapshot.exec->id};
+  }
+}
+
 }  // namespace
 
 RuntimeStatusStore::RuntimeStatusStore(RuntimeConfig config)
@@ -140,7 +158,13 @@ RuntimeStatusStore::RuntimeStatusStore(RuntimeConfig config)
 
 void RuntimeStatusStore::publishSnapshot(StatusSnapshot snapshot) {
   std::lock_guard<std::mutex> lock(mutex_);
+  const IdleStatus published_idle = snapshot.idle;
   snapshot_ = std::move(snapshot);
+  if (sameIdleConfig(published_idle, idle_status_)) {
+    idle_status_ = published_idle;
+  }
+  snapshot_.idle = idle_status_;
+  normalizeActive(snapshot_);
   if (snapshot_.hz == 0.0) {
     snapshot_.hz = config_.hz;
   }
@@ -177,6 +201,8 @@ StatusSnapshot RuntimeStatusStore::snapshot() const {
   if (snapshot.hz == 0.0) {
     snapshot.hz = config_.hz;
   }
+  snapshot.idle = idle_status_;
+  normalizeActive(snapshot);
   return snapshot;
 }
 
@@ -248,17 +274,44 @@ StopResult RuntimeStatusStore::acceptStop() {
   return {ErrorCode::Ok, ControllerState::Stopping, StopReason::Stop, 0};
 }
 
-ControlResult RuntimeStatusStore::acceptControl(ControlMode mode) {
+ControlResult RuntimeStatusStore::acceptControl(ControlMode mode, bool preserve_queued) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (mode == ControlMode::StandbyVelocity &&
       (snapshot_.ctrl == ControllerState::Passive ||
        snapshot_.ctrl == ControllerState::Fault)) {
     return {ErrorCode::ControlStateConflict};
   }
-  if (mode == ControlMode::FixStand) {
+  if (mode == ControlMode::FixStand && !preserve_queued) {
     cancelQueuedLocked(StopReason::Stop);
   }
   return {ErrorCode::Ok};
+}
+
+IdleResult RuntimeStatusStore::acceptIdleConfig(std::vector<IdleMotion> motions) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  idle_config_ = std::move(motions);
+  idle_status_ = idleStatusForConfig(idle_config_);
+  snapshot_.idle = idle_status_;
+  if (snapshot_.active.kind == ActiveKind::Idle) {
+    snapshot_.active = {ActiveKind::None, ""};
+  }
+  IdleResult result;
+  result.idle = idle_status_;
+  return result;
+}
+
+bool RuntimeStatusStore::clearIdleConfig() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const bool had_idle = !idle_config_.empty() || idle_status_.enabled ||
+                        snapshot_.idle.enabled ||
+                        snapshot_.active.kind == ActiveKind::Idle;
+  idle_config_.clear();
+  idle_status_ = IdleStatus{};
+  snapshot_.idle = idle_status_;
+  if (snapshot_.active.kind == ActiveKind::Idle) {
+    snapshot_.active = {ActiveKind::None, ""};
+  }
+  return had_idle;
 }
 
 std::size_t RuntimeStatusStore::cancelQueuedForStop(std::uint64_t sequence) {

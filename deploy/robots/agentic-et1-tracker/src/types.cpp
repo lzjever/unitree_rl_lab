@@ -96,6 +96,18 @@ std::string toString(MotionMode mode) {
   return "queue";
 }
 
+std::string toString(ActiveKind kind) {
+  switch (kind) {
+    case ActiveKind::None:
+      return "none";
+    case ActiveKind::User:
+      return "user";
+    case ActiveKind::Idle:
+      return "idle";
+  }
+  return "none";
+}
+
 std::string toString(RuntimeMode mode) {
   switch (mode) {
     case RuntimeMode::Unknown:

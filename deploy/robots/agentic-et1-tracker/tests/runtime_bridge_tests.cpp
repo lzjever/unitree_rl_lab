@@ -33,6 +33,18 @@ ExecuteCommand executeCommand(std::string id,
   return command;
 }
 
+IdleMotion idleMotion(std::string path,
+                      std::size_t frames = 40,
+                      double duration_s = 0.8) {
+  IdleMotion motion;
+  motion.path = std::move(path);
+  motion.track.frames = frames;
+  motion.track.duration_s = duration_s;
+  motion.track.fps = 50.0;
+  motion.track.canonical_path = motion.path;
+  return motion;
+}
+
 StatusSnapshot readySnapshot(ControllerState ctrl = ControllerState::Idle) {
   StatusSnapshot snapshot;
   snapshot.ready = true;
@@ -73,6 +85,60 @@ TEST_CASE("RuntimeBridge admits queue requests without touching controller state
   REQUIRE(lookup.run->path == "/tmp/run-a.trk");
   REQUIRE(lookup.run->frames == 120);
   REQUIRE(lookup.run->duration_s == 2.4);
+}
+
+TEST_CASE("RuntimeBridge configureIdle publishes status without user queue state") {
+  const RuntimeConfig config = runtimeConfig(8);
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  store.publishSnapshot(readySnapshot());
+
+  const auto result =
+      bridge.configureIdle({idleMotion("/tmp/idle-a.trk"), idleMotion("/tmp/idle-b.trk")});
+
+  REQUIRE(result.code == ErrorCode::Ok);
+  REQUIRE(result.idle.enabled);
+  REQUIRE(result.idle.n == 2);
+  REQUIRE_FALSE(result.idle.active);
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.active.kind == ActiveKind::None);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.queue.ids.empty());
+  REQUIRE(snapshot.idle.enabled);
+  REQUIRE(snapshot.idle.n == 2);
+  REQUIRE_FALSE(snapshot.idle.active);
+  REQUIRE(store.findRun("/tmp/idle-a.trk").code == ErrorCode::RunNotFound);
+
+  auto command = bridge.consumeNextCommand();
+  REQUIRE(command.has_value());
+  REQUIRE(command->kind == CommandKind::IdleConfig);
+  REQUIRE(command->idle_motions.size() == 2);
+  REQUIRE(command->idle_motions.at(0).path == "/tmp/idle-a.trk");
+  REQUIRE(store.snapshot().idle.enabled);
+}
+
+TEST_CASE("RuntimeBridge stop clears idle status and emits stop for idle config") {
+  const RuntimeConfig config = runtimeConfig(8);
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  store.publishSnapshot(readySnapshot());
+
+  REQUIRE(bridge.configureIdle({idleMotion("/tmp/idle.trk")}).ok());
+  REQUIRE(store.snapshot().idle.enabled);
+
+  const auto stopped = bridge.stop();
+
+  REQUIRE(stopped.code == ErrorCode::Ok);
+  REQUIRE(stopped.state == ControllerState::Idle);
+  REQUIRE(stopped.stop_reason == StopReason::None);
+  REQUIRE_FALSE(store.snapshot().idle.enabled);
+  REQUIRE(store.snapshot().idle.n == 0);
+  REQUIRE_FALSE(store.snapshot().idle.active);
+  auto command = bridge.consumeNextCommand();
+  REQUIRE(command.has_value());
+  REQUIRE(command->kind == CommandKind::Stop);
+  REQUIRE_FALSE(bridge.consumeNextCommand().has_value());
 }
 
 TEST_CASE("RuntimeStatusStore lookup prefers current exec then accepted queue then recent") {
@@ -577,6 +643,47 @@ TEST_CASE("RuntimeBridge stop watermark preserves queue accepted after stop") {
   REQUIRE(command.has_value());
   REQUIRE(command->kind == CommandKind::Queue);
   REQUIRE(command->request.id == "new-before-consume");
+  REQUIRE_FALSE(bridge.consumeNextCommand().has_value());
+}
+
+TEST_CASE("RuntimeBridge fixstand after pending stop preserves stop watermark") {
+  const RuntimeConfig config = runtimeConfig(8);
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+
+  store.publishSnapshot(readySnapshot());
+  REQUIRE(bridge.submitQueue(executeCommand("old-before-stop")).ok());
+  REQUIRE(bridge.stop().state == ControllerState::Stopping);
+  REQUIRE(bridge.submitQueue(executeCommand("new-after-stop")).ok());
+
+  const ControlResult fixstand = bridge.fixStand();
+  REQUIRE(fixstand.ok());
+  REQUIRE(store.snapshot().queue.ids ==
+          std::vector<std::string>{"old-before-stop", "new-after-stop"});
+
+  auto command = bridge.consumeNextCommand();
+  REQUIRE(command.has_value());
+  REQUIRE(command->kind == CommandKind::Stop);
+
+  const auto old = store.findRun("old-before-stop");
+  REQUIRE(old.code == ErrorCode::Ok);
+  REQUIRE(old.run->state == MotionState::Canceled);
+  REQUIRE(old.run->stop_reason == StopReason::Stop);
+
+  const auto kept = store.findRun("new-after-stop");
+  REQUIRE(kept.code == ErrorCode::Ok);
+  REQUIRE(kept.run->state == MotionState::Queued);
+  REQUIRE(kept.run->stop_reason == StopReason::None);
+  REQUIRE(store.snapshot().queue.ids == std::vector<std::string>{"new-after-stop"});
+
+  command = bridge.consumeNextCommand();
+  REQUIRE(command.has_value());
+  REQUIRE(command->kind == CommandKind::FixStand);
+
+  command = bridge.consumeNextCommand();
+  REQUIRE(command.has_value());
+  REQUIRE(command->kind == CommandKind::Queue);
+  REQUIRE(command->request.id == "new-after-stop");
   REQUIRE_FALSE(bridge.consumeNextCommand().has_value());
 }
 

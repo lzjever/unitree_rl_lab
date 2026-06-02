@@ -23,8 +23,21 @@ class TrackerState:
         self.next_id = 1
         self.run_status = {}
         self.missing_execute_id = False
+        self.execute_idle_response = False
         self.large_health = False
         self.large_control = False
+        self.active = {"kind": "none", "id": None}
+        self.idle = {
+            "enabled": False,
+            "n": 0,
+            "active": False,
+            "current": None,
+            "frame": 0,
+            "frames": 0,
+            "time_s": 0,
+            "duration_s": 0,
+            "progress": 0,
+        }
 
     def top_status(self):
         return {
@@ -32,6 +45,8 @@ class TrackerState:
             "ctrl": self.ctrl,
             "ready": self.ready,
             "err": self.err,
+            "active": dict(self.active),
+            "idle": dict(self.idle),
             "pose": list(range(64)),
         }
 
@@ -101,7 +116,26 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(state.response({"ok": True}, state.large_control))
         elif self.path == "/stop":
             self.send_json(state.response({"ok": True}, state.large_control))
+        elif self.path == "/idle":
+            paths = payload.get("paths") if isinstance(payload, dict) else None
+            state.idle.update(
+                {
+                    "enabled": bool(paths),
+                    "n": len(paths or []),
+                    "active": False,
+                    "current": None,
+                    "frame": 0,
+                    "frames": 0,
+                    "progress": 0,
+                }
+            )
+            self.send_json({"ok": True, "idle": {key: state.idle[key] for key in ("enabled", "n", "active")}})
         elif self.path == "/execute":
+            if state.execute_idle_response:
+                state.active = {"kind": "idle", "id": None}
+                state.idle.update({"enabled": True, "n": 1, "active": True, "current": 0, "frame": 3, "frames": 12, "progress": 0.25})
+                self.send_json({"ok": True, "active": dict(state.active), "idle": dict(state.idle)})
+                return
             if state.missing_execute_id:
                 self.send_json({"ok": True})
                 return
@@ -148,7 +182,25 @@ class ServerCase(unittest.TestCase):
     def test_state_short_output_omits_pose(self):
         proc, out = self.cli("state")
         self.assertEqual(proc.returncode, 0)
-        self.assertEqual(out, {"ok": True, "ctrl": "standby_velocity", "ready": True, "err": None})
+        self.assertEqual(
+            out,
+            {
+                "ok": True,
+                "ctrl": "standby_velocity",
+                "ready": True,
+                "err": None,
+                "active": {"kind": "none", "id": None},
+                "idle": {
+                    "enabled": False,
+                    "n": 0,
+                    "active": False,
+                    "current": None,
+                    "frame": 0,
+                    "frames": 0,
+                    "progress": 0,
+                },
+            },
+        )
 
     def test_ready_from_passive_fixstand_then_standby(self):
         self.state.ctrl = "passive"
@@ -183,6 +235,29 @@ class ServerCase(unittest.TestCase):
         self.assertEqual(proc.returncode, 0)
         self.assertEqual(out, {"ok": True, "body": {"x": 1}})
 
+    def test_idle_set_and_clear(self):
+        proc, out = self.cli("idle", "set", TRK, "/tmp/et1-idle-b.trk")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(out, {"ok": True, "idle": {"enabled": True, "n": 2, "active": False}})
+
+        proc, out = self.cli("idle", "clear")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(out, {"ok": True, "idle": {"enabled": False, "n": 0, "active": False}})
+        self.assertEqual(
+            [(m, p, b) for m, p, b in self.state.records if m == "POST" and p == "/idle"],
+            [
+                ("POST", "/idle", {"paths": [TRK, "/tmp/et1-idle-b.trk"]}),
+                ("POST", "/idle", {"paths": []}),
+            ],
+        )
+
+    def test_idle_set_validates_paths_before_post(self):
+        proc, out = self.cli("idle", "set", "relative.trk")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["error"]["code"], "bad_path")
+        self.assertEqual(self.state.records, [])
+
     def test_wait_failed_terminal_is_nonzero(self):
         self.state.run_status["bad"] = [{"ok": True, "id": "bad", "state": "failed", "err": "boom"}]
         proc, out = self.cli("wait", "bad", "--timeout", "1", "--poll", "0.01")
@@ -209,6 +284,14 @@ class ServerCase(unittest.TestCase):
         self.assertFalse(out["ok"])
         self.assertEqual(out["error"]["code"], "missing_id")
         self.assertEqual(out["ctrl"], "standby_velocity")
+        self.assertNotIn(("GET", "/status?id=None"), [(m, p) for m, p, _ in self.state.records])
+
+    def test_run_wait_idle_active_response_is_not_a_run_id(self):
+        self.state.execute_idle_response = True
+        proc, out = self.cli("run", TRK, "--wait", "--recover", "off", "--timeout", "1", "--poll", "0.01")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["error"]["code"], "missing_id")
         self.assertNotIn(("GET", "/status?id=None"), [(m, p) for m, p, _ in self.state.records])
 
     def test_exec_wait_missing_execute_id_is_short_error(self):

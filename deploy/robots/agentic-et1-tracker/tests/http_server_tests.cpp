@@ -70,6 +70,16 @@ class FakeSink final : public ExecutionCommandSink {
     return standby_velocity_result;
   }
 
+  IdleResult configureIdle(std::vector<IdleMotion> motions) override {
+    ++idle_calls;
+    idle_motions = std::move(motions);
+    IdleResult out{ErrorCode::Ok, IdleStatus{}};
+    out.idle.enabled = !idle_motions.empty();
+    out.idle.n = idle_motions.size();
+    out.idle.active = false;
+    return out;
+  }
+
   ExecuteResult queue_result{ErrorCode::Ok, "", MotionState::Queued, 1};
   ExecuteResult interrupt_result{ErrorCode::Ok, "", MotionState::Queued, 1};
   StopResult stop_result{ErrorCode::Ok, ControllerState::Stopping, StopReason::Stop, 0};
@@ -80,8 +90,10 @@ class FakeSink final : public ExecutionCommandSink {
   int stop_calls{0};
   int fixstand_calls{0};
   int standby_velocity_calls{0};
+  int idle_calls{0};
   std::vector<ExecuteCommand> queue_commands;
   std::vector<ExecuteCommand> interrupt_commands;
+  std::vector<IdleMotion> idle_motions;
 };
 
 class FakeStatus final : public StatusReader {
@@ -420,6 +432,58 @@ TEST_CASE("POST /execute malformed JSON returns request invalid before ports") {
   REQUIRE(r.h.sink.queue_calls == 0);
   REQUIRE(r.h.sink.interrupt_calls == 0);
   REQUIRE(r.h.ids.calls == 0);
+}
+
+TEST_CASE("POST /execute strict schema rejects extra fields before ports") {
+  RunningHarness r;
+  httplib::Client client("127.0.0.1", r.h.server.boundPort());
+
+  const auto result = client.Post(
+      "/execute",
+      R"({"path":"/tracks/wave.trk","paths":["/tracks/idle.trk"]})",
+      "application/json");
+
+  r.requireJson(result, 400);
+  const auto body = r.parse(result);
+  REQUIRE(body.at("ok") == false);
+  REQUIRE(body.at("error").at("code") == "REQUEST_INVALID");
+  REQUIRE(r.h.validator.calls == 0);
+  REQUIRE(r.h.sink.queue_calls == 0);
+  REQUIRE(r.h.sink.interrupt_calls == 0);
+  REQUIRE(r.h.ids.calls == 0);
+}
+
+TEST_CASE("POST /idle route configures and clears idle paths") {
+  RunningHarness r;
+  httplib::Client client("127.0.0.1", r.h.server.boundPort());
+
+  auto result = client.Post(
+      "/idle", R"({"paths":["/tracks/idle-a.trk"]})", "application/json");
+
+  r.requireJson(result, 200);
+  auto body = r.parse(result);
+  REQUIRE(body.at("ok") == true);
+  REQUIRE(body.at("idle").at("enabled") == true);
+  REQUIRE(body.at("idle").at("n") == 1);
+  REQUIRE(body.at("idle").at("active") == false);
+  REQUIRE(r.h.validator.calls == 1);
+  REQUIRE(r.h.validator.paths == std::vector<std::string>{"/tracks/idle-a.trk"});
+  REQUIRE(r.h.sink.idle_calls == 1);
+  REQUIRE(r.h.sink.idle_motions.at(0).path == "/tracks/idle-a.trk");
+  REQUIRE(r.h.sink.queue_calls == 0);
+  REQUIRE(r.h.sink.interrupt_calls == 0);
+  REQUIRE(r.h.ids.calls == 0);
+
+  result = client.Post("/idle", R"({"paths":[]})", "application/json");
+
+  r.requireJson(result, 200);
+  body = r.parse(result);
+  REQUIRE(body.at("ok") == true);
+  REQUIRE(body.at("idle").at("enabled") == false);
+  REQUIRE(body.at("idle").at("n") == 0);
+  REQUIRE(r.h.validator.calls == 1);
+  REQUIRE(r.h.sink.idle_calls == 2);
+  REQUIRE(r.h.sink.idle_motions.empty());
 }
 
 TEST_CASE("POST /stop empty body stops and non-empty body is rejected") {

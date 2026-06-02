@@ -46,17 +46,34 @@ Commands:
 - `GET /status`: full runtime state.
 - `GET /status?id=<id>`: one run plus compact runtime context.
 - `POST /execute`: `{"path":"/absolute/file.trk","mode":"queue|interrupt"}`.
-  `mode` is optional and defaults to `queue`.
+  Only `path` and optional `mode` are allowed; `mode` defaults to `queue`.
+- `POST /idle`: `{"paths":["/absolute/idle-a.trk","/absolute/idle-b.trk"]}`.
+- `POST /idle`: `{"paths":[]}` clears the idle pool.
 - `POST /stop`: empty body; stops active work and cancels queued work.
 - `POST /fixstand`: empty body; enter FixStand.
 - `POST /standby_velocity`: empty body; enter StandbyVelocity.
 
-`/execute` accepts local `.trk` paths allowed by `motion_dirs` only. It does not
-accept uploads, non-`.trk` files, or embedded motion payloads.
+`/execute` accepts local `.trk` paths allowed by `motion_dirs` only. It rejects
+uploads, non-`.trk` files, embedded motion payloads, `paths`, and any extra
+JSON field with 400 `REQUEST_INVALID` before path validation, command sinks, or
+run id allocation. Idle playback yields to user `/execute`; the accepted user
+run still receives the only waitable run id.
+
+`/idle` is a config endpoint, not a run submission endpoint. It atomically
+replaces the idle pool after validating every path with the same local `.trk`
+rules as `/execute`; any failed path leaves the old idle config unchanged.
+`{"paths":[]}` clears the config without path validation. Idle does not use
+`queue.limit`, `queue.ids`, `exec`, or `GET /status?id=...`.
+
+`/stop` is highest priority for active work, stops idle playback, and clears the
+idle config. It preserves the stop watermark: user queue/interrupt requests
+accepted after a pending stop are not canceled by that older stop.
+
 Control-changing routes return the current `/status.err` readiness error before
-claiming success when the runtime is unavailable or not ready. `/fixstand`
-remains available from `passive` and `fault` recovery states; `/standby_velocity`
-returns `CONTROL_STATE_CONFLICT` from those states.
+claiming success when the runtime is unavailable or not ready. `FixStand` is the
+only software recovery exception for `block:"bad_orientation"` when LowCmd is
+not externally occupied; it does not bypass `lowcmd_occupied`. `/standby_velocity`
+returns `CONTROL_STATE_CONFLICT` from `passive` and `fault`.
 
 Startup safety:
 
@@ -65,6 +82,8 @@ Startup safety:
   refuses to start the writing runtime if a fresh external LowCmd owner exists.
 - Startup owner conflict status is compact: `ready:false`,
   `block:"lowcmd_occupied"`, `err.code:"ROBOT_NOT_READY"`.
+- Any API response caused by `block:"lowcmd_occupied"` uses `next:"manual"`;
+  agents must not wait/retry to auto-reclaim LowCmd.
 
 Error envelope:
 
@@ -82,8 +101,8 @@ Common error handling:
 | `REQUEST_INVALID` | `fix` | Fix JSON/body/path/mode and retry. |
 | `SERVICE_NOT_READY` | `status` | Poll `/status`. |
 | `ROBOT_DISCONNECTED` | `wait_robot` | Wait; poll `/status`. |
-| `ROBOT_NOT_READY` | `wait_robot` | Wait or operator action; poll `/status`. |
-| `ROBOT_BAD_ORIENTATION` | `manual` | Operator fixes pose, then `/fixstand`. |
+| `ROBOT_NOT_READY` | `wait_robot` or `manual` | If `block:"lowcmd_occupied"`, operator/manual only; otherwise wait and poll `/status`. |
+| `ROBOT_BAD_ORIENTATION` | `manual` | `/fixstand` is the software recovery route only when `block:"bad_orientation"` and LowCmd is free; otherwise operator action. |
 | `MODEL_NOT_READY` | `status` | Poll `/health` or `/status`. |
 | `TRK_*` | `fix` | Use an allowed existing `.trk`. |
 | `QUEUE_FULL` | `status` | Poll `/status`; retry after queue drains. |
@@ -96,14 +115,20 @@ Status schemas:
 
 ```json
 // GET /status
-{"ok":true,"ready":true,"mode":"sim","robot":"idle","ctrl":"standby_velocity","stop_reason":null,"hz":1000,"exec":null,"queue":{"n":0,"limit":8,"ids":[]},"low_ms":0,"block":null,"err":null,"pose":{"q":[1,0,0,0],"g":[0,0,0],"p":null,"v":null}}
+{"ok":true,"ready":true,"mode":"sim","robot":"idle","ctrl":"standby_velocity","stop_reason":null,"hz":1000,"active":{"kind":"none","id":null},"exec":null,"queue":{"n":0,"limit":8,"ids":[]},"idle":{"enabled":true,"n":2,"active":false,"current":null,"frame":0,"frames":0,"time_s":0,"duration_s":0,"progress":0},"low_ms":0,"block":null,"err":null,"pose":{"q":[1,0,0,0],"g":[0,0,0],"p":null,"v":null}}
+
+// GET /status while idle is playing
+{"ok":true,"ready":true,"mode":"sim","robot":"running","ctrl":"running","stop_reason":null,"hz":1000,"active":{"kind":"idle","id":null},"exec":null,"queue":{"n":0,"limit":8,"ids":[]},"idle":{"enabled":true,"n":2,"active":true,"current":0,"frame":12,"frames":120,"time_s":0.24,"duration_s":2.4,"progress":0.1},"low_ms":0,"block":null,"err":null,"pose":{"q":[1,0,0,0],"g":[0,0,0],"p":null,"v":null}}
 
 // GET /status?id=<id>
 {"ok":true,"id":"a7K3p9Qx","state":"queued","frame":0,"frames":120,"time_s":0,"duration_s":2.4,"progress":0,"stop_reason":null,"err":null,"path":"/absolute/file.trk","robot":"holding","ctrl":"fixstand","ready":false,"block":"operator_wait","queue_pos":1,"top_err":"ROBOT_NOT_READY"}
 ```
 
-`queue_pos` is 1-based and `null` when the run is not queued. `top_err` is the
-full `/status.err` code or `null`.
+`active.kind` is authoritative: `user` with a non-null `id` is the only waitable
+run. `idle` has `id:null`; `exec` and `queue` only describe user runs. Idle
+progress lives under `idle` and is not queryable with `GET /status?id=...`.
+`queue_pos` is 1-based and `null` when the user run is not queued. `top_err` is
+the full `/status.err` code or `null`.
 `pose` is intentionally small for frequent polling: `q` is lowstate quaternion
 `[w,x,y,z]`, `g` is lowstate gyro `[x,y,z]`, `p` is highstate position or
 `null`, and `v` is highstate linear velocity or `null`.
@@ -113,14 +138,13 @@ Controller states:
 | ctrl | robot behavior | accepts | rejects/notes |
 | --- | --- | --- | --- |
 | `starting` | Runtime is initializing. | `/status`, `/health` | Control routes return readiness errors such as `SERVICE_NOT_READY` or `MODEL_NOT_READY`; wait for `ready:true`. |
-| `passive` | Safety sink; publishes passive damping command. | `/fixstand`, `/stop` | `/execute` and `/standby_velocity` return `CONTROL_STATE_CONFLICT`. |
-| `fixstand` | Holds configured stand posture. | `/standby_velocity`, `/stop`, `/fixstand` | `/execute` returns conflict; call `/standby_velocity` first. |
-| `standby_velocity` | Velocity policy with zero command; robot stands idle. | `/execute`, `/fixstand`, `/stop` | Normal state for starting `.trk`. |
-| `idle` | Tracker idle without full velocity runtime, mainly tests/stubs. | `/execute`, `/fixstand`, `/stop` | Real GA runtime normally uses `standby_velocity`. |
-| `preparing` | Runtime is preparing a run. | `/stop`, `/execute` queue/interrupt | Poll `/status?id=<id>`. |
-| `running` | Executing a `.trk` through GeneralTracker. | `/stop`, `/execute` queue/interrupt | `queue` waits; `interrupt` preempts current run. |
-| `stopping` | Stop/interrupt transition to StandbyVelocity. | `/status`, `/stop` | `/execute` returns conflict; wait for `ctrl:"standby_velocity"`. |
-| `fault` | Hard safety fault; no normal track execution. | `/fixstand`, `/stop` | `/execute` and `/standby_velocity` return conflict until resolved. |
+| `passive` | Safety sink; publishes passive damping command. | `/fixstand`, `/stop`, `/idle` config/clear | `/execute` and `/standby_velocity` return `CONTROL_STATE_CONFLICT`. If `block:"lowcmd_occupied"`, next action is `manual`. |
+| `fixstand` | Holds configured stand posture. | `/standby_velocity`, `/stop`, `/fixstand`, `/idle` config/clear | `/execute` returns conflict; call `/standby_velocity` first. `/fixstand` is only the `bad_orientation` software recovery exception. |
+| `standby_velocity` | Velocity policy with zero command; robot stands idle. | `/execute`, `/idle`, `/fixstand`, `/stop` | Normal state for starting user `.trk`; idle auto-play may start only when ready/safe and no user active/queue exists. |
+| idle active (`active.kind:"idle"`) | GeneralTracker plays an idle pool motion without a user id. | `/execute`, `/stop`, `/idle`, `/fixstand`, `/standby_velocity` | `exec:null`, user `queue` unchanged. User `/execute` preempts idle. |
+| `preparing`/`running` with `active.kind:"user"` | Preparing or executing a user `.trk`. | `/stop`, `/execute` queue/interrupt, `/idle` config/clear | `queue` waits; `interrupt` preempts current user run. Poll `/status?id=<id>`. |
+| `stopping` | Stop/interrupt transition to StandbyVelocity or a safety state. | `/status`, `/stop`, `/idle` clear/config | `/execute` returns conflict at the HTTP API; wait for `ctrl:"standby_velocity"`. |
+| `fault` | Safety/manual state; no normal track execution. | `/fixstand`, `/stop`, `/idle` config/clear | `/execute` and `/standby_velocity` return conflict until resolved. `lowcmd_occupied` remains manual/operator. |
 
 `/execute` checks request shape, then readiness, then controller state. If
 `starting` is not ready it returns the readiness error, not

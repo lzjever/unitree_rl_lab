@@ -13,7 +13,11 @@ void CommandMailbox::submitInterrupt(MotionRequest request) {
 }
 
 void CommandMailbox::submitStop() {
-  pending_.push_back({CommandKind::Stop, MotionRequest{}, next_sequence_++});
+  Command command;
+  command.kind = CommandKind::Stop;
+  command.sequence = next_sequence_++;
+  command.stop_requires_stopping = true;
+  pending_.push_back(std::move(command));
 }
 
 std::optional<Command> CommandMailbox::consumeNext() {
@@ -57,6 +61,7 @@ int CommandMailbox::priority(CommandKind kind) {
     case CommandKind::Interrupt:
       return 2;
     case CommandKind::Queue:
+    case CommandKind::IdleConfig:
       return 1;
   }
   return 0;

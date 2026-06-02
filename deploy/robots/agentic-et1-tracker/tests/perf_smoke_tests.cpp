@@ -106,6 +106,13 @@ class PerfSink final : public ExecutionCommandSink {
 
   ControlResult standbyVelocity() override { return {ErrorCode::Ok}; }
 
+  IdleResult configureIdle(std::vector<IdleMotion> motions) override {
+    IdleResult result;
+    result.idle.enabled = !motions.empty();
+    result.idle.n = motions.size();
+    return result;
+  }
+
  private:
   std::atomic<std::size_t> queued_{0};
   std::atomic<std::size_t> interrupted_{0};

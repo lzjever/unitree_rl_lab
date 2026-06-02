@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <deque>
 #include <optional>
+#include <vector>
 
 #include "agentic_et1_tracker/core/types.hpp"
 
@@ -14,6 +15,7 @@ enum class CommandKind {
   Stop,
   FixStand,
   StandbyVelocity,
+  IdleConfig,
 };
 
 struct Command {
@@ -21,6 +23,8 @@ struct Command {
   MotionRequest request;
   std::uint64_t sequence{0};
   ControlMode control{ControlMode::StandbyVelocity};
+  std::vector<IdleMotion> idle_motions;
+  bool stop_requires_stopping{false};
 };
 
 class CommandMailbox {

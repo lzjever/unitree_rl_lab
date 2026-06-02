@@ -31,6 +31,7 @@ class FakeSink final : public ExecutionCommandSink {
   StopResult stop_result{ErrorCode::Ok, ControllerState::Stopping, StopReason::Stop, 0};
   ControlResult fixstand_result{ErrorCode::Ok};
   ControlResult standby_velocity_result{ErrorCode::Ok};
+  IdleResult idle_result{ErrorCode::Ok, IdleStatus{}};
 
   ExecuteResult submitQueue(const ExecuteCommand& command) override {
     ++queue_calls;
@@ -66,14 +67,26 @@ class FakeSink final : public ExecutionCommandSink {
     return standby_velocity_result;
   }
 
+  IdleResult configureIdle(std::vector<IdleMotion> motions) override {
+    ++idle_calls;
+    idle_motions = std::move(motions);
+    auto result = idle_result;
+    result.idle.enabled = !idle_motions.empty();
+    result.idle.n = idle_motions.size();
+    result.idle.active = false;
+    return result;
+  }
+
   int queue_calls{0};
   int interrupt_calls{0};
   int stop_calls{0};
   int fixstand_calls{0};
   int standby_velocity_calls{0};
+  int idle_calls{0};
   bool throw_stop{false};
   std::vector<ExecuteCommand> queue_commands;
   std::vector<ExecuteCommand> interrupt_commands;
+  std::vector<IdleMotion> idle_motions;
 };
 
 class FakeStatus final : public StatusReader {
@@ -108,6 +121,14 @@ class FakeValidator final : public TrackValidatorPort {
   TrackValidation validate(const std::string& path) override {
     ++calls;
     paths.push_back(path);
+    const auto override = results.find(path);
+    if (override != results.end()) {
+      auto validation = override->second;
+      if (validation.ok() && validation.metadata.canonical_path.empty()) {
+        validation.metadata.canonical_path = path;
+      }
+      return validation;
+    }
     auto validation = result;
     if (validation.ok() && validation.metadata.canonical_path.empty()) {
       validation.metadata.canonical_path = path;
@@ -118,6 +139,7 @@ class FakeValidator final : public TrackValidatorPort {
   int calls{0};
   std::vector<std::string> paths;
   TrackValidation result{ErrorCode::Ok, TrackMetadata{12, 0.22}, ""};
+  std::map<std::string, TrackValidation> results;
 };
 
 class FakeIds final : public RunIdGenerator {
@@ -250,6 +272,9 @@ TEST_CASE("POST execute rejects invalid JSON contract before ports") {
       R"({"path":3})",
       R"({"path":"/tracks/a.trk","mode":null})",
       R"({"path":"/tracks/a.trk","mode":"replace"})",
+      R"({"path":"/tracks/a.trk","paths":["/tracks/b.trk"]})",
+      R"({"path":"/tracks/a.trk","extra":true})",
+      R"({"paths":["/tracks/a.trk"]})",
   };
 
   for (const auto& body : bodies) {
@@ -261,9 +286,104 @@ TEST_CASE("POST execute rejects invalid JSON contract before ports") {
     requireFailure(response, "REQUEST_INVALID");
     REQUIRE(h.sink.queue_calls == 0);
     REQUIRE(h.sink.interrupt_calls == 0);
+    REQUIRE(h.sink.idle_calls == 0);
     REQUIRE(h.validator.calls == 0);
     REQUIRE(h.ids.calls == 0);
   }
+}
+
+TEST_CASE("POST idle rejects invalid JSON contract before ports") {
+  const std::vector<std::string> bodies{
+      "",
+      "not-json",
+      R"({})",
+      R"({"paths":"/tracks/a.trk"})",
+      R"({"paths":[3]})",
+      R"({"paths":["/tracks/a.trk"],"mode":"queue"})",
+  };
+
+  for (const auto& body : bodies) {
+    Harness h;
+    const auto response = h.service.handle({"POST", "/idle", body});
+
+    CAPTURE(body);
+    REQUIRE(response.status == 400);
+    requireFailure(response, "REQUEST_INVALID");
+    REQUIRE(h.sink.idle_calls == 0);
+    REQUIRE(h.sink.queue_calls == 0);
+    REQUIRE(h.sink.interrupt_calls == 0);
+    REQUIRE(h.validator.calls == 0);
+    REQUIRE(h.ids.calls == 0);
+  }
+}
+
+TEST_CASE("POST idle validates paths atomically and never allocates run ids") {
+  Harness h;
+  h.validator.results["/tracks/a.trk"] =
+      {ErrorCode::Ok, TrackMetadata{10, 0.2, 50.0, "/canonical/a.trk"}, ""};
+  h.validator.results["/tracks/bad.trk"] =
+      {ErrorCode::TrkFileNotFound, TrackMetadata{}, "missing"};
+
+  auto response = h.service.handle(
+      {"POST", "/idle", R"({"paths":["/tracks/a.trk","/tracks/bad.trk"]})"});
+
+  REQUIRE(response.status == 400);
+  requireFailure(response, "TRK_FILE_NOT_FOUND");
+  REQUIRE(h.validator.paths ==
+          std::vector<std::string>{"/tracks/a.trk", "/tracks/bad.trk"});
+  REQUIRE(h.sink.idle_calls == 0);
+  REQUIRE(h.ids.calls == 0);
+
+  h.validator.results["/tracks/b.trk"] =
+      {ErrorCode::Ok, TrackMetadata{20, 0.4, 50.0, "/canonical/b.trk"}, ""};
+  response = h.service.handle(
+      {"POST", "/idle", R"({"paths":["/tracks/a.trk","/tracks/b.trk"]})"});
+
+  REQUIRE(response.status == 200);
+  requireFields(response.body, {"ok", "idle"});
+  REQUIRE(response.body.at("ok") == true);
+  REQUIRE(response.body.at("idle").at("enabled") == true);
+  REQUIRE(response.body.at("idle").at("n") == 2);
+  REQUIRE(response.body.at("idle").at("active") == false);
+  REQUIRE(h.sink.idle_calls == 1);
+  REQUIRE(h.sink.idle_motions.at(0).path == "/canonical/a.trk");
+  REQUIRE(h.sink.idle_motions.at(1).path == "/canonical/b.trk");
+  REQUIRE(h.ids.calls == 0);
+}
+
+TEST_CASE("POST idle accepts empty paths as an atomic clear without validation") {
+  Harness h;
+
+  const auto response = h.service.handle({"POST", "/idle", R"({"paths":[]})"});
+
+  REQUIRE(response.status == 200);
+  REQUIRE(response.body.at("ok") == true);
+  REQUIRE(response.body.at("idle").at("enabled") == false);
+  REQUIRE(response.body.at("idle").at("n") == 0);
+  REQUIRE(response.body.at("idle").at("active") == false);
+  REQUIRE(h.sink.idle_calls == 1);
+  REQUIRE(h.sink.idle_motions.empty());
+  REQUIRE(h.validator.calls == 0);
+  REQUIRE(h.ids.calls == 0);
+}
+
+TEST_CASE("POST idle is only a config endpoint and ignores execute readiness gates") {
+  Harness h;
+  h.status.snapshot_value.ready = false;
+  h.status.snapshot_value.ctrl = ControllerState::Passive;
+  h.status.snapshot_value.robot = RobotState::Fault;
+  h.status.snapshot_value.err = ErrorCode::RobotBadOrientation;
+
+  const auto response =
+      h.service.handle({"POST", "/idle", R"({"paths":["/tracks/idle.trk"]})"});
+
+  REQUIRE(response.status == 200);
+  REQUIRE(response.body.at("idle").at("enabled") == true);
+  REQUIRE(h.validator.calls == 1);
+  REQUIRE(h.sink.idle_calls == 1);
+  REQUIRE(h.sink.queue_calls == 0);
+  REQUIRE(h.sink.interrupt_calls == 0);
+  REQUIRE(h.ids.calls == 0);
 }
 
 TEST_CASE("POST execute maps validator failures and does not submit commands") {
@@ -367,6 +487,52 @@ TEST_CASE("POST execute gates service robot model and fault readiness before val
     REQUIRE(h.sink.queue_calls == 0);
     REQUIRE(h.sink.interrupt_calls == 0);
     REQUIRE(h.ids.calls == 0);
+  }
+}
+
+TEST_CASE("POST execute reports lowcmd occupancy as manual next action") {
+  Harness h;
+  h.status.snapshot_value.ready = false;
+  h.status.snapshot_value.ctrl = ControllerState::StandbyVelocity;
+  h.status.snapshot_value.robot = RobotState::NotReady;
+  h.status.snapshot_value.err = ErrorCode::RobotNotReady;
+  h.status.snapshot_value.block = "lowcmd_occupied";
+
+  const auto response =
+      h.service.handle({"POST", "/execute", R"({"path":"/tracks/a.trk"})"});
+
+  REQUIRE(response.status == 409);
+  requireFailure(response, "ROBOT_NOT_READY");
+  REQUIRE(nextAction(response) == "manual");
+  REQUIRE(h.validator.calls == 0);
+  REQUIRE(h.sink.queue_calls == 0);
+  REQUIRE(h.sink.interrupt_calls == 0);
+  REQUIRE(h.ids.calls == 0);
+}
+
+TEST_CASE("POST control endpoints report lowcmd occupancy as manual before sink") {
+  for (const auto& target : {"/fixstand", "/standby_velocity"}) {
+    for (const ControllerState ctrl :
+         {ControllerState::Passive, ControllerState::Fault}) {
+      Harness h;
+      h.status.snapshot_value.ready = false;
+      h.status.snapshot_value.ctrl = ctrl;
+      h.status.snapshot_value.robot = RobotState::NotReady;
+      h.status.snapshot_value.err = ErrorCode::RobotNotReady;
+      h.status.snapshot_value.block = "lowcmd_occupied";
+
+      const auto response = h.service.handle({"POST", target, ""});
+
+      CAPTURE(target);
+      CAPTURE(toString(ctrl));
+      REQUIRE(response.status == 409);
+      requireFailure(response, "ROBOT_NOT_READY");
+      REQUIRE(nextAction(response) == "manual");
+      REQUIRE(h.sink.fixstand_calls == 0);
+      REQUIRE(h.sink.standby_velocity_calls == 0);
+      REQUIRE(h.validator.calls == 0);
+      REQUIRE(h.ids.calls == 0);
+    }
   }
 }
 
@@ -506,13 +672,14 @@ TEST_CASE("POST fixstand remains available from passive and fault recovery state
            {ControllerState::Passive, RobotState::NotReady,
             ErrorCode::RobotBadOrientation},
            {ControllerState::Fault, RobotState::Fault,
-            ErrorCode::SafetyLimitTriggered},
+            ErrorCode::RobotBadOrientation},
        }) {
     Harness h;
     h.status.snapshot_value.ready = false;
     h.status.snapshot_value.ctrl = item.ctrl;
     h.status.snapshot_value.robot = item.robot;
     h.status.snapshot_value.err = item.err;
+    h.status.snapshot_value.block = "bad_orientation";
 
     const auto response = h.service.handle({"POST", "/fixstand", ""});
 
@@ -522,6 +689,26 @@ TEST_CASE("POST fixstand remains available from passive and fault recovery state
     REQUIRE(response.body.at("ok") == true);
     REQUIRE(response.body.at("state") == "accepted");
     REQUIRE(h.sink.fixstand_calls == 1);
+    REQUIRE(h.sink.standby_velocity_calls == 0);
+  }
+}
+
+TEST_CASE("POST fixstand rejects non-orientation recovery faults before sink") {
+  for (const ErrorCode err :
+       {ErrorCode::RobotNotReady, ErrorCode::SafetyLimitTriggered}) {
+    Harness h;
+    h.status.snapshot_value.ready = false;
+    h.status.snapshot_value.ctrl = ControllerState::Fault;
+    h.status.snapshot_value.robot = RobotState::Fault;
+    h.status.snapshot_value.err = err;
+    h.status.snapshot_value.block = "safety_limit";
+
+    const auto response = h.service.handle({"POST", "/fixstand", ""});
+
+    CAPTURE(toString(err));
+    REQUIRE(response.status == 409);
+    requireFailure(response, toString(err));
+    REQUIRE(h.sink.fixstand_calls == 0);
     REQUIRE(h.sink.standby_velocity_calls == 0);
   }
 }
@@ -612,12 +799,59 @@ TEST_CASE("GET status renders idle nulls and queue short fields") {
   REQUIRE(response.status == 200);
   REQUIRE(response.body.at("ok") == true);
   REQUIRE(response.body.at("mode") == "sim");
+  REQUIRE(response.body.at("active").at("kind") == "none");
+  REQUIRE(response.body.at("active").at("id").is_null());
   REQUIRE(response.body.at("exec").is_null());
   REQUIRE(response.body.at("queue").at("n") == 2);
   REQUIRE(response.body.at("queue").at("limit") == 8);
   REQUIRE(response.body.at("queue").at("ids").at(0) == "a");
+  REQUIRE(response.body.at("idle").at("enabled") == false);
+  REQUIRE(response.body.at("idle").at("n") == 0);
+  REQUIRE(response.body.at("idle").at("active") == false);
+  REQUIRE(response.body.at("idle").at("current").is_null());
   REQUIRE(response.body.at("err").is_null());
   REQUIRE(response.body.at("stop_reason").is_null());
+}
+
+TEST_CASE("GET status renders authoritative active and idle progress fields") {
+  Harness h;
+  h.status.snapshot_value.ctrl = ControllerState::Running;
+  h.status.snapshot_value.active.kind = ActiveKind::Idle;
+  h.status.snapshot_value.idle.enabled = true;
+  h.status.snapshot_value.idle.n = 2;
+  h.status.snapshot_value.idle.active = true;
+  h.status.snapshot_value.idle.current = 0;
+  h.status.snapshot_value.idle.frame = 12;
+  h.status.snapshot_value.idle.frames = 120;
+  h.status.snapshot_value.idle.time_s = 0.24;
+  h.status.snapshot_value.idle.duration_s = 2.4;
+  h.status.snapshot_value.idle.progress = 0.1;
+
+  auto response = h.service.handle({"GET", "/status", ""});
+
+  REQUIRE(response.status == 200);
+  REQUIRE(response.body.at("active").at("kind") == "idle");
+  REQUIRE(response.body.at("active").at("id").is_null());
+  REQUIRE(response.body.at("exec").is_null());
+  REQUIRE(response.body.at("idle").at("enabled") == true);
+  REQUIRE(response.body.at("idle").at("n") == 2);
+  REQUIRE(response.body.at("idle").at("active") == true);
+  REQUIRE(response.body.at("idle").at("current") == 0);
+  REQUIRE(response.body.at("idle").at("frame") == 12);
+  REQUIRE(response.body.at("idle").at("frames") == 120);
+  REQUIRE(response.body.at("idle").at("time_s") == 0.24);
+  REQUIRE(response.body.at("idle").at("duration_s") == 2.4);
+  REQUIRE(response.body.at("idle").at("progress") == 0.1);
+
+  h.status.snapshot_value.active = {ActiveKind::User, "active"};
+  h.status.snapshot_value.exec = run("active", MotionState::Running);
+  h.status.snapshot_value.idle.active = false;
+
+  response = h.service.handle({"GET", "/status", ""});
+  REQUIRE(response.body.at("active").at("kind") == "user");
+  REQUIRE(response.body.at("active").at("id") == "active");
+  REQUIRE(response.body.at("exec").at("id") == "active");
+  REQUIRE(response.body.at("idle").at("active") == false);
 }
 
 TEST_CASE("GET status renders compact pose for high-rate agent polling") {
@@ -674,6 +908,8 @@ TEST_CASE("GET status renders running progress and top-level stopping reason") {
   requireFields(response.body.at("exec"),
                 {"id", "state", "frame", "frames", "time_s", "duration_s",
                  "progress", "stop_reason", "err"});
+  REQUIRE(response.body.at("active").at("kind") == "user");
+  REQUIRE(response.body.at("active").at("id") == "active");
   REQUIRE(response.body.at("exec").at("frame") == 4);
   REQUIRE(response.body.at("exec").at("frames") == 20);
   REQUIRE(response.body.at("exec").at("progress") == 0.25);

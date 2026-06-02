@@ -33,13 +33,6 @@ struct TrackerControllerConfig {
   double hz{50.0};
 };
 
-struct TrackMetadata {
-  std::size_t frames{0};
-  double duration_s{0.0};
-  double fps{50.0};
-  std::string canonical_path;
-};
-
 struct ExecuteRequest {
   std::string id;
   std::string path;

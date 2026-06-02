@@ -100,6 +100,7 @@ void AgentHttpServer::installHandler() {
                      kJsonContentType);
                });
   server_->Post("/execute", handler);
+  server_->Post("/idle", handler);
   server_->Post("/stop", handler);
   server_->Post("/fixstand", handler);
   server_->Post("/standby_velocity", handler);

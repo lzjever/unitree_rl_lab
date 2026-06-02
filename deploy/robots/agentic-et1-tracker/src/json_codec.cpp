@@ -78,6 +78,29 @@ nlohmann::json queueStatusJson(const QueueStatus& status) {
   };
 }
 
+nlohmann::json activeStatusJson(const ActiveStatus& status) {
+  return {
+      {"kind", toString(status.kind)},
+      {"id", status.kind == ActiveKind::User ? nlohmann::json(status.id)
+                                             : nlohmann::json(nullptr)},
+  };
+}
+
+nlohmann::json idleStatusJson(const IdleStatus& status) {
+  return {
+      {"enabled", status.enabled},
+      {"n", status.n},
+      {"active", status.active},
+      {"current", status.current ? nlohmann::json(*status.current)
+                                 : nlohmann::json(nullptr)},
+      {"frame", status.frame},
+      {"frames", status.frames},
+      {"time_s", status.time_s},
+      {"duration_s", status.duration_s},
+      {"progress", status.progress},
+  };
+}
+
 template <std::size_t N>
 nlohmann::json optionalArrayJson(const std::optional<std::array<float, N>>& value) {
   if (!value) {
@@ -99,6 +122,13 @@ nlohmann::json poseSnapshotJson(const PoseSnapshot& pose) {
   };
 }
 
+ActiveStatus effectiveActiveStatus(const StatusSnapshot& snapshot) {
+  if (snapshot.active.kind == ActiveKind::None && snapshot.exec) {
+    return {ActiveKind::User, snapshot.exec->id};
+  }
+  return snapshot.active;
+}
+
 nlohmann::json statusSnapshotJson(const StatusSnapshot& snapshot) {
   return {
       {"ok", true},
@@ -108,9 +138,11 @@ nlohmann::json statusSnapshotJson(const StatusSnapshot& snapshot) {
       {"ctrl", toString(snapshot.ctrl)},
       {"stop_reason", stopReasonJson(snapshot.stop_reason)},
       {"hz", snapshot.hz},
+      {"active", activeStatusJson(effectiveActiveStatus(snapshot))},
       {"exec", snapshot.exec ? motionStatusJson(*snapshot.exec, false)
                              : nlohmann::json(nullptr)},
       {"queue", queueStatusJson(snapshot.queue)},
+      {"idle", idleStatusJson(snapshot.idle)},
       {"low_ms", snapshot.low_ms},
       {"block", nullableString(snapshot.block)},
       {"err", nullableErrorJson(snapshot.err)},
