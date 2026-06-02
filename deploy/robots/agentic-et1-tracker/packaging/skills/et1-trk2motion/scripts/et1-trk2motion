@@ -1,0 +1,425 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+
+DEFAULT_URL = "http://127.0.0.1:8083"
+TERMINAL = {"done", "stopped", "canceled", "failed"}
+GOOD_TERMINAL = {"done"}
+
+
+class CliError(Exception):
+    def __init__(self, code, message, status=2, next_step=None, detail=None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status = status
+        self.next = next_step
+        self.detail = detail or {}
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise CliError("invalid_args", message)
+
+
+def compact(value):
+    return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+
+
+def print_json(out, stream=sys.stdout):
+    print(compact(out), file=stream)
+
+
+def error_doc(code, message, next_step=None, detail=None):
+    out = {"ok": False, "error": {"code": code, "message": message}}
+    if next_step:
+        out["next"] = next_step
+    if detail:
+        for key in ("ctrl", "ready", "err"):
+            if key in detail:
+                out[key] = detail.get(key)
+        if "last" in detail:
+            out["last"] = detail["last"]
+    return out
+
+
+def fail(code, message, status=2, next_step=None, detail=None):
+    print_json(error_doc(code, message, next_step, detail))
+    return status
+
+
+def tracker_url(raw):
+    raw = (raw or DEFAULT_URL).strip().rstrip("/")
+    parsed = urllib.parse.urlsplit(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise CliError("bad_url", "ET1_TRACKER_URL must be absolute http(s)")
+    return raw
+
+
+def request(base, method, path, body=None, timeout=5.0):
+    data = None
+    headers = {}
+    if body is not None:
+        data = json.dumps(body, separators=(",", ":")).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(base + path, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            text = resp.read().decode("utf-8")
+            return json.loads(text) if text else {"ok": True}
+    except urllib.error.HTTPError as e:
+        text = e.read().decode("utf-8", errors="replace")
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return error_doc("http_error", f"http {e.code}")
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        msg = getattr(e, "reason", e)
+        raise CliError("network_error", str(msg), status=1, next_step="status")
+    except json.JSONDecodeError:
+        raise CliError("bad_response", "tracker returned non-json", status=1)
+
+
+def post_empty(base, path, timeout):
+    return request(base, "POST", path, timeout=timeout)
+
+
+def full_status(base, run_id=None, timeout=5.0):
+    if run_id:
+        path = "/status?id=" + urllib.parse.quote(run_id, safe="")
+        return request(base, "GET", path, timeout=timeout)
+    return request(base, "GET", "/status", timeout=timeout)
+
+
+def short_status(doc, extra=None):
+    out = {"ok": bool(doc.get("ok", False))}
+    for key in ("id", "state", "ctrl", "ready", "err", "next"):
+        if key in doc:
+            out[key] = doc.get(key)
+    if "error" in doc:
+        out["error"] = doc["error"]
+    if extra:
+        out.update(extra)
+    return out
+
+
+def status_cmd(base, run_id, full, timeout):
+    doc = full_status(base, run_id, timeout)
+    return doc if full else short_status(doc)
+
+
+def copy_top_fields(out, top):
+    for key in ("ctrl", "ready", "err"):
+        if key in top:
+            out[key] = top.get(key)
+    return out
+
+
+def validate_path(path):
+    if not os.path.isabs(path):
+        raise CliError("bad_path", "path must be absolute", next_step="fix")
+    if not path.endswith(".trk"):
+        raise CliError("bad_path", "path must end with .trk", next_step="fix")
+
+
+def ready_cmd(base, timeout, max_steps=4):
+    seen = []
+    for _ in range(max_steps):
+        top = short_status(full_status(base, timeout=timeout))
+        seen.append(top.get("ctrl"))
+        if not top.get("ok"):
+            return top
+        ctrl = top.get("ctrl")
+        if ctrl == "standby_velocity" and top.get("ready") is not False:
+            return {"ok": True, "ctrl": ctrl, "ready": top.get("ready"), "err": top.get("err")}
+        if ctrl == "passive":
+            out = post_empty(base, "/fixstand", timeout)
+            if not out.get("ok"):
+                return with_top_fields(out, top)
+            continue
+        if ctrl == "fixstand":
+            out = post_empty(base, "/standby_velocity", timeout)
+            if not out.get("ok"):
+                return with_top_fields(out, top)
+            continue
+        if top.get("ready"):
+            return {"ok": True, "ctrl": ctrl, "ready": top.get("ready"), "err": top.get("err")}
+        return error_doc("not_ready", f"ctrl={ctrl}", top.get("next") or "manual", top)
+    top = short_status(full_status(base, timeout=timeout))
+    return error_doc("ready_loop", "ready did not converge", "manual", {**top, "last": {"seen": seen}})
+
+
+def with_top_fields(out, top):
+    merged = short_status(out)
+    for key, value in copy_top_fields({}, top).items():
+        if key not in merged:
+            merged[key] = value
+    if "next" not in merged and "next" in top:
+        merged["next"] = top["next"]
+    return merged
+
+
+def execute_once(base, path, mode, timeout):
+    validate_path(path)
+    return request(base, "POST", "/execute", {"path": path, "mode": mode}, timeout=timeout)
+
+
+def missing_id_error(base, timeout):
+    top = short_status(full_status(base, timeout=timeout))
+    return with_top_fields(error_doc("missing_id", "/execute returned ok without id", "status"), top)
+
+
+def wait_run(base, run_id, timeout, poll, allow_any_terminal=False):
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() <= deadline:
+        last = short_status(full_status(base, run_id, timeout=min(5.0, timeout)))
+        if not last.get("ok", False):
+            return last
+        state = last.get("state")
+        if state in TERMINAL:
+            if state in GOOD_TERMINAL or allow_any_terminal:
+                return last
+            return error_doc("run_failed", f"state={state}", "status", last)
+        time.sleep(poll)
+    return error_doc("wait_timeout", f"id={run_id}", "status", {"last": last})
+
+
+def run_cmd(base, path, mode, do_wait, recover, timeout, poll):
+    if recover == "auto":
+        pre = ready_cmd(base, timeout)
+        if not pre.get("ok"):
+            return pre
+    started = execute_once(base, path, mode, timeout)
+    if not started.get("ok"):
+        top = short_status(full_status(base, timeout=timeout))
+        return with_top_fields(started, top)
+    run_id = started.get("id")
+    out = {"ok": True, "id": run_id}
+    if not do_wait:
+        return out
+    if not run_id:
+        return missing_id_error(base, timeout)
+    waited = wait_run(base, run_id, timeout, poll)
+    top = short_status(full_status(base, timeout=timeout))
+    if not waited.get("ok"):
+        return with_top_fields(waited, top)
+    out["state"] = waited.get("state")
+    for key in ("ctrl", "ready", "err"):
+        if key in top:
+            out[key] = top.get(key)
+    return out
+
+
+def repeat_cmd(base, path, count, mode, recover, timeout, poll, verbose):
+    validate_path(path)
+    if recover == "auto":
+        pre = ready_cmd(base, timeout)
+        if not pre.get("ok"):
+            return pre
+    runs = []
+    done_count = 0
+    for index in range(1, count + 1):
+        started = execute_once(base, path, mode, timeout)
+        if not started.get("ok"):
+            top = short_status(full_status(base, timeout=timeout))
+            out = with_top_fields(started, top)
+            out.update({"i": index, "done": done_count, "n": count})
+            if verbose:
+                out["runs"] = runs
+            return out
+        run_id = started.get("id")
+        if not run_id:
+            out = missing_id_error(base, timeout)
+            out.update({"i": index, "done": done_count, "n": count})
+            if verbose:
+                out["runs"] = runs
+            return out
+        waited = wait_run(base, run_id, timeout, poll)
+        run = {"i": index, "id": run_id, "state": waited.get("state"), "err": waited.get("err")}
+        runs.append(run)
+        if not waited.get("ok"):
+            top = short_status(full_status(base, timeout=timeout))
+            out = with_top_fields(waited, top)
+            out.update({"i": index, "done": done_count, "n": count})
+            if verbose:
+                out["runs"] = runs
+            return out
+        done_count += 1
+    top = short_status(full_status(base, timeout=timeout))
+    out = {"ok": True, "n": count, "done": done_count}
+    for key in ("ctrl", "ready", "err"):
+        if key in top:
+            out[key] = top.get(key)
+    if verbose:
+        out["runs"] = runs
+    return out
+
+
+def parse_json_body(raw):
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise CliError("invalid_json", str(e), next_step="fix")
+
+
+def raw_cmd(base, method, path, body, timeout):
+    method = method.upper()
+    if method not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
+        raise CliError("invalid_args", "method must be GET/POST/PUT/PATCH/DELETE")
+    if not path.startswith("/"):
+        path = "/" + path
+    return request(base, method, path, parse_json_body(body), timeout=timeout)
+
+
+def health_cmd(base, timeout):
+    health = short_status(request(base, "GET", "/health", timeout=timeout))
+    if not health.get("ok"):
+        return health
+    top = short_status(full_status(base, timeout=timeout))
+    return copy_top_fields(health, top)
+
+
+def control_cmd(base, path, timeout):
+    action = request(base, "POST", path, timeout=timeout)
+    top = short_status(full_status(base, timeout=timeout))
+    if not action.get("ok"):
+        return with_top_fields(action, top)
+    return copy_top_fields({"ok": True}, top)
+
+
+def add_timing(parser):
+    parser.add_argument("--timeout", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--poll", type=float, default=argparse.SUPPRESS)
+
+
+def parse(argv):
+    parser = Parser(prog="et1-trk2motion")
+    parser.add_argument("--url", default=os.environ.get("ET1_TRACKER_URL", DEFAULT_URL))
+    parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument("--poll", type=float, default=0.2)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("health")
+
+    ps = sub.add_parser("status")
+    ps.add_argument("--id")
+    ps.add_argument("--full", action="store_true")
+
+    pst = sub.add_parser("state")
+    pst.add_argument("--id")
+    pst.add_argument("--full", action="store_true")
+
+    prd = sub.add_parser("ready")
+    add_timing(prd)
+
+    pf = sub.add_parser("fixstand")
+    add_timing(pf)
+
+    psv = sub.add_parser("standby")
+    add_timing(psv)
+
+    pstop = sub.add_parser("stop")
+    add_timing(pstop)
+
+    pe = sub.add_parser("exec")
+    pe.add_argument("path")
+    pe.add_argument("--mode", choices=("queue", "interrupt"), default="interrupt")
+    pe.add_argument("--wait", action="store_true")
+    pe.add_argument("--allow-terminal", action="store_true")
+    add_timing(pe)
+
+    prun = sub.add_parser("run")
+    prun.add_argument("path")
+    prun.add_argument("--mode", choices=("queue", "interrupt"), default="interrupt")
+    prun.add_argument("--wait", action="store_true")
+    prun.add_argument("--recover", choices=("auto", "off"), default="auto")
+    add_timing(prun)
+
+    pw = sub.add_parser("wait")
+    pw.add_argument("id")
+    pw.add_argument("--allow-terminal", action="store_true")
+    add_timing(pw)
+
+    prep = sub.add_parser("repeat")
+    prep.add_argument("path")
+    prep.add_argument("-n", "--count", type=int)
+    prep.add_argument("--mode", choices=("queue", "interrupt"), default="interrupt")
+    prep.add_argument("--recover", choices=("auto", "off"), default="auto")
+    prep.add_argument("--verbose", action="store_true")
+    add_timing(prep)
+
+    praw = sub.add_parser("raw")
+    praw.add_argument("method")
+    praw.add_argument("path")
+    praw.add_argument("json", nargs="?")
+    add_timing(praw)
+    return parser.parse_args(argv)
+
+
+def timing(args):
+    timeout = args.timeout if args.timeout is not None else 30.0
+    poll = args.poll if args.poll is not None else 0.2
+    if timeout <= 0 or poll <= 0:
+        raise CliError("invalid_args", "timeout and poll must be >0")
+    return timeout, poll
+
+
+def main(argv):
+    try:
+        args = parse(argv)
+        base = tracker_url(args.url)
+        timeout, poll = timing(args)
+        if args.cmd == "health":
+            out = health_cmd(base, timeout)
+        elif args.cmd in {"status", "state"}:
+            out = status_cmd(base, args.id, args.full, timeout)
+        elif args.cmd == "ready":
+            out = ready_cmd(base, timeout)
+        elif args.cmd == "fixstand":
+            out = control_cmd(base, "/fixstand", timeout)
+        elif args.cmd == "standby":
+            out = control_cmd(base, "/standby_velocity", timeout)
+        elif args.cmd == "stop":
+            out = control_cmd(base, "/stop", timeout)
+        elif args.cmd == "exec":
+            started = execute_once(base, args.path, args.mode, timeout)
+            if args.wait and started.get("ok") and not started.get("id"):
+                out = missing_id_error(base, timeout)
+            elif args.wait and started.get("ok"):
+                out = wait_run(base, started.get("id"), timeout, poll, args.allow_terminal)
+            else:
+                out = started
+        elif args.cmd == "run":
+            out = run_cmd(base, args.path, args.mode, args.wait, args.recover, timeout, poll)
+        elif args.cmd == "wait":
+            out = wait_run(base, args.id, timeout, poll, args.allow_terminal)
+        elif args.cmd == "repeat":
+            if args.count is None or args.count <= 0:
+                raise CliError("invalid_args", "count must be >0")
+            out = repeat_cmd(base, args.path, args.count, args.mode, args.recover, timeout, poll, args.verbose)
+        elif args.cmd == "raw":
+            out = raw_cmd(base, args.method, args.path, args.json, timeout)
+        else:
+            raise CliError("invalid_args", "unknown command")
+        print_json(out)
+        return 0 if out.get("ok", False) else 1
+    except CliError as e:
+        return fail(e.code, e.message, e.status, e.next, e.detail)
+    except KeyboardInterrupt:
+        return fail("interrupted", "interrupted", 130)
+    except Exception as e:
+        return fail("internal_error", str(e), 1)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

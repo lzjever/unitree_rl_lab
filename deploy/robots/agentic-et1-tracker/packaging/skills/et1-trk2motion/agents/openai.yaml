@@ -1,0 +1,4 @@
+interface:
+  display_name: "ET1 TRK to Motion"
+  short_description: "Execute ET1 .trk files through the local agentic tracker."
+  default_prompt: "Use scripts/et1-trk2motion first: state, ready, run PATH --wait, repeat PATH -n N, stop, fixstand, standby. Prefer compact one-line JSON and avoid curl. For complex fallback, read references/raw-http.md and use raw METHOD PATH [JSON]."

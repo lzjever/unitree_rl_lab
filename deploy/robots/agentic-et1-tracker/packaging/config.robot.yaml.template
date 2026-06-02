@@ -1,0 +1,28 @@
+agentic_et1_tracker:
+  bind: "127.0.0.1"
+  port: 8083
+  network: "eth0"
+  domain_id: 0
+  lock_path: "@PREFIX@/shared/run/agentic-et1-tracker.lock"
+  lowcmd_startup_preflight_ms: 200
+  mode_machine: 1
+  motion_dirs:
+    - "@PREFIX@/shared/motions"
+  queue_limit: 8
+  recent_limit: 32
+  max_track_duration_s: 120
+  stop_hold_s: 0.0
+  idle_mode: "hold_current"
+  policy:
+    profile: "GeneralTracker"
+    policy_dir: "@PREFIX@/current/share/agentic-et1-tracker/config/policy/general_tracker"
+    policy_file: "self_collision_footmesh_15k.onnx"
+    deploy: "@PREFIX@/current/share/agentic-et1-tracker/config/policy/general_tracker/params/deploy.yaml"
+    fps: 50
+  control:
+    startup_control: "FixStand"
+    velocity_policy_dir: "@PREFIX@/current/share/agentic-et1-tracker/config/policy/velocity/v0"
+    velocity_policy_file: "policy.onnx"
+    velocity_deploy: "@PREFIX@/current/share/agentic-et1-tracker/config/policy/velocity/v0/params/deploy.yaml"
+    fixstand_config: "@PREFIX@/current/share/agentic-et1-tracker/config/posture/fixstand/v0/fixstand.yaml"
+    passive_config: "@PREFIX@/current/share/agentic-et1-tracker/config/posture/passive/v0/passive.yaml"
