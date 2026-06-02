@@ -53,7 +53,8 @@ Commands:
 - `POST /idle`: `{"paths":["/absolute/idle-a.trk","/absolute/idle-b.trk"]}`.
 - `POST /idle`: `{"paths":[]}` clears the idle pool.
 - `POST /stop`: empty body; stops active work and cancels queued work.
-- `POST /passive`: empty body; enter Passive safety sink when LowCmd is free.
+- `POST /passive`: empty body; enter Passive safety sink when LowCmd is free;
+  stops active work, clears queued work, and clears the idle pool.
 - `POST /fixstand`: empty body; enter FixStand.
 - `POST /standby_velocity`: empty body; enter StandbyVelocity.
 
@@ -147,7 +148,7 @@ Controller states:
 | ctrl | robot behavior | accepts | rejects/notes |
 | --- | --- | --- | --- |
 | `starting` | Runtime is initializing. | `/status`, `/health` | Control routes return readiness errors such as `SERVICE_NOT_READY` or `MODEL_NOT_READY`; wait for `ready:true`. |
-| `passive` | Safety sink; publishes passive damping command. | `/fixstand`, `/passive`, `/stop`, `/idle` config/clear | `/execute` and `/standby_velocity` return `CONTROL_STATE_CONFLICT`. If `block:"lowcmd_occupied"`, next action is `manual`. |
+| `passive` | Safety sink; publishes passive damping command; idle pool is cleared. | `/fixstand`, `/passive`, `/stop`, `/idle` config/clear | `/execute` and `/standby_velocity` return `CONTROL_STATE_CONFLICT`. If `block:"lowcmd_occupied"`, next action is `manual`. |
 | `fixstand` | Holds configured stand posture. | `/standby_velocity`, `/passive`, `/stop`, `/fixstand`, `/idle` config/clear | `/execute` returns conflict; call `/standby_velocity` first. `/passive` and `/fixstand` are the `bad_orientation` software recovery exceptions. |
 | `standby_velocity` | Velocity policy with zero command; robot stands idle. | `/execute`, `/idle`, `/passive`, `/fixstand`, `/stop` | Normal state for starting user `.trk`; idle auto-play may start only when ready/safe and no user active/queue exists. |
 | idle active (`active.kind:"idle"`) | GeneralTracker plays an idle pool motion without a user id. | `/execute`, `/stop`, `/idle`, `/passive`, `/fixstand`, `/standby_velocity` | `exec:null`, user `queue` unchanged. User `/execute` preempts idle. |

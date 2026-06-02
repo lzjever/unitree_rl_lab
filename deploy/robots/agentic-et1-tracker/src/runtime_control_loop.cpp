@@ -329,6 +329,9 @@ void RuntimeControlLoop::handleStop(std::uint64_t sequence, bool requires_stoppi
 void RuntimeControlLoop::handleControl(ControlMode mode) {
   if (mode == ControlMode::Passive) {
     cancelWaiting(StopReason::Stop);
+    idle_config_.clear();
+    idle_next_index_ = 0;
+    idle_current_index_.reset();
     if (active_kind_ == ActiveKind::Idle) {
       stopIdleActive();
     } else if (active_) {

@@ -22,6 +22,7 @@ Default tracker: `http://127.0.0.1:8083`; override with `ET1_TRACKER_URL`.
 <skill-dir>/scripts/et1-trk2motion standby
 ```
 
+`passive` stops active work and clears queued work plus the idle pool.
 `ready` handles `passive -> fixstand -> standby` and `fixstand -> standby`.
 `run` defaults to `ready` first, then execute. Use `--recover off` only when
 the caller intentionally manages control state.

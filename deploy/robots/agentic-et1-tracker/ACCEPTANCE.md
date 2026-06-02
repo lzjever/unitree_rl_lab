@@ -62,6 +62,8 @@ Contract-level GA evidence must cover:
   automatic wait/retry recovery.
 - `bad_orientation` enters the safety path; `/passive` and `/fixstand` are the
   software recovery exceptions when LowCmd is free.
+- `/passive` clears active work, user queue, pending idle config, and idle
+  status so later FixStand -> StandbyVelocity cannot resume old idle playback.
 - Real `mode_machine: 1` startup may release Unitree MotionSwitcher default
   mode before LowCmd preflight. Sim `mode_machine: 0` startup must not call
   MotionSwitcher.

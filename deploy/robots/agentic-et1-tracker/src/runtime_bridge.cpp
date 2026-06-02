@@ -80,7 +80,9 @@ ControlResult RuntimeBridge::passive() {
     return result;
   }
 
+  status_.clearIdleConfig();
   clearPendingCommands();
+  clearPendingIdleConfigs();
   MotionRequest request;
   request.sequence = sequence;
   push(CommandKind::Passive, request, sequence);

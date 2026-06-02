@@ -581,6 +581,8 @@ TEST_CASE("RuntimeBridge passive cancels queued motions and enqueues Passive con
   RuntimeBridge bridge(config, store);
   store.publishSnapshot(readySnapshot(ControllerState::StandbyVelocity));
 
+  REQUIRE(bridge.configureIdle({idleMotion("/tmp/idle.trk")}).ok());
+  REQUIRE(store.snapshot().idle.enabled);
   REQUIRE(bridge.submitQueue(executeCommand("queued-a")).ok());
   REQUIRE(bridge.submitQueue(executeCommand("queued-b")).ok());
 
@@ -588,6 +590,9 @@ TEST_CASE("RuntimeBridge passive cancels queued motions and enqueues Passive con
 
   REQUIRE(result.code == ErrorCode::Ok);
   REQUIRE(store.snapshot().queue.ids.empty());
+  REQUIRE_FALSE(store.snapshot().idle.enabled);
+  REQUIRE(store.snapshot().idle.n == 0);
+  REQUIRE_FALSE(store.snapshot().idle.active);
   for (const auto& id : {"queued-a", "queued-b"}) {
     const auto found = store.findRun(id);
     REQUIRE(found.code == ErrorCode::Ok);
