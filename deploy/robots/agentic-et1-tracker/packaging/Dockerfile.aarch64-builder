@@ -1,0 +1,43 @@
+FROM ubuntu:20.04
+
+ARG YAML_CPP_TAG=0.8.0
+ARG YAML_CPP_INSTALL=/opt/agentic-et1/aarch64/yaml-cpp
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    binutils-aarch64-linux-gnu \
+    cmake \
+    file \
+    g++ \
+    gcc \
+    g++-aarch64-linux-gnu \
+    gcc-aarch64-linux-gnu \
+    git \
+    libc6-dev-arm64-cross \
+    make \
+    xz-utils \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 --branch "${YAML_CPP_TAG}" https://github.com/jbeder/yaml-cpp.git /tmp/yaml-cpp \
+  && cmake -S /tmp/yaml-cpp -B /tmp/yaml-cpp-build \
+    -DCMAKE_SYSTEM_NAME=Linux \
+    -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+    -DCMAKE_C_COMPILER=/usr/bin/aarch64-linux-gnu-gcc \
+    -DCMAKE_CXX_COMPILER=/usr/bin/aarch64-linux-gnu-g++ \
+    -DCMAKE_AR=/usr/bin/aarch64-linux-gnu-ar \
+    -DCMAKE_RANLIB=/usr/bin/aarch64-linux-gnu-ranlib \
+    -DCMAKE_STRIP=/usr/bin/aarch64-linux-gnu-strip \
+    -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX="${YAML_CPP_INSTALL}" \
+    -DYAML_CPP_BUILD_TESTS=OFF \
+    -DYAML_CPP_BUILD_TOOLS=OFF \
+    -DYAML_BUILD_SHARED_LIBS=ON \
+  && cmake --build /tmp/yaml-cpp-build --parallel "$(nproc 2>/dev/null || printf '4')" \
+  && cmake --install /tmp/yaml-cpp-build \
+  && rm -rf /tmp/yaml-cpp /tmp/yaml-cpp-build
+
+ENV AGENTIC_ET1_YAML_CPP_AARCH64_ROOT="${YAML_CPP_INSTALL}"
+WORKDIR /work/unitree_rl_lab

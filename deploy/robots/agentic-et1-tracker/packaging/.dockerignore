@@ -1,0 +1,10 @@
+dist/
+tmp/
+temp/
+cache/
+.cache/
+*.tar
+*.tar.gz
+*.sha256
+*.readelf.txt
+*.file.txt

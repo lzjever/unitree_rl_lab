@@ -61,6 +61,89 @@ deploy/robots/agentic-et1-tracker/packaging/build_release.sh \
 Use `--cmake-arg -DNAME=VALUE` for SDK-specific settings that belong to the
 external toolchain or sysroot.
 
+## AArch64 Docker Release
+
+The fast aarch64 path uses a fixed builder image. The image is built once with
+Ubuntu 20.04 cross tools and yaml-cpp installed at:
+
+```text
+/opt/agentic-et1/aarch64/yaml-cpp
+```
+
+Build the image once:
+
+```sh
+deploy/robots/agentic-et1-tracker/packaging/build_aarch64_builder_image.sh
+```
+
+Optionally save it for another machine:
+
+```sh
+deploy/robots/agentic-et1-tracker/packaging/build_aarch64_builder_image.sh \
+  --save-output /tmp/agentic-et1-tracker-aarch64-builder.tar
+docker load -i /tmp/agentic-et1-tracker-aarch64-builder.tar
+```
+
+Daily release command:
+
+```sh
+deploy/robots/agentic-et1-tracker/packaging/build_aarch64_release_in_docker.sh
+```
+
+Without `--version`, the release version defaults to `timestamp-gitsha`; the
+bottom-level `build_release.sh` appends the target architecture, so the tarball
+is named `agentic-et1-tracker-<timestamp-gitsha>-aarch64.tar.gz`.
+
+If the image is not present locally, bootstrap it and then release:
+
+```sh
+deploy/robots/agentic-et1-tracker/packaging/build_aarch64_release_in_docker.sh \
+  --bootstrap-image
+```
+
+To pin a human version, pass it without the architecture suffix unless you
+intentionally want that suffix inside the version:
+
+```sh
+deploy/robots/agentic-et1-tracker/packaging/build_aarch64_release_in_docker.sh \
+  --version 2026.06.01-et1
+```
+
+The aarch64 release entry still calls `build_release.sh` as the bottom-level
+packager. The container only runs the release build; it does not `apt install`
+or rebuild yaml-cpp. Outputs keep the existing names:
+
+```text
+agentic-et1-tracker-<version>-aarch64.tar.gz
+agentic-et1-tracker-<version>-aarch64.tar.gz.sha256
+agentic-et1-tracker-<version>-aarch64.file.txt
+agentic-et1-tracker-<version>-aarch64.readelf.txt
+```
+
+By default they are written to `deploy/robots/agentic-et1-tracker/packaging/dist`.
+
+The Docker release prepares a real clone workspace from the current commit and
+copies `third_party/unitree_sdk2_install_aarch64` next to that clone. ONNX
+Runtime stays repo-local under `deploy/thirdparty` inside the clone. This avoids
+`git worktree` metadata and host absolute symlinks that can point outside the
+container mount.
+
+The clone is prepared from the current git commit (`HEAD`). Uncommitted tracked
+changes, untracked files, and dirty local config edits are not included in the
+release workspace; commit changes first before using this release path.
+
+The aarch64 toolchain file keeps default `/work/...` paths for compatibility,
+but the Docker release also exports:
+
+```text
+AGENTIC_ET1_YAML_CPP_AARCH64_ROOT
+AGENTIC_ET1_UNITREE_SDK2_AARCH64_ROOT
+AGENTIC_ET1_ONNXRUNTIME_AARCH64_ROOT
+```
+
+Use matching CMake cache values if you need to point the same toolchain at a
+different mounted workspace.
+
 ## Install
 
 Extract the tarball on the target and run:

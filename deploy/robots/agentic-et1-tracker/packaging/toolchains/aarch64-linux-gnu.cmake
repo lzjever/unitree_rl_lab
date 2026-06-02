@@ -13,11 +13,27 @@ set(CMAKE_EXE_LINKER_FLAGS_INIT "-pthread")
 
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 
+set(AGENTIC_ET1_AARCH64_YAML_CPP_ROOT "$ENV{AGENTIC_ET1_YAML_CPP_AARCH64_ROOT}" CACHE PATH "aarch64 yaml-cpp install root")
+if(NOT AGENTIC_ET1_AARCH64_YAML_CPP_ROOT)
+  set(AGENTIC_ET1_AARCH64_YAML_CPP_ROOT /opt/agentic-et1/aarch64/yaml-cpp)
+endif()
+
+set(AGENTIC_ET1_AARCH64_UNITREE_SDK2_ROOT "$ENV{AGENTIC_ET1_UNITREE_SDK2_AARCH64_ROOT}" CACHE PATH "aarch64 Unitree SDK2 install root")
+if(NOT AGENTIC_ET1_AARCH64_UNITREE_SDK2_ROOT)
+  set(AGENTIC_ET1_AARCH64_UNITREE_SDK2_ROOT /work/third_party/unitree_sdk2_install_aarch64)
+endif()
+
+set(AGENTIC_ET1_AARCH64_ONNXRUNTIME_ROOT "$ENV{AGENTIC_ET1_ONNXRUNTIME_AARCH64_ROOT}" CACHE PATH "aarch64 ONNX Runtime root")
+if(NOT AGENTIC_ET1_AARCH64_ONNXRUNTIME_ROOT)
+  set(AGENTIC_ET1_AARCH64_ONNXRUNTIME_ROOT /work/unitree_rl_lab/deploy/thirdparty/onnxruntime-linux-aarch64-1.26.0)
+endif()
+
 set(CMAKE_FIND_ROOT_PATH
   /usr/aarch64-linux-gnu
-  /work/third_party/unitree_sdk2_install_aarch64
+  ${AGENTIC_ET1_AARCH64_YAML_CPP_ROOT}
+  ${AGENTIC_ET1_AARCH64_UNITREE_SDK2_ROOT}
+  ${AGENTIC_ET1_AARCH64_ONNXRUNTIME_ROOT}
   /work/third_party/yaml-cpp_install_aarch64
-  /work/unitree_rl_lab/deploy/thirdparty/onnxruntime-linux-aarch64-1.26.0
 )
 
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
