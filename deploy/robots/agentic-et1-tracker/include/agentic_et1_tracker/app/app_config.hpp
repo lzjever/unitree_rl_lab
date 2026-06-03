@@ -26,6 +26,7 @@ struct ControlConfig {
   std::string velocity_deploy{"config/policy/velocity/v0/params/deploy.yaml"};
   std::string fixstand_config{"config/posture/fixstand/v0/fixstand.yaml"};
   std::string passive_config{"config/posture/passive/v0/passive.yaml"};
+  std::string standby_reference{"config/reference/standby/v0/standby_ref.trk"};
 };
 
 struct ReferenceConfig {

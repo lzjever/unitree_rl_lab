@@ -39,9 +39,9 @@ progress lives under `idle`. Internal synthetic transitions use
 enter queue/history and have no run id. `/stop` immediately aborts active user,
 idle, holding, or transition work and does not play `standby_ref.trk`.
 
-`standby_ref.trk` is recorded and simulator accepted, but runtime playback and
-real-robot GA gates remain pending. Direct `/standby_velocity` remains valid
-without playback of that asset.
+`standby_ref.trk` is recorded, simulator accepted, and runtime-gated
+internally; real-robot GA gates remain pending. Direct `/standby_velocity`
+remains valid.
 
 Only use direct HTTP knowledge when high-level commands cannot express the
 operation. Do not emit `curl` unless a human explicitly asks for it.

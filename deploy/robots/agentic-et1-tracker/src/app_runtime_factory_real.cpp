@@ -3,6 +3,7 @@
 #include <exception>
 #include <filesystem>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -12,6 +13,7 @@
 #include "agentic_et1_tracker/policy/onnx_policy_runtime.hpp"
 #include "agentic_et1_tracker/policy/velocity_deploy_config.hpp"
 #include "agentic_et1_tracker/robot/unitree_sdk_robot_io.hpp"
+#include "agentic_et1_tracker/trk/loader.hpp"
 
 #include "app_policy_path_guard.hpp"
 
@@ -20,6 +22,7 @@ namespace {
 
 constexpr const char* kPolicyNotLoadedBlock = "policy_not_loaded";
 constexpr const char* kRobotDisconnectedBlock = "robot_disconnected";
+constexpr double kInternalStandbyMaxTrackDurationS = 5.0;
 
 enum class FactoryPhase {
   Deploy,
@@ -78,6 +81,38 @@ std::filesystem::path velocityModelPath(const ControlConfig& config) {
          config.velocity_policy_file;
 }
 
+}  // namespace
+
+namespace app_internal {
+
+TrkValidationConfig internalStandbyTrkValidationConfig(
+    const AppConfig& config,
+    const std::filesystem::path& standby_reference) {
+  TrkValidationConfig trk_config = config.trk;
+  trk_config.allowlist_dirs = {standby_reference.parent_path()};
+  trk_config.max_duration_s = kInternalStandbyMaxTrackDurationS;
+  return trk_config;
+}
+
+}  // namespace app_internal
+
+namespace {
+
+std::shared_ptr<const TrkTrack> loadInternalStandbyTrack(const AppConfig& config) {
+  const std::filesystem::path path = config.control.standby_reference;
+  if (app_internal::referencesEt1RuntimeDependency(path)) {
+    throw std::runtime_error("standby reference points at ET1 app");
+  }
+
+  TrkValidationConfig trk_config =
+      app_internal::internalStandbyTrkValidationConfig(config, path);
+  TrkLoadResult loaded = TrkLoader(std::move(trk_config)).load(path);
+  if (!loaded.ok()) {
+    throw std::runtime_error("standby reference failed to load");
+  }
+  return std::make_shared<TrkTrack>(std::move(*loaded.track));
+}
+
 ControlMode startupControl(const ControlConfig& config) {
   if (config.startup_control == "FixStand") {
     return ControlMode::FixStand;
@@ -118,6 +153,7 @@ AppRuntimeFactoryResult createAppRuntimeDeps(const AppConfig& config) {
         loadVelocityDeployConfig(config.control.velocity_deploy);
     FixStandConfig fixstand_config = loadFixStandConfig(config.control.fixstand_config);
     PassiveConfig passive_config = loadPassiveConfig(config.control.passive_config);
+    std::shared_ptr<const TrkTrack> standby_track = loadInternalStandbyTrack(config);
 
     phase = FactoryPhase::Policy;
     const std::filesystem::path policy_model_path = modelPath(config.policy);
@@ -158,6 +194,7 @@ AppRuntimeFactoryResult createAppRuntimeDeps(const AppConfig& config) {
     deps.passive_config = std::move(passive_config);
     deps.startup_control = startupControl(config.control);
     deps.mode = runtimeMode(config);
+    deps.standby_track = std::move(standby_track);
 
     AppRuntimeFactoryResult result;
     result.deps.emplace(std::move(deps));

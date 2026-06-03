@@ -7,6 +7,7 @@
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -154,6 +155,13 @@ std::filesystem::path validTrk(TempTree& tmp, const std::string& name, std::uint
   const auto path = tmp.allowed / name;
   writeTrk(path, requiredArrays(frames));
   return path;
+}
+
+std::shared_ptr<const TrkTrack> loadTrack(const TrkValidationConfig& config,
+                                          const std::filesystem::path& path) {
+  TrkLoadResult loaded = TrkLoader(config).load(path);
+  REQUIRE(loaded.ok());
+  return std::make_shared<TrkTrack>(std::move(*loaded.track));
 }
 
 std::filesystem::path invalidContactTrk(TempTree& tmp, const std::string& name) {
@@ -516,7 +524,8 @@ RuntimeControlLoop makeControlLoop(RuntimeConfig config,
                                    FixStandConfig fixstand_config = fixStandConfig(),
                                    ControlMode startup_control = ControlMode::FixStand,
                                    PassiveConfig passive_config = passiveConfig(),
-                                   ReferenceFrameSink* reference_sink = nullptr) {
+                                   ReferenceFrameSink* reference_sink = nullptr,
+                                   std::shared_ptr<const TrkTrack> standby_track = nullptr) {
   return RuntimeControlLoop(config,
                             bridge,
                             store,
@@ -531,7 +540,8 @@ RuntimeControlLoop makeControlLoop(RuntimeConfig config,
                             startup_control,
                             kExpectedModeMachine,
                             RuntimeMode::Real,
-                            reference_sink);
+                            reference_sink,
+                            std::move(standby_track));
 }
 
 void requireIdle(const RuntimeStatusStore& store) {
@@ -1031,6 +1041,124 @@ TEST_CASE("RuntimeControlLoop control commands leave holding with required termi
   }
 }
 
+TEST_CASE("RuntimeControlLoop standby velocity from holding gates through standby reference") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  const auto standby_track =
+      loadTrack(tmp.trkConfig(), validTrk(tmp, "internal_standby_ref.trk", 2));
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  FakeReferenceSink reference;
+  auto loop = makeControlLoop(config,
+                              bridge,
+                              store,
+                              tmp.trkConfig(),
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              deploy_config,
+                              velocity_config,
+                              fixStandConfig(),
+                              ControlMode::StandbyVelocity,
+                              passiveConfig(),
+                              &reference,
+                              standby_track);
+  startHoldingRun(loop, store, bridge, tmp, "held-to-standby-ref", &reference);
+
+  REQUIRE(bridge.standbyVelocity().ok());
+  loop.tick();
+
+  auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Running);
+  REQUIRE(snapshot.active.kind == ActiveKind::Transition);
+  REQUIRE(snapshot.active.id.empty());
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.transition.active);
+  REQUIRE(snapshot.transition.target == "standby");
+  REQUIRE(snapshot.transition.target_id.empty());
+  REQUIRE_FALSE(snapshot.transition.target_state.has_value());
+  REQUIRE(snapshot.queue.ids.empty());
+  REQUIRE_FALSE(snapshot.idle.active);
+  REQUIRE(reference.latest.active);
+  REQUIRE(reference.latest.id.empty());
+  REQUIRE(store.findRun("held-to-standby-ref").run->state == MotionState::Done);
+  REQUIRE(store.findRun("standby_ref").code == ErrorCode::RunNotFound);
+
+  bool saw_standby_playback = false;
+  const std::size_t synthetic_frames = snapshot.transition.frames;
+  for (std::size_t i = 0; i < synthetic_frames + 4; ++i) {
+    loop.tick();
+    snapshot = store.snapshot();
+    REQUIRE_FALSE(snapshot.exec.has_value());
+    REQUIRE(snapshot.queue.ids.empty());
+    if (snapshot.active.kind == ActiveKind::Transition &&
+        snapshot.transition.target == "standby" &&
+        snapshot.transition.frames == standby_track->metadata.frames) {
+      saw_standby_playback = true;
+      break;
+    }
+  }
+  REQUIRE(saw_standby_playback);
+
+  for (std::size_t i = 0; i < standby_track->metadata.frames + 4; ++i) {
+    loop.tick();
+    snapshot = store.snapshot();
+    if (snapshot.active.kind == ActiveKind::None) {
+      break;
+    }
+  }
+
+  snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::StandbyVelocity);
+  REQUIRE(snapshot.active.kind == ActiveKind::None);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE(snapshot.queue.ids.empty());
+  REQUIRE_FALSE(reference.latest.active);
+  REQUIRE(store.findRun("held-to-standby-ref").run->state == MotionState::Done);
+}
+
+TEST_CASE("RuntimeControlLoop completed user gates through standby reference when idle has no work") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  const auto standby_track =
+      loadTrack(tmp.trkConfig(), validTrk(tmp, "complete_standby_ref.trk", 2));
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  RuntimeControlLoop loop(config,
+                          bridge,
+                          store,
+                          TrkLoader(tmp.trkConfig()),
+                          &reference,
+                          standby_track);
+
+  const auto path = validTrk(tmp, "complete_before_standby.trk", 1);
+  REQUIRE(bridge.submitQueue(
+              executeCommand("complete-before-standby", path, MotionMode::Queue, 1))
+              .ok());
+  startQueuedRun(loop, store, "complete-before-standby");
+
+  loop.tick();
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Running);
+  REQUIRE(snapshot.active.kind == ActiveKind::Transition);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.transition.active);
+  REQUIRE(snapshot.transition.target == "standby");
+  REQUIRE(snapshot.transition.target_id.empty());
+  REQUIRE_FALSE(snapshot.transition.target_state.has_value());
+  REQUIRE(snapshot.queue.ids.empty());
+  REQUIRE(store.findRun("complete-before-standby").run->state == MotionState::Done);
+  REQUIRE(store.findRun("standby_ref").code == ErrorCode::RunNotFound);
+}
+
 TEST_CASE("RuntimeControlLoop holding to user transition is internal status only") {
   TempTree tmp;
   const RuntimeConfig config = runtimeConfig();
@@ -1368,7 +1496,14 @@ TEST_CASE("RuntimeControlLoop completed user enters idle through internal transi
   RuntimeStatusStore store(config);
   RuntimeBridge bridge(config, store);
   FakeReferenceSink reference;
-  RuntimeControlLoop loop(config, bridge, store, TrkLoader(tmp.trkConfig()), &reference);
+  const auto standby_track =
+      loadTrack(tmp.trkConfig(), validTrk(tmp, "idle_priority_standby_ref.trk", 2));
+  RuntimeControlLoop loop(config,
+                          bridge,
+                          store,
+                          TrkLoader(tmp.trkConfig()),
+                          &reference,
+                          standby_track);
 
   const auto idle_path = validTrk(tmp, "user_to_idle_idle.trk", 2);
   REQUIRE(bridge.configureIdle({idleMotion(idle_path, 2)}).ok());
@@ -1480,6 +1615,74 @@ TEST_CASE("RuntimeControlLoop stop aborts active transition without playing stan
   REQUIRE_FALSE(store.snapshot().transition.active);
   REQUIRE(store.snapshot().queue.ids ==
           std::vector<std::string>{"post-stop-after-transition"});
+}
+
+TEST_CASE("RuntimeControlLoop controls abort standby reference gate without resuming playback") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const auto standby_track =
+      loadTrack(tmp.trkConfig(), validTrk(tmp, "abort_standby_ref.trk", 2));
+
+  struct Case {
+    const char* id;
+    ControlMode mode;
+    ControllerState expected_ctrl;
+  };
+
+  for (const auto& item : std::vector<Case>{
+           {"abort-standby-stop", ControlMode::StandbyVelocity,
+            ControllerState::Stopping},
+           {"abort-standby-passive", ControlMode::Passive, ControllerState::Passive},
+           {"abort-standby-fixstand", ControlMode::FixStand, ControllerState::FixStand},
+       }) {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeRobotIO robot(readyLowState(deploy_config));
+    FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+    FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+    FakeReferenceSink reference;
+    auto loop = makeControlLoop(config,
+                                bridge,
+                                store,
+                                tmp.trkConfig(),
+                                robot,
+                                tracker_policy,
+                                velocity_policy,
+                                deploy_config,
+                                velocity_config,
+                                fixStandConfig(),
+                                ControlMode::StandbyVelocity,
+                                passiveConfig(),
+                                &reference,
+                                standby_track);
+    startHoldingRun(loop, store, bridge, tmp, item.id, &reference);
+
+    REQUIRE(bridge.standbyVelocity().ok());
+    loop.tick();
+    REQUIRE(store.snapshot().active.kind == ActiveKind::Transition);
+    REQUIRE(store.snapshot().transition.target == "standby");
+
+    if (std::string(item.id) == "abort-standby-stop") {
+      REQUIRE(bridge.stop().state == ControllerState::Stopping);
+    } else if (item.mode == ControlMode::Passive) {
+      REQUIRE(bridge.passive().ok());
+    } else {
+      REQUIRE(bridge.fixStand().ok());
+    }
+    loop.tick();
+
+    const auto snapshot = store.snapshot();
+    REQUIRE(snapshot.ctrl == item.expected_ctrl);
+    REQUIRE(snapshot.active.kind == ActiveKind::None);
+    REQUIRE_FALSE(snapshot.exec.has_value());
+    REQUIRE_FALSE(snapshot.transition.active);
+    REQUIRE(snapshot.queue.ids.empty());
+    REQUIRE_FALSE(reference.latest.active);
+    REQUIRE(store.findRun(item.id).run->state == MotionState::Done);
+    REQUIRE(store.findRun("standby_ref").code == ErrorCode::RunNotFound);
+  }
 }
 
 TEST_CASE("RuntimeControlLoop clears reference on stop interrupt and loader failure") {

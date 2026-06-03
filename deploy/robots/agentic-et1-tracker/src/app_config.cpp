@@ -1,6 +1,7 @@
 #include "agentic_et1_tracker/app/app_config.hpp"
 
 #include <cmath>
+#include <optional>
 #include <sstream>
 #include <system_error>
 #include <utility>
@@ -27,6 +28,7 @@ constexpr int kMinDomainId = 0;
 constexpr int kMaxDomainId = 232;
 constexpr double kMinRuntimeRate = 1.0;
 constexpr double kMaxRuntimeRate = 1000.0;
+constexpr const char* kInternalStandbyReference = "reference/standby/v0/standby_ref.trk";
 
 ConfigError error(const std::string& message) { return ConfigError("config error: " + message); }
 
@@ -198,7 +200,7 @@ std::filesystem::path configDirectory(const std::filesystem::path& config_path) 
 void rejectEt1RuntimeDependency(const std::string& key, const std::filesystem::path& path) {
   if (app_internal::referencesEt1RuntimeDependency(path)) {
     throw error(std::string(key) +
-                " must not point at the ET1 app deploy/robots/et1 config.yaml or policy tree");
+                " must not point at the ET1 app deploy/robots/et1 config tree");
   }
 }
 
@@ -226,6 +228,30 @@ std::string resolveConfigPath(const char* key,
       (path.is_absolute() ? path : config_dir / path).lexically_normal();
   rejectEt1RuntimeDependency(key, resolved);
   return resolved.string();
+}
+
+std::optional<std::filesystem::path> appConfigRootFromPolicyDir(
+    const std::filesystem::path& policy_dir) {
+  const std::filesystem::path normalized = policy_dir.lexically_normal();
+  std::filesystem::path candidate;
+  bool previous_was_config = false;
+  for (const auto& part : normalized) {
+    const std::string value = part.generic_string();
+    if (previous_was_config && value == "policy") {
+      return candidate.lexically_normal();
+    }
+    candidate /= part;
+    previous_was_config = value == "config";
+  }
+  return std::nullopt;
+}
+
+std::string defaultInternalStandbyReference(const std::filesystem::path& policy_dir,
+                                            const std::filesystem::path& config_dir) {
+  if (const auto app_config_root = appConfigRootFromPolicyDir(policy_dir)) {
+    return (*app_config_root / kInternalStandbyReference).lexically_normal().string();
+  }
+  return (config_dir / ControlConfig{}.standby_reference).lexically_normal().string();
 }
 
 void validateDeployPath(const std::string& policy_dir, const std::string& deploy) {
@@ -384,6 +410,7 @@ AppConfig loadAppConfig(const std::filesystem::path& path) {
     }
 
     const YAML::Node control = section["control"];
+    bool standby_reference_explicit = false;
     if (control) {
       if (!control.IsMap()) {
         throw error("control must be a map");
@@ -400,6 +427,9 @@ AppConfig loadAppConfig(const std::filesystem::path& path) {
           optionalString(control, "fixstand_config", config.control.fixstand_config);
       config.control.passive_config =
           optionalString(control, "passive_config", config.control.passive_config);
+      standby_reference_explicit = static_cast<bool>(control["standby_reference"]);
+      config.control.standby_reference =
+          optionalString(control, "standby_reference", config.control.standby_reference);
     }
     if (config.control.startup_control != kStartupFixStand &&
         config.control.startup_control != kStartupStandbyVelocity) {
@@ -426,6 +456,15 @@ AppConfig loadAppConfig(const std::filesystem::path& path) {
                           config_dir);
     config.control.passive_config =
         resolveConfigPath("control.passive_config", config.control.passive_config,
+                          config_dir);
+    if (!standby_reference_explicit) {
+      config.control.standby_reference =
+          defaultInternalStandbyReference(config.policy.policy_dir, config_dir);
+      rejectEt1RuntimeDependency("control.standby_reference",
+                                 config.control.standby_reference);
+    }
+    config.control.standby_reference =
+        resolveConfigPath("control.standby_reference", config.control.standby_reference,
                           config_dir);
     validateDeployPath(config.control.velocity_policy_dir, config.control.velocity_deploy);
     validatePolicyModelPath("control velocity model", config.control.velocity_policy_dir,

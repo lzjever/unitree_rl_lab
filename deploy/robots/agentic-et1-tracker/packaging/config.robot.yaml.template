@@ -30,3 +30,4 @@ agentic_et1_tracker:
     velocity_deploy: "@PREFIX@/current/share/agentic-et1-tracker/config/policy/velocity/v0/params/deploy.yaml"
     fixstand_config: "@PREFIX@/current/share/agentic-et1-tracker/config/posture/fixstand/v0/fixstand.yaml"
     passive_config: "@PREFIX@/current/share/agentic-et1-tracker/config/posture/passive/v0/passive.yaml"
+    standby_reference: "@PREFIX@/current/share/agentic-et1-tracker/config/reference/standby/v0/standby_ref.trk"

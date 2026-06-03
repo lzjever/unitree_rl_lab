@@ -4,6 +4,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <string>
 
 #include "agentic_et1_tracker/app/app_config.hpp"
@@ -103,6 +104,25 @@ bool pathIsAtOrWithin(const std::filesystem::path& child, const std::filesystem:
   return child_it != child_end;
 }
 
+std::string readText(const std::filesystem::path& path) {
+  std::ifstream in(path);
+  REQUIRE(in);
+  std::ostringstream out;
+  out << in.rdbuf();
+  return out.str();
+}
+
+std::string replaceAll(std::string value,
+                       const std::string& needle,
+                       const std::string& replacement) {
+  std::size_t pos = 0;
+  while ((pos = value.find(needle, pos)) != std::string::npos) {
+    value.replace(pos, needle.size(), replacement);
+    pos += replacement.size();
+  }
+  return value;
+}
+
 }  // namespace
 
 TEST_CASE("AppConfig loads PRD defaults from agentic_et1_tracker section") {
@@ -155,6 +175,10 @@ agentic_et1_tracker:
           (config_dir / "config/posture/passive/v0/passive.yaml")
               .lexically_normal()
               .string());
+  REQUIRE(config.control.standby_reference ==
+          (config_dir / "config/reference/standby/v0/standby_ref.trk")
+              .lexically_normal()
+              .string());
   REQUIRE_FALSE(config.reference.enabled);
 }
 
@@ -181,6 +205,10 @@ TEST_CASE("AppConfig default file keeps StandbyVelocity and posture assets app-o
                            root / "config/posture/fixstand/v0"));
   REQUIRE(pathIsAtOrWithin(config.control.passive_config,
                            root / "config/posture/passive/v0"));
+  REQUIRE(config.control.standby_reference ==
+          (root / "config/reference/standby/v0/standby_ref.trk")
+              .lexically_normal()
+              .string());
   REQUIRE(config.control.startup_control == "FixStand");
   REQUIRE(config.stop_hold_s == 0.0);
   REQUIRE(config.runtime.stop_hold_s == 0.0);
@@ -212,9 +240,88 @@ TEST_CASE("AppConfig simulation example is ready for local MuJoCo acceptance") {
                            root / "config/posture/fixstand/v0"));
   REQUIRE(pathIsAtOrWithin(config.control.passive_config,
                            root / "config/posture/passive/v0"));
+  REQUIRE(config.control.standby_reference ==
+          (root / "config/reference/standby/v0/standby_ref.trk")
+              .lexically_normal()
+              .string());
   REQUIRE(config.control.startup_control == "FixStand");
   REQUIRE(config.stop_hold_s == 0.0);
   REQUIRE(config.reference.enabled);
+}
+
+TEST_CASE("AppConfig release template resolves internal standby reference to release asset") {
+  TempConfigTree tmp;
+  const auto root = appRoot();
+  const auto prefix = tmp.root / "prefix";
+  const std::string templ = readText(root / "packaging/config.robot.yaml.template");
+  const auto config = tmp.load(replaceAll(templ, "@PREFIX@", prefix.string()));
+
+  REQUIRE(config.policy.profile == "GeneralTrackerCLN");
+  REQUIRE(config.policy.policy_file == "multi_policy_v17c2_70k.onnx");
+  REQUIRE(config.policy.policy_dir ==
+          (prefix / "current/share/agentic-et1-tracker/config/policy/general_tracker_cln")
+              .lexically_normal()
+              .string());
+  REQUIRE(config.control.standby_reference ==
+          (prefix / "current/share/agentic-et1-tracker/config/reference/standby/v0/standby_ref.trk")
+              .lexically_normal()
+              .string());
+}
+
+TEST_CASE("AppConfig preserved old release config derives missing standby reference from app "
+          "assets") {
+  TempConfigTree tmp;
+  const auto prefix = tmp.root / "prefix";
+  const auto app_config_root =
+      prefix / "current/share/agentic-et1-tracker/config";
+  const auto config = tmp.load("agentic_et1_tracker:\n"
+                               "  bind: \"127.0.0.1\"\n"
+                               "  port: 8083\n"
+                               "  network: \"eth0\"\n"
+                               "  domain_id: 0\n"
+                               "  lock_path: \"" +
+                               (prefix / "shared/run/agentic-et1-tracker.lock").string() +
+                               "\"\n"
+                               "  mode_machine: 1\n"
+                               "  motion_dirs:\n"
+                               "    - \"" +
+                               (prefix / "shared/motions").string() +
+                               "\"\n"
+                               "  policy:\n"
+                               "    profile: \"GeneralTrackerCLN\"\n"
+                               "    policy_dir: \"" +
+                               (app_config_root / "policy/general_tracker_cln").string() +
+                               "\"\n"
+                               "    policy_file: \"multi_policy_v17c2_70k.onnx\"\n"
+                               "    deploy: \"" +
+                               (app_config_root / "policy/general_tracker_cln/params/deploy.yaml")
+                                   .string() +
+                               "\"\n"
+                               "    fps: 50\n"
+                               "  control:\n"
+                               "    startup_control: \"FixStand\"\n"
+                               "    velocity_policy_dir: \"" +
+                               (app_config_root / "policy/velocity/v0").string() +
+                               "\"\n"
+                               "    velocity_policy_file: \"policy.onnx\"\n"
+                               "    velocity_deploy: \"" +
+                               (app_config_root / "policy/velocity/v0/params/deploy.yaml")
+                                   .string() +
+                               "\"\n"
+                               "    fixstand_config: \"" +
+                               (app_config_root / "posture/fixstand/v0/fixstand.yaml")
+                                   .string() +
+                               "\"\n"
+                               "    passive_config: \"" +
+                               (app_config_root / "posture/passive/v0/passive.yaml").string() +
+                               "\"\n");
+
+  REQUIRE(config.policy.profile == "GeneralTrackerCLN");
+  REQUIRE(config.policy.policy_file == "multi_policy_v17c2_70k.onnx");
+  REQUIRE(config.control.standby_reference ==
+          (app_config_root / "reference/standby/v0/standby_ref.trk")
+              .lexically_normal()
+              .string());
 }
 
 TEST_CASE("AppConfig maps complete PRD YAML into component configs") {
@@ -252,6 +359,7 @@ agentic_et1_tracker:
     velocity_deploy: "config/policy/velocity/custom/params/deploy.yaml"
     fixstand_config: "config/posture/fixstand/custom/fixstand.yaml"
     passive_config: "config/posture/passive/custom/passive.yaml"
+    standby_reference: "config/reference/standby/custom/standby_ref.trk"
   reference:
     enabled: true
 )yaml");
@@ -300,6 +408,10 @@ agentic_et1_tracker:
               .string());
   REQUIRE(config.control.passive_config ==
           (config_dir / "config/posture/passive/custom/passive.yaml")
+              .lexically_normal()
+              .string());
+  REQUIRE(config.control.standby_reference ==
+          (config_dir / "config/reference/standby/custom/standby_ref.trk")
               .lexically_normal()
               .string());
   REQUIRE(config.reference.enabled);
@@ -711,6 +823,16 @@ agentic_et1_tracker:
   motion_dirs: ["/tmp/motions"]
   control:
     passive_config: "/home/galbot/works/et1/unitree_rl_lab/deploy/robots/et1/config/config.yaml"
+)yaml"),
+                        ContainsSubstring("ET1"));
+  }
+
+  SECTION("standby_reference under ET1 app config tree") {
+    REQUIRE_THROWS_WITH(loadYaml(R"yaml(
+agentic_et1_tracker:
+  motion_dirs: ["/tmp/motions"]
+  control:
+    standby_reference: "/home/galbot/works/et1/unitree_rl_lab/deploy/robots/et1/config/reference/standby/v0/standby_ref.trk"
 )yaml"),
                         ContainsSubstring("ET1"));
   }

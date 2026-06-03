@@ -46,10 +46,10 @@ and `wait ID` return `ok:true` when the run reaches `state:"holding"`.
 Internal transitions do not enter user `queue`, consume `queue.limit`, create a
 run id, or write user history.
 
-`/stop` immediately aborts user, idle, holding, and transition work. Do not
-claim standby reference playback: the `standby_ref.trk` asset is recorded and
-simulator accepted, but runtime playback and real-robot GA gates remain
-pending. Direct `standby`/StandbyVelocity remains available.
+`/stop` immediately aborts user, idle, holding, and transition work. The
+`standby_ref.trk` asset is recorded, simulator accepted, and runtime-gated
+internally; real-robot GA gates remain pending. Direct
+`standby`/StandbyVelocity remains available.
 
 Final user reply after live control: action taken, run id if any, terminal state
 if waited, and current `ctrl/ready/err`.

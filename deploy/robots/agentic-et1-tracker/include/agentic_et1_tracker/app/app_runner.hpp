@@ -11,6 +11,7 @@
 #include "agentic_et1_tracker/policy/velocity_deploy_config.hpp"
 #include "agentic_et1_tracker/policy/velocity_policy_runner.hpp"
 #include "agentic_et1_tracker/robot/robot_io.hpp"
+#include "agentic_et1_tracker/trk/loader.hpp"
 
 namespace agentic_et1_tracker {
 
@@ -24,6 +25,7 @@ struct AppRuntimeDeps {
   PassiveConfig passive_config;
   ControlMode startup_control{ControlMode::FixStand};
   RuntimeMode mode{RuntimeMode::Sim};
+  std::shared_ptr<const TrkTrack> standby_track;
 };
 
 struct AppRuntimeFactoryResult;

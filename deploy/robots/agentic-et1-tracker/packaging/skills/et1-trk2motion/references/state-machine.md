@@ -19,11 +19,10 @@ Control states:
   reached its last frame with `hold:true`; `wait` returns success and the id
   remains queryable until another user run or a control command releases it.
 - `running` with `active.kind=="transition"`: internal synthetic transition to
-  `transition.target`. Validated current local targets are `user` and `idle`;
-  `standby` remains reserved because `standby_ref.trk` runtime playback and
-  real-robot GA gates are pending, even though the asset is recorded and
-  simulator accepted. It has no run id, does not enter queue/history, and does
-  not consume `queue.limit`.
+  `transition.target`. Validated current local targets are `user`, `idle`, and
+  the internal `standby_ref.trk` gate. Standby has no run id, does not enter
+  queue/history, and does not consume `queue.limit`; real-robot GA gates remain
+  pending.
 - `stopping`: poll `state`; `stop` remains idempotent.
 - `fault` or `block:"lowcmd_occupied"`: manual/operator state.
 
@@ -42,6 +41,6 @@ states other than `done` remain failures by default. Use
 acceptable.
 
 `stop` immediately aborts active user, idle, holding, or transition work.
-`standby_ref.trk` is recorded and simulator accepted, but runtime playback and
-real-robot GA gates remain pending; direct `standby`/`standby_velocity` remains
-available without playback of that asset.
+`standby_ref.trk` is recorded, simulator accepted, and runtime-gated
+internally; real-robot GA gates remain pending. Direct
+`standby`/`standby_velocity` remains available.

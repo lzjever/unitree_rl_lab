@@ -60,11 +60,13 @@ RuntimeControlLoop::RuntimeControlLoop(RuntimeConfig config,
                                        RuntimeBridge& bridge,
                                        RuntimeStatusStore& status,
                                        TrkLoader loader,
-                                       ReferenceFrameSink* reference_sink)
+                                       ReferenceFrameSink* reference_sink,
+                                       std::shared_ptr<const TrkTrack> standby_track)
     : config_(config),
       bridge_(bridge),
       status_(status),
       loader_(std::move(loader)),
+      standby_track_(std::move(standby_track)),
       reference_sink_(reference_sink) {
   clearReference();
   publishSnapshot();
@@ -80,11 +82,13 @@ RuntimeControlLoop::RuntimeControlLoop(RuntimeConfig config,
                                        PassiveConfig passive_config,
                                        std::uint8_t expected_mode_machine,
                                        RuntimeMode mode,
-                                       ReferenceFrameSink* reference_sink)
+                                       ReferenceFrameSink* reference_sink,
+                                       std::shared_ptr<const TrkTrack> standby_track)
     : config_(config),
       bridge_(bridge),
       status_(status),
       loader_(std::move(loader)),
+      standby_track_(std::move(standby_track)),
       reference_sink_(reference_sink),
       robot_io_(&robot_io),
       policy_(&policy),
@@ -114,11 +118,13 @@ RuntimeControlLoop::RuntimeControlLoop(RuntimeConfig config,
                                        ControlMode startup_control,
                                        std::uint8_t expected_mode_machine,
                                        RuntimeMode mode,
-                                       ReferenceFrameSink* reference_sink)
+                                       ReferenceFrameSink* reference_sink,
+                                       std::shared_ptr<const TrkTrack> standby_track)
     : config_(config),
       bridge_(bridge),
       status_(status),
       loader_(std::move(loader)),
+      standby_track_(std::move(standby_track)),
       reference_sink_(reference_sink),
       robot_io_(&robot_io),
       policy_(&policy),
@@ -368,6 +374,9 @@ void RuntimeControlLoop::handleControl(ControlMode mode) {
   }
   if (mode == ControlMode::StandbyVelocity && active_kind_ == ActiveKind::User &&
       active_ && active_->state == MotionState::Holding) {
+    if (startTransitionFromHoldingToStandby()) {
+      return;
+    }
     finishActive(MotionState::Done, StopReason::None, ErrorCode::Ok);
     post_stop_control_ = ControlMode::StandbyVelocity;
     stop_reason_ = StopReason::None;
@@ -925,6 +934,9 @@ void RuntimeControlLoop::advanceActive() {
     if (active_kind_ == ActiveKind::User && startTransitionFromCompletedUserToIdle()) {
       return;
     }
+    if (active_kind_ == ActiveKind::User && startTransitionFromCompletedUserToStandby()) {
+      return;
+    }
     finishActive(MotionState::Done, StopReason::None, ErrorCode::Ok);
     post_stop_control_ = ControlMode::StandbyVelocity;
     enterGeneralTrackerIdleState();
@@ -1060,6 +1072,9 @@ void RuntimeControlLoop::advanceActiveWithPolicy() {
       return;
     }
     if (active_kind_ == ActiveKind::User && startTransitionFromCompletedUserToIdle()) {
+      return;
+    }
+    if (active_kind_ == ActiveKind::User && startTransitionFromCompletedUserToStandby()) {
       return;
     }
     finishActive(MotionState::Done, StopReason::None, ErrorCode::Ok);
@@ -1212,6 +1227,40 @@ bool RuntimeControlLoop::startTransitionFromHoldingToNextUser() {
   return startSyntheticTransitionFromActiveFrame(std::move(target),
                                                  *target_frame,
                                                  transition_fps);
+}
+
+bool RuntimeControlLoop::startTransitionFromHoldingToStandby() {
+  if (!active_ || active_kind_ != ActiveKind::User ||
+      active_->state != MotionState::Holding || !active_track_ ||
+      !waiting_.empty() || !standby_track_) {
+    return false;
+  }
+
+  std::optional<LowStateSample> entry_low_state;
+  if (hasPolicyRuntime()) {
+    entry_low_state = readLowStateForStatus();
+    const RobotReadinessStatus readiness =
+        mapRobotReadiness(entry_low_state,
+                          robot_io_->lowCmdOccupancy(),
+                          expected_mode_machine_);
+    if (readiness.err != ErrorCode::Ok) {
+      failActiveReadiness(readiness);
+      return true;
+    }
+    applyReadiness(readiness);
+  }
+
+  const std::optional<TrkFrameView> target_frame = standby_track_->frame(0);
+  if (!target_frame) {
+    return false;
+  }
+
+  PendingTransition target;
+  target.target_kind = TransitionTargetKind::Standby;
+  target.target_track = standby_track_;
+  return startSyntheticTransitionFromActiveFrame(std::move(target),
+                                                 *target_frame,
+                                                 standby_track_->metadata.fps);
 }
 
 bool RuntimeControlLoop::startTransitionFromCurrentReferenceToUser(
@@ -1392,6 +1441,58 @@ bool RuntimeControlLoop::startTransitionFromCompletedUserToIdle() {
                                                  transition_fps);
 }
 
+bool RuntimeControlLoop::startTransitionFromCompletedUserToStandby() {
+  if (!active_ || active_kind_ != ActiveKind::User || active_->hold ||
+      !active_track_ || !waiting_.empty() || !idle_config_.empty() ||
+      !standby_track_) {
+    return false;
+  }
+
+  std::optional<LowStateSample> entry_low_state;
+  if (hasPolicyRuntime()) {
+    entry_low_state = readLowStateForStatus();
+    const RobotReadinessStatus readiness =
+        mapRobotReadiness(entry_low_state,
+                          robot_io_->lowCmdOccupancy(),
+                          expected_mode_machine_);
+    if (readiness.err != ErrorCode::Ok) {
+      active_->state = MotionState::Done;
+      active_->err = ErrorCode::Ok;
+      active_->stop_reason = StopReason::None;
+      active_->ended_at = std::chrono::steady_clock::now();
+      status_.publishRunStatus(toStatus(*active_));
+      active_.reset();
+      active_track_.reset();
+      policy_runner_.reset();
+      clearReference();
+      active_kind_ = ActiveKind::None;
+      idle_current_index_.reset();
+      if (readinessRequiresFault(readiness)) {
+        enterFault(readiness.err,
+                   readiness.robot,
+                   readiness.block,
+                   readiness.low_ms);
+      } else {
+        enterPassiveState(readiness);
+      }
+      return true;
+    }
+    applyReadiness(readiness);
+  }
+
+  const std::optional<TrkFrameView> target_frame = standby_track_->frame(0);
+  if (!target_frame) {
+    return false;
+  }
+
+  PendingTransition target;
+  target.target_kind = TransitionTargetKind::Standby;
+  target.target_track = standby_track_;
+  return startSyntheticTransitionFromActiveFrame(std::move(target),
+                                                 *target_frame,
+                                                 standby_track_->metadata.fps);
+}
+
 bool RuntimeControlLoop::startSyntheticTransitionFromActiveFrame(
     PendingTransition target,
     const TrkFrameView& target_frame,
@@ -1421,6 +1522,8 @@ bool RuntimeControlLoop::startSyntheticTransitionFromActiveFrame(
       finishActive(MotionState::Done, StopReason::None, ErrorCode::Ok);
       post_stop_control_ = ControlMode::StandbyVelocity;
       enterGeneralTrackerIdleState();
+    } else if (target.target_kind == TransitionTargetKind::Standby) {
+      return false;
     }
     return true;
   }
@@ -1512,6 +1615,77 @@ bool RuntimeControlLoop::startInternalTransition(
   active_kind_ = ActiveKind::Transition;
   active_track_ = std::move(track);
   transition_ = std::move(target);
+  idle_current_index_.reset();
+  policy_runner_ = std::move(runner);
+  enterInternalState(RuntimeInternalState::GeneralTrackerTransition);
+  publishReferenceTransition();
+  return true;
+}
+
+bool RuntimeControlLoop::startStandbyPlayback(PendingTransition target) {
+  if (target.target_kind != TransitionTargetKind::Standby ||
+      !target.target_track) {
+    return false;
+  }
+
+  std::optional<LowStateSample> entry_low_state;
+  if (hasPolicyRuntime()) {
+    entry_low_state = readLowStateForStatus();
+    const RobotReadinessStatus readiness =
+        mapRobotReadiness(entry_low_state,
+                          robot_io_->lowCmdOccupancy(),
+                          expected_mode_machine_);
+    if (readiness.err != ErrorCode::Ok) {
+      active_kind_ = ActiveKind::None;
+      idle_current_index_.reset();
+      if (readinessRequiresFault(readiness)) {
+        enterFault(readiness.err,
+                   readiness.robot,
+                   readiness.block,
+                   readiness.low_ms);
+      } else {
+        enterPassiveState(readiness);
+      }
+      return true;
+    }
+    applyReadiness(readiness);
+  }
+
+  std::optional<PolicyStepRunner> runner;
+  if (hasPolicyRuntime()) {
+    try {
+      runner.emplace(*deploy_config_,
+                     target.target_track,
+                     *entry_low_state,
+                     expected_mode_machine_);
+    } catch (const std::exception&) {
+      active_kind_ = ActiveKind::None;
+      idle_current_index_.reset();
+      enterFault(ErrorCode::ModelInferenceFailed,
+                 RobotState::Fault,
+                 "policy_inference_failed",
+                 runtime_state_.low_ms);
+      return true;
+    }
+  }
+
+  MotionRequest playback_request;
+  playback_request.state = MotionState::Running;
+  playback_request.frame = 0;
+  playback_request.frames = target.target_track->metadata.frames;
+  playback_request.fps = target.target_track->metadata.fps;
+  playback_request.duration_s = target.target_track->metadata.duration_s;
+  playback_request.err = ErrorCode::Ok;
+  playback_request.stop_reason = StopReason::None;
+  playback_request.started_at = std::chrono::steady_clock::now();
+
+  PendingTransition playback_target;
+  playback_target.target_kind = TransitionTargetKind::Standby;
+
+  active_ = std::move(playback_request);
+  active_kind_ = ActiveKind::Transition;
+  active_track_ = std::move(target.target_track);
+  transition_ = std::move(playback_target);
   idle_current_index_.reset();
   policy_runner_ = std::move(runner);
   enterInternalState(RuntimeInternalState::GeneralTrackerTransition);
@@ -1645,6 +1819,9 @@ void RuntimeControlLoop::completeTransition() {
   clearReference();
 
   if (target.target_kind == TransitionTargetKind::Standby) {
+    if (target.target_track && startStandbyPlayback(std::move(target))) {
+      return;
+    }
     active_kind_ = ActiveKind::None;
     idle_current_index_.reset();
     post_stop_control_ = ControlMode::StandbyVelocity;

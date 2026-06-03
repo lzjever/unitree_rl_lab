@@ -13,6 +13,14 @@
 #endif
 
 namespace agentic_et1_tracker {
+namespace app_internal {
+
+TrkValidationConfig internalStandbyTrkValidationConfig(
+    const AppConfig& config,
+    const std::filesystem::path& standby_reference);
+bool referencesEt1RuntimeDependency(const std::filesystem::path& path);
+
+}  // namespace app_internal
 namespace {
 
 struct TempTree {
@@ -304,6 +312,37 @@ TEST_CASE("AppRuntimeFactory real factory blocks final model symlink into ET1 co
 #else
   SUCCEED("real factory is not compiled in this build");
 #endif
+}
+
+TEST_CASE("AppRuntimeFactory real factory validates internal standby with fixed duration limit") {
+#if AGENTIC_ET1_TRACKER_REAL_FACTORY
+  AppConfig config;
+  config.trk.fps = 50.0;
+  config.trk.max_duration_s = 0.1;
+  config.trk.allowlist_dirs = {"/tmp/user-motions"};
+  const std::filesystem::path standby_reference =
+      "/opt/agentic-et1/current/share/agentic-et1-tracker/config/reference/standby/v0/"
+      "standby_ref.trk";
+
+  const TrkValidationConfig standby_config =
+      app_internal::internalStandbyTrkValidationConfig(config, standby_reference);
+
+  REQUIRE(standby_config.fps == 50.0);
+  REQUIRE(standby_config.max_duration_s == 5.0);
+  REQUIRE(standby_config.allowlist_dirs ==
+          std::vector<std::filesystem::path>{standby_reference.parent_path()});
+#else
+  SUCCEED("real factory is not compiled in this build");
+#endif
+}
+
+TEST_CASE("AppRuntimeFactory path guard rejects ET1 app reference tree but keeps app-owned assets") {
+  REQUIRE(app_internal::referencesEt1RuntimeDependency(
+      "/home/galbot/works/et1/unitree_rl_lab/deploy/robots/et1/config/reference/standby/v0/"
+      "standby_ref.trk"));
+  REQUIRE_FALSE(app_internal::referencesEt1RuntimeDependency(
+      "/home/galbot/works/et1/unitree_rl_lab/deploy/robots/agentic-et1-tracker/config/"
+      "reference/standby/v0/standby_ref.trk"));
 }
 
 TEST_CASE("AppRuntimeFactory releases Unitree motion mode only for real mode_machine") {

@@ -237,7 +237,8 @@ class AppRunner::Impl {
                             deps.startup_control,
                             static_cast<std::uint8_t>(config_.mode_machine),
                             deps.mode,
-                            reference_store_.get());
+                            reference_store_.get(),
+                            deps.standby_track);
       return;
     }
 
@@ -251,7 +252,8 @@ class AppRunner::Impl {
                           deps.passive_config,
                           static_cast<std::uint8_t>(config_.mode_machine),
                           deps.mode,
-                          reference_store_.get());
+                          reference_store_.get(),
+                          deps.standby_track);
   }
 
   void runtimeLoop() {

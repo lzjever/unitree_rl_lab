@@ -209,10 +209,11 @@ The public motion input contract remains the existing `.trk` format; CLN does
 not add `.et1trk` as a service input.
 
 `standby_ref.trk` is now an app-owned release asset with simulator visual
-acceptance recorded in its manifest. The real-robot/operator gate remains
-pending, and this docs/asset slice does not change runtime playback logic or
-claim overall GA. Direct `/standby_velocity` and the StandbyVelocity/Velocity0
-policy path remain available.
+acceptance recorded in its manifest. Runtime playback is gated internally by
+unit-covered transitions from user reference to standby reference and then back
+to StandbyVelocity/Velocity0. The real-robot/operator gate remains pending, and
+this does not claim overall GA. Direct `/standby_velocity` and the
+StandbyVelocity/Velocity0 policy path remain available.
 
 For manual or integration simulation testing in this workspace, the installed
 Unitree MuJoCo simulator under `/home/galbot/works/et1` can be used. Test

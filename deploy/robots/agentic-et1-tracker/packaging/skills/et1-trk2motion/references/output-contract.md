@@ -35,5 +35,5 @@ Use exit code `0` only when `ok:true`; `holding` is `ok:true` for `wait` and
 non-null `id` is waitable. Idle status is compact progress only and is not a
 run id. Internal transitions are reported through compact
 `transition.active/target/target_id/frame/frames/progress`; they have no id and
-do not enter user queue or history. `standby_ref.trk` is recorded and simulator
-accepted, but runtime playback and real-robot GA gates remain pending.
+do not enter user queue or history. `standby_ref.trk` is recorded, simulator
+accepted, and runtime-gated internally; real-robot GA gates remain pending.

@@ -212,8 +212,8 @@ Pending MuJoCo evidence must record:
 | Default ROBOT/ONNX build | recorded above | Keep default configure/build on the real integration path. |
 | Hermetic stub tests | recorded above | Keep explicit stub/test configure and tests passing. |
 | Docs/skill CLI contract | recorded above | Keep packaged and installed skill tests/diffs passing. |
-| `standby_ref.trk` release asset | simulator accepted; real robot pending | App-local asset and manifest are recorded; hardware/operator validation remains pending before GA. |
-| MuJoCo visual acceptance | partial; pending | Targeted standby_ref simulator review is recorded; broader scenarios listed above still need `config.sim.yaml.example` evidence. |
+| `standby_ref.trk` release asset and runtime gate | unit-covered; real robot pending | App-local asset, manifest, internal runtime playback, and abort behavior are recorded; hardware/operator validation remains pending before GA. |
+| MuJoCo visual acceptance | partial; pending | Targeted standby_ref simulator review and automated runtime gate coverage are recorded; broader scenarios listed above still need `config.sim.yaml.example` evidence. |
 | Real robot acceptance | pending | ET1 hardware/operator validation. |
 
 Do not mark GA until the pending broader MuJoCo/control and real-robot gates
@@ -223,5 +223,5 @@ are complete.
 
 True end-to-end MuJoCo control acceptance and real-robot validation are still
 pending. The real-robot gate requires ET1 hardware and an operator window. The
-standby reference asset is app-owned and simulator accepted, but hardware
-validation remains pending before GA.
+standby reference asset is app-owned, simulator accepted, and runtime-gated by
+unit tests, but hardware validation remains pending before GA.

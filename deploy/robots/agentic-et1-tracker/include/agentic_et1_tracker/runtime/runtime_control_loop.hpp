@@ -46,7 +46,8 @@ class RuntimeControlLoop final {
                      RuntimeBridge& bridge,
                      RuntimeStatusStore& status,
                      TrkLoader loader,
-                     ReferenceFrameSink* reference_sink = nullptr);
+                     ReferenceFrameSink* reference_sink = nullptr,
+                     std::shared_ptr<const TrkTrack> standby_track = nullptr);
   RuntimeControlLoop(RuntimeConfig config,
                      RuntimeBridge& bridge,
                      RuntimeStatusStore& status,
@@ -57,7 +58,8 @@ class RuntimeControlLoop final {
                      PassiveConfig passive_config,
                      std::uint8_t expected_mode_machine,
                      RuntimeMode mode = RuntimeMode::Real,
-                     ReferenceFrameSink* reference_sink = nullptr);
+                     ReferenceFrameSink* reference_sink = nullptr,
+                     std::shared_ptr<const TrkTrack> standby_track = nullptr);
   RuntimeControlLoop(RuntimeConfig config,
                      RuntimeBridge& bridge,
                      RuntimeStatusStore& status,
@@ -72,7 +74,8 @@ class RuntimeControlLoop final {
                      ControlMode startup_control,
                      std::uint8_t expected_mode_machine,
                      RuntimeMode mode = RuntimeMode::Real,
-                     ReferenceFrameSink* reference_sink = nullptr);
+                     ReferenceFrameSink* reference_sink = nullptr,
+                     std::shared_ptr<const TrkTrack> standby_track = nullptr);
 
   void tick();
   RuntimeInternalState internalStateForTest() const;
@@ -132,15 +135,18 @@ class RuntimeControlLoop final {
   void advanceHolding();
   void advanceHoldingWithPolicy();
   bool startTransitionFromHoldingToNextUser();
+  bool startTransitionFromHoldingToStandby();
   bool startTransitionFromCurrentReferenceToUser(MotionRequest target_request,
                                                 StopReason replaced_reason);
   bool startTransitionFromCompletedUserToIdle();
+  bool startTransitionFromCompletedUserToStandby();
   bool startSyntheticTransitionFromActiveFrame(PendingTransition target,
                                                const TrkFrameView& target_frame,
                                                double target_fps);
   bool startInternalTransition(std::shared_ptr<const TrkTrack> track,
                                PendingTransition target,
                                std::optional<LowStateSample> entry_low_state);
+  bool startStandbyPlayback(PendingTransition target);
   void advanceTransition();
   void advanceTransitionWithPolicy();
   void completeTransition();
@@ -205,6 +211,7 @@ class RuntimeControlLoop final {
   RuntimeBridge& bridge_;
   RuntimeStatusStore& status_;
   TrkLoader loader_;
+  std::shared_ptr<const TrkTrack> standby_track_;
   ReferenceFrameSink* reference_sink_{nullptr};
   RobotIO* robot_io_{nullptr};
   PolicyInference* policy_{nullptr};
