@@ -94,6 +94,13 @@ skill CLI 必须保持 one-line compact JSON；`holding` 对 `run --hold --wait`
 
 目标：用当前 HEAD 的真实 runtime 行为做模拟器验收，不复用旧语义证据。
 
+验收操作顺序修正：如果 `/status` 已经是 `ready:true`
+`ctrl:"standby_velocity"`，smoke/普通验收不要先发 `/passive`。这只是验收
+操作顺序修正，不是代码语义变更，也不新增 API。`/passive` 只在专门验证
+Passive safety sink 时发送，且需提前准备 MuJoCo reset/upright/operator
+支撑；`bad_orientation` 恢复应先 `/fixstand`，等待 `ready:true`
+`ctrl:"fixstand"`、`block:null`、`err:null` 后再 `/standby_velocity`。
+
 最少场景：
 
 - sim config 使用 app-owned assets，`mode_machine:0`，不调用 MotionSwitcher。
@@ -101,8 +108,8 @@ skill CLI 必须保持 one-line compact JSON；`holding` 对 `run --hold --wait`
 - `/execute` 普通完成、`hold:true` 末帧 holding、user-to-user transition、user-to-idle transition。
 - `/idle` set/clear、idle active 被用户 `/execute` 抢占。
 - `/stop` 在 user/idle/holding/transition 中立即 abort，不播放 standby_ref。
-- `/passive` 在 user/idle/holding/transition 中立即进入 Passive safety sink，清 user queue 和 idle pool/config，不自动恢复 `lowcmd_occupied`。
-- `bad_orientation -> passive`，且 `/fixstand` 是软件恢复例外。
+- 专门 passive safety-sink 场景：`/passive` 在 user/idle/holding/transition 中立即进入 Passive safety sink，清 user queue 和 idle pool/config，不自动恢复 `lowcmd_occupied`。
+- `bad_orientation -> passive`，恢复路径为 `/fixstand` 到 `ready:true ctrl:"fixstand" block:null err:null` 后再 `/standby_velocity`。
 - `lowcmd_occupied -> manual`，不自动恢复。
 
 证据必须写入 `ACCEPTANCE.md` 或等价验收记录，包含日期、commit、config、命令摘要、关键 `/status` 样例和观察结论。
@@ -190,6 +197,7 @@ Skill CLI：
 MuJoCo：
 
 - [ ] sim config 不调用 MotionSwitcher。
+- [ ] smoke/普通验收不从 ready `standby_velocity` 先发 `/passive`；`/passive` 只在专门 safety-sink 场景且准备 reset/upright/operator 支撑后执行。
 - [ ] 普通 run、hold-last、user-to-user transition、user-to-idle transition 可视通过。
 - [ ] `/stop`、bad_orientation、lowcmd_occupied 行为符合安全合同。
 

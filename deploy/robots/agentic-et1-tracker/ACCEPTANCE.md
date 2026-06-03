@@ -125,6 +125,10 @@ Earlier MuJoCo evidence predated the current FixStand/StandbyVelocity/FSM
 semantics and is historical only. No idle/status/control MuJoCo acceptance has
 been recorded in this docs/skill pass.
 
+This section records an acceptance operation-order correction only. It does
+not change code semantics, add an API, or claim that MuJoCo visual acceptance
+has completed.
+
 Use `config.sim.yaml.example` as the starting point for local MuJoCo
 acceptance. The acceptance config should keep sim-safe settings such as
 `mode_machine: 0`, `network: "lo"`, app-owned policy/control assets, the default
@@ -132,6 +136,17 @@ acceptance. The acceptance config should keep sim-safe settings such as
 `motion_dirs` to the test `.trk` directory for the run; the recommended local
 test directory remains `/home/galbot/works/et1/generated`, but the current local
 config may need adjustment to match the chosen test directory.
+
+Smoke and normal acceptance runs must not begin by sending `/passive` when
+`/status` already reports `ready:true` and `ctrl:"standby_velocity"`. Passive is
+the safety sink/damping state; in MuJoCo without rope or operator support it can
+let the robot fall and trigger `ROBOT_BAD_ORIENTATION`. Send `/passive` only in
+a dedicated passive safety-sink scenario, and prepare MuJoCo reset/upright state
+or operator support before doing so.
+
+When recovering from `bad_orientation`, call `/fixstand`, wait until `/status`
+shows `ready:true`, `ctrl:"fixstand"`, `block:null`, and `err:null`, then call
+`/standby_velocity`.
 
 Pending MuJoCo evidence must record:
 
@@ -143,8 +158,11 @@ Pending MuJoCo evidence must record:
   `motion_mode_release_failed` if release fails.
 - Startup `/status` with `ctrl:"fixstand"` when using default config.
 - `/status.pose` with compact `q/g/p/v` fields during idle and running states.
-- Manual `/passive`, `/fixstand`, and `/standby_velocity` requests accepted
-  with empty body only when `/status` shows a runtime that can consume them.
+- Manual `/fixstand` and `/standby_velocity` requests accepted with empty body
+  only when `/status` shows a runtime that can consume them.
+- Dedicated `/passive` safety-sink scenario only after MuJoCo reset/upright or
+  operator support is prepared; do not use `/passive` as a smoke/acceptance
+  prologue from an already ready `standby_velocity` state.
 - Static not-ready startup/model-load failure snapshots reject `/fixstand` and
   `/standby_velocity` with compact readiness errors and no queued control
   command.
@@ -159,8 +177,9 @@ Pending MuJoCo evidence must record:
 - `/stop` clears idle config while preserving stop-watermark behavior for user
   work accepted after the stop.
 - After `.trk` done or `/stop`, top-level `ctrl:"standby_velocity"`.
-- `lowcmd_occupied -> manual` and `bad_orientation -> passive` with FixStand
-  recovery exception.
+- `lowcmd_occupied -> manual` and `bad_orientation -> passive` with recovery
+  through `/fixstand`, confirmed `ready:true ctrl:"fixstand" block:null
+  err:null`, then `/standby_velocity`.
 - Fault/disconnect handling and latency/performance evidence.
 
 ## GA gates

@@ -234,6 +234,15 @@ Complete GA simulation evidence still needs recorded queue FIFO, interrupt,
 stop-to-standby_velocity, `/fixstand`, `/standby_velocity`, fault/disconnect,
 and performance results.
 
+This is an acceptance operation-order note only, not a code semantics change or
+new API. If `/status` already reports `ready:true` and
+`ctrl:"standby_velocity"`, smoke and normal acceptance should not first send
+`/passive`. Use `/passive` only for a dedicated passive safety-sink scenario
+after MuJoCo reset/upright state or operator support is prepared. To recover
+from `bad_orientation`, send `/fixstand`, wait for `ready:true`,
+`ctrl:"fixstand"`, `block:null`, and `err:null`, then send
+`/standby_velocity`.
+
 Prerequisites:
 
 - Preflight: before acceptance, confirm there is no old `et1_ctrl`,
@@ -271,6 +280,7 @@ agentic-et1-tracker \
 TRK=$(find /home/galbot/works/et1/generated -maxdepth 1 -name '*.trk' | head -n 1)
 curl http://127.0.0.1:8083/health
 curl http://127.0.0.1:8083/status
+# if already ready with ctrl:"standby_velocity", do not send /passive first
 curl -X POST http://127.0.0.1:8083/fixstand
 curl -X POST http://127.0.0.1:8083/standby_velocity
 curl -X POST http://127.0.0.1:8083/execute \
