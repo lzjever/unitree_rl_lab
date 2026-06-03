@@ -226,17 +226,19 @@ TEST_CASE("POST execute defaults to queue and only submits a queue command") {
       h.service.handle({"POST", "/execute", R"({"path":"/tracks/wave.trk"})"});
 
   REQUIRE(response.status == 200);
-  requireFields(response.body, {"ok", "id", "state", "q"});
+  requireFields(response.body, {"ok", "id", "state", "q", "hold"});
   REQUIRE(response.body.at("ok") == true);
   REQUIRE(response.body.at("id") == "a7K3p9Qx");
   REQUIRE(isBase62RunId(response.body.at("id").get<std::string>()));
   REQUIRE(response.body.at("state") == "queued");
   REQUIRE(response.body.at("q") == 1);
+  REQUIRE(response.body.at("hold") == false);
   REQUIRE(h.sink.queue_calls == 1);
   REQUIRE(h.sink.interrupt_calls == 0);
   REQUIRE(h.sink.queue_commands.at(0).id == "a7K3p9Qx");
   REQUIRE(h.sink.queue_commands.at(0).path == "/tracks/wave.trk");
   REQUIRE(h.sink.queue_commands.at(0).mode == MotionMode::Queue);
+  REQUIRE_FALSE(h.sink.queue_commands.at(0).hold);
   REQUIRE(h.sink.queue_commands.at(0).track.frames == 12);
   REQUIRE(h.validator.calls == 1);
 }
@@ -263,12 +265,47 @@ TEST_CASE("POST execute mode interrupt only submits an interrupt command") {
       {"POST", "/execute", R"({"path":"/tracks/urgent.trk","mode":"interrupt"})"});
 
   REQUIRE(response.status == 200);
-  requireFields(response.body, {"ok", "id", "state", "q"});
+  requireFields(response.body, {"ok", "id", "state", "q", "hold"});
   REQUIRE(response.body.at("ok") == true);
   REQUIRE(response.body.at("state") == "queued");
+  REQUIRE(response.body.at("hold") == false);
   REQUIRE(h.sink.queue_calls == 0);
   REQUIRE(h.sink.interrupt_calls == 1);
   REQUIRE(h.sink.interrupt_commands.at(0).mode == MotionMode::Interrupt);
+  REQUIRE_FALSE(h.sink.interrupt_commands.at(0).hold);
+}
+
+TEST_CASE("POST execute accepts boolean hold without changing mode semantics") {
+  {
+    Harness h;
+
+    const auto response =
+        h.service.handle({"POST", "/execute", R"({"path":"/tracks/hold.trk","hold":true})"});
+
+    REQUIRE(response.status == 200);
+    requireFields(response.body, {"ok", "id", "state", "q", "hold"});
+    REQUIRE(response.body.at("hold") == true);
+    REQUIRE(h.sink.queue_calls == 1);
+    REQUIRE(h.sink.interrupt_calls == 0);
+    REQUIRE(h.sink.queue_commands.at(0).mode == MotionMode::Queue);
+    REQUIRE(h.sink.queue_commands.at(0).hold);
+  }
+
+  {
+    Harness h;
+
+    const auto response = h.service.handle(
+        {"POST", "/execute",
+         R"({"path":"/tracks/no-hold.trk","mode":"interrupt","hold":false})"});
+
+    REQUIRE(response.status == 200);
+    requireFields(response.body, {"ok", "id", "state", "q", "hold"});
+    REQUIRE(response.body.at("hold") == false);
+    REQUIRE(h.sink.queue_calls == 0);
+    REQUIRE(h.sink.interrupt_calls == 1);
+    REQUIRE(h.sink.interrupt_commands.at(0).mode == MotionMode::Interrupt);
+    REQUIRE_FALSE(h.sink.interrupt_commands.at(0).hold);
+  }
 }
 
 TEST_CASE("POST execute rejects invalid JSON contract before ports") {
@@ -279,6 +316,9 @@ TEST_CASE("POST execute rejects invalid JSON contract before ports") {
       R"({"path":3})",
       R"({"path":"/tracks/a.trk","mode":null})",
       R"({"path":"/tracks/a.trk","mode":"replace"})",
+      R"({"path":"/tracks/a.trk","hold":null})",
+      R"({"path":"/tracks/a.trk","hold":"true"})",
+      R"({"path":"/tracks/a.trk","hold":1})",
       R"({"path":"/tracks/a.trk","paths":["/tracks/b.trk"]})",
       R"({"path":"/tracks/a.trk","extra":true})",
       R"({"paths":["/tracks/a.trk"]})",
@@ -866,6 +906,17 @@ TEST_CASE("GET status renders idle nulls and queue short fields") {
   REQUIRE(response.body.at("idle").at("current").is_null());
   REQUIRE(response.body.at("err").is_null());
   REQUIRE(response.body.at("stop_reason").is_null());
+
+  requireFields(response.body.at("transition"),
+                {"active", "target", "target_id", "target_state", "frame",
+                 "frames", "progress"});
+  REQUIRE(response.body.at("transition").at("active") == false);
+  REQUIRE(response.body.at("transition").at("target").is_null());
+  REQUIRE(response.body.at("transition").at("target_id").is_null());
+  REQUIRE(response.body.at("transition").at("target_state").is_null());
+  REQUIRE(response.body.at("transition").at("frame") == 0);
+  REQUIRE(response.body.at("transition").at("frames") == 0);
+  REQUIRE(response.body.at("transition").at("progress") == 0.0);
 }
 
 TEST_CASE("GET status renders authoritative active and idle progress fields") {
@@ -907,6 +958,20 @@ TEST_CASE("GET status renders authoritative active and idle progress fields") {
   REQUIRE(response.body.at("active").at("id") == "active");
   REQUIRE(response.body.at("exec").at("id") == "active");
   REQUIRE(response.body.at("idle").at("active") == false);
+}
+
+TEST_CASE("GET status renders transition active kind without controller expansion") {
+  Harness h;
+  h.status.snapshot_value.ctrl = ControllerState::Running;
+  h.status.snapshot_value.active = {ActiveKind::Transition, "internal-transition"};
+
+  const auto response = h.service.handle({"GET", "/status", ""});
+
+  REQUIRE(response.status == 200);
+  REQUIRE(response.body.at("ctrl") == "running");
+  REQUIRE(response.body.at("active").at("kind") == "transition");
+  REQUIRE(response.body.at("active").at("id").is_null());
+  REQUIRE(response.body.at("transition").at("active") == false);
 }
 
 TEST_CASE("GET status renders compact pose for high-rate agent polling") {
@@ -962,12 +1027,13 @@ TEST_CASE("GET status renders running progress and top-level stopping reason") {
   auto response = h.service.handle({"GET", "/status", ""});
   requireFields(response.body.at("exec"),
                 {"id", "state", "frame", "frames", "time_s", "duration_s",
-                 "progress", "stop_reason", "err"});
+                 "progress", "hold", "stop_reason", "err"});
   REQUIRE(response.body.at("active").at("kind") == "user");
   REQUIRE(response.body.at("active").at("id") == "active");
   REQUIRE(response.body.at("exec").at("frame") == 4);
   REQUIRE(response.body.at("exec").at("frames") == 20);
   REQUIRE(response.body.at("exec").at("progress") == 0.25);
+  REQUIRE(response.body.at("exec").at("hold") == false);
   REQUIRE(response.body.at("exec").at("duration_s") == 0.38);
   REQUIRE_FALSE(response.body.at("exec").contains("path"));
   REQUIRE(response.body.at("stop_reason").is_null());
@@ -978,6 +1044,33 @@ TEST_CASE("GET status renders running progress and top-level stopping reason") {
 
   response = h.service.handle({"GET", "/status", ""});
   REQUIRE(response.body.at("stop_reason") == "stop");
+}
+
+TEST_CASE("GET status by id exposes hold metadata for queued running and holding runs") {
+  Harness h;
+  auto queued = run("queued-hold", MotionState::Queued);
+  queued.hold = true;
+  auto running = run("running-no-hold", MotionState::Running);
+  running.hold = false;
+  auto holding = run("holding-hold", MotionState::Holding);
+  holding.hold = true;
+  holding.progress = 1.0;
+  h.status.runs.emplace(queued.id, queued);
+  h.status.runs.emplace(running.id, running);
+  h.status.runs.emplace(holding.id, holding);
+
+  for (const auto& item :
+       std::vector<std::pair<std::string, bool>>{{queued.id, true},
+                                                 {running.id, false},
+                                                 {holding.id, true}}) {
+    const auto response =
+        h.service.handle({"GET", std::string("/status?id=") + item.first, ""});
+
+    CAPTURE(item.first);
+    REQUIRE(response.status == 200);
+    REQUIRE(response.body.at("id") == item.first);
+    REQUIRE(response.body.at("hold") == item.second);
+  }
 }
 
 TEST_CASE("GET status by id covers active queued and recent run states") {

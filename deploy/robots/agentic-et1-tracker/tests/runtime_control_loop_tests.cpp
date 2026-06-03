@@ -62,6 +62,7 @@ struct ArrayFixture {
   bool invalid_contact{false};
   std::size_t invalid_contact_index{0};
   std::int64_t invalid_contact_value{3};
+  bool zero_first_quaternion{false};
 };
 
 template <typename T>
@@ -99,7 +100,10 @@ void writePayload(std::ofstream& out, const ArrayFixture& array) {
   }
 
   for (std::size_t i = 0; i < elements; ++i) {
-    writeScalar(out, static_cast<float>(i) * 0.25F);
+    const float value = array.zero_first_quaternion && i < 4
+                            ? 0.0F
+                            : static_cast<float>(i) * 0.25F;
+    writeScalar(out, value);
   }
 }
 
@@ -158,6 +162,17 @@ std::filesystem::path invalidContactTrk(TempTree& tmp, const std::string& name) 
   left.invalid_contact = true;
   left.invalid_contact_index = 1;
   left.invalid_contact_value = 3;
+  const auto path = tmp.allowed / name;
+  writeTrk(path, arrays);
+  return path;
+}
+
+std::filesystem::path zeroQuaternionTrk(TempTree& tmp,
+                                        const std::string& name,
+                                        std::uint64_t frames = 2) {
+  auto arrays = requiredArrays(frames);
+  auto& quat = arrayNamed(arrays, "body_quat_w");
+  quat.zero_first_quaternion = true;
   const auto path = tmp.allowed / name;
   writeTrk(path, arrays);
   return path;
@@ -437,11 +452,13 @@ std::filesystem::path appRoot() {
 ExecuteCommand executeCommand(std::string id,
                               const std::filesystem::path& path,
                               MotionMode mode = MotionMode::Queue,
-                              std::size_t frames = 3) {
+                              std::size_t frames = 3,
+                              bool hold = false) {
   ExecuteCommand command;
   command.id = std::move(id);
   command.path = path.string();
   command.mode = mode;
+  command.hold = hold;
   command.track.frames = frames;
   command.track.duration_s = static_cast<double>(frames) / 50.0;
   command.track.fps = 50.0;
@@ -498,7 +515,8 @@ RuntimeControlLoop makeControlLoop(RuntimeConfig config,
                                        velocityDeployConfig(),
                                    FixStandConfig fixstand_config = fixStandConfig(),
                                    ControlMode startup_control = ControlMode::FixStand,
-                                   PassiveConfig passive_config = passiveConfig()) {
+                                   PassiveConfig passive_config = passiveConfig(),
+                                   ReferenceFrameSink* reference_sink = nullptr) {
   return RuntimeControlLoop(config,
                             bridge,
                             store,
@@ -512,7 +530,8 @@ RuntimeControlLoop makeControlLoop(RuntimeConfig config,
                             std::move(passive_config),
                             startup_control,
                             kExpectedModeMachine,
-                            RuntimeMode::Real);
+                            RuntimeMode::Real,
+                            reference_sink);
 }
 
 void requireIdle(const RuntimeStatusStore& store) {
@@ -631,6 +650,60 @@ void startQueuedRun(RuntimeControlLoop& loop,
   REQUIRE(snapshot.ctrl == ControllerState::Running);
   REQUIRE(snapshot.exec.has_value());
   REQUIRE(snapshot.exec->id == id);
+}
+
+void startHoldingRun(RuntimeControlLoop& loop,
+                     RuntimeStatusStore& store,
+                     RuntimeBridge& bridge,
+                     TempTree& tmp,
+                     const std::string& id,
+                     FakeReferenceSink* reference = nullptr) {
+  const auto path = validTrk(tmp, id + ".trk", 1);
+  REQUIRE(bridge.submitQueue(
+              executeCommand(id, path, MotionMode::Queue, 1, true))
+              .ok());
+  startQueuedRun(loop, store, id);
+
+  loop.tick();
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Running);
+  REQUIRE(snapshot.active.kind == ActiveKind::User);
+  REQUIRE(snapshot.active.id == id);
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->id == id);
+  REQUIRE(snapshot.exec->state == MotionState::Holding);
+  REQUIRE(snapshot.exec->frame == 0);
+  REQUIRE(snapshot.exec->frames == 1);
+  REQUIRE(snapshot.exec->progress == 1.0);
+  if (reference != nullptr) {
+    REQUIRE(reference->latest.active);
+    REQUIRE(reference->latest.id == id);
+    REQUIRE(reference->latest.frame == 0);
+  }
+}
+
+void startHoldingToUserTransition(RuntimeControlLoop& loop,
+                                  RuntimeStatusStore& store,
+                                  RuntimeBridge& bridge,
+                                  TempTree& tmp,
+                                  const std::string& held_id,
+                                  const std::string& target_id,
+                                  FakeReferenceSink* reference = nullptr) {
+  startHoldingRun(loop, store, bridge, tmp, held_id, reference);
+  const auto target_path = validTrk(tmp, target_id + ".trk", 2);
+  REQUIRE(bridge.submitQueue(
+              executeCommand(target_id, target_path, MotionMode::Queue, 2))
+              .ok());
+
+  loop.tick();
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Running);
+  REQUIRE(snapshot.active.kind == ActiveKind::Transition);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.transition.active);
+  REQUIRE(snapshot.transition.target == "user");
+  REQUIRE(snapshot.transition.target_id == target_id);
+  REQUIRE(snapshot.queue.ids.empty());
 }
 
 TEST_CASE("PassiveConfig loads app-owned ET1 passive damping asset") {
@@ -770,6 +843,643 @@ TEST_CASE("RuntimeControlLoop publishes active raw reference frames then clears"
   REQUIRE(reference.published.at(reference.published.size() - 1).frame == 2);
   REQUIRE(reference.published.at(reference.published.size() - 1).p.at(0) ==
           std::array<float, 3>{{40.5F, 40.75F, 41.0F}});
+}
+
+TEST_CASE("RuntimeControlLoop hold true keeps user run on final reference frame") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  RuntimeControlLoop loop(config, bridge, store, TrkLoader(tmp.trkConfig()), &reference);
+
+  const auto path = validTrk(tmp, "hold_last.trk", 2);
+  REQUIRE(bridge.submitQueue(
+              executeCommand("hold-last", path, MotionMode::Queue, 2, true))
+              .ok());
+  startQueuedRun(loop, store, "hold-last");
+
+  loop.tick();
+  auto snapshot = store.snapshot();
+  REQUIRE(snapshot.exec->state == MotionState::Running);
+  REQUIRE(snapshot.exec->frame == 0);
+
+  loop.tick();
+  snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Running);
+  REQUIRE(snapshot.active.kind == ActiveKind::User);
+  REQUIRE(snapshot.active.id == "hold-last");
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->id == "hold-last");
+  REQUIRE(snapshot.exec->state == MotionState::Holding);
+  REQUIRE(snapshot.exec->hold);
+  REQUIRE(snapshot.exec->frame == 1);
+  REQUIRE(snapshot.exec->frames == 2);
+  REQUIRE(snapshot.exec->progress == 1.0);
+  REQUIRE(snapshot.queue.ids.empty());
+  REQUIRE(reference.latest.active);
+  REQUIRE(reference.latest.id == "hold-last");
+  REQUIRE(reference.latest.frame == 1);
+  const int publishes_at_hold = reference.publish_calls;
+
+  loop.tick();
+  snapshot = store.snapshot();
+  REQUIRE(snapshot.exec->state == MotionState::Holding);
+  REQUIRE(snapshot.exec->frame == 1);
+  REQUIRE(reference.latest.active);
+  REQUIRE(reference.latest.frame == 1);
+  REQUIRE(reference.publish_calls > publishes_at_hold);
+
+  const auto found = store.findRun("hold-last");
+  REQUIRE(found.ok());
+  REQUIRE(found.run->state == MotionState::Holding);
+  REQUIRE(found.run->progress == 1.0);
+}
+
+TEST_CASE("RuntimeControlLoop policy holding keeps executing final frame") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy policy(floatSeq(0.0F, kPolicyJointDim));
+  auto loop = makePolicyLoop(config,
+                             bridge,
+                             store,
+                             tmp.trkConfig(),
+                             robot,
+                             policy,
+                             deploy_config);
+
+  const auto path = validTrk(tmp, "policy_hold_final.trk", 2);
+  REQUIRE(bridge.submitQueue(
+              executeCommand("policy-hold", path, MotionMode::Queue, 2, true))
+              .ok());
+  startQueuedRun(loop, store, "policy-hold");
+
+  loop.tick();
+  REQUIRE(policy.calls == 1);
+
+  loop.tick();
+  REQUIRE(store.snapshot().exec->state == MotionState::Holding);
+  REQUIRE(policy.calls == 2);
+  constexpr std::size_t command_jnt_pos_offset = 9;
+  const float final_frame_joint0 = 6.5F;
+  REQUIRE(policy.inputs_seen.at(1).obs_current.at(command_jnt_pos_offset) ==
+          final_frame_joint0);
+
+  loop.tick();
+  REQUIRE(store.snapshot().exec->state == MotionState::Holding);
+  REQUIRE(policy.calls == 3);
+  REQUIRE(policy.inputs_seen.at(2).obs_current.at(command_jnt_pos_offset) ==
+          final_frame_joint0);
+}
+
+TEST_CASE("RuntimeControlLoop hold false preserves completed run behavior") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  auto loop = makeLoop(config, bridge, store, tmp.trkConfig());
+
+  const auto path = validTrk(tmp, "hold_false.trk", 1);
+  REQUIRE(bridge.submitQueue(
+              executeCommand("hold-false", path, MotionMode::Queue, 1, false))
+              .ok());
+  startQueuedRun(loop, store, "hold-false");
+
+  loop.tick();
+
+  requireIdle(store);
+  const auto found = store.findRun("hold-false");
+  REQUIRE(found.ok());
+  REQUIRE(found.run->state == MotionState::Done);
+  REQUIRE(found.run->progress == 1.0);
+}
+
+TEST_CASE("RuntimeControlLoop control commands leave holding with required terminal state") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+
+  struct Case {
+    const char* id;
+    ControlMode mode;
+    MotionState expected_state;
+    ControllerState expected_ctrl;
+    StopReason expected_reason;
+    int ticks_after_command;
+  };
+
+  for (const auto& item : std::vector<Case>{
+           {"holding-stop", ControlMode::StandbyVelocity, MotionState::Stopped,
+            ControllerState::StandbyVelocity, StopReason::Stop, 2},
+           {"holding-passive", ControlMode::Passive, MotionState::Stopped,
+            ControllerState::Passive, StopReason::Stop, 1},
+           {"holding-fixstand", ControlMode::FixStand, MotionState::Stopped,
+            ControllerState::FixStand, StopReason::Stop, 2},
+           {"holding-standby", ControlMode::StandbyVelocity, MotionState::Done,
+            ControllerState::StandbyVelocity, StopReason::None, 1},
+       }) {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeRobotIO robot(readyLowState(deploy_config));
+    FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+    FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+    FakeReferenceSink reference;
+    auto loop = makeControlLoop(config,
+                                bridge,
+                                store,
+                                tmp.trkConfig(),
+                                robot,
+                                tracker_policy,
+                                velocity_policy,
+                                deploy_config,
+                                velocity_config,
+                                fixstand_config,
+                                ControlMode::StandbyVelocity,
+                                passiveConfig(),
+                                &reference);
+    startHoldingRun(loop, store, bridge, tmp, item.id, &reference);
+
+    if (std::string(item.id) == "holding-stop") {
+      REQUIRE(bridge.stop().state == ControllerState::Stopping);
+    } else if (item.mode == ControlMode::Passive) {
+      REQUIRE(bridge.passive().ok());
+    } else if (item.mode == ControlMode::FixStand) {
+      REQUIRE(bridge.fixStand().ok());
+    } else {
+      REQUIRE(bridge.standbyVelocity().ok());
+    }
+
+    for (int i = 0; i < item.ticks_after_command; ++i) {
+      loop.tick();
+    }
+
+    const auto snapshot = store.snapshot();
+    REQUIRE(snapshot.ctrl == item.expected_ctrl);
+    REQUIRE(snapshot.active.kind == ActiveKind::None);
+    REQUIRE_FALSE(snapshot.exec.has_value());
+    REQUIRE_FALSE(reference.latest.active);
+    const auto found = store.findRun(item.id);
+    REQUIRE(found.ok());
+    REQUIRE(found.run->state == item.expected_state);
+    REQUIRE(found.run->stop_reason == item.expected_reason);
+  }
+}
+
+TEST_CASE("RuntimeControlLoop holding to user transition is internal status only") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  RuntimeControlLoop loop(config, bridge, store, TrkLoader(tmp.trkConfig()), &reference);
+
+  startHoldingRun(loop, store, bridge, tmp, "held-user", &reference);
+  const auto next_path = validTrk(tmp, "held_to_next.trk", 2);
+  REQUIRE(bridge.submitQueue(
+              executeCommand("next-user", next_path, MotionMode::Queue, 2))
+              .ok());
+
+  loop.tick();
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Running);
+  REQUIRE(snapshot.active.kind == ActiveKind::Transition);
+  REQUIRE(snapshot.active.id.empty());
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.transition.active);
+  REQUIRE(snapshot.transition.target == "user");
+  REQUIRE(snapshot.transition.target_id == "next-user");
+  REQUIRE(snapshot.transition.frame == 0);
+  REQUIRE(snapshot.transition.frames > 1);
+  REQUIRE(snapshot.queue.ids.empty());
+  REQUIRE(reference.latest.active);
+  REQUIRE(reference.latest.id.empty());
+  REQUIRE(store.findRun("held-user").run->state == MotionState::Done);
+  const auto target = store.findRun("next-user");
+  REQUIRE(target.ok());
+  REQUIRE(target.run->state == MotionState::Queued);
+  REQUIRE(target.run->frame == 0);
+  REQUIRE(target.run->frames == 2);
+  REQUIRE(target.run->progress == 0.0);
+  REQUIRE(store.findRun("transition").code == ErrorCode::RunNotFound);
+}
+
+TEST_CASE("RuntimeControlLoop transition completion starts target user at frame zero") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  RuntimeControlLoop loop(config, bridge, store, TrkLoader(tmp.trkConfig()), &reference);
+
+  startHoldingToUserTransition(loop,
+                               store,
+                               bridge,
+                               tmp,
+                               "held-complete-transition",
+                               "target-after-transition",
+                               &reference);
+  const std::size_t transition_frames = store.snapshot().transition.frames;
+  REQUIRE(transition_frames > 1);
+
+  for (std::size_t i = 0; i < transition_frames + 2; ++i) {
+    loop.tick();
+    const auto snapshot = store.snapshot();
+    if (snapshot.active.kind == ActiveKind::User) {
+      REQUIRE(snapshot.exec.has_value());
+      REQUIRE(snapshot.exec->id == "target-after-transition");
+      REQUIRE(snapshot.exec->state == MotionState::Running);
+      REQUIRE(snapshot.exec->frame == 0);
+      REQUIRE(snapshot.exec->frames == 2);
+      REQUIRE(snapshot.exec->progress == 0.5);
+      REQUIRE_FALSE(snapshot.transition.active);
+      REQUIRE(snapshot.queue.ids.empty());
+      REQUIRE(store.findRun("held-complete-transition").run->state ==
+              MotionState::Done);
+      return;
+    }
+  }
+
+  FAIL("target user did not start after synthetic transition");
+}
+
+TEST_CASE("RuntimeControlLoop transition abort controls terminate target user") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+
+  struct Case {
+    const char* target_id;
+    ControlMode mode;
+    ControllerState expected_ctrl;
+    int ticks_after_command;
+  };
+
+  for (const auto& item : std::vector<Case>{
+           {"transition-passive-target", ControlMode::Passive,
+            ControllerState::Passive, 1},
+           {"transition-fixstand-target", ControlMode::FixStand,
+            ControllerState::FixStand, 1},
+           {"transition-standby-target", ControlMode::StandbyVelocity,
+            ControllerState::StandbyVelocity, 1},
+       }) {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeRobotIO robot(readyLowState(deploy_config));
+    FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+    FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+    FakeReferenceSink reference;
+    auto loop = makeControlLoop(config,
+                                bridge,
+                                store,
+                                tmp.trkConfig(),
+                                robot,
+                                tracker_policy,
+                                velocity_policy,
+                                deploy_config,
+                                velocity_config,
+                                fixstand_config,
+                                ControlMode::StandbyVelocity,
+                                passiveConfig(),
+                                &reference);
+    startHoldingToUserTransition(loop,
+                                 store,
+                                 bridge,
+                                 tmp,
+                                 std::string(item.target_id) + "-held",
+                                 item.target_id,
+                                 &reference);
+
+    if (item.mode == ControlMode::Passive) {
+      REQUIRE(bridge.passive().ok());
+    } else if (item.mode == ControlMode::FixStand) {
+      REQUIRE(bridge.fixStand().ok());
+    } else {
+      REQUIRE(bridge.standbyVelocity().ok());
+    }
+
+    for (int i = 0; i < item.ticks_after_command; ++i) {
+      loop.tick();
+    }
+
+    const auto snapshot = store.snapshot();
+    REQUIRE(snapshot.ctrl == item.expected_ctrl);
+    REQUIRE(snapshot.active.kind == ActiveKind::None);
+    REQUIRE_FALSE(snapshot.exec.has_value());
+    REQUIRE_FALSE(snapshot.transition.active);
+    REQUIRE(snapshot.queue.ids.empty());
+    REQUIRE_FALSE(reference.latest.active);
+
+    const auto target = store.findRun(item.target_id);
+    REQUIRE(target.ok());
+    REQUIRE(target.run->state == MotionState::Canceled);
+    REQUIRE(target.run->stop_reason == StopReason::Stop);
+  }
+}
+
+TEST_CASE("RuntimeControlLoop interrupt during transition rebuilds to urgent target") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  RuntimeControlLoop loop(config, bridge, store, TrkLoader(tmp.trkConfig()), &reference);
+
+  startHoldingToUserTransition(loop,
+                               store,
+                               bridge,
+                               tmp,
+                               "held-before-interrupt-transition",
+                               "old-transition-target",
+                               &reference);
+  loop.tick();
+  const auto before = store.snapshot();
+  REQUIRE(before.active.kind == ActiveKind::Transition);
+  REQUIRE(before.transition.target_id == "old-transition-target");
+  REQUIRE(before.transition.frame >= 0);
+
+  const auto urgent_path = validTrk(tmp, "urgent_transition_target.trk", 3);
+  REQUIRE(bridge.submitInterrupt(
+              executeCommand("urgent-transition-target",
+                             urgent_path,
+                             MotionMode::Interrupt,
+                             3))
+              .ok());
+
+  loop.tick();
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Running);
+  REQUIRE(snapshot.active.kind == ActiveKind::Transition);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.transition.active);
+  REQUIRE(snapshot.transition.target == "user");
+  REQUIRE(snapshot.transition.target_id == "urgent-transition-target");
+  REQUIRE(snapshot.transition.frame == 0);
+  REQUIRE(snapshot.queue.ids.empty());
+  REQUIRE(reference.latest.active);
+
+  const auto old_target = store.findRun("old-transition-target");
+  REQUIRE(old_target.ok());
+  REQUIRE(old_target.run->state == MotionState::Canceled);
+  REQUIRE(old_target.run->stop_reason == StopReason::Interrupt);
+  const auto urgent = store.findRun("urgent-transition-target");
+  REQUIRE(urgent.ok());
+  REQUIRE(urgent.run->state == MotionState::Queued);
+}
+
+TEST_CASE("RuntimeControlLoop failed transition build leaves held source holding") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  RuntimeControlLoop loop(config, bridge, store, TrkLoader(tmp.trkConfig()), &reference);
+
+  startHoldingRun(loop, store, bridge, tmp, "held-transition-build-fails", &reference);
+  const auto invalid_path = invalidContactTrk(tmp, "invalid_transition_target.trk");
+  REQUIRE(bridge.submitQueue(
+              executeCommand("invalid-transition-target",
+                             invalid_path,
+                             MotionMode::Queue,
+                             3))
+              .ok());
+
+  loop.tick();
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Running);
+  REQUIRE(snapshot.active.kind == ActiveKind::User);
+  REQUIRE(snapshot.active.id == "held-transition-build-fails");
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->state == MotionState::Holding);
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE(snapshot.queue.ids.empty());
+  REQUIRE(store.findRun("held-transition-build-fails").run->state ==
+          MotionState::Holding);
+  REQUIRE(store.findRun("invalid-transition-target").run->state ==
+          MotionState::Failed);
+}
+
+TEST_CASE("RuntimeControlLoop transition start failure does not complete held source") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeReferenceSink reference;
+  RuntimeControlLoop loop(config,
+                          bridge,
+                          store,
+                          TrkLoader(tmp.trkConfig()),
+                          robot,
+                          policy,
+                          deploy_config,
+                          passiveConfig(),
+                          kExpectedModeMachine,
+                          RuntimeMode::Real,
+                          &reference);
+
+  startHoldingRun(loop, store, bridge, tmp, "held-transition-start-fails", &reference);
+  const auto target_path = validTrk(tmp, "transition_start_failure_target.trk", 2);
+  REQUIRE(bridge.submitQueue(
+              executeCommand("transition-start-failure-target",
+                             target_path,
+                             MotionMode::Queue,
+                             2))
+              .ok());
+
+  loop.failNextTransitionStartForTest();
+  loop.tick();
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Running);
+  REQUIRE(snapshot.active.kind == ActiveKind::User);
+  REQUIRE(snapshot.active.id == "held-transition-start-fails");
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->state == MotionState::Holding);
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE(store.findRun("held-transition-start-fails").run->state ==
+          MotionState::Holding);
+  const auto target = store.findRun("transition-start-failure-target");
+  REQUIRE(target.ok());
+  REQUIRE(target.run->state == MotionState::Failed);
+  REQUIRE(target.run->err == ErrorCode::InternalError);
+}
+
+TEST_CASE("RuntimeControlLoop interrupt transition restarts from current transition frame") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  RuntimeControlLoop loop(config, bridge, store, TrkLoader(tmp.trkConfig()), &reference);
+
+  startHoldingToUserTransition(loop,
+                               store,
+                               bridge,
+                               tmp,
+                               "held-current-frame-interrupt",
+                               "old-current-frame-target",
+                               &reference);
+  loop.tick();
+  loop.tick();
+  REQUIRE(store.snapshot().active.kind == ActiveKind::Transition);
+  REQUIRE(store.snapshot().transition.frame > 0);
+  const ReferenceFrameSnapshot interrupted_frame = reference.latest;
+  REQUIRE(interrupted_frame.active);
+
+  const auto urgent_path = validTrk(tmp, "urgent_current_frame_target.trk", 3);
+  REQUIRE(bridge.submitInterrupt(
+              executeCommand("urgent-current-frame-target",
+                             urgent_path,
+                             MotionMode::Interrupt,
+                             3))
+              .ok());
+
+  loop.tick();
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.active.kind == ActiveKind::Transition);
+  REQUIRE(snapshot.transition.target_id == "urgent-current-frame-target");
+  REQUIRE(snapshot.transition.frame == 0);
+  REQUIRE(reference.latest.active);
+  REQUIRE(reference.latest.frame == 0);
+  REQUIRE(reference.latest.p == interrupted_frame.p);
+  REQUIRE(reference.latest.q == interrupted_frame.q);
+  REQUIRE(reference.latest.c == interrupted_frame.c);
+  REQUIRE(reference.latest.com == interrupted_frame.com);
+  REQUIRE(reference.latest.comv == interrupted_frame.comv);
+}
+
+TEST_CASE("RuntimeControlLoop completed user enters idle through internal transition") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  RuntimeControlLoop loop(config, bridge, store, TrkLoader(tmp.trkConfig()), &reference);
+
+  const auto idle_path = validTrk(tmp, "user_to_idle_idle.trk", 2);
+  REQUIRE(bridge.configureIdle({idleMotion(idle_path, 2)}).ok());
+  loop.tick();
+  REQUIRE(store.snapshot().idle.enabled);
+  REQUIRE_FALSE(store.snapshot().idle.active);
+
+  const auto user_path = validTrk(tmp, "user_to_idle_user.trk", 1);
+  REQUIRE(bridge.submitQueue(
+              executeCommand("user-before-idle", user_path, MotionMode::Queue, 1))
+              .ok());
+  startQueuedRun(loop, store, "user-before-idle");
+
+  loop.tick();
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Running);
+  REQUIRE(snapshot.active.kind == ActiveKind::Transition);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.transition.active);
+  REQUIRE(snapshot.transition.target == "idle");
+  REQUIRE(snapshot.transition.target_id.empty());
+  REQUIRE(snapshot.queue.ids.empty());
+  REQUIRE(snapshot.idle.enabled);
+  REQUIRE_FALSE(snapshot.idle.active);
+  REQUIRE(store.findRun("user-before-idle").run->state == MotionState::Done);
+}
+
+TEST_CASE("RuntimeControlLoop invalid idle transition build completes user and falls back") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  RuntimeControlLoop loop(config, bridge, store, TrkLoader(tmp.trkConfig()), &reference);
+
+  const auto idle_path = zeroQuaternionTrk(tmp, "user_to_invalid_idle.trk", 2);
+  REQUIRE(bridge.configureIdle({idleMotion(idle_path, 2)}).ok());
+  loop.tick();
+  REQUIRE(store.snapshot().idle.enabled);
+  REQUIRE_FALSE(store.snapshot().idle.active);
+
+  const auto user_path = validTrk(tmp, "user_before_invalid_idle.trk", 1);
+  REQUIRE(bridge.submitQueue(
+              executeCommand("user-before-invalid-idle",
+                             user_path,
+                             MotionMode::Queue,
+                             1))
+              .ok());
+  startQueuedRun(loop, store, "user-before-invalid-idle");
+
+  loop.tick();
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Idle);
+  REQUIRE(snapshot.active.kind == ActiveKind::None);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE(snapshot.queue.ids.empty());
+  REQUIRE(snapshot.idle.enabled);
+  REQUIRE_FALSE(snapshot.idle.active);
+  REQUIRE(store.findRun("user-before-invalid-idle").run->state ==
+          MotionState::Done);
+
+  loop.tick();
+  const auto next = store.snapshot();
+  REQUIRE(next.active.kind != ActiveKind::User);
+  REQUIRE_FALSE(next.transition.active);
+  REQUIRE(store.findRun("user-before-invalid-idle").run->state ==
+          MotionState::Done);
+}
+
+TEST_CASE("RuntimeControlLoop stop aborts active transition without playing standby reference") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  RuntimeControlLoop loop(config, bridge, store, TrkLoader(tmp.trkConfig()), &reference);
+
+  startHoldingRun(loop, store, bridge, tmp, "held-before-stop", &reference);
+  const auto next_path = validTrk(tmp, "transition_stop_next.trk", 2);
+  REQUIRE(bridge.submitQueue(executeCommand("next-after-stop", next_path)).ok());
+  loop.tick();
+  REQUIRE(store.snapshot().active.kind == ActiveKind::Transition);
+
+  REQUIRE(bridge.stop().state == ControllerState::Stopping);
+  const auto post_stop_path = validTrk(tmp, "post_stop_after_transition.trk", 2);
+  REQUIRE(bridge.submitQueue(executeCommand("post-stop-after-transition",
+                                            post_stop_path,
+                                            MotionMode::Queue,
+                                            2))
+              .ok());
+  loop.tick();
+
+  auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Stopping);
+  REQUIRE(snapshot.stop_reason == StopReason::Stop);
+  REQUIRE(snapshot.active.kind == ActiveKind::None);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE(snapshot.queue.ids ==
+          std::vector<std::string>{"post-stop-after-transition"});
+  REQUIRE_FALSE(reference.latest.active);
+  REQUIRE(store.findRun("next-after-stop").run->state == MotionState::Canceled);
+
+  loop.tick();
+  requireIdle(store);
+  REQUIRE_FALSE(store.snapshot().transition.active);
+  REQUIRE(store.snapshot().queue.ids ==
+          std::vector<std::string>{"post-stop-after-transition"});
 }
 
 TEST_CASE("RuntimeControlLoop clears reference on stop interrupt and loader failure") {

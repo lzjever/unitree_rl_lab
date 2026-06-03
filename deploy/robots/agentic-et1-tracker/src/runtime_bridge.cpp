@@ -16,6 +16,7 @@ MotionRequest motionRequest(const ExecuteCommand& command, std::uint64_t sequenc
   request.frames = command.track.frames;
   request.fps = command.track.fps;
   request.duration_s = command.track.duration_s;
+  request.hold = command.hold;
   request.err = ErrorCode::Ok;
   request.stop_reason = StopReason::None;
   return request;

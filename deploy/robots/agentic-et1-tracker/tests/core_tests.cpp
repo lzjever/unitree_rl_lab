@@ -149,6 +149,20 @@ TEST_CASE("CommandMailbox consumes stop before interrupt before queue in one tic
   REQUIRE_FALSE(mailbox.consumeNext().has_value());
 }
 
+TEST_CASE("CommandMailbox preserves hold metadata on motion requests") {
+  CommandMailbox mailbox;
+  auto hold = request("hold");
+  hold.hold = true;
+
+  mailbox.submitQueue(hold);
+
+  auto command = mailbox.consumeNext();
+  REQUIRE(command.has_value());
+  REQUIRE(command->kind == CommandKind::Queue);
+  REQUIRE(command->request.id == "hold");
+  REQUIRE(command->request.hold);
+}
+
 TEST_CASE("Progress follows PRD frame plus one contract") {
   REQUIRE(computeProgress(0, 10, MotionState::Running) == 1.0 / 10.0);
   REQUIRE(computeProgress(8, 10, MotionState::Running) == 9.0 / 10.0);
@@ -163,6 +177,40 @@ TEST_CASE("Progress follows PRD frame plus one contract") {
   REQUIRE(computeProgress(0, 10, MotionState::Done) == 1.0);
   REQUIRE(computeProgress(0, 0, MotionState::Done) == 1.0);
   REQUIRE(computeProgress(0, 0, MotionState::Running) == 0.0);
+  REQUIRE(computeProgress(0, 10, MotionState::Holding) == 1.0);
+  REQUIRE(computeProgress(0, 0, MotionState::Holding) == 1.0);
+}
+
+TEST_CASE("Motion and active kind string contracts include holding and transition") {
+  REQUIRE(toString(MotionState::Holding) == "holding");
+  REQUIRE(toString(ActiveKind::Transition) == "transition");
+}
+
+TEST_CASE("TransitionStatus defaults to inactive public status metadata") {
+  TransitionStatus transition;
+
+  REQUIRE_FALSE(transition.active);
+  REQUIRE(transition.target.empty());
+  REQUIRE(transition.target_id.empty());
+  REQUIRE_FALSE(transition.target_state.has_value());
+  REQUIRE(transition.frame == 0);
+  REQUIRE(transition.frames == 0);
+  REQUIRE(transition.progress == 0.0);
+}
+
+TEST_CASE("MotionStatus preserves hold metadata from motion requests") {
+  auto hold = request("hold-status");
+  hold.hold = true;
+  hold.state = MotionState::Holding;
+  hold.frame = 4;
+  hold.frames = 5;
+
+  const MotionStatus status = makeMotionStatus(hold);
+
+  REQUIRE(status.id == "hold-status");
+  REQUIRE(status.state == MotionState::Holding);
+  REQUIRE(status.hold);
+  REQUIRE(status.progress == 1.0);
 }
 
 TEST_CASE("ErrorInfo exposes stable code and next action contracts") {

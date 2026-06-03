@@ -22,6 +22,7 @@ struct ExecuteCommand {
   std::string id;
   std::string path;
   MotionMode mode{MotionMode::Queue};
+  bool hold{false};
   TrackMetadata track;
 };
 

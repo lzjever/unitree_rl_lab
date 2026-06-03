@@ -103,6 +103,19 @@ bool parseMode(const nlohmann::json& input, MotionMode& mode) {
   return false;
 }
 
+bool parseHold(const nlohmann::json& input, bool& hold) {
+  hold = false;
+  const auto it = input.find("hold");
+  if (it == input.end()) {
+    return true;
+  }
+  if (!it->is_boolean()) {
+    return false;
+  }
+  hold = it->get<bool>();
+  return true;
+}
+
 bool hasOnlyKeys(const nlohmann::json& input, const std::vector<std::string>& allowed) {
   for (const auto& item : input.items()) {
     if (std::find(allowed.begin(), allowed.end(), item.key()) == allowed.end()) {
@@ -284,7 +297,7 @@ ApiResponse AgentApiService::execute(const std::string& body) {
   if (input.is_discarded() || !input.is_object()) {
     return error(ErrorCode::RequestInvalid);
   }
-  if (!hasOnlyKeys(input, {"path", "mode"})) {
+  if (!hasOnlyKeys(input, {"path", "mode", "hold"})) {
     return error(ErrorCode::RequestInvalid);
   }
 
@@ -296,6 +309,10 @@ ApiResponse AgentApiService::execute(const std::string& body) {
 
   MotionMode mode = MotionMode::Queue;
   if (!parseMode(input, mode)) {
+    return error(ErrorCode::RequestInvalid);
+  }
+  bool hold = false;
+  if (!parseHold(input, hold)) {
     return error(ErrorCode::RequestInvalid);
   }
 
@@ -321,6 +338,7 @@ ApiResponse AgentApiService::execute(const std::string& body) {
   command.id = ids_.generate();
   command.path = validation.metadata.canonical_path;
   command.mode = mode;
+  command.hold = hold;
   command.track = validation.metadata;
 
   const ExecuteResult result =
@@ -334,6 +352,7 @@ ApiResponse AgentApiService::execute(const std::string& body) {
   out["id"] = result.id;
   out["state"] = toString(result.state);
   out["q"] = result.q;
+  out["hold"] = hold;
   return {200, out};
 }
 

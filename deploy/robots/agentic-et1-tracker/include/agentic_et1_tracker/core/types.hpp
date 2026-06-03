@@ -49,6 +49,7 @@ struct ErrorInfo {
 enum class MotionState {
   Queued,
   Running,
+  Holding,
   Stopping,
   Done,
   Stopped,
@@ -65,6 +66,7 @@ enum class ActiveKind {
   None,
   User,
   Idle,
+  Transition,
 };
 
 enum class RuntimeMode {
@@ -115,6 +117,7 @@ struct MotionRequest {
   std::size_t frames{0};
   double fps{50.0};
   double duration_s{0.0};
+  bool hold{false};
   ErrorCode err{ErrorCode::Ok};
   StopReason stop_reason{StopReason::None};
   std::chrono::steady_clock::time_point enqueued_at{};

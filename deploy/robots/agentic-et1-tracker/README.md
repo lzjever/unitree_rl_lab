@@ -48,8 +48,9 @@ Commands:
 - `GET /health`: `{"ok":bool,"state":"starting|ready|error","mode":"sim|real|unknown"}`
 - `GET /status`: full runtime state.
 - `GET /status?id=<id>`: one run plus compact runtime context.
-- `POST /execute`: `{"path":"/absolute/file.trk","mode":"queue|interrupt"}`.
-  Only `path` and optional `mode` are allowed; `mode` defaults to `queue`.
+- `POST /execute`: `{"path":"/absolute/file.trk","mode":"queue|interrupt","hold":true}`.
+  Only `path`, optional `mode`, and optional boolean `hold` are allowed;
+  `mode` defaults to `queue`, and omitted `hold` behaves as `false`.
 - `POST /idle`: `{"paths":["/absolute/idle-a.trk","/absolute/idle-b.trk"]}`.
 - `POST /idle`: `{"paths":[]}` clears the idle pool.
 - `POST /stop`: empty body; stops active work and cancels queued work.
@@ -59,10 +60,13 @@ Commands:
 - `POST /standby_velocity`: empty body; enter StandbyVelocity.
 
 `/execute` accepts local `.trk` paths allowed by `motion_dirs` only. It rejects
-uploads, non-`.trk` files, embedded motion payloads, `paths`, and any extra
-JSON field with 400 `REQUEST_INVALID` before path validation, command sinks, or
-run id allocation. Idle playback yields to user `/execute`; the accepted user
-run still receives the only waitable run id.
+uploads, non-`.trk` files, embedded motion payloads, `paths`, and any JSON
+field other than `path`, `mode`, or `hold` with 400 `REQUEST_INVALID` before
+path validation, command sinks, or run id allocation. `hold` must be boolean.
+Idle playback yields to user `/execute`; the accepted user run still receives
+the only waitable run id. With `hold:true`, a user run that reaches its last
+frame enters `state:"holding"` and keeps the same run id queryable through
+`GET /status?id=<id>` until another user run or a control command releases it.
 
 `/idle` is a config endpoint, not a run submission endpoint. It atomically
 replaces the idle pool after validating every path with the same local `.trk`
@@ -70,9 +74,11 @@ rules as `/execute`; any failed path leaves the old idle config unchanged.
 `{"paths":[]}` clears the config without path validation. Idle does not use
 `queue.limit`, `queue.ids`, `exec`, or `GET /status?id=...`.
 
-`/stop` is highest priority for active work, stops idle playback, and clears the
-idle config. It preserves the stop watermark: user queue/interrupt requests
-accepted after a pending stop are not canceled by that older stop.
+`/stop` is highest priority for active work, stops idle playback, immediately
+aborts holding runs and internal transitions, and clears the idle config. It
+does not play `standby_ref.trk`. It preserves the stop watermark: user
+queue/interrupt requests accepted after a pending stop are not canceled by that
+older stop.
 
 Control-changing routes return the current `/status.err` readiness error before
 claiming success when the runtime is unavailable or not ready. `/passive` and
@@ -125,18 +131,33 @@ Status schemas:
 
 ```json
 // GET /status
-{"ok":true,"ready":true,"mode":"sim","robot":"idle","ctrl":"standby_velocity","stop_reason":null,"hz":1000,"active":{"kind":"none","id":null},"exec":null,"queue":{"n":0,"limit":8,"ids":[]},"idle":{"enabled":true,"n":2,"active":false,"current":null,"frame":0,"frames":0,"time_s":0,"duration_s":0,"progress":0},"low_ms":0,"block":null,"err":null,"pose":{"q":[1,0,0,0],"g":[0,0,0],"p":null,"v":null}}
+{"ok":true,"ready":true,"mode":"sim","robot":"idle","ctrl":"standby_velocity","stop_reason":null,"hz":1000,"active":{"kind":"none","id":null},"exec":null,"queue":{"n":0,"limit":8,"ids":[]},"transition":{"active":false,"target":null,"target_id":null,"target_state":null,"frame":0,"frames":0,"progress":0},"idle":{"enabled":true,"n":2,"active":false,"current":null,"frame":0,"frames":0,"time_s":0,"duration_s":0,"progress":0},"low_ms":0,"block":null,"err":null,"pose":{"q":[1,0,0,0],"g":[0,0,0],"p":null,"v":null}}
 
 // GET /status while idle is playing
-{"ok":true,"ready":true,"mode":"sim","robot":"running","ctrl":"running","stop_reason":null,"hz":1000,"active":{"kind":"idle","id":null},"exec":null,"queue":{"n":0,"limit":8,"ids":[]},"idle":{"enabled":true,"n":2,"active":true,"current":0,"frame":12,"frames":120,"time_s":0.24,"duration_s":2.4,"progress":0.1},"low_ms":0,"block":null,"err":null,"pose":{"q":[1,0,0,0],"g":[0,0,0],"p":null,"v":null}}
+{"ok":true,"ready":true,"mode":"sim","robot":"running","ctrl":"running","stop_reason":null,"hz":1000,"active":{"kind":"idle","id":null},"exec":null,"queue":{"n":0,"limit":8,"ids":[]},"transition":{"active":false,"target":null,"target_id":null,"target_state":null,"frame":0,"frames":0,"progress":0},"idle":{"enabled":true,"n":2,"active":true,"current":0,"frame":12,"frames":120,"time_s":0.24,"duration_s":2.4,"progress":0.1},"low_ms":0,"block":null,"err":null,"pose":{"q":[1,0,0,0],"g":[0,0,0],"p":null,"v":null}}
+
+// GET /status while a held user run owns the reference
+{"ok":true,"ready":true,"mode":"sim","robot":"running","ctrl":"running","stop_reason":null,"hz":1000,"active":{"kind":"user","id":"a7K3p9Qx"},"exec":{"id":"a7K3p9Qx","state":"holding","frame":119,"frames":120,"time_s":2.38,"duration_s":2.4,"progress":1,"hold":true,"stop_reason":null,"err":null},"queue":{"n":0,"limit":8,"ids":[]},"transition":{"active":false,"target":null,"target_id":null,"target_state":null,"frame":0,"frames":0,"progress":0},"idle":{"enabled":false,"n":0,"active":false,"current":null,"frame":0,"frames":0,"time_s":0,"duration_s":0,"progress":0},"low_ms":0,"block":null,"err":null,"pose":{"q":[1,0,0,0],"g":[0,0,0],"p":null,"v":null}}
+
+// GET /status during an internal transition to a user run
+{"ok":true,"ready":true,"mode":"sim","robot":"running","ctrl":"running","stop_reason":null,"hz":1000,"active":{"kind":"transition","id":null},"exec":null,"queue":{"n":0,"limit":8,"ids":[]},"transition":{"active":true,"target":"user","target_id":"b8L4s0Ry","target_state":"queued","frame":8,"frames":25,"progress":0.32},"idle":{"enabled":false,"n":0,"active":false,"current":null,"frame":0,"frames":0,"time_s":0,"duration_s":0,"progress":0},"low_ms":0,"block":null,"err":null,"pose":{"q":[1,0,0,0],"g":[0,0,0],"p":null,"v":null}}
 
 // GET /status?id=<id>
-{"ok":true,"id":"a7K3p9Qx","state":"queued","frame":0,"frames":120,"time_s":0,"duration_s":2.4,"progress":0,"stop_reason":null,"err":null,"path":"/absolute/file.trk","robot":"holding","ctrl":"fixstand","ready":false,"block":"operator_wait","queue_pos":1,"top_err":"ROBOT_NOT_READY"}
+{"ok":true,"id":"a7K3p9Qx","state":"holding","frame":119,"frames":120,"time_s":2.38,"duration_s":2.4,"progress":1,"hold":true,"stop_reason":null,"err":null,"path":"/absolute/file.trk","robot":"running","ctrl":"running","ready":true,"block":null,"queue_pos":null,"top_err":null}
 ```
 
-`active.kind` is authoritative: `user` with a non-null `id` is the only waitable
-run. `idle` has `id:null`; `exec` and `queue` only describe user runs. Idle
-progress lives under `idle` and is not queryable with `GET /status?id=...`.
+`active.kind` is authoritative and is one of `none`, `user`, `idle`, or
+`transition`. `user` with a non-null `id` is the only waitable active run;
+`state:"holding"` is a user run state and should be treated as a successful
+held state by hold-aware clients. `idle` and `transition` both have `id:null`;
+`exec` and `queue` only describe user runs. Idle progress lives under `idle`
+and is not queryable with `GET /status?id=...`. Internal synthetic transitions
+live under `transition`, do not enter `queue`, do not consume `queue.limit`, do
+not create a run id, and are not written to user run history.
+`exec.hold` is present in run status and mirrors the accepted `/execute` hold
+flag. `transition.target_state` is always present: `null` when no target state
+applies, `queued` for a user transition target, or `running` for an idle
+transition target.
 `queue_pos` is 1-based and `null` when the user run is not queued. `top_err` is
 the full `/status.err` code or `null`.
 `pose` is intentionally small for frequent polling: `q` is lowstate quaternion
@@ -153,6 +174,8 @@ Controller states:
 | `standby_velocity` | Velocity policy with zero command; robot stands idle. | `/execute`, `/idle`, `/passive`, `/fixstand`, `/stop` | Normal state for starting user `.trk`; idle auto-play may start only when ready/safe and no user active/queue exists. |
 | idle active (`active.kind:"idle"`) | GeneralTracker plays an idle pool motion without a user id. | `/execute`, `/stop`, `/idle`, `/passive`, `/fixstand`, `/standby_velocity` | `exec:null`, user `queue` unchanged. User `/execute` preempts idle. |
 | `preparing`/`running` with `active.kind:"user"` | Preparing or executing a user `.trk`. | `/stop`, `/passive`, `/execute` queue/interrupt, `/idle` config/clear | `queue` waits; `interrupt` preempts current user run. Poll `/status?id=<id>`. |
+| holding (`active.kind:"user"`, `exec.state:"holding"`) | Holds the last reference frame of a user `.trk` submitted with `hold:true`. | `/execute` queue/interrupt, `/stop`, `/passive`, `/fixstand`, `/standby_velocity`, `/idle` config/clear | Same user id remains queryable. `/stop`, `/passive`, and `/fixstand` end it immediately; no `standby_ref.trk` playback. |
+| transition active (`active.kind:"transition"`) | Internal synthetic reference transition toward `transition.target`. | `/execute` queue/interrupt, `/stop`, `/passive`, `/fixstand`, `/standby_velocity`, `/idle` config/clear | Not a user run; no id, queue entry, queue limit use, or user history entry. `/stop` aborts immediately. |
 | `stopping` | Stop/interrupt transition to StandbyVelocity or a safety state. | `/status`, `/passive`, `/stop`, `/idle` clear/config | `/execute` returns conflict at the HTTP API; wait for `ctrl:"standby_velocity"`. |
 | `fault` | Safety/manual state; no normal track execution. | `/passive` only for `bad_orientation`, `/fixstand`, `/stop`, `/idle` config/clear | `/execute` and `/standby_velocity` return conflict until resolved. `lowcmd_occupied` remains manual/operator. |
 
@@ -181,6 +204,12 @@ Release policy/control assets are owned by `agentic-et1-tracker` and live under
 
 Runtime configuration must point at these app-local release assets. Runtime
 does not fall back to the ET1 app tree under `deploy/robots/et1`.
+
+`standby_ref.trk` remains a gated release deliverable. Until an app-local,
+validated `config/reference/standby/v0/standby_ref.trk` plus manifest is
+checked in and accepted, do not claim a completed standby reference transition
+or rely on playback of that asset. Direct `/standby_velocity` and the
+StandbyVelocity/Velocity0 policy path remain available.
 
 For manual or integration simulation testing in this workspace, the installed
 Unitree MuJoCo simulator under `/home/galbot/works/et1` can be used. Test
@@ -217,13 +246,14 @@ Prerequisites:
   ET1 app policy tree.
 - `policy.deploy` must live under `policy.policy_dir/params`, and `lock_path`
   must be absolute when explicitly configured.
-- Use `config.sim.yaml.example` for local MuJoCo acceptance. It sets
-  `mode_machine: 0`, `network: "lo"`,
-  `motion_dirs: ["/home/galbot/works/et1/generated"]`, and app-owned assets.
-  It also keeps `lowcmd_startup_preflight_ms: 200`, sets
-  `release_motion_mode_on_startup: false`, and enables the hidden sim-only
-  reference endpoint. Adjust only `domain_id` or `port` when the local
-  simulator requires it.
+- Use `config.sim.yaml.example` as the starting point for local MuJoCo
+  acceptance. Keep sim-safe settings such as `mode_machine: 0`, `network: "lo"`,
+  app-owned assets, `lowcmd_startup_preflight_ms: 200`,
+  `release_motion_mode_on_startup: false`, and the hidden sim-only reference
+  endpoint. Set `motion_dirs` to the test `.trk` directory for the run; the
+  recommended local test directory remains `/home/galbot/works/et1/generated`,
+  but the current local config may need adjustment to match the chosen test
+  directory. Adjust `domain_id` or `port` when the local simulator requires it.
 - Start the Unitree MuJoCo simulator only after the Preflight is clear. The
   operator controls MuJoCo rope timing and keyboard actions manually.
 

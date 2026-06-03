@@ -1,6 +1,7 @@
 # Agentic ET1 Tracker Acceptance Evidence
 
 Date: 2026-05-29
+Latest targeted update: 2026-06-03
 Environment: local workspace `/home/galbot/works/et1`
 
 ## Build/test evidence
@@ -18,6 +19,24 @@ Environment: local workspace `/home/galbot/works/et1`
 - `git diff --check`: passed.
 
 ## Docs/skill evidence
+
+2026-06-03 targeted docs/skill/release verification:
+
+- `cmake --build /home/galbot/works/et1/unitree_rl_lab/deploy/robots/agentic-et1-tracker/build --target agentic_et1_tracker_core_tests agentic_et1_tracker_trk_tests agentic_et1_tracker_api_tests agentic_et1_tracker_runtime_tests`:
+  passed.
+- `ctest --test-dir /home/galbot/works/et1/unitree_rl_lab/deploy/robots/agentic-et1-tracker/build -R 'agentic_et1_tracker_(core|trk|api|runtime)_tests' --output-on-failure`:
+  4/4 passed.
+- `python3 /home/galbot/works/et1/unitree_rl_lab/deploy/robots/agentic-et1-tracker/packaging/skills/et1-trk2motion/tests/test_et1_trk2motion.py`:
+  21/21 passed.
+- `python3 -m py_compile /home/galbot/works/et1/unitree_rl_lab/deploy/robots/agentic-et1-tracker/packaging/skills/et1-trk2motion/scripts/et1-trk2motion /home/galbot/works/et1/unitree_rl_lab/deploy/robots/agentic-et1-tracker/packaging/skills/et1-trk2motion/tests/test_et1_trk2motion.py`:
+  passed.
+- `git diff --check -- deploy/robots/agentic-et1-tracker/ACCEPTANCE.md`:
+  passed.
+
+This targeted verification did not execute MuJoCo visual acceptance or real
+robot acceptance. It also did not unlock the `standby_ref.trk` asset gate; no
+validated app-local `config/reference/standby/v0/standby_ref.trk` plus manifest
+was accepted in this round.
 
 2026-06-02 docs/skill CLI checks only:
 
@@ -45,12 +64,43 @@ fallback to the ET1 app tree:
 - FixStand posture: `config/posture/fixstand/v0/fixstand.yaml`
 - Passive posture: `config/posture/passive/v0/passive.yaml`
 
+## Offline standby_ref candidate evidence
+
+2026-06-03 local offline candidate generation for later MuJoCo acceptance:
+
+- Command:
+  `python3 deploy/robots/agentic-et1-tracker/tools/derive_standby_ref_candidate.py --source /home/galbot/works/et1/generated/squat_stand.trk --out-dir deploy/robots/agentic-et1-tracker/build/standby_ref_candidate --tail-frames 25 --fps 50`
+- Output:
+  `deploy/robots/agentic-et1-tracker/build/standby_ref_candidate/standby_ref.candidate.trk`
+  and `CANDIDATE_MANIFEST.json`.
+- Manifest status: `candidate_pending_mujoco_acceptance`; this candidate is
+  build-local evidence only and is not a release asset.
+- Source: `/home/galbot/works/et1/generated/squat_stand.trk`,
+  sha256 `e748af2d54ac6a08bfcf8e242d2f9c75e28a387af978716213b3e114349ee5f8`,
+  frames `249`, exact tail window `224..248`.
+- Candidate: sha256
+  `6ca49404e1ee1008f6226a2f7c00e990f0447ae6c826657246b7a29fbb525741`,
+  size `41400` bytes, frames `25`, fps `50.0`, duration `0.48` s.
+- Static metrics: `joint_max_drift=0.0181495845`,
+  `root_xyz_drift=0.00115438467`, `root_tilt_max_deg=3.02591769`,
+  `root_lin_vel_max=0.0127365116`, left/right contact constant with values
+  `[0]`.
+- `python3 /home/galbot/works/et1/unitree_rl_lab/deploy/robots/agentic-et1-tracker/tools/test_derive_standby_ref_candidate.py`:
+  11/11 passed.
+- `python3 -m py_compile /home/galbot/works/et1/unitree_rl_lab/deploy/robots/agentic-et1-tracker/tools/derive_standby_ref_candidate.py /home/galbot/works/et1/unitree_rl_lab/deploy/robots/agentic-et1-tracker/tools/test_derive_standby_ref_candidate.py`:
+  passed.
+
+This does not unlock the `standby_ref.trk` release gate. No candidate was
+placed under `config/reference/standby/v0/`, and no release
+`standby_ref.trk` asset was accepted.
+
 ## GA idle/status/control acceptance items
 
 Contract-level GA evidence must cover:
 
-- `/execute` accepts only `path` and optional `mode`; extra fields and `paths`
-  return 400 `REQUEST_INVALID` before validator, sink, or id allocation.
+- `/execute` accepts only `path`, optional `mode`, and optional boolean `hold`;
+  extra fields and `paths` return 400 `REQUEST_INVALID` before validator, sink,
+  or id allocation.
 - `/idle {"paths":[...]}` atomically configures the idle pool; `{"paths":[]}`
   clears it; idle never creates a user run id.
 - `/status.active.kind` is authoritative. `exec` and `queue` describe user runs
@@ -75,11 +125,13 @@ Earlier MuJoCo evidence predated the current FixStand/StandbyVelocity/FSM
 semantics and is historical only. No idle/status/control MuJoCo acceptance has
 been recorded in this docs/skill pass.
 
-Use `config.sim.yaml.example` for local MuJoCo acceptance. It sets
-`mode_machine: 0`, `network: "lo"`, app-owned policy/control assets, and
-`motion_dirs: ["/home/galbot/works/et1/generated"]`. It keeps the startup
-LowCmd owner preflight at the default `200` ms and disables MotionSwitcher
-release.
+Use `config.sim.yaml.example` as the starting point for local MuJoCo
+acceptance. The acceptance config should keep sim-safe settings such as
+`mode_machine: 0`, `network: "lo"`, app-owned policy/control assets, the default
+`200` ms LowCmd owner preflight, and disabled MotionSwitcher release. Set
+`motion_dirs` to the test `.trk` directory for the run; the recommended local
+test directory remains `/home/galbot/works/et1/generated`, but the current local
+config may need adjustment to match the chosen test directory.
 
 Pending MuJoCo evidence must record:
 
@@ -118,12 +170,16 @@ Pending MuJoCo evidence must record:
 | Default ROBOT/ONNX build | recorded above | Keep default configure/build on the real integration path. |
 | Hermetic stub tests | recorded above | Keep explicit stub/test configure and tests passing. |
 | Docs/skill CLI contract | recorded above | Keep packaged and installed skill tests/diffs passing. |
+| `standby_ref.trk` release asset | pending | App-local validated asset plus manifest; gate not unlocked in the 2026-06-03 targeted verification. |
 | MuJoCo visual acceptance | pending | Record scenarios listed above with `config.sim.yaml.example`. |
 | Real robot acceptance | pending | ET1 hardware/operator validation. |
 
-Do not mark GA until the two pending external gates are complete.
+Do not mark GA until the pending MuJoCo, real-robot, and standby asset gates
+are complete.
 
 ## Remaining external pending
 
-True real-robot validation is still pending and requires ET1 hardware and an
-operator window.
+True MuJoCo visual acceptance and real-robot validation are still pending. The
+real-robot gate requires ET1 hardware and an operator window. The standby
+reference asset gate remains pending until a validated app-local
+`standby_ref.trk` plus manifest is accepted.

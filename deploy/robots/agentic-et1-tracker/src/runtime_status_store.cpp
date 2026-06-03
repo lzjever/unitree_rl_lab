@@ -18,6 +18,7 @@ MotionStatus queuedStatus(const ExecuteCommand& command, std::uint64_t sequence)
   status.time_s = 0.0;
   status.duration_s = command.track.duration_s;
   status.progress = computeProgress(0, command.track.frames, MotionState::Queued);
+  status.hold = command.hold;
   status.stop_reason = StopReason::None;
   status.err = ErrorCode::Ok;
   return status;
@@ -54,7 +55,8 @@ bool terminal(MotionState state) {
 }
 
 bool activeLike(MotionState state) {
-  return state == MotionState::Running || state == MotionState::Stopping;
+  return state == MotionState::Running || state == MotionState::Holding ||
+         state == MotionState::Stopping;
 }
 
 void pushRecent(std::deque<MotionStatus>& recent,
@@ -88,6 +90,12 @@ bool acceptedNonQueued(const std::deque<MotionStatus>& accepted,
 
 bool isCurrentExec(const StatusSnapshot& snapshot, const std::string& id) {
   return snapshot.exec && snapshot.exec->id == id;
+}
+
+bool isTransitionTarget(const StatusSnapshot& snapshot, const std::string& id) {
+  return snapshot.transition.active && snapshot.transition.target == "user" &&
+         !snapshot.transition.target_id.empty() &&
+         snapshot.transition.target_id == id;
 }
 
 MotionStatus canceledStatus(const std::deque<MotionStatus>& accepted,
@@ -342,6 +350,7 @@ std::vector<std::string> RuntimeStatusStore::queuedIdsLocked() const {
 
   for (const auto& id : snapshot_.queue.ids) {
     if (!containsId(ids, id) && !isCurrentExec(snapshot_, id) &&
+        !isTransitionTarget(snapshot_, id) &&
         !recentHas(recent_, id) && !acceptedNonQueued(accepted_, id)) {
       ids.push_back(id);
     }
@@ -349,6 +358,7 @@ std::vector<std::string> RuntimeStatusStore::queuedIdsLocked() const {
 
   for (const auto& id : acceptedQueuedIds(accepted_)) {
     if (!containsId(ids, id) && !isCurrentExec(snapshot_, id) &&
+        !isTransitionTarget(snapshot_, id) &&
         !recentHas(recent_, id)) {
       ids.push_back(id);
     }

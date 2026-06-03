@@ -40,6 +40,7 @@ target_link_libraries(agentic_et1_tracker_robot_core
 add_library(agentic_et1_tracker_trk
   src/trk_loader.cpp
   src/trk_scanner.cpp
+  src/trk_synthetic_transition.cpp
   src/trk_validator.cpp
 )
 
@@ -362,6 +363,7 @@ if(AGENTIC_ET1_BUILD_TESTS)
 
   add_executable(agentic_et1_tracker_trk_tests
     tests/trk_loader_tests.cpp
+    tests/trk_synthetic_transition_tests.cpp
     tests/trk_tests.cpp
   )
   target_link_libraries(agentic_et1_tracker_trk_tests

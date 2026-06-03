@@ -33,6 +33,7 @@ struct MotionStatus {
   double time_s{0.0};
   double duration_s{0.0};
   double progress{0.0};
+  bool hold{false};
   StopReason stop_reason{StopReason::None};
   ErrorCode err{ErrorCode::Ok};
 };
@@ -54,6 +55,16 @@ struct IdleStatus {
   double progress{0.0};
 };
 
+struct TransitionStatus {
+  bool active{false};
+  std::string target;
+  std::string target_id;
+  std::optional<MotionState> target_state;
+  std::size_t frame{0};
+  std::size_t frames{0};
+  double progress{0.0};
+};
+
 struct PoseSnapshot {
   std::optional<std::array<float, 4>> q_wxyz;
   std::optional<std::array<float, 3>> gyro_xyz;
@@ -72,6 +83,7 @@ struct StatusSnapshot {
   std::optional<MotionStatus> exec;
   QueueStatus queue;
   IdleStatus idle;
+  TransitionStatus transition;
   std::size_t low_ms{0};
   std::string block;
   ErrorCode err{ErrorCode::Ok};

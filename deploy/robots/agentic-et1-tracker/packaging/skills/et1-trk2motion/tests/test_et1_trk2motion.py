@@ -27,6 +27,16 @@ class TrackerState:
         self.large_health = False
         self.large_control = False
         self.active = {"kind": "none", "id": None}
+        self.transition = {
+            "active": False,
+            "target": None,
+            "target_id": None,
+            "frame": 0,
+            "frames": 0,
+            "time_s": 0,
+            "duration_s": 0,
+            "progress": 0,
+        }
         self.idle = {
             "enabled": False,
             "n": 0,
@@ -46,6 +56,7 @@ class TrackerState:
             "ready": self.ready,
             "err": self.err,
             "active": dict(self.active),
+            "transition": dict(self.transition),
             "idle": dict(self.idle),
             "pose": list(range(64)),
         }
@@ -194,6 +205,14 @@ class ServerCase(unittest.TestCase):
                 "ready": True,
                 "err": None,
                 "active": {"kind": "none", "id": None},
+                "transition": {
+                    "active": False,
+                    "target": None,
+                    "target_id": None,
+                    "frame": 0,
+                    "frames": 0,
+                    "progress": 0,
+                },
                 "idle": {
                     "enabled": False,
                     "n": 0,
@@ -225,6 +244,61 @@ class ServerCase(unittest.TestCase):
         self.assertEqual(
             [(m, p) for m, p, _ in self.state.records],
             [("GET", "/status"), ("POST", "/execute"), ("GET", "/status?id=r1"), ("GET", "/status")],
+        )
+
+    def test_run_hold_sends_hold_true_only_when_requested(self):
+        proc, out = self.cli("run", TRK, "--hold", "--recover", "off")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(out["id"], "r1")
+        self.assertEqual(
+            [(m, p, b) for m, p, b in self.state.records],
+            [("POST", "/execute", {"path": TRK, "mode": "interrupt", "hold": True})],
+        )
+
+    def test_run_without_hold_does_not_send_hold_false(self):
+        proc, out = self.cli("run", TRK, "--recover", "off")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(out["id"], "r1")
+        self.assertEqual(
+            [(m, p, b) for m, p, b in self.state.records],
+            [("POST", "/execute", {"path": TRK, "mode": "interrupt"})],
+        )
+
+    def test_run_hold_wait_returns_compact_holding_status(self):
+        self.state.run_status["r1"] = [
+            {
+                "ok": True,
+                "id": "r1",
+                "state": "holding",
+                "frame": 119,
+                "frames": 120,
+                "time_s": 2.38,
+                "duration_s": 2.4,
+                "progress": 1,
+                "err": None,
+                "path": TRK,
+                "pose": list(range(64)),
+            }
+        ]
+        proc, out = self.cli("run", TRK, "--hold", "--wait", "--recover", "off", "--timeout", "1", "--poll", "0.01")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(
+            out,
+            {
+                "ok": True,
+                "id": "r1",
+                "state": "holding",
+                "frame": 119,
+                "frames": 120,
+                "progress": 1,
+                "err": None,
+                "ctrl": "standby_velocity",
+                "ready": True,
+            },
+        )
+        self.assertEqual(
+            [(m, p) for m, p, _ in self.state.records],
+            [("POST", "/execute"), ("GET", "/status?id=r1"), ("GET", "/status")],
         )
 
     def test_repeat_summary_not_verbose(self):
@@ -268,6 +342,38 @@ class ServerCase(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertFalse(out["ok"])
         self.assertEqual(out["error"]["code"], "run_failed")
+
+    def test_wait_holding_returns_success_without_timeout(self):
+        self.state.run_status["held"] = [
+            {
+                "ok": True,
+                "id": "held",
+                "state": "holding",
+                "frame": 119,
+                "frames": 120,
+                "time_s": 2.38,
+                "duration_s": 2.4,
+                "progress": 1,
+                "err": None,
+                "path": TRK,
+                "pose": list(range(64)),
+            }
+        ]
+        proc, out = self.cli("wait", "held", "--timeout", "1", "--poll", "0.01")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(
+            out,
+            {
+                "ok": True,
+                "id": "held",
+                "state": "holding",
+                "frame": 119,
+                "frames": 120,
+                "progress": 1,
+                "err": None,
+            },
+        )
+        self.assertEqual([(m, p) for m, p, _ in self.state.records], [("GET", "/status?id=held")])
 
     def test_wait_unknown_id_returns_without_polling(self):
         proc, out = self.cli("wait", "missing", "--timeout", "1", "--poll", "0.01")
@@ -321,6 +427,39 @@ class ServerCase(unittest.TestCase):
                 self.assertNotIn("pose", out)
                 self.assertNotIn("samples", out)
                 self.assertLess(len(proc.stdout), 160)
+
+    def test_state_short_output_includes_compact_transition(self):
+        self.state.ctrl = "running"
+        self.state.active = {"kind": "transition", "id": None, "path": "/tmp/drop.trk"}
+        self.state.transition.update(
+            {
+                "active": True,
+                "target": "user",
+                "target_id": "r2",
+                "target_state": "queued",
+                "frame": 8,
+                "frames": 25,
+                "time_s": 0.16,
+                "duration_s": 0.5,
+                "progress": 0.32,
+            }
+        )
+        proc, out = self.cli("state")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(out["active"], {"kind": "transition", "id": None})
+        self.assertEqual(
+            out["transition"],
+            {
+                "active": True,
+                "target": "user",
+                "target_id": "r2",
+                "frame": 8,
+                "frames": 25,
+                "progress": 0.32,
+            },
+        )
+        self.assertNotIn("pose", out)
+        self.assertNotIn("time_s", out["transition"])
 
     def test_run_subcommand_timeout_poll_position(self):
         proc, out = self.cli("run", TRK, "--timeout", "2", "--poll", "0.01")

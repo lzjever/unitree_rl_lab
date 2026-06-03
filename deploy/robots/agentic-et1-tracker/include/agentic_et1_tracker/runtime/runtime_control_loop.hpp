@@ -27,6 +27,7 @@ enum class RuntimeInternalState {
   Velocity,
   GeneralTrackerIdle,
   GeneralTrackerActive,
+  GeneralTrackerTransition,
   Stopping,
   Fault,
 };
@@ -75,6 +76,7 @@ class RuntimeControlLoop final {
 
   void tick();
   RuntimeInternalState internalStateForTest() const;
+  void failNextTransitionStartForTest();
 
  private:
   struct SnapshotRuntimeState {
@@ -83,6 +85,21 @@ class RuntimeControlLoop final {
     std::size_t low_ms{0};
     std::string block;
     ErrorCode err{ErrorCode::Ok};
+  };
+
+  enum class TransitionTargetKind {
+    User,
+    Idle,
+    Standby,
+  };
+
+  struct PendingTransition {
+    TransitionTargetKind target_kind{TransitionTargetKind::User};
+    std::string target_id;
+    std::optional<MotionState> target_state;
+    std::optional<MotionRequest> target_request;
+    std::shared_ptr<const TrkTrack> target_track;
+    std::optional<std::size_t> idle_index;
   };
 
   bool consumePendingCommands();
@@ -112,6 +129,28 @@ class RuntimeControlLoop final {
   void completePreparing();
   void advanceActive();
   void advanceActiveWithPolicy();
+  void advanceHolding();
+  void advanceHoldingWithPolicy();
+  bool startTransitionFromHoldingToNextUser();
+  bool startTransitionFromCurrentReferenceToUser(MotionRequest target_request,
+                                                StopReason replaced_reason);
+  bool startTransitionFromCompletedUserToIdle();
+  bool startSyntheticTransitionFromActiveFrame(PendingTransition target,
+                                               const TrkFrameView& target_frame,
+                                               double target_fps);
+  bool startInternalTransition(std::shared_ptr<const TrkTrack> track,
+                               PendingTransition target,
+                               std::optional<LowStateSample> entry_low_state);
+  void advanceTransition();
+  void advanceTransitionWithPolicy();
+  void completeTransition();
+  void finishTransitionTarget(MotionState state,
+                              StopReason reason,
+                              ErrorCode error);
+  void abortTransition(MotionState target_state = MotionState::Canceled,
+                       StopReason reason = StopReason::Stop,
+                       ErrorCode error = ErrorCode::Ok);
+  bool failActiveReadiness(const RobotReadinessStatus& readiness);
   void publishIdleHoldIfReady();
   void publishControlIfReady();
   bool writePassiveDamping();
@@ -137,6 +176,7 @@ class RuntimeControlLoop final {
   std::size_t stopHoldTicks() const;
   void publishActive();
   void publishReferenceActive();
+  void publishReferenceTransition();
   void clearReference();
   void publishSnapshot();
   std::optional<LowStateSample> readLowStateForStatus();
@@ -181,6 +221,7 @@ class RuntimeControlLoop final {
   std::optional<MotionRequest> active_;
   ActiveKind active_kind_{ActiveKind::None};
   std::shared_ptr<const TrkTrack> active_track_;
+  std::optional<PendingTransition> transition_;
   std::optional<PolicyStepRunner> policy_runner_;
   std::vector<IdleMotion> idle_config_;
   std::size_t idle_next_index_{0};
@@ -195,6 +236,7 @@ class RuntimeControlLoop final {
   std::size_t stopping_hold_ticks_remaining_{0};
   std::size_t active_policy_ticks_until_next_{0};
   std::size_t velocity_policy_ticks_until_next_{0};
+  bool fail_next_transition_start_for_test_{false};
   std::optional<LowCmdFrame> lowcmd_buffer_;
   std::optional<LowStateSample> latest_low_state_;
   std::optional<HighStateSample> latest_high_state_;

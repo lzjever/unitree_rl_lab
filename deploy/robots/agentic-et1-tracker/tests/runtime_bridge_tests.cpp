@@ -23,11 +23,13 @@ RuntimeConfig runtimeConfig(std::size_t queue_limit = 8) {
 ExecuteCommand executeCommand(std::string id,
                               MotionMode mode = MotionMode::Queue,
                               std::size_t frames = 120,
-                              double duration_s = 2.4) {
+                              double duration_s = 2.4,
+                              bool hold = false) {
   ExecuteCommand command;
   command.id = std::move(id);
   command.path = "/tmp/" + command.id + ".trk";
   command.mode = mode;
+  command.hold = hold;
   command.track.frames = frames;
   command.track.duration_s = duration_s;
   return command;
@@ -85,6 +87,74 @@ TEST_CASE("RuntimeBridge admits queue requests without touching controller state
   REQUIRE(lookup.run->path == "/tmp/run-a.trk");
   REQUIRE(lookup.run->frames == 120);
   REQUIRE(lookup.run->duration_s == 2.4);
+  REQUIRE_FALSE(lookup.run->hold);
+}
+
+TEST_CASE("RuntimeBridge preserves execute hold metadata through status and commands") {
+  const RuntimeConfig config = runtimeConfig(2);
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  store.publishSnapshot(readySnapshot());
+
+  const auto result =
+      bridge.submitQueue(executeCommand("hold-run", MotionMode::Queue, 120, 2.4, true));
+
+  REQUIRE(result.code == ErrorCode::Ok);
+  auto lookup = store.findRun("hold-run");
+  REQUIRE(lookup.code == ErrorCode::Ok);
+  REQUIRE(lookup.run.has_value());
+  REQUIRE(lookup.run->hold);
+
+  auto command = bridge.consumeNextCommand();
+  REQUIRE(command.has_value());
+  REQUIRE(command->kind == CommandKind::Queue);
+  REQUIRE(command->request.id == "hold-run");
+  REQUIRE(command->request.hold);
+}
+
+TEST_CASE("RuntimeStatusStore keeps holding runs queryable without queue ids") {
+  const RuntimeConfig config = runtimeConfig(1);
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  store.publishSnapshot(readySnapshot());
+
+  REQUIRE(bridge.submitQueue(
+              executeCommand("held", MotionMode::Queue, 120, 2.4, true))
+              .ok());
+  REQUIRE(bridge.consumeNextCommand().has_value());
+
+  MotionStatus holding = *store.findRun("held").run;
+  holding.state = MotionState::Holding;
+  holding.frame = 119;
+  holding.progress = computeProgress(holding.frame, holding.frames, holding.state);
+  store.publishRunStatus(holding);
+
+  auto running = readySnapshot(ControllerState::Running);
+  running.active = {ActiveKind::User, "held"};
+  running.exec = holding;
+  running.queue.ids = {"held"};
+  running.queue.n = 1;
+  store.publishSnapshot(running);
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.active.kind == ActiveKind::User);
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->id == "held");
+  REQUIRE(snapshot.exec->state == MotionState::Holding);
+  REQUIRE(snapshot.exec->hold);
+  REQUIRE(snapshot.exec->progress == 1.0);
+  REQUIRE(snapshot.queue.ids.empty());
+
+  const auto found = store.findRun("held");
+  REQUIRE(found.code == ErrorCode::Ok);
+  REQUIRE(found.run.has_value());
+  REQUIRE(found.run->state == MotionState::Holding);
+  REQUIRE(found.run->hold);
+
+  const auto next = bridge.submitQueue(executeCommand("next"));
+  REQUIRE(next.code == ErrorCode::Ok);
+  REQUIRE(next.q == 1);
+  REQUIRE(store.snapshot().queue.ids == std::vector<std::string>{"next"});
 }
 
 TEST_CASE("RuntimeBridge configureIdle publishes status without user queue state") {

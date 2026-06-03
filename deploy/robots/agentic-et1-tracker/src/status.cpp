@@ -10,7 +10,7 @@ double computeProgress(std::size_t frame, std::size_t frames, MotionState state)
       state == MotionState::Failed) {
     return 0.0;
   }
-  if (state == MotionState::Done) {
+  if (state == MotionState::Done || state == MotionState::Holding) {
     return 1.0;
   }
   if (frames == 0) {
@@ -39,6 +39,7 @@ MotionStatus makeMotionStatus(const MotionRequest& request) {
                                     : 0.0;
   status.duration_s = request.duration_s;
   status.progress = computeProgress(request.frame, request.frames, request.state);
+  status.hold = request.hold;
   status.stop_reason = request.stop_reason;
   status.err = request.err;
   return status;

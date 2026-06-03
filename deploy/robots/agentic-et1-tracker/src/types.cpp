@@ -72,6 +72,8 @@ std::string toString(MotionState state) {
       return "queued";
     case MotionState::Running:
       return "running";
+    case MotionState::Holding:
+      return "holding";
     case MotionState::Stopping:
       return "stopping";
     case MotionState::Done:
@@ -104,6 +106,8 @@ std::string toString(ActiveKind kind) {
       return "user";
     case ActiveKind::Idle:
       return "idle";
+    case ActiveKind::Transition:
+      return "transition";
   }
   return "none";
 }

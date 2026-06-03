@@ -61,6 +61,7 @@ nlohmann::json motionStatusJson(const MotionStatus& status, bool include_path) {
       {"time_s", status.time_s},
       {"duration_s", status.duration_s},
       {"progress", status.progress},
+      {"hold", status.hold},
       {"stop_reason", stopReasonJson(status.stop_reason)},
       {"err", nullableErrorJson(status.err)},
   };
@@ -97,6 +98,20 @@ nlohmann::json idleStatusJson(const IdleStatus& status) {
       {"frames", status.frames},
       {"time_s", status.time_s},
       {"duration_s", status.duration_s},
+      {"progress", status.progress},
+  };
+}
+
+nlohmann::json transitionStatusJson(const TransitionStatus& status) {
+  return {
+      {"active", status.active},
+      {"target", nullableString(status.target)},
+      {"target_id", nullableString(status.target_id)},
+      {"target_state",
+       status.target_state ? nlohmann::json(toString(*status.target_state))
+                           : nlohmann::json(nullptr)},
+      {"frame", status.frame},
+      {"frames", status.frames},
       {"progress", status.progress},
   };
 }
@@ -143,6 +158,7 @@ nlohmann::json statusSnapshotJson(const StatusSnapshot& snapshot) {
                              : nlohmann::json(nullptr)},
       {"queue", queueStatusJson(snapshot.queue)},
       {"idle", idleStatusJson(snapshot.idle)},
+      {"transition", transitionStatusJson(snapshot.transition)},
       {"low_ms", snapshot.low_ms},
       {"block", nullableString(snapshot.block)},
       {"err", nullableErrorJson(snapshot.err)},
