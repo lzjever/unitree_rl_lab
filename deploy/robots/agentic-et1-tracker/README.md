@@ -205,6 +205,8 @@ Release policy/control assets are owned by `agentic-et1-tracker` and live under
 
 Runtime configuration must point at these app-local release assets. Runtime
 does not fall back to the ET1 app tree under `deploy/robots/et1`.
+Release packages carry only the CLN tracker policy directory and omit the unused
+legacy `config/policy/general_tracker` tracker policy directory.
 The public motion input contract remains the existing `.trk` format; CLN does
 not add `.et1trk` as a service input.
 

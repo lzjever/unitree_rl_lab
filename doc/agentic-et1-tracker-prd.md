@@ -163,21 +163,21 @@ ET1 参考实现中，非 `.npz` 文件会直接按 ET1TRK1 cache 读取；历�
 
 ### 4.4 GA profile 绑定
 
-GA 只绑定一份 GeneralTracker-compatible frozen profile。ET1 `config/config.yaml` 里的 `GeneralTracker` 只是参考来源和兼容目标，不是运行时依赖。
+GA 只绑定一份 GeneralTrackerCLN frozen profile。ET1 `config/config.yaml` 里的 tracker 配置只是参考来源和兼容目标，不是运行时依赖。
 
 冻结 profile 的最小合同：
 
-- `policy_dir: config/policy/general_tracker`
-- 默认 `policy_file: self_collision_footmesh_15k.onnx`
-- `deploy_file: deploy.yaml`，即 `config/policy/general_tracker/params/deploy.yaml`
+- `policy_dir: config/policy/general_tracker_cln`
+- 默认 `policy_file: multi_policy_v17c2_70k.onnx`
+- `deploy_file: deploy.yaml`，即 `config/policy/general_tracker_cln/params/deploy.yaml`
 - `fps: 50`
 - `no_global_mode: true`
 - `use_motion_root_command: true`
 - `use_motion_velocity_command: true`
 
-运行时资产必须由新 app 自己目录或外部部署资产目录提供，例如新 app 的 `config/policy/general_tracker`。允许从 ET1 app 参考配置拷贝或导出一份 frozen profile，但交付物归 `agentic-et1-tracker` 管理，不从 `deploy/robots/et1` 运行时读取。GA 默认配置必须指向真实存在的 agentic-owned asset；如果部署包未携带或未挂载该 frozen profile，服务只能进入 not-ready/error，不能回退读取 ET1 app 的 policy/deploy tree。
+运行时资产必须由新 app 自己目录或外部部署资产目录提供，例如新 app 的 `config/policy/general_tracker_cln`。允许从 ET1 app 参考配置拷贝或导出一份 frozen profile，但交付物归 `agentic-et1-tracker` 管理，不从 `deploy/robots/et1` 运行时读取。GA 默认配置必须指向真实存在的 agentic-owned asset；如果部署包未携带或未挂载该 frozen profile，服务只能进入 not-ready/error，不能回退读取 ET1 app 的 policy/deploy tree。
 
-`GeneralTrackerCJM` 虽然在当前 ET1 配置中复用了 `config/policy/general_tracker` 和同一个 onnx/deploy 文件，但它是另一个 profile，不是本服务的 GA 绑定对象。`GeneralTrackerCLN` 使用 `config/policy/general_tracker_cln/params/deploy.yaml`，包含 `command_yaw`、`future_commands` 等不同观测合同；legacy `track` deploy 的 joint/sdk map 和 action scale 也不同。GA 不承诺兼容 CJM、CLN、legacy `track`、dance 或其他历史 profile。
+`GeneralTrackerCJM` 虽然在当前 ET1 配置中复用了 `config/policy/general_tracker` 和旧 onnx/deploy 文件，但它是另一个 profile，不是本服务的 GA 绑定对象。`GeneralTrackerCLN` 使用 `config/policy/general_tracker_cln/params/deploy.yaml`，包含 `command_yaw`、`future_commands` 等观测合同。GA 不承诺兼容 CJM、legacy `GeneralTracker`、legacy `track`、dance 或其他历史 profile。
 
 因此，HTTP 接收的 `.trk` 必须匹配本 app-local GeneralTracker GA schema；`ET1TRK1` 容器合法不等于可执行。
 
@@ -289,7 +289,7 @@ unitree_rl_lab/deploy/robots/agentic-et1-tracker/
 - 加载 ONNX 模型。
 - 维护 policy history。
 - 生成 action。
-- 仅支持固定 GeneralTracker-compatible frozen profile 和 `config/policy/general_tracker/params/deploy.yaml` 的 GA 最小合同，不做通用 policy 平台。
+- 仅支持固定 GeneralTrackerCLN frozen profile 和 `config/policy/general_tracker_cln/params/deploy.yaml` 的 GA 最小合同，不做通用 policy 平台。
 
 `RobotIO`：
 
@@ -503,17 +503,17 @@ start gate 不满足时不得推进 reference、不得加载新 `.trk`、不得�
 
 ### 6.4 Policy/Observation 合同
 
-GA 只支持固定 GeneralTracker-compatible frozen profile 和 `config/policy/general_tracker/params/deploy.yaml` 的最小运行合同，不扩展成通用 policy 平台。
+GA 只支持固定 GeneralTrackerCLN frozen profile 和 `config/policy/general_tracker_cln/params/deploy.yaml` 的最小运行合同，不扩展成通用 policy 平台。
 
 固定绑定：
 
-- profile：GeneralTracker-compatible frozen profile
-- policy 目录：新 app 自有 `unitree_rl_lab/deploy/robots/agentic-et1-tracker/config/policy/general_tracker` 或外部部署资产目录
-- 默认模型：`self_collision_footmesh_15k.onnx`
-- deploy 配置：`config/policy/general_tracker/params/deploy.yaml`
+- profile：GeneralTrackerCLN frozen profile
+- policy 目录：新 app 自有 `unitree_rl_lab/deploy/robots/agentic-et1-tracker/config/policy/general_tracker_cln` 或外部部署资产目录
+- 默认模型：`multi_policy_v17c2_70k.onnx`
+- deploy 配置：`config/policy/general_tracker_cln/params/deploy.yaml`
 - motion：`.trk` 内容必须匹配本 app-local GeneralTracker GA `TrkSchema`
 
-禁止把 `unitree_rl_lab/deploy/robots/et1/config/policy/...` 作为运行时 `policy_dir` 或默认 deploy/model 来源。允许拷贝或导出一份 frozen profile 到新 app 的 `config/policy/general_tracker` 或部署资产目录；manifest/hash 只用于 release/package 检查和部署审计，不是 runtime fallback、远程下载或 ET1 路径解析机制。GA 交付时默认 `policy_dir`、ONNX 和 deploy YAML 必须解析到 agentic-owned 真实文件。
+禁止把 `unitree_rl_lab/deploy/robots/et1/config/policy/...` 作为运行时 `policy_dir` 或默认 deploy/model 来源。允许拷贝或导出一份 frozen profile 到新 app 的 `config/policy/general_tracker_cln` 或部署资产目录；manifest/hash 只用于 release/package 检查和部署审计，不是 runtime fallback、远程下载或 ET1 路径解析机制。GA 交付时默认 `policy_dir`、ONNX 和 deploy YAML 必须解析到 agentic-owned 真实文件。
 
 必须支持并校验：
 
@@ -1099,10 +1099,10 @@ agentic_et1_tracker:
   stop_hold_s: 0.5
   idle_mode: "hold_current"
   policy:
-    profile: "GeneralTracker"
-    policy_dir: "config/policy/general_tracker"
-    policy_file: "self_collision_footmesh_15k.onnx"
-    deploy: "config/policy/general_tracker/params/deploy.yaml"
+    profile: "GeneralTrackerCLN"
+    policy_dir: "config/policy/general_tracker_cln"
+    policy_file: "multi_policy_v17c2_70k.onnx"
+    deploy: "config/policy/general_tracker_cln/params/deploy.yaml"
     fps: 50
 ```
 
@@ -1235,7 +1235,7 @@ agent 高频使用的是 4 个核心动作，另有 `GET /health` 用于 readine
 - 生产 HTTP 必须通过 `RuntimeBridge`、`CommandMailbox`、`MotionQueue` 和 `RuntimeControlLoop`；`TrackerController` 只能作为 core/test façade，不能作为生产同步控制入口。
 - 新 app 必须自己实现 app-local `TrkSchema`，并让 validator/loader 共用它。
 - 新 app 必须自己实现轻量 `.trk` 预校验、payload skip 和异常隔离。
-- 新 app 只支持固定 GeneralTracker-compatible frozen profile 和 `config/policy/general_tracker/params/deploy.yaml` 的最小 Policy/Observation 合同。
+- 新 app 只支持固定 GeneralTrackerCLN frozen profile 和 `config/policy/general_tracker_cln/params/deploy.yaml` 的最小 Policy/Observation 合同。
 - frozen profile 必须复制或导出到新 app 目录或外部部署资产目录，默认配置必须指向 agentic-owned 真实资产。
 - 真机/仿真能力应继承 Unitree SDK 和 `mode_machine` 语义，而不是继承 ET1 app 代码。
 - HTTP 线程只提交命令，不能直接发布 LowCmd。
@@ -1255,7 +1255,7 @@ agent 高频使用的是 4 个核心动作，另有 `GET /health` 用于 readine
 - 工程边界闭合：独立 app，不改、不包、不链 ET1 app，CMake 只用 target-level include/link。
 - 状态机闭合：`starting/idle/preparing/running/stopping/fault`。
 - 停止语义闭合：不暴露单独抢断状态，统一用 `ctrl:"stopping"` 和 `stop_reason`；stop 取消集合由 command sequence/watermark 定义。
-- Policy/Observation 边界闭合：只支持固定 GeneralTracker-compatible frozen profile 和 `config/policy/general_tracker/params/deploy.yaml` 的最小合同。
+- Policy/Observation 边界闭合：只支持固定 GeneralTrackerCLN frozen profile 和 `config/policy/general_tracker_cln/params/deploy.yaml` 的最小合同。
 - 安全边界闭合：LowCmd best-effort 占用检测、本 app 进程锁、部署层单控制进程约束、allowlist、bad orientation、fault 拒绝执行。
 - 输入边界闭合：只接受 `.trk` 路径，内容必须满足 app-local ET1TRK1 `TrkSchema`。
 - 性能边界闭合：HTTP 线程不推理、不发布 LowCmd、不读大 payload。

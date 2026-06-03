@@ -20,6 +20,31 @@ Environment: local workspace `/home/galbot/works/et1`
 
 ## Docs/skill evidence
 
+2026-06-04 CLN model/release package verification for this CLN release
+packaging change set:
+
+- App-owned CLN model was byte-identical to the updated ET1 source asset
+  `deploy/robots/et1/config/policy/general_tracker_cln/exported/multi_policy_v17c2_70k.onnx`;
+  sha256 `d4f37c972eb5e98e37a1d425302a70729343009a1564974921965c5faea0d911`.
+- `agentic_et1_tracker_policy_onnx_tests`:
+  `OnnxPolicyRuntime constructs and runs the app-owned GeneralTrackerCLN policy`
+  passed.
+- `agentic_et1_tracker_app_tests "*AppConfig*" "~*simulation example*"`:
+  193 assertions / 21 test cases passed; the local sim example test was
+  excluded because the local working tree has an operator-specific
+  `motion_dirs` edit.
+- Temporary x86_64 release package built with
+  `-DAGENTIC_ET1_BUILD_ROBOT=OFF`; packaged `scripts/selftest.sh` passed,
+  verified the CLN model hash, and verified the unused legacy
+  `config/policy/general_tracker` tracker policy directory is absent while
+  `general_tracker_cln` and `velocity/v0` remain packaged.
+- `git diff --check`, `bash -n packaging/build_release.sh`, and
+  `bash -n packaging/scripts/selftest.sh`: passed.
+
+This evidence is limited to model selection, config tests, and release package
+selftest. It does not claim broader MuJoCo/operator acceptance or real-robot GA
+completion.
+
 2026-06-04 package/skill verification for commit `eb5be7602d796bcdba72e1f660333761864f9ab0`:
 
 - Commit: `eb5be7602d796bcdba72e1f660333761864f9ab0`.
@@ -76,6 +101,8 @@ fallback to the ET1 app tree:
 
 - Default CLN policy: `GeneralTrackerCLN` at
   `config/policy/general_tracker_cln`
+- Release packages carry this CLN tracker policy and omit the unused legacy
+  `config/policy/general_tracker` tracker policy directory.
 - StandbyVelocity: `config/policy/velocity/v0`
 - FixStand posture: `config/posture/fixstand/v0/fixstand.yaml`
 - Passive posture: `config/posture/passive/v0/passive.yaml`

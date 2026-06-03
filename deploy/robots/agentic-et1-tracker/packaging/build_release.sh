@@ -222,6 +222,7 @@ install -m 0644 "$SCRIPT_DIR/README.release.md" "$package_root/README.release.md
 printf '%s\n' "$version" > "$package_root/VERSION"
 
 cp -a "$TRACKER_DIR/config" "$package_root/share/agentic-et1-tracker/"
+rm -rf "$package_root/share/agentic-et1-tracker/config/policy/general_tracker"
 cp -a "$SCRIPT_DIR/scripts/." "$package_root/scripts/"
 cp -a "$skill_dir" "$package_root/skills/et1-trk2motion"
 chmod +x "$package_root"/scripts/*.sh

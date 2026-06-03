@@ -58,6 +58,8 @@ check_sha256() {
 check_exec "$ET1_BIN"
 check_exec "$ET1_CLI"
 check_file "$ET1_RELEASE_DIR/config/config.robot.yaml.template"
+[[ ! -d "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/general_tracker" ]] || \
+  die "legacy policy directory must not be present: $ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/general_tracker"
 check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/general_tracker_cln/ASSET_MANIFEST.yaml"
 check_sha256 "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/general_tracker_cln/exported/multi_policy_v17c2_70k.onnx" \
   "d4f37c972eb5e98e37a1d425302a70729343009a1564974921965c5faea0d911"
