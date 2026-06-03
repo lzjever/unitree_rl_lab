@@ -14,10 +14,13 @@
 
 当前不能声明 GA 完成。以下 gate 仍未完成：
 
-- `standby_ref.trk` runtime playback gate。asset 与 manifest 已记录，且
-  simulator accepted；runtime 接入与播放验收仍 pending。
-- 当前版本 MuJoCo visual acceptance。
+- broader MuJoCo/operator acceptance。targeted standby_ref simulator asset
+  accepted 已记录，但完整 MuJoCo 操作矩阵仍 pending。
 - ET1 real robot acceptance。
+
+已完成的软件证据：`standby_ref.trk` asset 与 manifest 已记录，targeted
+simulator asset accepted，standby_ref runtime gate 已接入，并有
+unit/runtime/release selftest 覆盖。不要据此宣称整体 GA。
 
 ## 2. KISS / DRY / YAGNI
 
@@ -74,9 +77,9 @@ skill CLI 必须保持 one-line compact JSON；`holding` 对 `run --hold --wait`
 - `/stop` 可 abort user、idle、holding、transition，并且不播放 `standby_ref.trk`。
 - `/passive` 可 abort user、idle、holding、transition，清 user queue 和 idle pool/config，并停在 Passive safety sink；与 `/stop` 的区别是落点固定为 passive safety sink，不保留恢复到 standby 的语义；与 `/fixstand` 的区别是 passive 是 safety sink，fixstand 是姿态恢复；与 `/standby_velocity` 的区别是 passive 不进入可执行/idle 待命状态。
 
-`standby_ref` asset 已记录且 simulator accepted，但当前仍不是可依赖 runtime
-playback 功能。只有 runtime 明确接入并完成 real robot/operator gate 后，才能声明
-standby reference transition 可用。
+`standby_ref` asset 已记录且 targeted simulator asset accepted；runtime gate 已接入，
+并由 unit/runtime/release selftest 覆盖。broader MuJoCo/operator 与 real
+robot GA gates 仍 pending；只有这些外部 gate 完成后，才能声明整体 GA。
 
 ## 4. 后续 gate / 最少工作包
 
@@ -133,18 +136,21 @@ Passive safety sink 时发送，且需提前准备 MuJoCo reset/upright/operator
 
 ### WP4 standby_ref runtime playback gate
 
-目标：在已记录且 simulator accepted 的 standby_ref asset 基础上，只在 runtime
-接入和 real robot/operator 验收完成后声明 standby reference transition 可用。
+状态：standby_ref runtime gate 已接入，并由 unit/runtime/release selftest 覆盖。
+targeted standby_ref simulator asset accepted 已记录。broader MuJoCo/operator 与
+real robot GA gates 仍 pending；不要声明整体 GA。
 
 交付条件：
 
-- 保持已固化的 `config/reference/standby/v0/standby_ref.trk` 和
+- [x] 保持已固化的 `config/reference/standby/v0/standby_ref.trk` 和
   `config/reference/standby/v0/ASSET_MANIFEST.yaml`，记录 source、sha256、
   frames、fps、duration、simulator acceptance 结论。
-- runtime 接入 standby_ref playback 后，通过必要真机/operator 审核。
-- candidate 工具输出的 `CANDIDATE_MANIFEST.json` 只记录候选生成证据，不是 release manifest，不进入 runtime release 约定。
-- release package selftest 检查 `standby_ref.trk` 和 `ASSET_MANIFEST.yaml`。
-- runtime 只读取 app-local release asset；缺失或损坏不得 fallback 到 ET1 app tree。
+- [x] runtime 接入 standby_ref playback，并有 unit/runtime 覆盖。
+- [ ] broader MuJoCo/operator 审核通过。
+- [ ] real robot/operator 审核通过。
+- [x] candidate 工具输出的 `CANDIDATE_MANIFEST.json` 只记录候选生成证据，不是 release manifest，不进入 runtime release 约定。
+- [x] release package selftest 检查 `standby_ref.trk` 和 `ASSET_MANIFEST.yaml`。
+- [x] runtime 只读取 app-local release asset；缺失或损坏不得 fallback 到 ET1 app tree。
 
 仍需保持：
 
@@ -159,8 +165,8 @@ Passive safety sink 时发送，且需提前准备 MuJoCo reset/upright/operator
 
 交付项：
 
-- packaged skill tests 通过。
-- 安装到本地 agent/codex skill 位置后的 diff 或版本证据通过。
+- [x] packaged skill tests 通过。
+- [x] 安装到本地 agent/codex skill 位置后的 diff 或版本证据通过。
 - CLI `run --hold --wait`、`status`、`raw` 输出仍为 compact one-line JSON。
 - aarch64 release package 从当前 `HEAD` 克隆构建，包含 app-owned assets、skill、scripts、selftest。
 - 明确记录：未提交 tracked changes、untracked files、本地 config edits 不会进入 release workspace。
@@ -181,24 +187,24 @@ Passive safety sink 时发送，且需提前准备 MuJoCo reset/upright/operator
 
 API schema：
 
-- [ ] `/execute` 只接受 `path/mode/hold`；`hold` 非 boolean、`paths`、额外字段均 400 `REQUEST_INVALID`。
-- [ ] `/idle` set/clear 原子；失败不污染旧配置。
-- [ ] 空 body 控制接口拒绝非空 body。
+- [x] `/execute` 只接受 `path/mode/hold`；`hold` 非 boolean、`paths`、额外字段均 400 `REQUEST_INVALID`。
+- [x] `/idle` set/clear 原子；失败不污染旧配置。
+- [x] 空 body 控制接口拒绝非空 body。
 
 Runtime state：
 
-- [ ] `active.kind` 仅为 `none/user/idle/transition`。
-- [ ] `exec/queue` 只描述用户 run。
-- [ ] `holding` 保持原 run id，`progress:1`，持续发布末帧。
-- [ ] transition 不进入 queue/history，不产生 run id。
-- [ ] `/stop` abort user/idle/holding/transition，不播放 standby_ref。
-- [ ] `/passive` abort active work，清 user queue 和 idle pool/config，进入 Passive safety sink，且不自动恢复 `lowcmd_occupied`。
+- [x] `active.kind` 仅为 `none/user/idle/transition`。
+- [x] `exec/queue` 只描述用户 run。
+- [x] `holding` 保持原 run id，`progress:1`，持续发布末帧。
+- [x] transition 不进入 queue/history，不产生 run id。
+- [x] `/stop` abort user/idle/holding/transition，不播放 standby_ref。
+- [x] `/passive` abort active work，清 user queue 和 idle pool/config，进入 Passive safety sink，且不自动恢复 `lowcmd_occupied`。
 
 Skill CLI：
 
-- [ ] `run --hold --wait` 在 `holding` 返回 `ok:true`。
-- [ ] `status` 默认 compact，不输出大 pose。
-- [ ] raw HTTP fallback 覆盖 `/execute hold`、`/idle`、`/stop`。
+- [x] `run --hold --wait` 在 `holding` 返回 `ok:true`。
+- [x] `status` 默认 compact，不输出大 pose。
+- [x] raw HTTP fallback 覆盖 `/execute hold`、`/idle`、`/stop`。
 
 MuJoCo：
 
@@ -215,15 +221,15 @@ Real robot：
 
 Release package：
 
-- [ ] app-owned assets 完整，无 ET1 app fallback。
-- [ ] release notes 明确 `standby_ref.trk` asset 已模拟器接受、真机 gate
-  pending，且不声明整体 GA。
-- [ ] standby release asset selftest 检查
+- [x] app-owned assets 完整，无 ET1 app fallback。
+- [x] release notes 明确 `standby_ref.trk` asset 已模拟器接受、runtime gate
+  已接入、broader MuJoCo/operator 与真机 gate pending，且不声明整体 GA。
+- [x] standby release asset selftest 检查
   `config/reference/standby/v0/standby_ref.trk` 和
   `config/reference/standby/v0/ASSET_MANIFEST.yaml`；不把
   `CANDIDATE_MANIFEST.json` 当 release manifest。
 - [ ] aarch64 package 从 `HEAD` 构建；所有 release 必要变更已 commit。
-- [ ] package selftest 和 skill tests 通过。
+- [x] package selftest 和 skill tests 通过。
 
 ## 7. 安全约束
 

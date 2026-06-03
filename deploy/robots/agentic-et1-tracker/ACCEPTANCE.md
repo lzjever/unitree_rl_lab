@@ -1,7 +1,7 @@
 # Agentic ET1 Tracker Acceptance Evidence
 
 Date: 2026-05-29
-Latest targeted update: 2026-06-03
+Latest targeted update: 2026-06-04
 Environment: local workspace `/home/galbot/works/et1`
 
 ## Build/test evidence
@@ -19,6 +19,21 @@ Environment: local workspace `/home/galbot/works/et1`
 - `git diff --check`: passed.
 
 ## Docs/skill evidence
+
+2026-06-04 package/skill verification for commit `eb5be7602d796bcdba72e1f660333761864f9ab0`:
+
+- Commit: `eb5be7602d796bcdba72e1f660333761864f9ab0`.
+- Temporary x86_64 release package built from a clean detached HEAD worktree
+  with `-DAGENTIC_ET1_BUILD_ROBOT=OFF` because local `unitree_sdk2` was not
+  available for the default ROBOT release configure.
+- `/tmp/agentic-et1-tracker-head-selftest-unpack/agentic-et1-tracker-head-eb5be76-selftest-x86_64/scripts/selftest.sh`:
+  passed; verified packaged default CLN assets, `standby_ref.trk`, manifest
+  files, and bundled binary/CLI help.
+- `python3 deploy/robots/agentic-et1-tracker/packaging/skills/et1-trk2motion/tests/test_et1_trk2motion.py`:
+  26/26 passed.
+
+This evidence is limited to package selftest and skill tests. It does not
+claim broader MuJoCo/operator acceptance or real-robot GA completion.
 
 2026-06-03 targeted docs/skill/release verification:
 
