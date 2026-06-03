@@ -52,6 +52,11 @@ std::filesystem::path uniqueTestLockPath() {
          ("agentic_et1_tracker_app_runner_tests_" + uniqueTestSuffix() + ".lock");
 }
 
+std::filesystem::path appRoot() {
+  return std::filesystem::absolute(std::filesystem::path(__FILE__).parent_path().parent_path())
+      .lexically_normal();
+}
+
 struct TempTree {
   TempTree() {
     root = std::filesystem::temp_directory_path() /
@@ -821,7 +826,8 @@ TEST_CASE("Ready AppRunner rejects invalid trk before enqueue") {
   TempTree tmp;
   FakeRobotIO* robot = nullptr;
   FakePolicy* policy = nullptr;
-  AppRunner runner(productionTestConfig(tmp), makeDeps(robot, policy));
+  const auto config = productionTestConfig(tmp);
+  AppRunner runner(config, makeDeps(robot, policy));
   REQUIRE(runner.start());
   auto client = httplib::Client("127.0.0.1", runner.boundPort());
 
@@ -849,6 +855,24 @@ TEST_CASE("Ready AppRunner rejects invalid trk before enqueue") {
   REQUIRE(outside.at("error").at("code") == "TRK_PATH_NOT_ALLOWED");
   REQUIRE(policy->calls.load() == 0);
   REQUIRE(robot->write_low_cmd_calls.load() >= 1);
+
+  const auto standby_ref =
+      appRoot() / "config/reference/standby/v0/standby_ref.trk";
+  REQUIRE(std::filesystem::is_regular_file(standby_ref));
+  REQUIRE(config.trk.allowlist_dirs == std::vector<std::filesystem::path>{tmp.allowed});
+  const auto standby =
+      body(client.Post("/execute",
+                       (std::string(R"({"path":")") + standby_ref.string() + R"("})").c_str(),
+                       "application/json"),
+           403);
+  REQUIRE(standby.at("ok") == false);
+  REQUIRE(standby.at("error").at("code") == "TRK_PATH_NOT_ALLOWED");
+  const auto status = body(client.Get("/status"), 200);
+  REQUIRE(status.at("exec").is_null());
+  REQUIRE(status.at("queue").at("n") == 0);
+  REQUIRE(status.at("queue").at("ids").empty());
+  REQUIRE(body(client.Get("/status?id=a7K3p9Qx"), 404).at("error").at("code") ==
+          "RUN_NOT_FOUND");
 
   runner.stop();
 }

@@ -15,10 +15,12 @@
 - `standby_ref.trk` 已在 2026-06-03 固化为 app-local release asset：
   `config/reference/standby/v0/standby_ref.trk` 与 manifest 已提交，模拟器视觉
   验收已记录；真机/operator gate 仍 pending。
-- 本次 release asset 切片未修改 runtime playback 逻辑；standby reference
-  transition 的真机 gate 和整体 GA 仍不能宣称完成。
+- standby_ref runtime gate 已接入：runtime 会加载 app-local
+  `standby_ref.trk`，内部 playback/abort 行为已有 unit/runtime/release
+  selftest 覆盖。targeted standby_ref simulator asset accepted 已记录；broader
+  MuJoCo/operator 场景和 real robot GA gates 仍 pending。
 - direct `/standby_velocity` 与 StandbyVelocity/Velocity0 policy 路径仍然可用；
-  standby reference asset 只是后续 gated deliverable，不是当前可依赖能力。
+  standby reference 不替代 Velocity0，也不能作为整体 GA 能力宣称。
 
 ## 1. 目标范围
 
@@ -104,8 +106,9 @@ POST /execute
   idle 语义：如果 idle pool 已配置，且 runtime ready/safe、无 user active、
   无 user queue/interrupt/pending，则从用户最后一帧到选中 idle `.trk` 第一帧
   插入 internal synthetic transition，然后进入 idle；否则按既有路径回到
-  `standby_velocity`。standby reference transition 只有在 app-local validated
-  standby_ref runtime playback gate 完成后才能替代这里的直接回 standby 路径。
+  `standby_velocity`。standby reference transition 已受 app-local validated
+  standby_ref runtime gate 保护；使用范围仍限于自然回 standby 或显式
+  `/standby_velocity`，不表示 broader MuJoCo/operator 或 real robot GA 完成。
 - `hold:true`：用户 `.trk` 到达末帧后，run 进入 `holding`，runtime 持续发布
   和执行该 `.trk` 的最后一帧 reference。
 - holding 期间 `exec.state:"holding"`、`progress:1`，用户 run id 仍是原
@@ -117,9 +120,9 @@ POST /execute
   - `interrupt`：停止当前 holding run，取消符合现有 interrupt 规则的等待项，
     从 held last frame 到 interrupt 目标第一帧插入内部 synthetic transition。
 - `/stop`、`/passive`、`/fixstand`、`/standby_velocity` 可以结束 holding。
-  `/stop` 是立即终止语义，不播放 `standby_ref.trk`；只有 standby reference
-  runtime playback gate 完成后，自然完成后无新 user work 或显式 `/standby_velocity` 回
-  standby 才允许使用 standby_ref。
+  `/stop` 是立即终止语义，不播放 `standby_ref.trk`；自然完成后无新 user
+  work 或显式 `/standby_velocity` 回 standby 才允许使用已 runtime-gated 的
+  standby_ref。
 - 当前一个 holding run 因新用户 run 开始 transition 而让路时，前一个 run
   才转为 `done`。
 - `/standby_velocity` 从 holding 明确回 standby 时，held run 最终状态为
@@ -139,7 +142,7 @@ POST /execute
 | `/stop` | 立即 abort held user；held run 转 `stopped`；保留 stop watermark；清理 active/queue/idle 按现有 stop 合同；不播放 `standby_ref.trk`；之后由现有逻辑进入 `standby_velocity` 或 safety/passive/fault | 立即 abort 当前 internal transition 或 standby_ref；保留 stop watermark；清理 active/queue/idle 按现有 stop 合同；不播放 `standby_ref.trk`；之后由现有逻辑进入 `standby_velocity` 或 safety/passive/fault |
 | `/passive` | held run 转 `stopped`；立即进入安全 passive 路径；不播放 `standby_ref.trk` | 立即停止 internal transition 并进入 passive；不播放 `standby_ref.trk` |
 | `/fixstand` | held run 转 `stopped`；进入 FixStand；不播放 `standby_ref.trk` | 停止 internal transition 并进入 FixStand；不播放 `standby_ref.trk` |
-| `/standby_velocity` | held run 转 `done`；明确回 standby。当前 release 不播放 standby_ref；只有 standby reference runtime playback gate 完成后才可走 held frame -> standby_ref -> `standby_velocity`。若 safety/readiness 不允许则 abort 到 safety/passive/fault，不强行播放 | 停止或接管当前 internal transition。当前 release 不播放 standby_ref；runtime playback gate 完成后才可改走当前 frame -> standby_ref -> `standby_velocity`。若 safety/readiness 不允许则 abort 到 safety/passive/fault |
+| `/standby_velocity` | held run 转 `done`；明确回 standby。runtime-gated standby_ref 可走 held frame -> standby_ref -> `standby_velocity`；若 safety/readiness 不允许则 abort 到 safety/passive/fault，不强行播放 | 停止或接管当前 internal transition。runtime-gated standby_ref 可走当前 frame -> standby_ref -> `standby_velocity`；若 safety/readiness 不允许则 abort 到 safety/passive/fault |
 
 ## 4. Internal Synthetic Transition
 
@@ -161,9 +164,10 @@ synthetic transition 是 runtime 内部对象，不是用户提交的 motion：
   `agentic-et1-tracker` 本地边界内。
 - 输入为 `source_frame` 和 `target_frame`：
   - `source_frame` 来自 held last frame、当前 user/idle reference frame；standby
-    reference 当前帧只在 standby_ref runtime playback gate 完成后参与。
+    reference 当前帧只在 standby_ref runtime gate 允许的回 standby 路径中参与。
   - `target_frame` 来自下一段用户 `.trk` 第一帧、选中 idle `.trk` 第一帧；
-    `standby_ref.trk` 第一帧只在 standby_ref runtime playback gate 完成后参与。
+    `standby_ref.trk` 第一帧只在 standby_ref runtime gate 允许的回 standby
+    路径中参与。
 - 在内存中构造 synthetic `TrkTrack`，不落盘，不写入用户 motion 目录。
 - fps 使用 target `.trk` fps；内部 duration 固定为一个小常量，先不暴露配置。
 - 输出 `TrkTrack` metadata：
@@ -197,7 +201,7 @@ synthetic transition 是 runtime 内部对象，不是用户提交的 motion：
   - `ref_com_vel_navi` 使用 `ref_com_rel_navi` finite difference。
   - 所有输出 float 必须 finite；NaN/Inf 直接构造失败。
 - synthetic transition 完成后立即启动目标用户 `.trk`、进入目标 idle `.trk`；
-  standby_ref runtime playback gate 完成后才可继续播放 `standby_ref.trk`。
+  回 standby 路径可在 runtime gate 允许时继续播放 `standby_ref.trk`。
 
 对用户 run 的归属：
 
@@ -223,9 +227,10 @@ deploy/robots/agentic-et1-tracker/config/reference/standby/v0/ASSET_MANIFEST.yam
 deploy/robots/agentic-et1-tracker/config/reference/standby/v0/README.md
 ```
 
-当前 release 中该 asset 已固化并记录模拟器验收；真机/operator gate 仍 pending，
-且本资产切片未修改 runtime playback 逻辑。runtime 明确接入并完成剩余 gate 前，
-`transition.target:"standby"` 仍不能作为整体 GA 能力宣称。
+当前 release 中该 asset 已固化并记录 targeted simulator asset acceptance。
+runtime gate 已接入并由 unit/runtime/release selftest 覆盖；broader
+MuJoCo/operator 场景和 real robot gate 仍 pending，`transition.target:"standby"`
+仍不能作为整体 GA 能力宣称。
 
 用途边界必须写死：
 
@@ -407,8 +412,8 @@ reserved/gated standby transition 中（当前缺少 validated app-local
 - synthetic transition 不应让 `queue.n` 增加。
 - `GET /status?id=<id>` 只返回用户 run；transition 没有 id，也不能查询。
 - `/_sim/reference_frame` 在 reference enabled 时应能显示 holding frame 和
-  synthetic transition frame；standby_ref frame 只在 runtime playback gate 完成后用于
-  MuJoCo 验收。
+  synthetic transition frame；standby_ref frame 已受 runtime gate 覆盖，broader
+  MuJoCo/operator 验收仍 pending。
 - status 不需要暴露绝对 path；保持当前隐私和 token 紧凑策略。
 
 ## 7. Runtime 实现步骤
@@ -461,17 +466,18 @@ reserved/gated standby transition 中（当前缺少 validated app-local
      status 使用 `transition.target:"idle"`；完成后进入 `active.kind:"idle"`。
 
 6. 实现 gated standby transition
-   - 当前 release 已固化 app-local `standby_ref.trk` 与 manifest，但 runtime
-     playback gate 仍 pending；当前 release 不应声明 standby_ref 可播放。
+   - 当前 release 已固化 app-local `standby_ref.trk` 与 manifest，runtime gate
+     已接入，并由 unit/runtime/release selftest 覆盖；当前 release 仍不应声明
+     broader MuJoCo/operator 或 real robot GA。
    - 加载固化 `standby_ref.trk`。
    - 新增内部 app-owned asset loader，使用 app-local release-resolved default
      path 和独立 internal allowlist。
-   - runtime playback gate 完成后，从当前 held frame 到 `standby_ref.trk` 第一帧
-     插入 synthetic transition。
-   - runtime playback gate 完成后播放 `standby_ref.trk`。
+   - 在 runtime gate 允许的回 standby 路径中，从当前 held frame 到
+     `standby_ref.trk` 第一帧插入 synthetic transition。
+   - 在 runtime gate 允许的回 standby 路径中播放 `standby_ref.trk`。
    - 完成后进入 `standby_velocity`，由 Velocity0 维持站立。
-   - standby_ref 只用于 runtime playback gate 完成后自然完成且无新 user work，或显式
-     `/standby_velocity` 回 standby；不得用于 `/stop`。
+   - standby_ref 只用于自然完成且无新 user work，或显式 `/standby_velocity`
+     回 standby；不得用于 `/stop`。
    - `src/runtime_control_loop.cpp` 的 `handleStop` 必须立即 abort 当前
      user/transition/standby_ref，清理 active/queue/idle 按现有 stop 合同，不播放
      standby_ref，并继续保留 stop watermark。
@@ -483,7 +489,7 @@ reserved/gated standby transition 中（当前缺少 validated app-local
    - `src/json_codec.cpp` 的 `statusSnapshotJson` 增加 `transition`。
    - `motionStatusJson` 支持 `holding`。
    - reference sink 发布 hold、synthetic transition；standby_ref 当前帧只在
-     runtime playback gate 完成后发布。
+     runtime gate 允许的回 standby 路径中发布。
 
 8. 发布资产落地
    - 离线生成候选 `standby_ref.candidate.trk`。
@@ -539,8 +545,8 @@ Runtime tests：
 
 - `hold:false` 保持原有用户 run 完成行为；完成后如果 idle pool 已配置且
   ready/safe/no user queue/interrupt/pending，则进入 idle，否则按既有路径回
-  `standby_velocity`。standby transition/ref 只在 runtime playback gate 完成后
-  测试。
+  `standby_velocity`。standby transition/ref 由 runtime gate 覆盖，broader
+  MuJoCo/operator 和 real robot 验收仍 pending。
 - `hold:true` 到最后一帧后进入 holding，不立即清 active user。
 - holding run 到末帧后 `exec.state:"holding"`、`progress:1`，原 id 仍可通过
   `GET /status?id=<id>` 查询。
@@ -561,12 +567,12 @@ Runtime tests：
   `standby_ref.trk`。
 - `/passive` 立即进入 passive 且不播放 `standby_ref.trk`；`/fixstand` 进入
   FixStand 且不播放 `standby_ref.trk`。
-- `/standby_velocity` 是明确回 standby；当前 release 不播放 standby_ref。
-  standby_ref runtime playback gate 完成后才可走 standby_ref；
-  safety/readiness 不允许时必须 abort 到既有 safety/passive/fault 路径。
-- standby_ref runtime playback gate 完成后，自然完成后无新 user work、或显式
-  `/standby_velocity` 回 standby 时，执行 current frame -> synthetic transition
-  -> `standby_ref.trk` -> `standby_velocity`。
+- `/standby_velocity` 是明确回 standby；runtime-gated standby_ref 可走
+  standby_ref；safety/readiness 不允许时必须 abort 到既有
+  safety/passive/fault 路径。
+- 自然完成后无新 user work、或显式 `/standby_velocity` 回 standby 时，允许执行
+  current frame -> synthetic transition -> `standby_ref.trk` ->
+  `standby_velocity`。
 - `standby_ref.trk` 不能循环播放，不能从 `passive/fault/lowcmd_occupied`
   自动启动。
 - bad orientation、lowcmd occupied、policy inference failure 仍走现有 safety/fault
@@ -578,9 +584,9 @@ TRK/asset tests：
   `frames/fps/duration_s` 按 endpoint-inclusive span 一致，所有 float finite。
 - synthetic builder 覆盖 shortest-path nlerp normalize、finite difference
   velocity、contact nearest/step 的边界测试。
-- standby_ref asset 已记录且 simulator accepted，但 runtime playback gate 完成前
-  不声明 `standby_ref.trk` 可播放；gate 完成时 `standby_ref.trk` 必须通过
-  `TrkLoader` 和 validator。
+- standby_ref asset 已记录且 targeted simulator accepted；runtime gate 已接入，
+  `standby_ref.trk` 必须通过 `TrkLoader` 和 validator。broader
+  MuJoCo/operator 与 real robot GA gate 仍 pending。
 - standby asset loader 使用独立 internal allowlist，只允许
   app-local release-resolved default path；不读取、不扩展用户 `motion_dirs`。
 - 用户 `/execute` 引用 `standby_ref.trk` 必须继续被用户 motion allowlist 拒绝。
@@ -605,21 +611,20 @@ MuJoCo acceptance：
 - held last frame 到下一条 `.trk` 第一帧 transition 连续，足端和躯干无明显突变。
 - user run 自然完成后进入 idle 时，用户最后一帧到 idle 第一帧 transition
   连续，随后 `/status.active.kind` 切到 `idle`。
-- standby_ref runtime playback gate 完成后，held last frame 回 standby 路径连续，
-  并最终看到 `ctrl:"standby_velocity"`；gate pending 时不记录 standby_ref 播放
-  验收。
+- runtime-gated standby_ref 的 held last frame 回 standby 路径连续，并最终看到
+  `ctrl:"standby_velocity"`；仍需 broader MuJoCo/operator 验收记录。
 - `/stop` 在 holding/transition/standby_ref 中立即终止，不播放 standby_ref。
 - `standby_ref.trk` 不替代 Velocity0：过渡完成后 Velocity0 仍在运行。
 - transition 期间 `/status` 显示 `active.kind:"transition"` 和
   `transition.active:true`，用户 queue 不增加。
 - `/_sim/reference_frame` 可观察到 hold/user/idle transition reference frame；
-  standby_ref reference frame 只在 runtime playback gate 完成后验收。
+  standby_ref reference frame 的 broader MuJoCo/operator 验收仍 pending。
 
 Real robot acceptance：
 
 - 仅在 MuJoCo 验收通过后进行。
 - 操作员确认 hold、user-to-user transition 均可人工停止；standby transition
-  只在 runtime playback gate 完成后验收。
+  仍需 real robot/operator 验收。
 - 验证 `/stop`、`/passive`、`/fixstand` 在 holding/transition 中优先级正确。
 - 验证低电平占用和 bad orientation 不被 hold/transition 自动恢复逻辑绕过。
 
@@ -629,7 +634,8 @@ Real robot acceptance：
 - synthetic transition 插值可能产生不自然脚接触或速度：先用短时、保守插值，并以
   MuJoCo 视觉和安全验收作为发布 gate。
 - `standby_ref.trk` 与 Velocity0 姿态不兼容会导致过渡末端跳变：runtime
-  playback gate 完成前必须检查结束帧与 Velocity0 起始站姿兼容。
+  playback gate 已 unit-covered，但 broader MuJoCo/operator 和 real robot gate
+  仍需验证 Velocity0 动态兼容性。
 - 状态扩展可能影响 LLM agent 解析：保持 `exec/queue` 用户语义不变，并将
   transition 放到独立字段。
 - 内部 transition 如果误入 queue，会破坏 queue limit 和 run history：测试必须
@@ -657,9 +663,8 @@ Real robot acceptance：
 - holding/transition 不新增 public controller state；对外 `ctrl` 保持现有表。
 - user-to-user synthetic transition 不进用户 queue、不生成用户 run id、不占
   queue limit。
-- standby reference transition 只有在 runtime playback gate 和 real
-  robot/operator 验收完成后才能宣称可播放；缺失安全资产时不得播放
-  standby_ref。
+- standby reference runtime gate 已接入；只有 broader MuJoCo/operator 和 real
+  robot/operator 验收完成后才能宣称整体 GA。缺失安全资产时不得播放 standby_ref。
 - 运行时不调用 `nl2trk`；`standby_ref.trk` 必须离线生成、筛选、固化并记录
   manifest 后才能作为 release asset 使用。
 - `et1-trk2motion run PATH --hold` 和 wait 逻辑能正确处理 `holding` 与

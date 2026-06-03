@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <map>
 #include <regex>
@@ -972,6 +973,38 @@ TEST_CASE("GET status renders transition active kind without controller expansio
   REQUIRE(response.body.at("active").at("kind") == "transition");
   REQUIRE(response.body.at("active").at("id").is_null());
   REQUIRE(response.body.at("transition").at("active") == false);
+}
+
+TEST_CASE("GET status renders active transition snapshot public contract") {
+  Harness h;
+  h.status.snapshot_value.ctrl = ControllerState::Running;
+  h.status.snapshot_value.active = {ActiveKind::Transition, ""};
+  h.status.snapshot_value.queue = {1, 8, {"queued-user"}};
+  h.status.snapshot_value.transition.active = true;
+  h.status.snapshot_value.transition.target = "user";
+  h.status.snapshot_value.transition.target_id = "target-run";
+  h.status.snapshot_value.transition.target_state = MotionState::Queued;
+  h.status.snapshot_value.transition.frame = 3;
+  h.status.snapshot_value.transition.frames = 12;
+  h.status.snapshot_value.transition.progress = 0.25;
+
+  const auto response = h.service.handle({"GET", "/status", ""});
+
+  REQUIRE(response.status == 200);
+  REQUIRE(response.body.at("active").at("kind") == "transition");
+  REQUIRE(response.body.at("active").at("id").is_null());
+  REQUIRE(response.body.at("exec").is_null());
+  REQUIRE(response.body.at("transition").at("active") == true);
+  REQUIRE(response.body.at("transition").at("target") == "user");
+  REQUIRE(response.body.at("transition").at("target_id") == "target-run");
+  REQUIRE(response.body.at("transition").at("target_state") == "queued");
+  REQUIRE(response.body.at("transition").at("frame") == 3);
+  REQUIRE(response.body.at("transition").at("frames") == 12);
+  REQUIRE(response.body.at("transition").at("progress") == 0.25);
+  REQUIRE(response.body.at("queue").at("ids") == nlohmann::json::array({"queued-user"}));
+  REQUIRE(std::find(response.body.at("queue").at("ids").begin(),
+                    response.body.at("queue").at("ids").end(),
+                    "transition") == response.body.at("queue").at("ids").end());
 }
 
 TEST_CASE("GET status renders compact pose for high-rate agent polling") {

@@ -56,6 +56,33 @@ AppConfig factoryConfig(const TempTree& tmp) {
   return config;
 }
 
+std::filesystem::path appRoot() {
+  return std::filesystem::absolute(std::filesystem::path(__FILE__).parent_path().parent_path())
+      .lexically_normal();
+}
+
+AppConfig realFactoryConfigWithRepoAssets() {
+  const auto root = appRoot();
+  AppConfig config;
+  config.mode_machine = 0;
+  config.release_motion_mode_on_startup = false;
+  config.trk.allowlist_dirs = {"/tmp/user-motions"};
+  config.policy.profile = "GeneralTrackerCLN";
+  config.policy.policy_dir = (root / "config/policy/general_tracker_cln").string();
+  config.policy.policy_file = "multi_policy_v17c2_70k.onnx";
+  config.policy.deploy =
+      (root / "config/policy/general_tracker_cln/params/deploy.yaml").string();
+  config.control.velocity_policy_dir = (root / "config/policy/velocity/v0").string();
+  config.control.velocity_policy_file = "policy.onnx";
+  config.control.velocity_deploy =
+      (root / "config/policy/velocity/v0/params/deploy.yaml").string();
+  config.control.fixstand_config =
+      (root / "config/posture/fixstand/v0/fixstand.yaml").string();
+  config.control.passive_config =
+      (root / "config/posture/passive/v0/passive.yaml").string();
+  return config;
+}
+
 std::string repeatValues(const std::string& value, int count) {
   std::ostringstream out;
   out << '[';
@@ -144,6 +171,18 @@ void writeText(const std::filesystem::path& path, const std::string& text) {
   std::ofstream out(path, std::ios::binary);
   REQUIRE(out);
   out << text;
+}
+
+void writeBadTrk(const std::filesystem::path& path) {
+  std::filesystem::create_directories(path.parent_path());
+  writeText(path, "not an ET1TRK1 file");
+}
+
+void copyRepoStandbyRefTo(const std::filesystem::path& path) {
+  std::filesystem::create_directories(path.parent_path());
+  const auto source = appRoot() / "config/reference/standby/v0/standby_ref.trk";
+  REQUIRE(std::filesystem::is_regular_file(source));
+  std::filesystem::copy_file(source, path, std::filesystem::copy_options::overwrite_existing);
 }
 
 void writeMinimalGaOnnx(const std::filesystem::path& path) {
@@ -331,6 +370,53 @@ TEST_CASE("AppRuntimeFactory real factory validates internal standby with fixed 
   REQUIRE(standby_config.max_duration_s == 5.0);
   REQUIRE(standby_config.allowlist_dirs ==
           std::vector<std::filesystem::path>{standby_reference.parent_path()});
+#else
+  SUCCEED("real factory is not compiled in this build");
+#endif
+}
+
+TEST_CASE("AppRuntimeFactory real factory reports not-ready when internal standby asset is "
+          "missing without ET1 fallback") {
+#if AGENTIC_ET1_TRACKER_REAL_FACTORY
+  TempTree tmp;
+  AppConfig config = realFactoryConfigWithRepoAssets();
+  config.control.standby_reference =
+      (tmp.root / "deploy/robots/agentic-et1-tracker/config/reference/standby/v0/"
+                  "standby_ref.trk")
+          .string();
+
+  const auto et1_fallback =
+      tmp.root / "deploy/robots/et1/config/reference/standby/v0/standby_ref.trk";
+  copyRepoStandbyRefTo(et1_fallback);
+
+  const AppRuntimeFactoryResult result = createAppRuntimeDeps(config);
+
+  requireModelNotReady(result);
+  requireMode(result, RuntimeMode::Sim);
+#else
+  SUCCEED("real factory is not compiled in this build");
+#endif
+}
+
+TEST_CASE("AppRuntimeFactory real factory reports not-ready when internal standby asset is "
+          "damaged without ET1 fallback") {
+#if AGENTIC_ET1_TRACKER_REAL_FACTORY
+  TempTree tmp;
+  AppConfig config = realFactoryConfigWithRepoAssets();
+  const auto standby_reference =
+      tmp.root / "deploy/robots/agentic-et1-tracker/config/reference/standby/v0/"
+                 "standby_ref.trk";
+  writeBadTrk(standby_reference);
+  config.control.standby_reference = standby_reference.string();
+
+  const auto et1_fallback =
+      tmp.root / "deploy/robots/et1/config/reference/standby/v0/standby_ref.trk";
+  copyRepoStandbyRefTo(et1_fallback);
+
+  const AppRuntimeFactoryResult result = createAppRuntimeDeps(config);
+
+  requireModelNotReady(result);
+  requireMode(result, RuntimeMode::Sim);
 #else
   SUCCEED("real factory is not compiled in this build");
 #endif

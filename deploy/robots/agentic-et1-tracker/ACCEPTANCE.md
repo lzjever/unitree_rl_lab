@@ -95,7 +95,8 @@ fallback to the ET1 app tree:
 
 This candidate generation step alone did not record a `standby_ref.trk` release
 asset. The later release asset promotion below records the accepted app-local
-asset and keeps runtime playback and real-robot GA gates pending.
+asset. Runtime gate coverage is now recorded below; broader MuJoCo/operator and
+real-robot GA gates remain pending.
 
 ## Standby_ref release asset evidence
 
@@ -110,11 +111,24 @@ asset and keeps runtime playback and real-robot GA gates pending.
 - Release asset sha256:
   `6ca49404e1ee1008f6226a2f7c00e990f0447ae6c826657246b7a29fbb525741`,
   size `41400` bytes, frames `25`, fps `50.0`, duration `0.48` s.
-- Scope: asset, docs, and selftest only. Runtime playback logic was not
-  changed in this slice.
+- Runtime gate status: app-local `standby_ref.trk` load/playback is wired into
+  runtime and covered by unit/runtime/release tests.
 - Status: release asset recorded and simulator visual acceptance recorded for
-  this asset; runtime playback and real-robot/operator validation remain
-  pending. This does not claim overall GA.
+  this asset; broader MuJoCo/operator validation and real-robot/operator
+  validation remain pending. This does not claim overall GA.
+
+2026-06-03 targeted standby_ref runtime gate evidence:
+
+- `agentic_et1_tracker_api_tests`: active transition `/status` JSON contract,
+  including `active.kind:"transition"`, `exec:null`, transition progress, and
+  user-only queue ids.
+- `agentic_et1_tracker_app_tests`: user `/execute` of app-local
+  `config/reference/standby/v0/standby_ref.trk` remains rejected by the user
+  motion allowlist, with no user queue/history entry; missing/damaged internal
+  standby asset reports not-ready without ET1 app tree fallback.
+- `agentic_et1_tracker_runtime_tests`: runtime standby_ref playback/abort gate
+  coverage for natural return to standby and control interruption.
+- Release selftest covers packaged `standby_ref.trk` and manifest presence.
 
 ## GA idle/status/control acceptance items
 
@@ -212,7 +226,7 @@ Pending MuJoCo evidence must record:
 | Default ROBOT/ONNX build | recorded above | Keep default configure/build on the real integration path. |
 | Hermetic stub tests | recorded above | Keep explicit stub/test configure and tests passing. |
 | Docs/skill CLI contract | recorded above | Keep packaged and installed skill tests/diffs passing. |
-| `standby_ref.trk` release asset and runtime gate | unit-covered; real robot pending | App-local asset, manifest, internal runtime playback, and abort behavior are recorded; hardware/operator validation remains pending before GA. |
+| `standby_ref.trk` release asset and runtime gate | unit/runtime/release covered; real robot pending | App-local asset, manifest, internal runtime playback, abort behavior, user allowlist rejection, and internal asset failure behavior are recorded; hardware/operator validation remains pending before GA. |
 | MuJoCo visual acceptance | partial; pending | Targeted standby_ref simulator review and automated runtime gate coverage are recorded; broader scenarios listed above still need `config.sim.yaml.example` evidence. |
 | Real robot acceptance | pending | ET1 hardware/operator validation. |
 
