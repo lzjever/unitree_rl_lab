@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "et1-trk2motion"
 TRK = "/tmp/et1-test.trk"
+CONTRACT_NEXT_TOKENS = {"status", "retry", "wait_robot", "fix", "fixstand", "standby_velocity", "stop", "manual"}
 
 
 class TrackerState:
@@ -20,10 +21,12 @@ class TrackerState:
         self.ready = True
         self.err = None
         self.records = []
+        self.top_status_queue = []
         self.next_id = 1
         self.run_status = {}
         self.missing_execute_id = False
         self.execute_idle_response = False
+        self.control_failures = {}
         self.large_health = False
         self.large_control = False
         self.active = {"kind": "none", "id": None}
@@ -50,6 +53,8 @@ class TrackerState:
         }
 
     def top_status(self):
+        if self.top_status_queue:
+            return self.top_status_queue.pop(0)
         return {
             "ok": True,
             "ctrl": self.ctrl,
@@ -60,6 +65,11 @@ class TrackerState:
             "idle": dict(self.idle),
             "pose": list(range(64)),
         }
+
+    def queued_top_status(self, ctrl, ready, err=None):
+        doc = self.top_status()
+        doc.update({"ctrl": ctrl, "ready": ready, "err": err})
+        return doc
 
     def status_for(self, run_id):
         if run_id not in self.run_status:
@@ -118,18 +128,30 @@ class Handler(BaseHTTPRequestHandler):
         payload = self.body()
         state.records.append(("POST", self.path, payload))
         if self.path == "/fixstand":
+            if self.path in state.control_failures:
+                self.send_json(state.response(state.control_failures[self.path], state.large_control))
+                return
             state.ctrl = "fixstand"
             state.ready = False
             self.send_json(state.response({"ok": True}, state.large_control))
         elif self.path == "/passive":
+            if self.path in state.control_failures:
+                self.send_json(state.response(state.control_failures[self.path], state.large_control))
+                return
             state.ctrl = "passive"
             state.ready = False
             self.send_json(state.response({"ok": True}, state.large_control))
         elif self.path == "/standby_velocity":
+            if self.path in state.control_failures:
+                self.send_json(state.response(state.control_failures[self.path], state.large_control))
+                return
             state.ctrl = "standby_velocity"
             state.ready = True
             self.send_json(state.response({"ok": True}, state.large_control))
         elif self.path == "/stop":
+            if self.path in state.control_failures:
+                self.send_json(state.response(state.control_failures[self.path], state.large_control))
+                return
             self.send_json(state.response({"ok": True}, state.large_control))
         elif self.path == "/idle":
             paths = payload.get("paths") if isinstance(payload, dict) else None
@@ -225,6 +247,46 @@ class ServerCase(unittest.TestCase):
             },
         )
 
+    def test_state_status_short_output_preserves_contract_next_tokens(self):
+        for command in ("state", "status"):
+            for token in sorted(CONTRACT_NEXT_TOKENS):
+                with self.subTest(command=command, token=token):
+                    self.state.top_status_queue = [dict(self.state.top_status(), next=token)]
+                    proc, out = self.cli(command)
+                    self.assertEqual(proc.returncode, 0)
+                    self.assertEqual(out["next"], token)
+
+        self.state.top_status_queue = [dict(self.state.top_status(), next="stand by velocity")]
+        proc, out = self.cli("state")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(out["next"], "status")
+
+    def test_control_failure_with_top_fields_preserves_contract_next_tokens(self):
+        cases = (
+            ("fixstand", "/fixstand", "fixstand"),
+            ("standby", "/standby_velocity", "standby_velocity"),
+            ("stop", "/stop", "stop"),
+        )
+        for command, path, token in cases:
+            with self.subTest(command=command, token=token):
+                self.state.control_failures = {
+                    path: {"ok": False, "error": {"code": "CONTROL_STATE_CONFLICT", "message": path}, "next": token}
+                }
+                proc, out = self.cli(command)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertEqual(out["next"], token)
+                self.assertIn(out["next"], CONTRACT_NEXT_TOKENS)
+                self.assertEqual(out["ctrl"], self.state.ctrl)
+                self.assertEqual(out["ready"], self.state.ready)
+
+        self.state.control_failures = {
+            "/stop": {"ok": False, "error": {"code": "ROBOT_NOT_READY", "message": "not ready"}}
+        }
+        self.state.top_status_queue = [dict(self.state.top_status(), next="wait_robot")]
+        proc, out = self.cli("stop")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(out["next"], "wait_robot")
+
     def test_ready_from_passive_fixstand_then_standby(self):
         self.state.ctrl = "passive"
         self.state.ready = False
@@ -235,6 +297,57 @@ class ServerCase(unittest.TestCase):
             [(m, p) for m, p, _ in self.state.records],
             [("GET", "/status"), ("POST", "/fixstand"), ("GET", "/status"), ("POST", "/standby_velocity"), ("GET", "/status")],
         )
+
+    def test_ready_waits_for_fixstand_after_passive_before_standby(self):
+        self.state.ctrl = "passive"
+        self.state.ready = False
+        self.state.top_status_queue = [
+            self.state.queued_top_status("passive", False),
+            self.state.queued_top_status("passive", False),
+            self.state.queued_top_status("passive", False),
+            self.state.queued_top_status("fixstand", True),
+            self.state.queued_top_status("standby_velocity", True),
+        ]
+        proc, out = self.cli("ready", "--timeout", "1", "--poll", "0.01")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(out, {"ok": True, "ctrl": "standby_velocity", "ready": True, "err": None})
+        self.assertEqual([p for m, p, _ in self.state.records if m == "POST"], ["/fixstand", "/standby_velocity"])
+
+    def test_ready_waits_for_standby_after_standby_command(self):
+        self.state.ctrl = "fixstand"
+        self.state.ready = True
+        self.state.top_status_queue = [
+            self.state.queued_top_status("fixstand", True),
+            self.state.queued_top_status("fixstand", True),
+            self.state.queued_top_status("fixstand", True),
+            self.state.queued_top_status("standby_velocity", True),
+        ]
+        proc, out = self.cli("ready", "--timeout", "1", "--poll", "0.01")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(out, {"ok": True, "ctrl": "standby_velocity", "ready": True, "err": None})
+        self.assertEqual([p for m, p, _ in self.state.records if m == "POST"], ["/standby_velocity"])
+
+    def test_ready_loop_timeout_uses_contract_next_and_compact_detail(self):
+        for ctrl in ("passive", "fixstand"):
+            with self.subTest(ctrl=ctrl):
+                self.state = TrackerState()
+                self.server.state = self.state
+                self.state.ctrl = ctrl
+                self.state.ready = False
+                self.state.top_status_queue = [self.state.queued_top_status(ctrl, False) for _ in range(32)]
+                proc, out = self.cli("ready", "--timeout", "0.08", "--poll", "0.01")
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertFalse(out["ok"])
+                self.assertEqual(out["error"]["code"], "ready_loop")
+                self.assertEqual(out["next"], "status")
+                self.assertIn(out["next"], CONTRACT_NEXT_TOKENS)
+                self.assertEqual(out["ctrl"], ctrl)
+                self.assertEqual(out["ready"], False)
+                self.assertIsNone(out["err"])
+                self.assertEqual(out["last"], {"ctrl": ctrl, "ready": False, "err": None})
+                compact_out = json.dumps(out, separators=(",", ":"))
+                for field in ("pose", "active", "transition", "idle"):
+                    self.assertNotIn(field, compact_out)
 
     def test_run_wait_auto_ready_execute_wait_status(self):
         proc, out = self.cli("run", TRK, "--wait", "--timeout", "2", "--poll", "0.01")

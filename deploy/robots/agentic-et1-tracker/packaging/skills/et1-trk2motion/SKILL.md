@@ -24,7 +24,8 @@ Default tracker: `http://127.0.0.1:8083`; override with `ET1_TRACKER_URL`.
 ```
 
 `passive` stops active work and clears queued work plus the idle pool.
-`ready` handles `passive -> fixstand -> standby` and `fixstand -> standby`.
+`ready` handles `passive -> fixstand -> standby` and `fixstand -> standby`,
+polling until convergence within `--timeout`.
 `run` defaults to `ready` first, then execute. Use `--recover off` only when
 the caller intentionally manages control state. `run PATH --hold` sends
 `hold:true` to `/execute`; omitted `--hold` sends no `hold` field.
