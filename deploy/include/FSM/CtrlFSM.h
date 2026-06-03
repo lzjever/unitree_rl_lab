@@ -5,6 +5,7 @@
 
 #include <unitree/common/thread/recurrent_thread.hpp>
 #include <chrono>
+#include <mutex>
 #include "BaseState.h"
 #include <spdlog/spdlog.h>
 #include <yaml-cpp/yaml.h>
@@ -75,6 +76,18 @@ public:
 
         states.push_back(std::move(state));
     }
+
+    bool requestTransition(const std::string& target_state, const std::string& reason)
+    {
+        auto it = FSMStringMap.right.find(target_state);
+        if (it == FSMStringMap.right.end()) {
+            spdlog::warn("FSM: requested unknown state {}", target_state);
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        return transitionToLocked(it->second, reason);
+    }
     
     ~CtrlFSM()
     {
@@ -97,6 +110,7 @@ private:
 
     void run_()
     {
+        std::lock_guard<std::mutex> lock(state_mutex_);
         currentState->pre_run();
         const auto now = std::chrono::steady_clock::now();
         const auto desired_dt = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
@@ -122,30 +136,43 @@ private:
 
         if(nextStateMode != 0 && !currentState->isState(nextStateMode))
         {
-            for(auto & state : states)
+            transitionToLocked(nextStateMode, transition_reason);
+        }
+    }
+
+    bool transitionToLocked(int nextStateMode, const std::string& transition_reason)
+    {
+        if (nextStateMode == 0 || !currentState || currentState->isState(nextStateMode)) {
+            return false;
+        }
+
+        for(auto & state : states)
+        {
+            if(state->isState(nextStateMode))
             {
-                if(state->isState(nextStateMode))
-                {
-                    if (transition_reason.empty()) {
-                        spdlog::info("FSM: Change state from {} to {}", currentState->getStateString(), state->getStateString());
-                    } else {
-                        spdlog::info("FSM: Change state from {} to {} due to {}",
-                                     currentState->getStateString(),
-                                     state->getStateString(),
-                                     transition_reason);
-                    }
-                    currentState->exit();
-                    currentState = state;
-                    currentState->enter();
-                    last_state_run_time_ = std::chrono::steady_clock::now() - std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                        std::chrono::duration<double>(currentState->run_dt()));
-                    break;
+                if (transition_reason.empty()) {
+                    spdlog::info("FSM: Change state from {} to {}", currentState->getStateString(), state->getStateString());
+                } else {
+                    spdlog::info("FSM: Change state from {} to {} due to {}",
+                                 currentState->getStateString(),
+                                 state->getStateString(),
+                                 transition_reason);
                 }
+                currentState->exit();
+                currentState = state;
+                currentState->enter();
+                last_state_run_time_ = std::chrono::steady_clock::now() - std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                    std::chrono::duration<double>(currentState->run_dt()));
+                return true;
             }
         }
+
+        spdlog::warn("FSM: requested state id {} is not registered", nextStateMode);
+        return false;
     }
 
     std::shared_ptr<BaseState> currentState;
     std::chrono::steady_clock::time_point last_state_run_time_;
+    std::mutex state_mutex_;
     unitree::common::RecurrentThreadPtr fsm_thread_;
 };

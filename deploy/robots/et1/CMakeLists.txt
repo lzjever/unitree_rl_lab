@@ -5,6 +5,8 @@ set(CMAKE_CXX_STANDARD 17)
 
 find_package(Boost REQUIRED COMPONENTS program_options)
 find_package(yaml-cpp REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(ZMQ REQUIRED libzmq)
 
 if(DEFINED ENV{UNITREE_SDK2_PATH})
     set(UNITREE_SDK2_PATH $ENV{UNITREE_SDK2_PATH})
@@ -60,6 +62,7 @@ include_directories(
   /usr/include/eigen3
   include
   ${ONNXRUNTIME_INCLUDE_DIR}
+  ${ZMQ_INCLUDE_DIRS}
   ${PROJECT_SOURCE_DIR}/../../include/
 )
 
@@ -67,6 +70,7 @@ link_libraries(
   unitree_sdk2 rt pthread
   Boost::program_options yaml-cpp fmt
   ${ONNXRUNTIME_LIBRARY}
+  ${ZMQ_LIBRARIES}
 )
 
 file(GLOB_RECURSE ADD_SRC_LIST

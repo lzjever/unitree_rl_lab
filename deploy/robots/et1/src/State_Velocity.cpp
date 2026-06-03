@@ -1,9 +1,11 @@
 #include "State_Velocity.h"
 
 #include <algorithm>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <unordered_map>
+#include <zmq.hpp>
 
 #include "State_Track.h"
 #include "isaaclab/envs/mdp/actions/joint_actions.h"
@@ -36,6 +38,21 @@ REGISTER_OBSERVATION(keyboard_velocity_commands)
 
 namespace
 {
+constexpr char kLiveMagic[8] = {'E', 'T', '1', 'L', 'I', 'V', 'E', '1'};
+constexpr uint32_t kLiveVersion = 1;
+constexpr uint32_t kLiveFlagReset = 1u << 0;
+
+struct LiveWireHeader
+{
+    char magic[8];
+    uint32_t version;
+    uint32_t flags;
+    uint64_t sequence;
+    uint64_t publish_time_ns;
+    uint32_t float_count;
+    uint32_t reserved;
+};
+
 std::string trim_copy(const std::string& value)
 {
     const auto begin = value.find_first_not_of(" \t\r\n");
@@ -144,6 +161,43 @@ State_Velocity::State_Velocity(int state_mode, std::string state_string)
     policy_kp_ = env->cfg["policy_kp"] ? env->cfg["policy_kp"].as<std::vector<float>>() : env->robot->data.joint_stiffness;
     policy_kd_ = env->cfg["policy_kd"] ? env->cfg["policy_kd"].as<std::vector<float>>() : env->robot->data.joint_damping;
 
+    if (cfg["live_stream_trigger"] && cfg["live_stream_trigger"]["enabled"].as<bool>(false)) {
+        const auto trigger_cfg = cfg["live_stream_trigger"];
+        live_stream_trigger_enabled_ = true;
+        live_stream_trigger_endpoint_ = trigger_cfg["endpoint"]
+            ? trigger_cfg["endpoint"].as<std::string>()
+            : live_stream_trigger_endpoint_;
+        live_stream_trigger_topic_ = trigger_cfg["topic"]
+            ? trigger_cfg["topic"].as<std::string>()
+            : live_stream_trigger_topic_;
+        live_stream_trigger_target_state_ = trigger_cfg["target_state"]
+            ? trigger_cfg["target_state"].as<std::string>()
+            : live_stream_trigger_target_state_;
+        live_stream_trigger_receive_timeout_ms_ = trigger_cfg["receive_timeout_ms"]
+            ? trigger_cfg["receive_timeout_ms"].as<int>()
+            : live_stream_trigger_receive_timeout_ms_;
+        live_stream_trigger_high_water_mark_ = trigger_cfg["high_water_mark"]
+            ? trigger_cfg["high_water_mark"].as<int>()
+            : live_stream_trigger_high_water_mark_;
+        if (!FSMStringMap.right.count(live_stream_trigger_target_state_)) {
+            throw std::runtime_error(
+                "Velocity: live_stream_trigger target state is not registered: "
+                + live_stream_trigger_target_state_);
+        }
+        registered_checks.push_back({
+            [this]() -> bool {
+                return live_stream_trigger_pending_.exchange(false);
+            },
+            FSMStringMap.right.at(live_stream_trigger_target_state_),
+            "ZMQ live stream reset frame"
+        });
+        spdlog::info(
+            "Velocity: live stream trigger enabled endpoint='{}' topic='{}' target='{}'",
+            live_stream_trigger_endpoint_,
+            live_stream_trigger_topic_,
+            live_stream_trigger_target_state_);
+    }
+
     if (FSMStringMap.right.count("GeneralTracker")) {
         auto tracker_cfg = param::config["FSM"]["GeneralTracker"];
         const std::string request_file = tracker_cfg["request_file"]
@@ -187,8 +241,89 @@ State_Velocity::State_Velocity(int state_mode, std::string state_string)
     });
 }
 
+void State_Velocity::start_live_stream_trigger()
+{
+    if (!live_stream_trigger_enabled_ || live_stream_trigger_running_.exchange(true)) {
+        return;
+    }
+    live_stream_trigger_pending_ = false;
+    live_stream_trigger_thread_ = std::thread([this] {
+        live_stream_trigger_loop();
+    });
+}
+
+void State_Velocity::stop_live_stream_trigger()
+{
+    live_stream_trigger_running_ = false;
+    if (live_stream_trigger_thread_.joinable()) {
+        live_stream_trigger_thread_.join();
+    }
+    live_stream_trigger_pending_ = false;
+}
+
+void State_Velocity::live_stream_trigger_loop()
+{
+    try {
+        zmq::context_t context(1);
+        zmq::socket_t socket(context, zmq::socket_type::sub);
+        socket.set(zmq::sockopt::linger, 0);
+        socket.set(zmq::sockopt::rcvtimeo, live_stream_trigger_receive_timeout_ms_);
+        socket.set(zmq::sockopt::rcvhwm, live_stream_trigger_high_water_mark_);
+        socket.set(zmq::sockopt::subscribe, live_stream_trigger_topic_);
+        socket.connect(live_stream_trigger_endpoint_);
+        spdlog::info(
+            "Velocity: live stream trigger connected to '{}' topic '{}'",
+            live_stream_trigger_endpoint_,
+            live_stream_trigger_topic_);
+
+        while (live_stream_trigger_running_.load()) {
+            zmq::message_t first;
+            if (!socket.recv(first, zmq::recv_flags::none)) {
+                continue;
+            }
+
+            zmq::message_t payload;
+            const bool multipart = socket.get(zmq::sockopt::rcvmore);
+            const zmq::message_t* data_msg = &first;
+            if (multipart) {
+                if (!socket.recv(payload, zmq::recv_flags::none)) {
+                    continue;
+                }
+                data_msg = &payload;
+                while (socket.get(zmq::sockopt::rcvmore)) {
+                    zmq::message_t ignored;
+                    if (!socket.recv(ignored, zmq::recv_flags::none)) {
+                        break;
+                    }
+                }
+            }
+
+            if (data_msg->size() < sizeof(LiveWireHeader)) {
+                continue;
+            }
+            LiveWireHeader header{};
+            std::memcpy(&header, data_msg->data(), sizeof(header));
+            if (std::memcmp(header.magic, kLiveMagic, sizeof(kLiveMagic)) != 0
+                || header.version != kLiveVersion
+                || header.float_count < 62
+                || (header.flags & kLiveFlagReset) == 0) {
+                continue;
+            }
+
+            live_stream_trigger_pending_ = true;
+            spdlog::info(
+                "Velocity: detected ZMQ live stream reset frame sequence={}, requesting {}",
+                header.sequence,
+                live_stream_trigger_target_state_);
+        }
+    } catch (const std::exception& e) {
+        spdlog::error("Velocity: live stream trigger stopped after exception: {}", e.what());
+    }
+}
+
 void State_Velocity::enter()
 {
+    start_live_stream_trigger();
     const int motor_cmd_count = static_cast<int>(lowcmd->msg_.motor_cmd().size());
     const size_t joint_count = std::min({
         env->robot->data.joint_ids_map.size(),
@@ -257,6 +392,7 @@ void State_Velocity::run()
 
 void State_Velocity::exit()
 {
+    stop_live_stream_trigger();
     policy_thread_running_ = false;
     if (policy_thread_.joinable()) {
         policy_thread_.join();

@@ -140,6 +140,9 @@ inline po::variables_map helper(int argc, char** argv)
         ("version,v", "show version")
         ("log", "record log file")
         ("network,n", po::value<std::string>()->default_value(""), "dds network interface")
+        ("sim-auto", "automatically switch Passive -> FixStand -> Velocity for sim2sim only")
+        ("sim-auto-port", po::value<int>()->default_value(8090), "localhost UDP port of unitree_mujoco sim control")
+        ("sim-auto-contact-timeout", po::value<double>()->default_value(8.0), "seconds to wait for both feet contact before holding FixStand")
         ;
 
     po::variables_map vm;

@@ -11,6 +11,7 @@
 #include <limits>
 #include <sstream>
 #include <spdlog/spdlog.h>
+#include <zmq.hpp>
 
 #include "unitree_articulation.h"
 #include "isaaclab/envs/mdp/observations/observations.h"
@@ -22,6 +23,22 @@ std::optional<std::filesystem::path> State_Track::pending_motion_file_;
 
 namespace
 {
+constexpr char kLiveMagic[8] = {'E', 'T', '1', 'L', 'I', 'V', 'E', '1'};
+constexpr uint32_t kLiveVersion = 1;
+constexpr uint32_t kLiveFlagReset = 1u << 0;
+constexpr uint32_t kLiveFlagEnd = 1u << 1;
+
+struct LiveWireHeader
+{
+    char magic[8];
+    uint32_t version;
+    uint32_t flags;
+    uint64_t sequence;
+    uint64_t publish_time_ns;
+    uint32_t float_count;
+    uint32_t reserved;
+};
+
 enum class CacheDType : uint32_t
 {
     Float32 = 1,
@@ -126,6 +143,52 @@ TrackerRequestLine parse_tracker_request_line(const std::string& raw_line)
     request.motion_file = trim_copy(request.motion_file);
     request.has_profile = true;
     return request;
+}
+
+std::optional<YAML::Node> find_yaml_key(const YAML::Node& node, const std::string& key)
+{
+    if (!node) {
+        return std::nullopt;
+    }
+    if (node.IsMap()) {
+        for (const auto& item : node) {
+            if (item.first.IsScalar() && item.first.as<std::string>() == key) {
+                return item.second;
+            }
+            if (auto found = find_yaml_key(item.second, key)) {
+                return found;
+            }
+        }
+    } else if (node.IsSequence()) {
+        for (const auto& item : node) {
+            if (auto found = find_yaml_key(item, key)) {
+                return found;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+size_t infer_future_horizon(const YAML::Node& deploy_cfg)
+{
+    const auto future_commands = find_yaml_key(deploy_cfg["observations"], "future_commands");
+    if (!future_commands) {
+        return 0;
+    }
+    const auto params = (*future_commands)["params"];
+    if (params && params["horizon"]) {
+        const int configured_horizon = params["horizon"].as<int>();
+        if (configured_horizon > 0) {
+            return static_cast<size_t>(configured_horizon);
+        }
+    }
+    return static_cast<size_t>(State_Track::ReferenceLoader::kDefaultFutureHorizon);
+}
+
+size_t infer_live_initial_buffer_frames(const YAML::Node& deploy_cfg)
+{
+    const size_t future_horizon = infer_future_horizon(deploy_cfg);
+    return future_horizon > 0 ? future_horizon + 1 : 1;
 }
 }
 
@@ -265,8 +328,9 @@ REGISTER_OBSERVATION(ref_com_vel_navi)
 }
 }
 
-State_Track::ReferenceLoader::ReferenceLoader(const std::filesystem::path& motion_file, float fps)
-    : fps_(fps)
+State_Track::ReferenceLoader::ReferenceLoader(const std::filesystem::path& motion_file, float fps, size_t future_horizon)
+    : fps_(fps),
+      future_horizon_(future_horizon)
 {
     spdlog::info("Track: initializing reference loader from '{}' at {} FPS", motion_file.string(), fps_);
     const auto cache_file = ensure_cache_file(motion_file);
@@ -274,9 +338,37 @@ State_Track::ReferenceLoader::ReferenceLoader(const std::filesystem::path& motio
     load_cache_file(cache_file);
     joint_pos_ = Eigen::VectorXf::Zero(kJointDim);
     joint_vel_ = Eigen::VectorXf::Zero(kJointDim);
-    future_commands_.assign(kFutureHorizon * kFutureCommandDim, 0.0f);
+    future_commands_.assign(future_horizon_ * kFutureCommandDim, 0.0f);
     duration_ = frame_count_ > 0 ? static_cast<float>(frame_count_ - 1) / fps_ : 0.0f;
     spdlog::info("Track: reference loaded with {} frames, duration {:.3f}s", frame_count_, duration_);
+}
+
+State_Track::ReferenceLoader::ReferenceLoader(const LiveStreamConfig& live_config, float fps, size_t future_horizon)
+    : fps_(fps),
+      duration_(std::numeric_limits<float>::infinity()),
+      future_horizon_(future_horizon),
+      live_stream_enabled_(true),
+      live_config_(live_config)
+{
+    joint_pos_ = Eigen::VectorXf::Zero(kJointDim);
+    joint_vel_ = Eigen::VectorXf::Zero(kJointDim);
+    future_commands_.assign(future_horizon_ * kFutureCommandDim, 0.0f);
+    spdlog::info("Track: initializing live reference stream from '{}' topic '{}' future_horizon={}",
+                 live_config_.endpoint,
+                 live_config_.topic,
+                 future_horizon_);
+    start_live_receiver();
+}
+
+State_Track::ReferenceLoader::~ReferenceLoader()
+{
+    stop_live_receiver();
+}
+
+size_t State_Track::ReferenceLoader::live_buffer_size() const
+{
+    std::lock_guard<std::mutex> lock(live_mutex_);
+    return live_queue_.size();
 }
 
 void State_Track::ReferenceLoader::reset(const Eigen::VectorXf& default_joint_pos)
@@ -289,6 +381,24 @@ void State_Track::ReferenceLoader::reset(const Eigen::VectorXf& default_joint_po
     ref_com_rel_navi_.setZero();
     ref_com_vel_navi_.setZero();
     initial_ref_yaw_bias_ = 0.0f;
+    if (live_stream_enabled_) {
+        joint_pos_ = default_joint_pos_.size() == kJointDim
+            ? default_joint_pos_
+            : Eigen::VectorXf::Zero(kJointDim);
+        joint_vel_ = Eigen::VectorXf::Zero(kJointDim);
+        root_ori_b_ << 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f;
+        root_ori_b_unbiased_ << 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f;
+        xy_yaw_vel_.setZero();
+        foot_support_state_.setZero();
+        std::fill(future_commands_.begin(), future_commands_.end(), 0.0f);
+        std::lock_guard<std::mutex> lock(live_mutex_);
+        live_has_last_frame_ = false;
+        current_frame_index_ = 0;
+        current_time_s_ = 0.0f;
+        spdlog::info("Track: preserving {} pre-buffered live reference frames across reset",
+                     live_queue_.size());
+        return;
+    }
     if (frame_count_ > 0 && body_quat_w_seq_.size() >= 4) {
         initial_ref_yaw_bias_ = quat_to_yaw(
             body_quat_w_seq_[0],
@@ -317,6 +427,63 @@ void State_Track::ReferenceLoader::update(float time_s,
                                           bool use_motion_velocity_command,
                                           bool loop_reference)
 {
+    if (live_stream_enabled_) {
+        LiveFrame frame;
+        std::deque<LiveFrame> queue_snapshot;
+        bool has_frame = false;
+        {
+            std::lock_guard<std::mutex> lock(live_mutex_);
+            if (live_queue_.size() >= live_config_.initial_buffer_frames || live_has_last_frame_) {
+                if (!live_queue_.empty()) {
+                    frame = live_queue_.front();
+                    live_queue_.pop_front();
+                    live_last_frame_ = frame;
+                    live_has_last_frame_ = true;
+                    has_frame = true;
+                } else if (live_has_last_frame_) {
+                    frame = live_last_frame_;
+                    has_frame = true;
+                }
+            }
+            queue_snapshot = live_queue_;
+        }
+
+        if (has_frame) {
+            if (frame.reset) {
+                current_frame_index_ = 0;
+                current_time_s_ = 0.0f;
+            }
+            apply_live_frame(frame,
+                             no_global_mode,
+                             current_root_yaw,
+                             current_root_quat,
+                             current_root_quat_unbiased,
+                             use_motion_root_command,
+                             use_motion_velocity_command);
+            update_live_future_commands(queue_snapshot,
+                                        frame,
+                                        no_global_mode,
+                                        current_root_quat,
+                                        use_motion_root_command,
+                                        use_motion_velocity_command);
+            current_frame_index_ += 1;
+            current_time_s_ = static_cast<float>(current_frame_index_) / fps_;
+        } else {
+            if (default_joint_pos_.size() == kJointDim) {
+                joint_pos_ = default_joint_pos_;
+            }
+            joint_vel_.setZero();
+            root_ori_b_ << 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f;
+            root_ori_b_unbiased_ << 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f;
+            xy_yaw_vel_.setZero();
+            foot_support_state_.setZero();
+            ref_com_rel_navi_.setZero();
+            ref_com_vel_navi_.setZero();
+            std::fill(future_commands_.begin(), future_commands_.end(), 0.0f);
+        }
+        return;
+    }
+
     if (frame_count_ == 0) {
         return;
     }
@@ -398,10 +565,10 @@ void State_Track::ReferenceLoader::update(float time_s,
         xy_yaw_vel_.setZero();
     }
 
-    if (future_commands_.size() != static_cast<size_t>(kFutureHorizon * kFutureCommandDim)) {
-        future_commands_.assign(kFutureHorizon * kFutureCommandDim, 0.0f);
+    if (future_commands_.size() != static_cast<size_t>(future_horizon_ * kFutureCommandDim)) {
+        future_commands_.assign(future_horizon_ * kFutureCommandDim, 0.0f);
     }
-    for (int horizon_idx = 0; horizon_idx < kFutureHorizon; ++horizon_idx) {
+    for (size_t horizon_idx = 0; horizon_idx < future_horizon_; ++horizon_idx) {
         const size_t future_frame = std::min(frame_index + static_cast<size_t>(horizon_idx + 1), frame_count_ - 1);
         const size_t future_body_offset = future_frame * kBodyCount;
         const size_t future_quat_offset = future_body_offset * 4;
@@ -454,7 +621,7 @@ void State_Track::ReferenceLoader::update(float time_s,
             future_xy_yaw_vel << future_lin_vel_navi.x(), future_lin_vel_navi.y(), future_ang_vel_navi.z();
         }
 
-        size_t out_offset = static_cast<size_t>(horizon_idx) * kFutureCommandDim;
+        size_t out_offset = horizon_idx * kFutureCommandDim;
         for (int i = 0; i < 6; ++i) {
             future_commands_[out_offset++] = future_root_ori_b[i];
         }
@@ -493,6 +660,284 @@ void State_Track::ReferenceLoader::update(float time_s,
         ref_com_vel_navi_ << ref_com_vel_navi_seq_[ref_com_vel_offset + 0],
                              ref_com_vel_navi_seq_[ref_com_vel_offset + 1],
                              ref_com_vel_navi_seq_[ref_com_vel_offset + 2];
+    }
+}
+
+void State_Track::ReferenceLoader::start_live_receiver()
+{
+    if (!live_stream_enabled_ || live_receiver_running_.load()) {
+        return;
+    }
+    live_receiver_running_ = true;
+    live_receiver_thread_ = std::thread([this] {
+        live_receiver_loop();
+    });
+}
+
+void State_Track::ReferenceLoader::stop_live_receiver()
+{
+    live_receiver_running_ = false;
+    if (live_receiver_thread_.joinable()) {
+        live_receiver_thread_.join();
+    }
+}
+
+void State_Track::ReferenceLoader::live_receiver_loop()
+{
+    try {
+        zmq::context_t context(1);
+        zmq::socket_t socket(context, zmq::socket_type::sub);
+        socket.set(zmq::sockopt::linger, 0);
+        socket.set(zmq::sockopt::rcvtimeo, live_config_.receive_timeout_ms);
+        socket.set(zmq::sockopt::rcvhwm, live_config_.high_water_mark);
+        socket.set(zmq::sockopt::subscribe, live_config_.topic);
+        socket.connect(live_config_.endpoint);
+        spdlog::info("Track: live receiver connected to '{}' topic '{}'",
+                     live_config_.endpoint,
+                     live_config_.topic);
+
+        while (live_receiver_running_.load()) {
+            zmq::message_t first;
+            const auto first_result = socket.recv(first, zmq::recv_flags::none);
+            if (!first_result) {
+                continue;
+            }
+
+            zmq::message_t payload;
+            const bool multipart = socket.get(zmq::sockopt::rcvmore);
+            const zmq::message_t* data_msg = &first;
+            if (multipart) {
+                const auto payload_result = socket.recv(payload, zmq::recv_flags::none);
+                if (!payload_result) {
+                    continue;
+                }
+                data_msg = &payload;
+                while (socket.get(zmq::sockopt::rcvmore)) {
+                    zmq::message_t ignored;
+                    const auto ignored_result = socket.recv(ignored, zmq::recv_flags::none);
+                    if (!ignored_result) {
+                        break;
+                    }
+                }
+            }
+
+            LiveFrame frame;
+            if (!parse_live_message(data_msg->data(), data_msg->size(), frame)) {
+                continue;
+            }
+            push_live_frame(frame);
+        }
+    } catch (const std::exception& e) {
+        spdlog::error("Track: live receiver stopped after exception: {}", e.what());
+    }
+}
+
+bool State_Track::ReferenceLoader::parse_live_message(const void* data, size_t size, LiveFrame& frame) const
+{
+    if (size < sizeof(LiveWireHeader)) {
+        spdlog::warn("Track: dropped live frame smaller than header ({} bytes)", size);
+        return false;
+    }
+
+    LiveWireHeader header{};
+    std::memcpy(&header, data, sizeof(header));
+    if (std::memcmp(header.magic, kLiveMagic, sizeof(kLiveMagic)) != 0 || header.version != kLiveVersion) {
+        spdlog::warn("Track: dropped live frame with unsupported magic/version");
+        return false;
+    }
+
+    const size_t payload_bytes = size - sizeof(LiveWireHeader);
+    const size_t expected_bytes = static_cast<size_t>(header.float_count) * sizeof(float);
+    if (payload_bytes < expected_bytes || header.float_count < 62) {
+        spdlog::warn("Track: dropped live frame with invalid float_count {}", header.float_count);
+        return false;
+    }
+
+    const auto* values = reinterpret_cast<const float*>(
+        static_cast<const uint8_t*>(data) + sizeof(LiveWireHeader));
+    size_t offset = 0;
+    for (int i = 0; i < kJointDim; ++i) {
+        frame.joint_pos[i] = values[offset++];
+    }
+    for (int i = 0; i < kJointDim; ++i) {
+        frame.joint_vel[i] = values[offset++];
+    }
+    frame.root_quat_w = Eigen::Quaternionf(
+        values[offset + 0],
+        values[offset + 1],
+        values[offset + 2],
+        values[offset + 3]);
+    frame.root_quat_w.normalize();
+    offset += 4;
+    frame.root_lin_vel_w << values[offset + 0], values[offset + 1], values[offset + 2];
+    offset += 3;
+    frame.root_ang_vel_w << values[offset + 0], values[offset + 1], values[offset + 2];
+    offset += 3;
+    if (header.float_count >= offset + 2) {
+        frame.left_foot_contact_state = static_cast<int>(std::round(values[offset + 0]));
+        frame.right_foot_contact_state = static_cast<int>(std::round(values[offset + 1]));
+        offset += 2;
+    }
+    if (header.float_count >= offset + 3) {
+        frame.ref_com_rel_navi << values[offset + 0], values[offset + 1], values[offset + 2];
+        offset += 3;
+    }
+    if (header.float_count >= offset + 3) {
+        frame.ref_com_vel_navi << values[offset + 0], values[offset + 1], values[offset + 2];
+    }
+    frame.sequence = header.sequence;
+    frame.publish_time_ns = header.publish_time_ns;
+    frame.reset = (header.flags & kLiveFlagReset) != 0;
+    frame.end = (header.flags & kLiveFlagEnd) != 0;
+    return true;
+}
+
+void State_Track::ReferenceLoader::push_live_frame(const LiveFrame& frame)
+{
+    std::lock_guard<std::mutex> lock(live_mutex_);
+    if (frame.reset) {
+        live_queue_.clear();
+        live_has_last_frame_ = false;
+        live_last_sequence_ = 0;
+    }
+    if (live_last_sequence_ != 0 && frame.sequence <= live_last_sequence_) {
+        return;
+    }
+    live_last_sequence_ = frame.sequence;
+    live_queue_.push_back(frame);
+    while (live_queue_.size() > live_config_.max_queue_frames) {
+        live_queue_.pop_front();
+    }
+}
+
+void State_Track::ReferenceLoader::apply_live_frame(const LiveFrame& frame,
+                                                    bool no_global_mode,
+                                                    float current_root_yaw,
+                                                    const Eigen::Quaternionf& current_root_quat,
+                                                    const Eigen::Quaternionf& current_root_quat_unbiased,
+                                                    bool use_motion_root_command,
+                                                    bool use_motion_velocity_command)
+{
+    if (joint_pos_.size() != kJointDim) {
+        joint_pos_ = Eigen::VectorXf::Zero(kJointDim);
+    }
+    if (joint_vel_.size() != kJointDim) {
+        joint_vel_ = Eigen::VectorXf::Zero(kJointDim);
+    }
+    for (int i = 0; i < kJointDim; ++i) {
+        joint_pos_[i] = frame.joint_pos[i];
+        joint_vel_[i] = frame.joint_vel[i];
+    }
+
+    Eigen::Quaternionf ref_root_q = frame.root_quat_w.normalized();
+    Eigen::Quaternionf ref_world_align_q = Eigen::Quaternionf::Identity();
+    if (no_global_mode) {
+        if (current_frame_index_ == 0) {
+            initial_ref_yaw_bias_ = quat_to_yaw(ref_root_q.w(), ref_root_q.x(), ref_root_q.y(), ref_root_q.z());
+        }
+        ref_world_align_q =
+            Eigen::Quaternionf(Eigen::AngleAxisf(initial_ref_yaw_bias_, Eigen::Vector3f::UnitZ())).conjugate();
+        ref_root_q = (ref_world_align_q * ref_root_q).normalized();
+    }
+
+    if (use_motion_root_command) {
+        const Eigen::Matrix3f root_rot_b =
+            (current_root_quat.normalized().conjugate() * ref_root_q).toRotationMatrix();
+        root_ori_b_ << root_rot_b(0, 0), root_rot_b(0, 1),
+                       root_rot_b(1, 0), root_rot_b(1, 1),
+                       root_rot_b(2, 0), root_rot_b(2, 1);
+
+        const Eigen::Matrix3f root_rot_b_unbiased =
+            (current_root_quat_unbiased.normalized().conjugate() * ref_root_q).toRotationMatrix();
+        root_ori_b_unbiased_ << root_rot_b_unbiased(0, 0), root_rot_b_unbiased(0, 1),
+                                root_rot_b_unbiased(1, 0), root_rot_b_unbiased(1, 1),
+                                root_rot_b_unbiased(2, 0), root_rot_b_unbiased(2, 1);
+    } else {
+        root_ori_b_ << 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f;
+        root_ori_b_unbiased_ << 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f;
+    }
+
+    const float yaw_ref = quat_to_yaw(ref_root_q.w(), ref_root_q.x(), ref_root_q.y(), ref_root_q.z());
+    const Eigen::Quaternionf ref_yaw_q =
+        Eigen::AngleAxisf(yaw_ref, Eigen::Vector3f::UnitZ()) * Eigen::Quaternionf::Identity();
+    const float yaw_error = wrap_to_pi(yaw_ref - current_root_yaw);
+    yaw_command_ << std::cos(yaw_error), std::sin(yaw_error);
+    if (use_motion_velocity_command) {
+        const Eigen::Vector3f ref_lin_vel_navi = ref_yaw_q.conjugate() * (ref_world_align_q * frame.root_lin_vel_w);
+        const Eigen::Vector3f ref_ang_vel_navi = ref_yaw_q.conjugate() * (ref_world_align_q * frame.root_ang_vel_w);
+        xy_yaw_vel_ << ref_lin_vel_navi.x(), ref_lin_vel_navi.y(), ref_ang_vel_navi.z();
+    } else {
+        xy_yaw_vel_.setZero();
+    }
+
+    foot_support_state_.setZero();
+    if (frame.left_foot_contact_state >= 0 && frame.left_foot_contact_state <= 2) {
+        foot_support_state_[frame.left_foot_contact_state] = 1.0f;
+    }
+    if (frame.right_foot_contact_state >= 0 && frame.right_foot_contact_state <= 2) {
+        foot_support_state_[3 + frame.right_foot_contact_state] = 1.0f;
+    }
+    ref_com_rel_navi_ = frame.ref_com_rel_navi;
+    ref_com_vel_navi_ = frame.ref_com_vel_navi;
+}
+
+void State_Track::ReferenceLoader::update_live_future_commands(const std::deque<LiveFrame>& queue_snapshot,
+                                                               const LiveFrame& fill_frame,
+                                                               bool no_global_mode,
+                                                               const Eigen::Quaternionf& current_root_quat,
+                                                               bool use_motion_root_command,
+                                                               bool use_motion_velocity_command)
+{
+    if (future_commands_.size() != static_cast<size_t>(future_horizon_ * kFutureCommandDim)) {
+        future_commands_.assign(future_horizon_ * kFutureCommandDim, 0.0f);
+    }
+
+    const Eigen::Quaternionf ref_world_align_q = no_global_mode
+        ? Eigen::Quaternionf(Eigen::AngleAxisf(initial_ref_yaw_bias_, Eigen::Vector3f::UnitZ())).conjugate()
+        : Eigen::Quaternionf::Identity();
+
+    for (size_t horizon_idx = 0; horizon_idx < future_horizon_; ++horizon_idx) {
+        const LiveFrame& frame = horizon_idx < queue_snapshot.size()
+            ? queue_snapshot[horizon_idx]
+            : fill_frame;
+        Eigen::Quaternionf future_ref_root_q = (ref_world_align_q * frame.root_quat_w).normalized();
+        Eigen::Matrix<float, 6, 1> future_root_ori_b;
+        if (use_motion_root_command) {
+            const Eigen::Matrix3f future_root_rot_b =
+                (current_root_quat.normalized().conjugate() * future_ref_root_q).toRotationMatrix();
+            future_root_ori_b << future_root_rot_b(0, 0), future_root_rot_b(0, 1),
+                                 future_root_rot_b(1, 0), future_root_rot_b(1, 1),
+                                 future_root_rot_b(2, 0), future_root_rot_b(2, 1);
+        } else {
+            future_root_ori_b << 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f;
+        }
+
+        Eigen::Vector3f future_xy_yaw_vel = Eigen::Vector3f::Zero();
+        if (use_motion_velocity_command) {
+            const float future_yaw_ref = quat_to_yaw(
+                future_ref_root_q.w(),
+                future_ref_root_q.x(),
+                future_ref_root_q.y(),
+                future_ref_root_q.z());
+            const Eigen::Quaternionf future_ref_yaw_q =
+                Eigen::AngleAxisf(future_yaw_ref, Eigen::Vector3f::UnitZ()) * Eigen::Quaternionf::Identity();
+            const Eigen::Vector3f future_lin_vel_navi =
+                future_ref_yaw_q.conjugate() * (ref_world_align_q * frame.root_lin_vel_w);
+            const Eigen::Vector3f future_ang_vel_navi =
+                future_ref_yaw_q.conjugate() * (ref_world_align_q * frame.root_ang_vel_w);
+            future_xy_yaw_vel << future_lin_vel_navi.x(), future_lin_vel_navi.y(), future_ang_vel_navi.z();
+        }
+
+        size_t out_offset = horizon_idx * kFutureCommandDim;
+        for (int i = 0; i < 6; ++i) {
+            future_commands_[out_offset++] = future_root_ori_b[i];
+        }
+        for (int i = 0; i < 3; ++i) {
+            future_commands_[out_offset++] = future_xy_yaw_vel[i];
+        }
+        for (int i = 0; i < kJointDim; ++i) {
+            future_commands_[out_offset++] = frame.joint_pos[i];
+        }
     }
 }
 
@@ -865,6 +1310,20 @@ State_Track::State_Track(int state_mode, std::string state_string)
     const std::string policy_file = cfg["policy_file"] ? cfg["policy_file"].as<std::string>() : "policy.onnx";
     const std::string deploy_file = cfg["deploy_file"] ? cfg["deploy_file"].as<std::string>() : "deploy.yaml";
     const auto policy_path = policy_dir / "exported" / policy_file;
+    const auto deploy_path = policy_dir / "params" / deploy_file;
+    YAML::Node deploy_cfg = YAML::LoadFile(deploy_path);
+    if (deploy_cfg["joint_ids_map"]) {
+        const auto joint_ids_map = deploy_cfg["joint_ids_map"].as<std::vector<int>>();
+        for (const int joint_id : joint_ids_map) {
+            if (joint_id < 0 || joint_id >= ReferenceLoader::kJointDim) {
+                throw std::runtime_error(
+                    "Track: deploy joint_ids_map contains index "
+                    + std::to_string(joint_id)
+                    + " outside ET1 live/reference joint dimension "
+                    + std::to_string(ReferenceLoader::kJointDim));
+            }
+        }
+    }
     request_file_ = cfg["request_file"]
         ? std::filesystem::path(cfg["request_file"].as<std::string>())
         : std::filesystem::path("debug/general_tracker_request.txt");
@@ -876,9 +1335,55 @@ State_Track::State_Track(int state_mode, std::string state_string)
     if (!default_motion_file_.is_absolute()) {
         default_motion_file_ = param::proj_dir / default_motion_file_;
     }
-    reference_fps_ = cfg["fps"].as<float>();
+    const float deploy_step_dt = deploy_cfg["step_dt"].as<float>();
+    reference_fps_ = deploy_step_dt > 0.0f ? 1.0f / deploy_step_dt : 50.0f;
+    if (cfg["fps"]) {
+        const float configured_fps = cfg["fps"].as<float>();
+        if (std::abs(configured_fps - reference_fps_) > 1e-3f) {
+            spdlog::warn(
+                "Track: ignoring FSM fps={} because deploy step_dt={} implies fps={}",
+                configured_fps,
+                deploy_step_dt,
+                reference_fps_);
+        }
+    }
     spdlog::info("Track: resolved default motion file '{}'", default_motion_file_.string());
-    reference_ = std::make_shared<ReferenceLoader>(default_motion_file_, reference_fps_);
+    reference_future_horizon_ = infer_future_horizon(deploy_cfg);
+    if (cfg["live_stream"] && cfg["live_stream"]["enabled"].as<bool>(false)) {
+        live_stream_enabled_ = true;
+        ReferenceLoader::LiveStreamConfig live_config;
+        const auto live_cfg = cfg["live_stream"];
+        live_config.endpoint = live_cfg["endpoint"]
+            ? live_cfg["endpoint"].as<std::string>()
+            : live_config.endpoint;
+        live_config.topic = live_cfg["topic"]
+            ? live_cfg["topic"].as<std::string>()
+            : live_config.topic;
+        live_config.max_queue_frames = live_cfg["max_queue_frames"]
+            ? live_cfg["max_queue_frames"].as<size_t>()
+            : live_config.max_queue_frames;
+        live_config.initial_buffer_frames = infer_live_initial_buffer_frames(deploy_cfg);
+        live_config.receive_timeout_ms = live_cfg["receive_timeout_ms"]
+            ? live_cfg["receive_timeout_ms"].as<int>()
+            : live_config.receive_timeout_ms;
+        live_config.high_water_mark = live_cfg["high_water_mark"]
+            ? live_cfg["high_water_mark"].as<int>()
+            : live_config.high_water_mark;
+        live_config.initial_buffer_frames = std::max<size_t>(1, live_config.initial_buffer_frames);
+        live_config.max_queue_frames = std::max(live_config.initial_buffer_frames, live_config.max_queue_frames);
+        spdlog::info("Track: live stream enabled endpoint='{}' topic='{}' queue={} initial_buffer={} future_horizon={}",
+                     live_config.endpoint,
+                     live_config.topic,
+                     live_config.max_queue_frames,
+                     live_config.initial_buffer_frames,
+                     reference_future_horizon_);
+        reference_ = std::make_shared<ReferenceLoader>(live_config, reference_fps_, reference_future_horizon_);
+    } else {
+        reference_ = std::make_shared<ReferenceLoader>(
+            default_motion_file_,
+            reference_fps_,
+            reference_future_horizon_);
+    }
     reference = reference_;
     if (require_requested_motion_) {
         spdlog::info("Track: default reference loaded for observation shape probing only; execution waits for external motion request");
@@ -886,9 +1391,9 @@ State_Track::State_Track(int state_mode, std::string state_string)
         spdlog::info("Track: reference pointer initialized");
     }
 
-    spdlog::info("Track: loading deploy config '{}'", (policy_dir / "params" / deploy_file).string());
+    spdlog::info("Track: loading deploy config '{}'", deploy_path.string());
     env = std::make_unique<isaaclab::ManagerBasedRLEnv>(
-        YAML::LoadFile(policy_dir / "params" / deploy_file),
+        deploy_cfg,
         std::make_shared<unitree::BaseArticulation<LowState_t::SharedPtr, HighState_t::SharedPtr>>(
             FSMState::lowstate, FSMState::highstate)
     );
@@ -972,6 +1477,9 @@ void State_Track::enter()
             playback_complete_ = true;
             return;
         }
+    } else if (live_stream_enabled_) {
+        reference = reference_;
+        active_tracking_ = true;
     } else if (require_requested_motion_ && !hybrid_locomotion_enabled_) {
         spdlog::warn("Track: no requested motion is pending; GeneralTracker will return to Velocity without running fallback motion_file");
         playback_complete_ = true;
@@ -1261,7 +1769,10 @@ bool State_Track::start_requested_motion(const std::filesystem::path& requested_
     }
 
     spdlog::info("Track: loading requested motion '{}'", motion_file.string());
-    reference_ = std::make_shared<ReferenceLoader>(motion_file, reference_fps_);
+    reference_ = std::make_shared<ReferenceLoader>(
+        motion_file,
+        reference_fps_,
+        reference_future_horizon_);
     reference = reference_;
     reference_->reset(env->robot->data.default_joint_pos);
     env->reset();
