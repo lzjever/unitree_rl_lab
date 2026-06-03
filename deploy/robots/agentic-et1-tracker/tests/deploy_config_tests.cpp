@@ -43,6 +43,22 @@ constexpr const char* kHistoryObs[] = {
     "ref_com_vel_navi",
 };
 
+constexpr const char* kClnCurrentObs[] = {
+    "command_yaw",
+    "command_root_ori_b",
+    "command_xy_yaw_vel",
+    "command_jnt_pos",
+    "projected_gravity",
+    "base_ang_vel",
+    "joint_pos_rel",
+    "joint_vel_rel",
+    "last_action",
+};
+
+constexpr const char* kClnHistoryObs[] = {
+    "future_commands",
+};
+
 struct TempDeploy {
   explicit TempDeploy(const std::string& yaml) {
     const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -121,6 +137,27 @@ std::string validDeployYaml() {
   return out.str();
 }
 
+std::string validClnDeployYaml() {
+  std::ostringstream out;
+  out << "joint_ids_map: " << intRange(0, 26) << "\n";
+  out << "sdk_joint_ids_map: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, "
+         "13, 15, 16, 17, 18, 19, 22, 23, 24, 25, 26, 29, 30]\n";
+  out << "step_dt: 0.02\n";
+  out << "default_joint_pos: " << repeatValues("0.25", 26) << "\n";
+  out << "actions:\n";
+  out << "  JointPositionAction:\n";
+  out << "    scale: " << repeatValues("0.1", 26) << "\n";
+  out << "    offset: " << repeatValues("0.0", 26) << "\n";
+  out << "policy_kp: " << repeatValues("1.0", 26) << "\n";
+  out << "policy_kd: " << repeatValues("0.1", 26) << "\n";
+  out << "observations:\n";
+  out << "  obs_current:\n";
+  out << obsBlock(kClnCurrentObs, sizeof(kClnCurrentObs) / sizeof(kClnCurrentObs[0]), 1);
+  out << "  obs_history:\n";
+  out << obsBlock(kClnHistoryObs, sizeof(kClnHistoryObs) / sizeof(kClnHistoryObs[0]), 1);
+  return out.str();
+}
+
 std::string replaceOnce(std::string yaml,
                         const std::string& needle,
                         const std::string& replacement) {
@@ -180,6 +217,25 @@ TEST_CASE("DeployConfig loads the frozen GeneralTracker deploy contract") {
   requireTerm(config.obs_history_terms, "command_root_ori_b", 6, 0);
   requireTerm(config.obs_history_terms, "command_xy_yaw_vel", 3, 6);
   requireTerm(config.obs_history_terms, "command_foot_support_state", 6, 93);
+}
+
+TEST_CASE("DeployConfig loads the GeneralTrackerCLN observation contract") {
+  const DeployConfig config = loadYaml(validClnDeployYaml());
+
+  REQUIRE(config.joint_dim == 26);
+  REQUIRE(config.observation_contract == ObservationContract::GeneralTrackerCLN);
+  REQUIRE(config.obs_current.size() == 9);
+  REQUIRE(config.obs_history.size() == 1);
+  REQUIRE(config.obs_current_terms.size() == 9);
+  REQUIRE(config.obs_history_terms.size() == 1);
+  REQUIRE(config.obs_current_dim == 121);
+  REQUIRE(config.obs_history_width == 35);
+  REQUIRE(config.obs_history_length == 25);
+
+  requireTerm(config.obs_current_terms, "command_yaw", 2, 0);
+  requireTerm(config.obs_current_terms, "command_root_ori_b", 6, 2);
+  requireTerm(config.obs_current_terms, "last_action", 26, 95);
+  requireTerm(config.obs_history_terms, "future_commands", 35, 0);
 }
 
 TEST_CASE("DeployConfig loads ET1 GeneralTracker override joint ids when configured") {

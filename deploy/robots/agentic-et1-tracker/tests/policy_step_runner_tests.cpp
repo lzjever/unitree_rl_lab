@@ -2,6 +2,8 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
@@ -21,9 +23,17 @@ constexpr std::size_t kJointDim = TrkSchema::kJointDim;
 constexpr std::size_t kBodyCount = TrkSchema::kBodyCount;
 constexpr std::size_t kHistoryLength = 25;
 constexpr std::size_t kHistoryWidth = 105;
+constexpr std::size_t kClnHistoryWidth = 35;
 constexpr std::size_t kObsCurrentLastActionOffset = 93;
+constexpr std::size_t kClnObsCurrentLastActionOffset = 95;
 constexpr std::size_t kObsCurrentCommandJointOffset = 9;
 constexpr std::size_t kObsHistoryCommandJointOffset = 9;
+constexpr std::size_t kClnFutureCommandJointOffset = 9;
+constexpr float kPi = 3.14159265358979323846F;
+
+std::array<float, 4> yawQuat(float radians) {
+  return {std::cos(radians * 0.5F), 0.0F, 0.0F, std::sin(radians * 0.5F)};
+}
 
 Vec seq(float start, std::size_t count) {
   Vec values;
@@ -95,6 +105,29 @@ DeployConfig validConfig() {
   });
   config.obs_current_dim = 131;
   config.obs_history_width = kHistoryWidth;
+  config.obs_history_length = kHistoryLength;
+  return config;
+}
+
+DeployConfig validClnConfig() {
+  DeployConfig config = validConfig();
+  config.observation_contract = ObservationContract::GeneralTrackerCLN;
+  config.obs_current_terms = terms({
+      {"command_yaw", 2},
+      {"command_root_ori_b", 6},
+      {"command_xy_yaw_vel", 3},
+      {"command_jnt_pos", kJointDim},
+      {"projected_gravity", 3},
+      {"base_ang_vel", 3},
+      {"joint_pos_rel", kJointDim},
+      {"joint_vel_rel", kJointDim},
+      {"last_action", kJointDim},
+  });
+  config.obs_history_terms = terms({
+      {"future_commands", kClnHistoryWidth},
+  });
+  config.obs_current_dim = 121;
+  config.obs_history_width = kClnHistoryWidth;
   config.obs_history_length = kHistoryLength;
   return config;
 }
@@ -176,6 +209,29 @@ TrkTrack makeTrack(std::size_t frames) {
   return track;
 }
 
+void setRootQuat(TrkTrack& track,
+                 std::size_t frame_index,
+                 const std::array<float, 4>& quat_wxyz) {
+  const std::size_t offset = frame_index * track.body_quat_w.frame_size;
+  for (std::size_t i = 0; i < quat_wxyz.size(); ++i) {
+    track.body_quat_w.values.at(offset + i) = quat_wxyz[i];
+  }
+}
+
+void setRootLinVel(TrkTrack& track, std::size_t frame_index, float x, float y, float z) {
+  const std::size_t offset = frame_index * track.body_lin_vel_w.frame_size;
+  track.body_lin_vel_w.values.at(offset) = x;
+  track.body_lin_vel_w.values.at(offset + 1) = y;
+  track.body_lin_vel_w.values.at(offset + 2) = z;
+}
+
+void setRootAngVel(TrkTrack& track, std::size_t frame_index, float x, float y, float z) {
+  const std::size_t offset = frame_index * track.body_ang_vel_w.frame_size;
+  track.body_ang_vel_w.values.at(offset) = x;
+  track.body_ang_vel_w.values.at(offset + 1) = y;
+  track.body_ang_vel_w.values.at(offset + 2) = z;
+}
+
 LowStateSample liveState(const DeployConfig& config) {
   LowStateSample low;
   low.fresh = true;
@@ -224,6 +280,14 @@ void requireHistoryJointRow(const Vec& history,
                             float joint_base) {
   requireSliceApprox(history,
                      row * kHistoryWidth + kObsHistoryCommandJointOffset,
+                     seq(joint_base, kJointDim));
+}
+
+void requireClnFutureJointRow(const Vec& history,
+                              std::size_t row,
+                              float joint_base) {
+  requireSliceApprox(history,
+                     row * kClnHistoryWidth + kClnFutureCommandJointOffset,
                      seq(joint_base, kJointDim));
 }
 
@@ -326,6 +390,44 @@ TEST_CASE("PolicyStepRunner second step feeds prior action and oldest-to-newest 
   requireHistoryJointRow(second.inputs.obs_history, 0, frameJointBase(0));
   requireHistoryJointRow(second.inputs.obs_history, kHistoryLength - 1,
                          frameJointBase(1));
+}
+
+TEST_CASE("PolicyStepRunner builds GeneralTrackerCLN future_commands from .trk frames") {
+  const DeployConfig config = validClnConfig();
+  const TrkTrack track = makeTrack(3);
+  const LowStateSample low = liveState(config);
+  PolicyStepRunner runner(config, track, low, 7);
+  RecordingPolicy policy(Vec(kJointDim, 0.0F));
+
+  const PolicyStepResult result = runner.step(1, low, policy);
+
+  REQUIRE(policy.calls.size() == 1);
+  REQUIRE(result.inputs.obs_current.size() == 121);
+  REQUIRE(result.inputs.obs_history.size() == kHistoryLength * kClnHistoryWidth);
+  requireZeroSlice(result.inputs.obs_current, kClnObsCurrentLastActionOffset, kJointDim);
+  requireClnFutureJointRow(result.inputs.obs_history, 0, frameJointBase(2));
+  requireClnFutureJointRow(result.inputs.obs_history, 1, frameJointBase(2));
+  requireClnFutureJointRow(result.inputs.obs_history, kHistoryLength - 1,
+                           frameJointBase(2));
+}
+
+TEST_CASE("PolicyStepRunner keeps CLN future_commands root and velocity golden order") {
+  const DeployConfig config = validClnConfig();
+  TrkTrack track = makeTrack(3);
+  setRootQuat(track, 2, yawQuat(kPi * 0.5F));
+  setRootLinVel(track, 2, 2.0F, -3.0F, 9.0F);
+  setRootAngVel(track, 2, 0.0F, 0.0F, 0.75F);
+  const LowStateSample low = liveState(config);
+  PolicyStepRunner runner(config, track, low, 7);
+  RecordingPolicy policy(Vec(kJointDim, 0.0F));
+
+  const PolicyStepResult result = runner.step(1, low, policy);
+
+  REQUIRE(result.inputs.obs_history.size() == kHistoryLength * kClnHistoryWidth);
+  requireSliceApprox(result.inputs.obs_history,
+                     0,
+                     {0.0F, -1.0F, 1.0F, 0.0F, 0.0F, 0.0F, -3.0F, -2.0F, 0.75F},
+                     1.0e-5F);
 }
 
 TEST_CASE("PolicyStepRunner owns a moved track across ticks") {

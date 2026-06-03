@@ -171,6 +171,11 @@ PolicyInputs validInputs() {
           Vec(kGaPolicyObsHistoryLength * kGaPolicyObsHistoryWidth, 0.0F)};
 }
 
+PolicyInputs validClnInputs() {
+  return {Vec(kClnPolicyObsCurrentDim, 0.0F),
+          Vec(kClnPolicyObsHistoryLength * kClnPolicyObsHistoryWidth, 0.0F)};
+}
+
 void requireRuntimeRejects(const OnnxPolicyRuntimeConfig& config,
                            const std::string& message) {
   try {
@@ -246,6 +251,22 @@ TEST_CASE("OnnxPolicyRuntime constructs and runs a minimal GA ONNX policy") {
                       [](float value) { return std::isfinite(value); }));
   REQUIRE(std::all_of(actions.begin(), actions.end(),
                       [](float value) { return value == 0.0F; }));
+}
+
+TEST_CASE("OnnxPolicyRuntime constructs and runs the app-owned GeneralTrackerCLN policy") {
+  const DeployConfig deploy_config =
+      loadDeployConfig(repoFile("config/policy/general_tracker_cln/params/deploy.yaml"));
+  REQUIRE(deploy_config.observation_contract == ObservationContract::GeneralTrackerCLN);
+
+  OnnxPolicyRuntime runtime(
+      {repoFile("config/policy/general_tracker_cln/exported/multi_policy_v17c2_70k.onnx"),
+       deploy_config});
+
+  const Vec actions = runtime.infer(validClnInputs());
+
+  REQUIRE(actions.size() == kGaPolicyJointDim);
+  REQUIRE(std::all_of(actions.begin(), actions.end(),
+                      [](float value) { return std::isfinite(value); }));
 }
 
 TEST_CASE("OnnxVelocityPolicyRuntime rejects bad inputs before ORT session load") {

@@ -45,15 +45,32 @@ check_exec() {
   printf 'ok exec %s\n' "$1"
 }
 
+check_sha256() {
+  local path="$1"
+  local expected="$2"
+  local actual
+  check_file "$path"
+  actual="$(sha256sum "$path" | awk '{print $1}')"
+  [[ "$actual" == "$expected" ]] || die "sha256 mismatch: $path expected $expected got $actual"
+  printf 'ok sha256 %s\n' "$path"
+}
+
 check_exec "$ET1_BIN"
 check_exec "$ET1_CLI"
 check_file "$ET1_RELEASE_DIR/config/config.robot.yaml.template"
-check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/general_tracker/exported/self_collision_footmesh_15k.onnx"
-check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/general_tracker/params/deploy.yaml"
+check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/general_tracker_cln/ASSET_MANIFEST.yaml"
+check_sha256 "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/general_tracker_cln/exported/multi_policy_v17c2_70k.onnx" \
+  "d4f37c972eb5e98e37a1d425302a70729343009a1564974921965c5faea0d911"
+check_sha256 "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/general_tracker_cln/params/deploy.yaml" \
+  "de8ba00c0b79590b2ccc0a7d84fcc0db4a8869ad9111e54e46c9427b89ffaf84"
 check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/velocity/v0/exported/policy.onnx"
 check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/velocity/v0/params/deploy.yaml"
 check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/posture/fixstand/v0/fixstand.yaml"
 check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/posture/passive/v0/passive.yaml"
+check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/reference/standby/v0/ASSET_MANIFEST.yaml"
+check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/reference/standby/v0/README.md"
+check_sha256 "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/reference/standby/v0/standby_ref.trk" \
+  "6ca49404e1ee1008f6226a2f7c00e990f0447ae6c826657246b7a29fbb525741"
 
 prepend_release_lib_path
 "$ET1_BIN" --help >/dev/null 2>&1

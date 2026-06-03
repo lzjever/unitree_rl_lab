@@ -126,6 +126,10 @@ target_include_directories(agentic_et1_tracker_policy_math
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
+target_link_libraries(agentic_et1_tracker_policy_math
+  PUBLIC
+    agentic_et1_tracker_trk
+)
 
 add_library(agentic_et1_tracker_policy_io_contract
   src/policy_io_contract.cpp
@@ -254,6 +258,7 @@ target_link_libraries(agentic_et1_tracker_app
     agentic_et1_tracker_http
     agentic_et1_tracker_runtime
   PRIVATE
+    agentic_et1_tracker_policy
     Threads::Threads
     ${AGENTIC_ET1_YAML_TARGET}
 )
@@ -474,6 +479,7 @@ if(AGENTIC_ET1_BUILD_TESTS)
     target_link_libraries(agentic_et1_tracker_policy_onnx_tests
       PRIVATE
         agentic_et1_tracker_policy_onnx
+        agentic_et1_tracker_policy
         Catch2::Catch2WithMain
     )
     set_target_properties(agentic_et1_tracker_policy_onnx_tests PROPERTIES

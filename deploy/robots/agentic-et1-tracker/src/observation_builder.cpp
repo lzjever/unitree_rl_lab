@@ -1,5 +1,6 @@
 #include "agentic_et1_tracker/policy/observation_builder.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <sstream>
@@ -12,6 +13,7 @@ namespace {
 
 constexpr std::size_t kJointDim = TrkSchema::kJointDim;
 constexpr std::size_t kSdkDim = kSdkMotorCount;
+constexpr std::size_t kClnFutureCommandWidth = 35;
 constexpr double kQuatNormEpsilon = 1.0e-12;
 
 struct Vec3 {
@@ -25,6 +27,12 @@ struct Quat {
   double x{0.0};
   double y{0.0};
   double z{0.0};
+};
+
+struct FrameKinematics {
+  Quat ref_q;
+  Quat robot_q;
+  Quat relative_q;
 };
 
 ObservationBuilderError error(const std::string& message) {
@@ -271,6 +279,87 @@ Vec commandVelocity(const TrkFrameView& frame,
   return {static_cast<float>(lin.x), static_cast<float>(lin.y), static_cast<float>(ang.z)};
 }
 
+FrameKinematics frameKinematics(const TrkFrameView& frame,
+                                const LowStateSample& low_state,
+                                const ObservationBuilderState& state,
+                                const ObservationBuilderConfig& builder_config) {
+  const Quat ref_q_raw = quatFromView(frame.body_quat_w, "body_quat_w");
+  const Quat robot_q_raw = quatFromArray(low_state.quat_wxyz, "low_state.quat_wxyz");
+  const Quat ref_q = removeYawBias(ref_q_raw, state.first_ref_root_yaw,
+                                   builder_config.no_global_mode);
+  const Quat robot_q = removeYawBias(robot_q_raw, state.entry_robot_yaw,
+                                     builder_config.no_global_mode);
+  const Quat relative_q =
+      normalizeQuat(multiply(conjugate(robot_q), ref_q), "command_root_ori_b quaternion");
+  return {ref_q, robot_q, relative_q};
+}
+
+Vec commandYaw(Quat ref_q, Quat robot_q) {
+  const double yaw_error = yawFromQuat(ref_q) - yawFromQuat(robot_q);
+  return {static_cast<float>(std::cos(yaw_error)),
+          static_cast<float>(std::sin(yaw_error))};
+}
+
+TrkFrameView requireTrackFrame(const TrkTrack& track, std::size_t frame_index) {
+  const auto frame = track.frame(frame_index);
+  if (!frame.has_value()) {
+    throw error("frame index is outside track frames");
+  }
+  return *frame;
+}
+
+void appendFutureCommand(const TrkFrameView& future_frame,
+                         Quat robot_q,
+                         Vec& out,
+                         const ObservationBuilderState& state,
+                         const ObservationBuilderConfig& builder_config) {
+  const Quat future_ref_q_raw = quatFromView(future_frame.body_quat_w,
+                                             "future_commands.body_quat_w");
+  const Quat future_ref_q = removeYawBias(future_ref_q_raw, state.first_ref_root_yaw,
+                                          builder_config.no_global_mode);
+  const Quat future_relative_q =
+      normalizeQuat(multiply(conjugate(robot_q), future_ref_q),
+                    "future_commands.root_ori_b quaternion");
+
+  Vec future_root_ori_b;
+  rotationFirstTwoColumns(future_relative_q, future_root_ori_b);
+  out.insert(out.end(), future_root_ori_b.begin(), future_root_ori_b.end());
+
+  const Vec future_xy_yaw_vel =
+      commandVelocity(future_frame, future_ref_q, state, builder_config);
+  out.insert(out.end(), future_xy_yaw_vel.begin(), future_xy_yaw_vel.end());
+
+  const Vec future_joint_pos = copyView("future_commands.joint_pos",
+                                        future_frame.joint_pos, kJointDim);
+  out.insert(out.end(), future_joint_pos.begin(), future_joint_pos.end());
+}
+
+Vec futureCommands(const DeployConfig& config,
+                   const TrkTrack& track,
+                   std::size_t frame_index,
+                   Quat robot_q,
+                   const ObservationBuilderState& state,
+                   const ObservationBuilderConfig& builder_config) {
+  if (track.metadata.frames == 0) {
+    throw error("track must contain at least one frame");
+  }
+  const std::size_t expected_size = config.obs_history_length * config.obs_history_width;
+  if (config.obs_history_width != kClnFutureCommandWidth) {
+    throw error("GeneralTrackerCLN future command width must be 35");
+  }
+
+  Vec out;
+  out.reserve(expected_size);
+  for (std::size_t horizon_idx = 0; horizon_idx < config.obs_history_length; ++horizon_idx) {
+    const std::size_t future_frame_index =
+        std::min(frame_index + horizon_idx + 1, track.metadata.frames - 1);
+    appendFutureCommand(requireTrackFrame(track, future_frame_index), robot_q, out,
+                        state, builder_config);
+  }
+  requireExactSize("future_commands", out.size(), expected_size);
+  return out;
+}
+
 }  // namespace
 
 ObservationBuilderState makeObservationBuilderState(
@@ -299,27 +388,44 @@ PolicyObservationParts buildObservationParts(
   validateDeployConfigForBuilder(config);
   validateLastAction(last_action);
 
-  const Quat ref_q_raw = quatFromView(frame.body_quat_w, "body_quat_w");
-  const Quat robot_q_raw = quatFromArray(low_state.quat_wxyz, "low_state.quat_wxyz");
-  const Quat ref_q = removeYawBias(ref_q_raw, state.first_ref_root_yaw,
-                                   builder_config.no_global_mode);
-  const Quat robot_q = removeYawBias(robot_q_raw, state.entry_robot_yaw,
-                                     builder_config.no_global_mode);
-  const Quat relative_q =
-      normalizeQuat(multiply(conjugate(robot_q), ref_q), "command_root_ori_b quaternion");
+  const FrameKinematics kinematics =
+      frameKinematics(frame, low_state, state, builder_config);
 
   PolicyObservationParts parts;
-  rotationFirstTwoColumns(relative_q, parts.command_root_ori_b);
-  parts.command_xy_yaw_vel = commandVelocity(frame, ref_q, state, builder_config);
+  parts.command_yaw = commandYaw(kinematics.ref_q, kinematics.robot_q);
+  rotationFirstTwoColumns(kinematics.relative_q, parts.command_root_ori_b);
+  parts.command_xy_yaw_vel = commandVelocity(frame, kinematics.ref_q, state, builder_config);
   parts.command_jnt_pos = copyView("joint_pos", frame.joint_pos, kJointDim);
-  parts.projected_gravity = projectedGravity(robot_q);
+  parts.projected_gravity = projectedGravity(kinematics.robot_q);
   parts.base_ang_vel = baseAngularVelocity(low_state);
   fillJointObservations(config, low_state, parts.command_jnt_pos, parts.joint_pos_rel,
                         parts.joint_vel_rel);
   parts.last_action = last_action;
-  parts.command_foot_support_state = supportState(frame);
-  parts.ref_com_rel_navi = copyView("ref_com_rel_navi", frame.ref_com_rel_navi, 3);
-  parts.ref_com_vel_navi = copyView("ref_com_vel_navi", frame.ref_com_vel_navi, 3);
+  if (config.observation_contract == ObservationContract::GeneralTracker) {
+    parts.command_foot_support_state = supportState(frame);
+    parts.ref_com_rel_navi = copyView("ref_com_rel_navi", frame.ref_com_rel_navi, 3);
+    parts.ref_com_vel_navi = copyView("ref_com_vel_navi", frame.ref_com_vel_navi, 3);
+  }
+  return parts;
+}
+
+PolicyObservationParts buildObservationParts(
+    const DeployConfig& config,
+    const TrkTrack& track,
+    std::size_t frame_index,
+    const LowStateSample& low_state,
+    const Vec& last_action,
+    const ObservationBuilderState& state,
+    const ObservationBuilderConfig& builder_config) {
+  const TrkFrameView frame = requireTrackFrame(track, frame_index);
+  PolicyObservationParts parts =
+      buildObservationParts(config, frame, low_state, last_action, state, builder_config);
+  if (config.observation_contract == ObservationContract::GeneralTrackerCLN) {
+    const FrameKinematics kinematics =
+        frameKinematics(frame, low_state, state, builder_config);
+    parts.future_commands =
+        futureCommands(config, track, frame_index, kinematics.robot_q, state, builder_config);
+  }
   return parts;
 }
 

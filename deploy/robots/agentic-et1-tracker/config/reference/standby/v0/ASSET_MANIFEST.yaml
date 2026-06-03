@@ -1,0 +1,51 @@
+profile: StandbyReference
+owner: agentic-et1-tracker
+asset_dir: config/reference/standby/v0
+purpose: release/package audit only
+runtime_use: "not a runtime fallback, downloader config, registry, idle pool, or user motion path"
+runtime_contract:
+  schema:
+    name: ET1TRK1
+    version: 1
+  fps: 50
+  frames: 25
+  duration_s: 0.48
+  joint_dim: 26
+  body_count: 27
+required_files:
+  - path: standby_ref.trk
+    sha256: "6ca49404e1ee1008f6226a2f7c00e990f0447ae6c826657246b7a29fbb525741"
+    size_bytes: 41400
+source:
+  release_source: build-local standby_ref candidate
+  candidate_path: build/standby_ref_candidate/standby_ref.candidate.trk
+  candidate_sha256: "6ca49404e1ee1008f6226a2f7c00e990f0447ae6c826657246b7a29fbb525741"
+  candidate_manifest: build/standby_ref_candidate/CANDIDATE_MANIFEST.json
+  source_path: /home/galbot/works/et1/generated/squat_stand.trk
+  source_sha256: "e748af2d54ac6a08bfcf8e242d2f9c75e28a387af978716213b3e114349ee5f8"
+  source_window:
+    mode: tail_exact_slice
+    frame_start: 224
+    frame_end: 248
+    frames: 25
+static_metrics:
+  joint_max_drift: 0.018149584531784058
+  root_xyz_drift: 0.001154384667151058
+  root_tilt_max_deg: 3.025917691190345
+  root_lin_vel_max: 0.01273651162561001
+  contact:
+    left_constant: true
+    left_values: [0]
+    right_constant: true
+    right_values: [0]
+acceptance:
+  simulator_visual:
+    status: accepted
+    accepted_on: 2026-06-03
+    evidence: user reviewed this exact candidate in simulator and accepted it
+  real_robot:
+    status: pending
+    required_before_ga: true
+  overall_ga:
+    status: not_claimed
+source_notes: "copied byte-for-byte from the build-local candidate after simulator acceptance; real-robot gate remains pending; this asset manifest does not change runtime playback logic"

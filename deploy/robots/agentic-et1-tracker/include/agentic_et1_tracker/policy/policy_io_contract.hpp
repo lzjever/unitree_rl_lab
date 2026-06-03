@@ -14,6 +14,9 @@ inline constexpr std::size_t kGaPolicyJointDim = 26;
 inline constexpr std::size_t kGaPolicyObsCurrentDim = 131;
 inline constexpr std::size_t kGaPolicyObsHistoryLength = 25;
 inline constexpr std::size_t kGaPolicyObsHistoryWidth = 105;
+inline constexpr std::size_t kClnPolicyObsCurrentDim = 121;
+inline constexpr std::size_t kClnPolicyObsHistoryLength = 25;
+inline constexpr std::size_t kClnPolicyObsHistoryWidth = 35;
 
 enum class PolicyTensorElementType {
   Float32,
@@ -41,7 +44,7 @@ class PolicyIoContractError final : public std::runtime_error {
 void validateGaDeployConfig(const DeployConfig& config);
 void validateGaPolicyIoContract(const DeployConfig& config,
                                 const PolicyModelMetadata& metadata);
-void validateGaPolicyInputs(const PolicyInputs& inputs);
+void validateGaPolicyInputs(const DeployConfig& config, const PolicyInputs& inputs);
 void validateVelocityDeployConfig(const VelocityDeployConfig& config);
 void validateVelocityPolicyIoContract(const VelocityDeployConfig& config,
                                       const PolicyModelMetadata& metadata);

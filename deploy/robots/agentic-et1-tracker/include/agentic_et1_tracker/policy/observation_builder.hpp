@@ -37,6 +37,15 @@ PolicyObservationParts buildObservationParts(
     const ObservationBuilderState& state,
     const ObservationBuilderConfig& builder_config = {});
 
+PolicyObservationParts buildObservationParts(
+    const DeployConfig& config,
+    const TrkTrack& track,
+    std::size_t frame_index,
+    const LowStateSample& low_state,
+    const Vec& last_action,
+    const ObservationBuilderState& state,
+    const ObservationBuilderConfig& builder_config = {});
+
 std::size_t referenceFrameIndex(double elapsed_s, double fps, std::size_t frame_count);
 
 }  // namespace agentic_et1_tracker

@@ -16,10 +16,10 @@ agentic_et1_tracker:
   reference:
     enabled: true
   policy:
-    profile: "GeneralTracker"
-    policy_dir: "config/policy/general_tracker"
-    policy_file: "self_collision_footmesh_15k.onnx"
-    deploy: "config/policy/general_tracker/params/deploy.yaml"
+    profile: "GeneralTrackerCLN"
+    policy_dir: "config/policy/general_tracker_cln"
+    policy_file: "multi_policy_v17c2_70k.onnx"
+    deploy: "config/policy/general_tracker_cln/params/deploy.yaml"
     fps: 50
   control:
     startup_control: "FixStand"

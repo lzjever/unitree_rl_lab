@@ -60,6 +60,28 @@ const std::array<ExpectedObservationTerm, 10>& expectedHistoryTerms() {
   return values;
 }
 
+const std::array<ExpectedObservationTerm, 9>& expectedClnCurrentTerms() {
+  static constexpr std::array<ExpectedObservationTerm, 9> values{{
+      {"command_yaw", 2},
+      {"command_root_ori_b", 6},
+      {"command_xy_yaw_vel", 3},
+      {"command_jnt_pos", kGaPolicyJointDim},
+      {"projected_gravity", 3},
+      {"base_ang_vel", 3},
+      {"joint_pos_rel", kGaPolicyJointDim},
+      {"joint_vel_rel", kGaPolicyJointDim},
+      {"last_action", kGaPolicyJointDim},
+  }};
+  return values;
+}
+
+const std::array<ExpectedObservationTerm, 1>& expectedClnHistoryTerms() {
+  static constexpr std::array<ExpectedObservationTerm, 1> values{{
+      {"future_commands", kClnPolicyObsHistoryWidth},
+  }};
+  return values;
+}
+
 PolicyIoContractError error(const std::string& message) {
   return PolicyIoContractError("policy io contract error: " + message);
 }
@@ -167,11 +189,6 @@ void requireFrozenObservationTerms(
 
 void validateGaDeployConfig(const DeployConfig& config) {
   requireSize("joint_dim", config.joint_dim, kGaPolicyJointDim);
-  requireSize("obs_current_dim", config.obs_current_dim, kGaPolicyObsCurrentDim);
-  requireSize("obs_history_width", config.obs_history_width,
-              kGaPolicyObsHistoryWidth);
-  requireSize("obs_history_length", config.obs_history_length,
-              kGaPolicyObsHistoryLength);
   requireSize("action_scale", config.action_scale.size(), kGaPolicyJointDim);
   requireSize("action_offset", config.action_offset.size(), kGaPolicyJointDim);
   requireSize("policy_kp", config.policy_kp.size(), kGaPolicyJointDim);
@@ -186,10 +203,27 @@ void validateGaDeployConfig(const DeployConfig& config) {
   requireFrozenMap("joint_ids_map", config.joint_ids_map, expectedJointIdsMap());
   requireFrozenMap("sdk_joint_ids_map", config.sdk_joint_ids_map,
                    expectedSdkJointIdsMap());
-  requireFrozenObservationTerms("obs_current_terms", config.obs_current_terms,
-                                expectedCurrentTerms());
-  requireFrozenObservationTerms("obs_history_terms", config.obs_history_terms,
-                                expectedHistoryTerms());
+  if (config.observation_contract == ObservationContract::GeneralTrackerCLN) {
+    requireSize("obs_current_dim", config.obs_current_dim, kClnPolicyObsCurrentDim);
+    requireSize("obs_history_width", config.obs_history_width,
+                kClnPolicyObsHistoryWidth);
+    requireSize("obs_history_length", config.obs_history_length,
+                kClnPolicyObsHistoryLength);
+    requireFrozenObservationTerms("obs_current_terms", config.obs_current_terms,
+                                  expectedClnCurrentTerms());
+    requireFrozenObservationTerms("obs_history_terms", config.obs_history_terms,
+                                  expectedClnHistoryTerms());
+  } else {
+    requireSize("obs_current_dim", config.obs_current_dim, kGaPolicyObsCurrentDim);
+    requireSize("obs_history_width", config.obs_history_width,
+                kGaPolicyObsHistoryWidth);
+    requireSize("obs_history_length", config.obs_history_length,
+                kGaPolicyObsHistoryLength);
+    requireFrozenObservationTerms("obs_current_terms", config.obs_current_terms,
+                                  expectedCurrentTerms());
+    requireFrozenObservationTerms("obs_history_terms", config.obs_history_terms,
+                                  expectedHistoryTerms());
+  }
 }
 
 void validateGaPolicyIoContract(const DeployConfig& config,
@@ -203,14 +237,14 @@ void validateGaPolicyIoContract(const DeployConfig& config,
   requireName("input[0]", obs_current.name, "obs_current");
   requireDtype("obs_current", obs_current.element_type);
   requireShape("obs_current", obs_current.shape,
-               {1, static_cast<std::int64_t>(kGaPolicyObsCurrentDim)});
+               {1, static_cast<std::int64_t>(config.obs_current_dim)});
 
   const PolicyTensorMetadata& obs_history = metadata.inputs[1];
   requireName("input[1]", obs_history.name, "obs_history");
   requireDtype("obs_history", obs_history.element_type);
   requireShape("obs_history", obs_history.shape,
-               {1, static_cast<std::int64_t>(kGaPolicyObsHistoryLength),
-                static_cast<std::int64_t>(kGaPolicyObsHistoryWidth)});
+               {1, static_cast<std::int64_t>(config.obs_history_length),
+                static_cast<std::int64_t>(config.obs_history_width)});
 
   const PolicyTensorMetadata& actions = metadata.outputs[0];
   requireName("output[0]", actions.name, "actions");
@@ -219,10 +253,11 @@ void validateGaPolicyIoContract(const DeployConfig& config,
                {1, static_cast<std::int64_t>(kGaPolicyJointDim)});
 }
 
-void validateGaPolicyInputs(const PolicyInputs& inputs) {
-  requireSize("obs_current", inputs.obs_current.size(), kGaPolicyObsCurrentDim);
+void validateGaPolicyInputs(const DeployConfig& config, const PolicyInputs& inputs) {
+  validateGaDeployConfig(config);
+  requireSize("obs_current", inputs.obs_current.size(), config.obs_current_dim);
   requireSize("obs_history", inputs.obs_history.size(),
-              kGaPolicyObsHistoryLength * kGaPolicyObsHistoryWidth);
+              config.obs_history_length * config.obs_history_width);
 }
 
 void validateVelocityDeployConfig(const VelocityDeployConfig& config) {

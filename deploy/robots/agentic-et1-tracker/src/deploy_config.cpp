@@ -14,6 +14,8 @@ namespace {
 constexpr std::size_t kJointDim = 26;
 constexpr double kStepDt = 0.02;
 constexpr double kStepDtEpsilon = 1.0e-9;
+constexpr std::size_t kClnFutureHorizon = 25;
+constexpr std::size_t kClnFutureCommandWidth = 35;
 constexpr std::array<int, kJointDim> kJointIdsMap{{
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
     13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
@@ -53,6 +55,20 @@ constexpr std::array<ObservationSpec, 10> kHistoryObs{{
     {"ref_com_rel_navi", 3},
     {"ref_com_vel_navi", 3},
 }};
+constexpr std::array<ObservationSpec, 9> kClnCurrentObs{{
+    {"command_yaw", 2},
+    {"command_root_ori_b", 6},
+    {"command_xy_yaw_vel", 3},
+    {"command_jnt_pos", kJointDim},
+    {"projected_gravity", 3},
+    {"base_ang_vel", 3},
+    {"joint_pos_rel", kJointDim},
+    {"joint_vel_rel", kJointDim},
+    {"last_action", kJointDim},
+}};
+constexpr std::array<ObservationSpec, 1> kClnHistoryObs{{
+    {"future_commands", kClnFutureCommandWidth},
+}};
 
 DeployConfigError error(const std::string& message) {
   return DeployConfigError("deploy config error: " + message);
@@ -90,6 +106,19 @@ bool contains(const std::array<ObservationSpec, N>& specs, std::string_view name
   return std::find_if(specs.begin(), specs.end(), [name](const ObservationSpec& spec) {
            return spec.name == name;
          }) != specs.end();
+}
+
+bool groupHasObservationKey(const YAML::Node& group, std::string_view name) {
+  if (!group || !group.IsMap()) {
+    return false;
+  }
+  for (const auto& entry : group) {
+    const std::string key = scalarAs<std::string>(entry.first, "observation key");
+    if (key == name) {
+      return true;
+    }
+  }
+  return false;
 }
 
 template <std::size_t N>
@@ -232,6 +261,26 @@ std::size_t historyLength(const YAML::Node& obs, const std::string& field) {
     throw error(field + ".history_length must be positive");
   }
   return static_cast<std::size_t>(value);
+}
+
+std::size_t futureCommandsHorizon(const YAML::Node& obs_history) {
+  const YAML::Node future_commands =
+      requiredMap(obs_history, "future_commands", "observations.obs_history.future_commands");
+  const YAML::Node params = future_commands["params"];
+  if (params && !params.IsNull()) {
+    if (!params.IsMap()) {
+      throw error("observations.obs_history.future_commands.params must be a map");
+    }
+    const YAML::Node horizon = params["horizon"];
+    if (horizon && !horizon.IsNull()) {
+      const long long value =
+          scalarAs<long long>(horizon, "observations.obs_history.future_commands.params.horizon");
+      if (value != static_cast<long long>(kClnFutureHorizon)) {
+        throw error("observations.obs_history.future_commands.params.horizon must be 25");
+      }
+    }
+  }
+  return kClnFutureHorizon;
 }
 
 template <std::size_t N>
@@ -405,15 +454,32 @@ DeployConfig loadDeployConfig(const std::filesystem::path& path) {
         requiredMap(observations, "obs_current", "observations.obs_current");
     const YAML::Node obs_history =
         requiredMap(observations, "obs_history", "observations.obs_history");
-    validateObservationGroup(obs_current, kCurrentObs, "observations.obs_current", 1);
-    config.obs_history_length =
-        validateObservationGroup(obs_history, kHistoryObs, "observations.obs_history", 25);
-    config.obs_current = toStrings(kCurrentObs);
-    config.obs_history = toStrings(kHistoryObs);
-    config.obs_current_terms = toTerms(kCurrentObs);
-    config.obs_history_terms = toTerms(kHistoryObs);
-    config.obs_current_dim = sumWidths(kCurrentObs);
-    config.obs_history_width = sumWidths(kHistoryObs);
+    const bool is_cln =
+        groupHasObservationKey(obs_current, "command_yaw") &&
+        groupHasObservationKey(obs_history, "future_commands");
+    if (is_cln) {
+      config.observation_contract = ObservationContract::GeneralTrackerCLN;
+      validateObservationGroup(obs_current, kClnCurrentObs, "observations.obs_current", 1);
+      validateObservationGroup(obs_history, kClnHistoryObs, "observations.obs_history", 1);
+      config.obs_history_length = futureCommandsHorizon(obs_history);
+      config.obs_current = toStrings(kClnCurrentObs);
+      config.obs_history = toStrings(kClnHistoryObs);
+      config.obs_current_terms = toTerms(kClnCurrentObs);
+      config.obs_history_terms = toTerms(kClnHistoryObs);
+      config.obs_current_dim = sumWidths(kClnCurrentObs);
+      config.obs_history_width = sumWidths(kClnHistoryObs);
+    } else {
+      config.observation_contract = ObservationContract::GeneralTracker;
+      validateObservationGroup(obs_current, kCurrentObs, "observations.obs_current", 1);
+      config.obs_history_length =
+          validateObservationGroup(obs_history, kHistoryObs, "observations.obs_history", 25);
+      config.obs_current = toStrings(kCurrentObs);
+      config.obs_history = toStrings(kHistoryObs);
+      config.obs_current_terms = toTerms(kCurrentObs);
+      config.obs_history_terms = toTerms(kHistoryObs);
+      config.obs_current_dim = sumWidths(kCurrentObs);
+      config.obs_history_width = sumWidths(kHistoryObs);
+    }
 
     return config;
   } catch (const DeployConfigError&) {

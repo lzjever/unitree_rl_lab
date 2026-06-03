@@ -88,6 +88,18 @@ ControlMode startupControl(const ControlConfig& config) {
   throw PolicyRuntimeError("unsupported startup control");
 }
 
+bool policyProfileMatchesDeployContract(const PolicyConfig& policy,
+                                        ObservationContract contract) {
+  bool profile_is_cln = false;
+  if (policy.profile == "GeneralTrackerCLN") {
+    profile_is_cln = true;
+  } else if (policy.profile != "GeneralTracker") {
+    return false;
+  }
+  const bool deploy_is_cln = contract == ObservationContract::GeneralTrackerCLN;
+  return profile_is_cln == deploy_is_cln;
+}
+
 }  // namespace
 
 bool shouldReleaseMotionModeOnStartup(const AppConfig& config) {
@@ -98,6 +110,10 @@ AppRuntimeFactoryResult createAppRuntimeDeps(const AppConfig& config) {
   FactoryPhase phase = FactoryPhase::Deploy;
   try {
     DeployConfig deploy_config = loadDeployConfig(config.policy.deploy);
+    if (!policyProfileMatchesDeployContract(config.policy,
+                                            deploy_config.observation_contract)) {
+      return modelNotReady(config);
+    }
     VelocityDeployConfig velocity_deploy_config =
         loadVelocityDeployConfig(config.control.velocity_deploy);
     FixStandConfig fixstand_config = loadFixStandConfig(config.control.fixstand_config);

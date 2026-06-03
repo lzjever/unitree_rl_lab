@@ -7,9 +7,6 @@ namespace agentic_et1_tracker {
 namespace {
 
 constexpr std::size_t kJointDim = 26;
-constexpr std::size_t kObsCurrentDim = 131;
-constexpr std::size_t kObsHistoryWidth = 105;
-constexpr std::size_t kObsHistoryLength = 25;
 
 PolicyMathError error(const std::string& message) {
   return PolicyMathError("policy math error: " + message);
@@ -32,6 +29,9 @@ void requireSize(const std::string& field,
 }
 
 const Vec& partByName(const PolicyObservationParts& parts, const std::string& name) {
+  if (name == "command_yaw") {
+    return parts.command_yaw;
+  }
   if (name == "command_root_ori_b") {
     return parts.command_root_ori_b;
   }
@@ -64,6 +64,9 @@ const Vec& partByName(const PolicyObservationParts& parts, const std::string& na
   }
   if (name == "ref_com_vel_navi") {
     return parts.ref_com_vel_navi;
+  }
+  if (name == "future_commands") {
+    return parts.future_commands;
   }
 
   throw error("unknown observation term '" + name + "'");
@@ -106,9 +109,15 @@ Vec buildRow(const std::vector<ObservationTerm>& terms,
 }
 
 void validatePolicyConfig(const DeployConfig& config) {
-  requireSize("DeployConfig.obs_current_dim", config.obs_current_dim, kObsCurrentDim);
-  requireSize("DeployConfig.obs_history_width", config.obs_history_width, kObsHistoryWidth);
-  requireSize("DeployConfig.obs_history_length", config.obs_history_length, kObsHistoryLength);
+  if (config.obs_current_dim == 0) {
+    throw error("DeployConfig.obs_current_dim must be positive");
+  }
+  if (config.obs_history_width == 0) {
+    throw error("DeployConfig.obs_history_width must be positive");
+  }
+  if (config.obs_history_length == 0) {
+    throw error("DeployConfig.obs_history_length must be positive");
+  }
 }
 
 void validateActionConfig(const DeployConfig& config) {
@@ -128,6 +137,10 @@ Vec copyDoublesAsFloats(const std::vector<double>& values) {
   return out;
 }
 
+bool usesTemporalHistory(const DeployConfig& config) {
+  return config.observation_contract == ObservationContract::GeneralTracker;
+}
+
 }  // namespace
 
 Vec buildObsCurrent(const DeployConfig& config, const PolicyObservationParts& parts) {
@@ -139,16 +152,24 @@ Vec buildObsCurrent(const DeployConfig& config, const PolicyObservationParts& pa
 HistoryBuffer::HistoryBuffer(const DeployConfig& config)
     : terms_(config.obs_history_terms),
       row_width_(config.obs_history_width),
-      length_(config.obs_history_length) {
+      length_(config.obs_history_length),
+      temporal_history_(usesTemporalHistory(config)) {
   validatePolicyConfig(config);
 }
 
 void HistoryBuffer::reset(const PolicyObservationParts& parts) {
+  if (!temporal_history_) {
+    rows_.clear();
+    return;
+  }
   const Vec row = buildRow(terms_, row_width_, parts, false, "obs_history");
   rows_.assign(length_, row);
 }
 
 void HistoryBuffer::push(const PolicyObservationParts& parts) {
+  if (!temporal_history_) {
+    return;
+  }
   if (rows_.empty()) {
     throw error("HistoryBuffer must be reset before push");
   }
@@ -159,6 +180,9 @@ void HistoryBuffer::push(const PolicyObservationParts& parts) {
 }
 
 Vec HistoryBuffer::flatten() const {
+  if (!temporal_history_) {
+    throw error("HistoryBuffer does not flatten GeneralTrackerCLN future_commands");
+  }
   if (rows_.empty()) {
     throw error("HistoryBuffer must be reset before flatten");
   }
@@ -180,6 +204,12 @@ PolicyInputs buildPolicyInputs(const DeployConfig& config,
 
   PolicyInputs inputs;
   inputs.obs_current = buildObsCurrent(config, current);
+  if (!usesTemporalHistory(config)) {
+    inputs.obs_history = current.future_commands;
+    requireSize("PolicyInputs.obs_history", inputs.obs_history.size(),
+                config.obs_history_length * config.obs_history_width);
+    return inputs;
+  }
   inputs.obs_history = history.flatten();
   requireSize("PolicyInputs.obs_history", inputs.obs_history.size(),
               config.obs_history_length * config.obs_history_width);

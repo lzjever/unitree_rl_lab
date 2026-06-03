@@ -19,6 +19,8 @@ constexpr std::size_t kJointDim = 26;
 constexpr std::size_t kHistoryLength = 25;
 constexpr std::size_t kCurrentDim = 131;
 constexpr std::size_t kHistoryWidth = 105;
+constexpr std::size_t kClnCurrentDim = 121;
+constexpr std::size_t kClnHistoryWidth = 35;
 
 Vec seq(float start, std::size_t count) {
   Vec values;
@@ -87,8 +89,32 @@ DeployConfig validConfig() {
   return config;
 }
 
+DeployConfig validClnConfig() {
+  DeployConfig config = validConfig();
+  config.observation_contract = ObservationContract::GeneralTrackerCLN;
+  config.obs_current_terms = terms({
+      {"command_yaw", 2},
+      {"command_root_ori_b", 6},
+      {"command_xy_yaw_vel", 3},
+      {"command_jnt_pos", kJointDim},
+      {"projected_gravity", 3},
+      {"base_ang_vel", 3},
+      {"joint_pos_rel", kJointDim},
+      {"joint_vel_rel", kJointDim},
+      {"last_action", kJointDim},
+  });
+  config.obs_history_terms = terms({
+      {"future_commands", kClnHistoryWidth},
+  });
+  config.obs_current_dim = kClnCurrentDim;
+  config.obs_history_width = kClnHistoryWidth;
+  config.obs_history_length = kHistoryLength;
+  return config;
+}
+
 PolicyObservationParts parts(float base) {
   PolicyObservationParts p;
+  p.command_yaw = seq(base - 10.0f, 2);
   p.command_root_ori_b = seq(base + 0.0f, 6);
   p.command_xy_yaw_vel = seq(base + 10.0f, 3);
   p.command_jnt_pos = seq(base + 20.0f, kJointDim);
@@ -100,6 +126,7 @@ PolicyObservationParts parts(float base) {
   p.command_foot_support_state = seq(base + 300.0f, 6);
   p.ref_com_rel_navi = seq(base + 400.0f, 3);
   p.ref_com_vel_navi = seq(base + 500.0f, 3);
+  p.future_commands = seq(base + 600.0f, kHistoryLength * kClnHistoryWidth);
   return p;
 }
 
@@ -137,6 +164,23 @@ Vec expectedHistoryRow(const PolicyObservationParts& p) {
   append(p.command_foot_support_state);
   append(p.ref_com_rel_navi);
   append(p.ref_com_vel_navi);
+  return out;
+}
+
+Vec expectedClnCurrentRow(const PolicyObservationParts& p) {
+  Vec out;
+  const auto append = [&out](const Vec& values) {
+    out.insert(out.end(), values.begin(), values.end());
+  };
+  append(p.command_yaw);
+  append(p.command_root_ori_b);
+  append(p.command_xy_yaw_vel);
+  append(p.command_jnt_pos);
+  append(p.projected_gravity);
+  append(p.base_ang_vel);
+  append(p.joint_pos_rel);
+  append(p.joint_vel_rel);
+  append(p.last_action);
   return out;
 }
 
@@ -250,6 +294,19 @@ TEST_CASE("buildPolicyInputs combines current observation and flattened history"
   requireRowEquals(inputs.obs_history, 24, expectedHistoryRow(newest));
 }
 
+TEST_CASE("buildPolicyInputs uses CLN future_commands as obs_history") {
+  const DeployConfig config = validClnConfig();
+  const PolicyObservationParts current = parts(1200.0f);
+  HistoryBuffer history(config);
+
+  const PolicyInputs inputs = buildPolicyInputs(config, current, history);
+
+  REQUIRE(inputs.obs_current == expectedClnCurrentRow(current));
+  REQUIRE(inputs.obs_history == current.future_commands);
+  REQUIRE(inputs.obs_current.size() == kClnCurrentDim);
+  REQUIRE(inputs.obs_history.size() == kHistoryLength * kClnHistoryWidth);
+}
+
 TEST_CASE("scaleAction applies scale and offset and copies policy gains") {
   const DeployConfig config = validConfig();
   const Vec raw = seq(-2.0f, kJointDim);
@@ -305,6 +362,17 @@ TEST_CASE("policy math validates observation and action widths") {
 
     REQUIRE_THROWS_WITH(scaleAction(config, raw), ContainsSubstring("policy_kd"));
     REQUIRE_THROWS_AS(scaleAction(config, raw), PolicyMathError);
+  }
+
+  SECTION("CLN future command length") {
+    const DeployConfig config = validClnConfig();
+    PolicyObservationParts p = parts(0.0f);
+    p.future_commands.pop_back();
+    HistoryBuffer history(config);
+
+    REQUIRE_THROWS_WITH(buildPolicyInputs(config, p, history),
+                        ContainsSubstring("PolicyInputs.obs_history"));
+    REQUIRE_THROWS_AS(buildPolicyInputs(config, p, history), PolicyMathError);
   }
 }
 

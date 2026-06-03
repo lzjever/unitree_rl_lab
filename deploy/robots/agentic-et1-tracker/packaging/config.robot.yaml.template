@@ -18,10 +18,10 @@ agentic_et1_tracker:
   stop_hold_s: 0.0
   idle_mode: "hold_current"
   policy:
-    profile: "GeneralTracker"
-    policy_dir: "@PREFIX@/current/share/agentic-et1-tracker/config/policy/general_tracker"
-    policy_file: "self_collision_footmesh_15k.onnx"
-    deploy: "@PREFIX@/current/share/agentic-et1-tracker/config/policy/general_tracker/params/deploy.yaml"
+    profile: "GeneralTrackerCLN"
+    policy_dir: "@PREFIX@/current/share/agentic-et1-tracker/config/policy/general_tracker_cln"
+    policy_file: "multi_policy_v17c2_70k.onnx"
+    deploy: "@PREFIX@/current/share/agentic-et1-tracker/config/policy/general_tracker_cln/params/deploy.yaml"
     fps: 50
   control:
     startup_control: "FixStand"

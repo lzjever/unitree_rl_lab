@@ -11,6 +11,7 @@ namespace agentic_et1_tracker {
 using Vec = std::vector<float>;
 
 struct PolicyObservationParts {
+  Vec command_yaw;
   Vec command_root_ori_b;
   Vec command_xy_yaw_vel;
   Vec command_jnt_pos;
@@ -22,6 +23,7 @@ struct PolicyObservationParts {
   Vec command_foot_support_state;
   Vec ref_com_rel_navi;
   Vec ref_com_vel_navi;
+  Vec future_commands;
 };
 
 struct PolicyInputs {
@@ -55,6 +57,7 @@ class HistoryBuffer {
   std::vector<ObservationTerm> terms_;
   std::size_t row_width_{0};
   std::size_t length_{0};
+  bool temporal_history_{true};
   std::vector<Vec> rows_;
 };
 

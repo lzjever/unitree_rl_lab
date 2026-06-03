@@ -14,7 +14,8 @@
 
 当前不能声明 GA 完成。以下 gate 仍未完成：
 
-- `standby_ref.trk` app-local release asset 与 manifest 固化。
+- `standby_ref.trk` runtime playback gate。asset 与 manifest 已记录，且
+  simulator accepted；runtime 接入与播放验收仍 pending。
 - 当前版本 MuJoCo visual acceptance。
 - ET1 real robot acceptance。
 
@@ -73,7 +74,9 @@ skill CLI 必须保持 one-line compact JSON；`holding` 对 `run --hold --wait`
 - `/stop` 可 abort user、idle、holding、transition，并且不播放 `standby_ref.trk`。
 - `/passive` 可 abort user、idle、holding、transition，清 user queue 和 idle pool/config，并停在 Passive safety sink；与 `/stop` 的区别是落点固定为 passive safety sink，不保留恢复到 standby 的语义；与 `/fixstand` 的区别是 passive 是 safety sink，fixstand 是姿态恢复；与 `/standby_velocity` 的区别是 passive 不进入可执行/idle 待命状态。
 
-`standby_ref` 当前是 release gate，不是可用功能。只有 app-local validated `config/reference/standby/v0/standby_ref.trk` 加 `config/reference/standby/v0/ASSET_MANIFEST.yaml` 被接受后，才能声明 standby reference transition 可用。
+`standby_ref` asset 已记录且 simulator accepted，但当前仍不是可依赖 runtime
+playback 功能。只有 runtime 明确接入并完成 real robot/operator gate 后，才能声明
+standby reference transition 可用。
 
 ## 4. 后续 gate / 最少工作包
 
@@ -128,14 +131,17 @@ Passive safety sink 时发送，且需提前准备 MuJoCo reset/upright/operator
 
 真机验收必须由 operator 明确记录通过/失败和风险备注。失败项不得用 MuJoCo 证据替代。
 
-### WP4 standby_ref release asset 解锁
+### WP4 standby_ref runtime playback gate
 
-目标：只在安全资产固化后解锁 standby reference transition。
+目标：在已记录且 simulator accepted 的 standby_ref asset 基础上，只在 runtime
+接入和 real robot/operator 验收完成后声明 standby reference transition 可用。
 
 交付条件：
 
-- 离线候选通过 MuJoCo visual acceptance 和必要真机/operator 审核。
-- 固化为 `config/reference/standby/v0/standby_ref.trk`，同时提交 `config/reference/standby/v0/ASSET_MANIFEST.yaml`，记录 source、sha256、frames、fps、duration、验收结论。
+- 保持已固化的 `config/reference/standby/v0/standby_ref.trk` 和
+  `config/reference/standby/v0/ASSET_MANIFEST.yaml`，记录 source、sha256、
+  frames、fps、duration、simulator acceptance 结论。
+- runtime 接入 standby_ref playback 后，通过必要真机/operator 审核。
 - candidate 工具输出的 `CANDIDATE_MANIFEST.json` 只记录候选生成证据，不是 release manifest，不进入 runtime release 约定。
 - release package selftest 检查 `standby_ref.trk` 和 `ASSET_MANIFEST.yaml`。
 - runtime 只读取 app-local release asset；缺失或损坏不得 fallback 到 ET1 app tree。
@@ -210,8 +216,12 @@ Real robot：
 Release package：
 
 - [ ] app-owned assets 完整，无 ET1 app fallback。
-- [ ] `standby_ref.trk` gate 若未解锁，release notes 明确 pending。
-- [ ] standby release asset 若解锁，selftest 同时检查 `config/reference/standby/v0/standby_ref.trk` 和 `config/reference/standby/v0/ASSET_MANIFEST.yaml`；不把 `CANDIDATE_MANIFEST.json` 当 release manifest。
+- [ ] release notes 明确 `standby_ref.trk` asset 已模拟器接受、真机 gate
+  pending，且不声明整体 GA。
+- [ ] standby release asset selftest 检查
+  `config/reference/standby/v0/standby_ref.trk` 和
+  `config/reference/standby/v0/ASSET_MANIFEST.yaml`；不把
+  `CANDIDATE_MANIFEST.json` 当 release manifest。
 - [ ] aarch64 package 从 `HEAD` 构建；所有 release 必要变更已 commit。
 - [ ] package selftest 和 skill tests 通过。
 

@@ -135,7 +135,8 @@ void requireFiniteActions(const Vec& actions) {
 
 struct OnnxPolicyRuntime::Impl {
   Impl(const std::filesystem::path& model_path, const DeployConfig& deploy_config)
-      : env(ORT_LOGGING_LEVEL_WARNING, "agentic_et1_policy_runtime") {
+      : deploy_config(deploy_config),
+        env(ORT_LOGGING_LEVEL_WARNING, "agentic_et1_policy_runtime") {
     session_options.SetIntraOpNumThreads(1);
     session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
     session = std::make_unique<Ort::Session>(
@@ -145,6 +146,7 @@ struct OnnxPolicyRuntime::Impl {
     validateGaPolicyIoContract(deploy_config, metadata);
   }
 
+  DeployConfig deploy_config;
   Ort::Env env;
   Ort::SessionOptions session_options;
   Ort::AllocatorWithDefaultOptions allocator;
@@ -174,16 +176,16 @@ OnnxPolicyRuntime& OnnxPolicyRuntime::operator=(OnnxPolicyRuntime&&) noexcept =
 
 Vec OnnxPolicyRuntime::infer(const PolicyInputs& inputs) {
   try {
-    validateGaPolicyInputs(inputs);
+    validateGaPolicyInputs(impl_->deploy_config, inputs);
 
     Vec obs_current = inputs.obs_current;
     Vec obs_history = inputs.obs_history;
 
     const std::array<std::int64_t, 2> obs_current_shape{
-        1, static_cast<std::int64_t>(kGaPolicyObsCurrentDim)};
+        1, static_cast<std::int64_t>(impl_->deploy_config.obs_current_dim)};
     const std::array<std::int64_t, 3> obs_history_shape{
-        1, static_cast<std::int64_t>(kGaPolicyObsHistoryLength),
-        static_cast<std::int64_t>(kGaPolicyObsHistoryWidth)};
+        1, static_cast<std::int64_t>(impl_->deploy_config.obs_history_length),
+        static_cast<std::int64_t>(impl_->deploy_config.obs_history_width)};
 
     Ort::MemoryInfo memory_info =
         Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);

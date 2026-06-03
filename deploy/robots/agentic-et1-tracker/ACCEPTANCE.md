@@ -34,9 +34,9 @@ Environment: local workspace `/home/galbot/works/et1`
   passed.
 
 This targeted verification did not execute MuJoCo visual acceptance or real
-robot acceptance. It also did not unlock the `standby_ref.trk` asset gate; no
-validated app-local `config/reference/standby/v0/standby_ref.trk` plus manifest
-was accepted in this round.
+robot acceptance. At that point there was not yet a recorded app-local
+`standby_ref.trk` release asset; see the later same-day standby reference asset
+evidence below for the simulator-accepted app-local asset promotion.
 
 2026-06-02 docs/skill CLI checks only:
 
@@ -59,10 +59,13 @@ App-local release assets live under
 `deploy/robots/agentic-et1-tracker/config` and must be used at runtime without
 fallback to the ET1 app tree:
 
-- GeneralTracker: `config/policy/general_tracker`
+- Default CLN policy: `GeneralTrackerCLN` at
+  `config/policy/general_tracker_cln`
 - StandbyVelocity: `config/policy/velocity/v0`
 - FixStand posture: `config/posture/fixstand/v0/fixstand.yaml`
 - Passive posture: `config/posture/passive/v0/passive.yaml`
+- Standby reference: `config/reference/standby/v0/standby_ref.trk`
+  with simulator acceptance recorded and real-robot validation pending.
 
 ## Offline standby_ref candidate evidence
 
@@ -90,9 +93,28 @@ fallback to the ET1 app tree:
 - `python3 -m py_compile /home/galbot/works/et1/unitree_rl_lab/deploy/robots/agentic-et1-tracker/tools/derive_standby_ref_candidate.py /home/galbot/works/et1/unitree_rl_lab/deploy/robots/agentic-et1-tracker/tools/test_derive_standby_ref_candidate.py`:
   passed.
 
-This does not unlock the `standby_ref.trk` release gate. No candidate was
-placed under `config/reference/standby/v0/`, and no release
-`standby_ref.trk` asset was accepted.
+This candidate generation step alone did not record a `standby_ref.trk` release
+asset. The later release asset promotion below records the accepted app-local
+asset and keeps runtime playback and real-robot GA gates pending.
+
+## Standby_ref release asset evidence
+
+2026-06-03 targeted standby reference asset promotion after simulator review:
+
+- User acceptance input: the candidate was reviewed in simulator and accepted
+  for use as `standby_ref`.
+- The build-local candidate was copied byte-for-byte to
+  `deploy/robots/agentic-et1-tracker/config/reference/standby/v0/standby_ref.trk`.
+- Release manifest and local README were added under
+  `config/reference/standby/v0/`.
+- Release asset sha256:
+  `6ca49404e1ee1008f6226a2f7c00e990f0447ae6c826657246b7a29fbb525741`,
+  size `41400` bytes, frames `25`, fps `50.0`, duration `0.48` s.
+- Scope: asset, docs, and selftest only. Runtime playback logic was not
+  changed in this slice.
+- Status: release asset recorded and simulator visual acceptance recorded for
+  this asset; runtime playback and real-robot/operator validation remain
+  pending. This does not claim overall GA.
 
 ## GA idle/status/control acceptance items
 
@@ -120,10 +142,11 @@ Contract-level GA evidence must cover:
 
 ## Manual MuJoCo acceptance
 
-No fresh MuJoCo visual acceptance has been recorded for the current revision.
-Earlier MuJoCo evidence predated the current FixStand/StandbyVelocity/FSM
-semantics and is historical only. No idle/status/control MuJoCo acceptance has
-been recorded in this docs/skill pass.
+No broad fresh MuJoCo visual acceptance has been recorded for the current
+revision beyond the targeted `standby_ref.trk` simulator review above. Earlier
+MuJoCo evidence predated the current FixStand/StandbyVelocity/FSM semantics and
+is historical only. No idle/status/control MuJoCo acceptance has been recorded
+in this docs/skill pass.
 
 This section records an acceptance operation-order correction only. It does
 not change code semantics, add an API, or claim that MuJoCo visual acceptance
@@ -189,16 +212,16 @@ Pending MuJoCo evidence must record:
 | Default ROBOT/ONNX build | recorded above | Keep default configure/build on the real integration path. |
 | Hermetic stub tests | recorded above | Keep explicit stub/test configure and tests passing. |
 | Docs/skill CLI contract | recorded above | Keep packaged and installed skill tests/diffs passing. |
-| `standby_ref.trk` release asset | pending | App-local validated asset plus manifest; gate not unlocked in the 2026-06-03 targeted verification. |
-| MuJoCo visual acceptance | pending | Record scenarios listed above with `config.sim.yaml.example`. |
+| `standby_ref.trk` release asset | simulator accepted; real robot pending | App-local asset and manifest are recorded; hardware/operator validation remains pending before GA. |
+| MuJoCo visual acceptance | partial; pending | Targeted standby_ref simulator review is recorded; broader scenarios listed above still need `config.sim.yaml.example` evidence. |
 | Real robot acceptance | pending | ET1 hardware/operator validation. |
 
-Do not mark GA until the pending MuJoCo, real-robot, and standby asset gates
+Do not mark GA until the pending broader MuJoCo/control and real-robot gates
 are complete.
 
 ## Remaining external pending
 
-True MuJoCo visual acceptance and real-robot validation are still pending. The
-real-robot gate requires ET1 hardware and an operator window. The standby
-reference asset gate remains pending until a validated app-local
-`standby_ref.trk` plus manifest is accepted.
+True end-to-end MuJoCo control acceptance and real-robot validation are still
+pending. The real-robot gate requires ET1 hardware and an operator window. The
+standby reference asset is app-owned and simulator accepted, but hardware
+validation remains pending before GA.

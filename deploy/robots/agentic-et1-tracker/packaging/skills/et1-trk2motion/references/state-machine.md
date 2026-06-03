@@ -20,9 +20,10 @@ Control states:
   remains queryable until another user run or a control command releases it.
 - `running` with `active.kind=="transition"`: internal synthetic transition to
   `transition.target`. Validated current local targets are `user` and `idle`;
-  `standby` is reserved/gated until an app-local validated `standby_ref.trk`
-  asset plus manifest is present. It has no run id, does not enter
-  queue/history, and does not consume `queue.limit`.
+  `standby` remains reserved because `standby_ref.trk` runtime playback and
+  real-robot GA gates are pending, even though the asset is recorded and
+  simulator accepted. It has no run id, does not enter queue/history, and does
+  not consume `queue.limit`.
 - `stopping`: poll `state`; `stop` remains idempotent.
 - `fault` or `block:"lowcmd_occupied"`: manual/operator state.
 
@@ -41,5 +42,6 @@ states other than `done` remain failures by default. Use
 acceptable.
 
 `stop` immediately aborts active user, idle, holding, or transition work.
-`standby_ref.trk` is gated until an app-local validated asset plus manifest is
-present; direct `standby`/`standby_velocity` remains available without it.
+`standby_ref.trk` is recorded and simulator accepted, but runtime playback and
+real-robot GA gates remain pending; direct `standby`/`standby_velocity` remains
+available without playback of that asset.

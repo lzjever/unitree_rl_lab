@@ -170,6 +170,7 @@ TEST_CASE("ObservationBuilder emits identity reference and live observation part
   const PolicyObservationParts parts =
       buildObservationParts(config, frame.view(), low, last_action, state);
 
+  requireVecApprox(parts.command_yaw, {1.0F, 0.0F});
   requireVecApprox(parts.command_root_ori_b, {1.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F});
   requireVecApprox(parts.command_xy_yaw_vel, {1.5F, -2.0F, -0.75F});
   requireSeqApprox(parts.command_jnt_pos, 100.0F, kJointDim);
@@ -216,6 +217,7 @@ TEST_CASE("ObservationBuilder applies yaw bias to root orientation and reference
   const float relative_yaw = 2.0F * kPi / 9.0F;
   const float c = std::cos(relative_yaw);
   const float s = std::sin(relative_yaw);
+  requireVecApprox(parts.command_yaw, {c, s});
   requireVecApprox(parts.command_root_ori_b, {c, -s, s, c, 0.0F, 0.0F});
 
   const float nav_yaw = kPi / 3.0F;

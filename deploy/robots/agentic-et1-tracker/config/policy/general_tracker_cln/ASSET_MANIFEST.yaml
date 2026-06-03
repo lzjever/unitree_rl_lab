@@ -1,0 +1,23 @@
+profile: GeneralTrackerCLN
+owner: agentic-et1-tracker
+asset_dir: config/policy/general_tracker_cln
+purpose: release/package audit only
+runtime_use: "not a runtime fallback, downloader config, or registry"
+schema:
+  name: ET1TRK1
+  version: 1
+  app_contract: agentic-et1-tracker GeneralTrackerCLN
+runtime_contract:
+  fps: 50
+  joint_dim: 26
+  obs_current_shape: [1, 121]
+  obs_history_shape: [1, 25, 35]
+  actions_shape: [1, 26]
+required_files:
+  - path: exported/multi_policy_v17c2_70k.onnx
+    sha256: "d4f37c972eb5e98e37a1d425302a70729343009a1564974921965c5faea0d911"
+    size_bytes: 12266250
+  - path: params/deploy.yaml
+    sha256: "de8ba00c0b79590b2ccc0a7d84fcc0db4a8869ad9111e54e46c9427b89ffaf84"
+    size_bytes: 3215
+source_notes: "app-owned copy of deploy/robots/et1/config/policy/general_tracker_cln release assets"

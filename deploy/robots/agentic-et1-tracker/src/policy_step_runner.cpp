@@ -13,18 +13,12 @@ PolicyStepError error(const std::string& message) {
   return PolicyStepError("policy step error: " + message);
 }
 
-TrkFrameView requireFrame(const TrkTrack& track, std::size_t frame_index) {
-  const std::optional<TrkFrameView> frame = track.frame(frame_index);
-  if (!frame.has_value()) {
-    std::ostringstream out;
-    out << "frame index " << frame_index << " is outside track frames";
-    throw error(out.str());
-  }
-  return *frame;
-}
-
 Vec zeroLastAction() {
   return Vec(kPolicyJointCount, 0.0F);
+}
+
+bool usesTemporalHistory(const DeployConfig& config) {
+  return config.observation_contract == ObservationContract::GeneralTracker;
 }
 
 }  // namespace
@@ -84,16 +78,17 @@ PolicyStepResult PolicyStepRunner::step(std::size_t frame_index,
                                         PolicyInference& policy,
                                         const LowCmdFrame* base_frame) {
   try {
-    const TrkFrameView frame = requireFrame(*track_, frame_index);
     const PolicyObservationParts parts =
-        buildObservationParts(config_, frame, low_state, last_action_, builder_state_,
+        buildObservationParts(config_, *track_, frame_index, low_state, last_action_, builder_state_,
                               builder_config_);
 
     HistoryBuffer next_history = history_;
-    if (history_ready_) {
-      next_history.push(parts);
-    } else {
-      next_history.reset(parts);
+    if (usesTemporalHistory(config_)) {
+      if (history_ready_) {
+        next_history.push(parts);
+      } else {
+        next_history.reset(parts);
+      }
     }
 
     PolicyStepResult result;
@@ -105,7 +100,7 @@ PolicyStepResult PolicyStepRunner::step(std::size_t frame_index,
         makeLowCmdFrame(config_, result.output, expected_mode_machine_, base_frame);
 
     history_ = std::move(next_history);
-    history_ready_ = true;
+    history_ready_ = usesTemporalHistory(config_) ? true : history_ready_;
     last_action_ = raw_action;
     return result;
   } catch (const PolicyStepError&) {

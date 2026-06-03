@@ -197,19 +197,22 @@ those remain manual operator actions during MuJoCo acceptance.
 Release policy/control assets are owned by `agentic-et1-tracker` and live under
 `deploy/robots/agentic-et1-tracker/config`:
 
-- GeneralTracker policy: `config/policy/general_tracker`
+- GeneralTrackerCLN policy: `config/policy/general_tracker_cln`
 - StandbyVelocity policy: `config/policy/velocity/v0`
 - FixStand posture: `config/posture/fixstand/v0/fixstand.yaml`
 - Passive posture: `config/posture/passive/v0/passive.yaml`
+- Standby reference asset: `config/reference/standby/v0/standby_ref.trk`
 
 Runtime configuration must point at these app-local release assets. Runtime
 does not fall back to the ET1 app tree under `deploy/robots/et1`.
+The public motion input contract remains the existing `.trk` format; CLN does
+not add `.et1trk` as a service input.
 
-`standby_ref.trk` remains a gated release deliverable. Until an app-local,
-validated `config/reference/standby/v0/standby_ref.trk` plus manifest is
-checked in and accepted, do not claim a completed standby reference transition
-or rely on playback of that asset. Direct `/standby_velocity` and the
-StandbyVelocity/Velocity0 policy path remain available.
+`standby_ref.trk` is now an app-owned release asset with simulator visual
+acceptance recorded in its manifest. The real-robot/operator gate remains
+pending, and this docs/asset slice does not change runtime playback logic or
+claim overall GA. Direct `/standby_velocity` and the StandbyVelocity/Velocity0
+policy path remain available.
 
 For manual or integration simulation testing in this workspace, the installed
 Unitree MuJoCo simulator under `/home/galbot/works/et1` can be used. Test
@@ -229,10 +232,10 @@ part of the agent-facing command contract.
 ## Manual MuJoCo Acceptance
 
 This is a manual integration acceptance skeleton, not a complete GA simulation
-evidence script and not evidence that acceptance has already been completed.
-Complete GA simulation evidence still needs recorded queue FIFO, interrupt,
-stop-to-standby_velocity, `/fixstand`, `/standby_velocity`, fault/disconnect,
-and performance results.
+evidence script. The standby reference asset has targeted simulator visual
+acceptance, but complete GA simulation evidence still needs recorded queue
+FIFO, interrupt, stop-to-standby_velocity, `/fixstand`, `/standby_velocity`,
+fault/disconnect, and performance results.
 
 This is an acceptance operation-order note only, not a code semantics change or
 new API. If `/status` already reports `ready:true` and

@@ -65,6 +65,20 @@ AppConfig loadYaml(const std::string& yaml) {
   return tmp.load();
 }
 
+std::string policyYaml(const std::string& profile,
+                       const std::filesystem::path& policy_dir,
+                       const std::filesystem::path& deploy) {
+  return "agentic_et1_tracker:\n"
+         "  motion_dirs: [\"/tmp/motions\"]\n"
+         "  policy:\n"
+         "    profile: \"" +
+         profile + "\"\n"
+         "    policy_dir: \"" +
+         policy_dir.string() + "\"\n"
+         "    deploy: \"" +
+         deploy.string() + "\"\n";
+}
+
 std::filesystem::path appRoot() {
   return std::filesystem::absolute(std::filesystem::path(__FILE__).parent_path().parent_path())
       .lexically_normal();
@@ -117,12 +131,12 @@ agentic_et1_tracker:
   REQUIRE(config.release_motion_mode_max_attempts == 3);
   REQUIRE(config.release_motion_mode_retry_interval_ms == 500);
   REQUIRE(config.lock_path.empty());
-  REQUIRE(config.policy.profile == "GeneralTracker");
+  REQUIRE(config.policy.profile == "GeneralTrackerCLN");
   REQUIRE(config.policy.policy_dir ==
-          (config_dir / "config/policy/general_tracker").lexically_normal().string());
-  REQUIRE(config.policy.policy_file == "self_collision_footmesh_15k.onnx");
+          (config_dir / "config/policy/general_tracker_cln").lexically_normal().string());
+  REQUIRE(config.policy.policy_file == "multi_policy_v17c2_70k.onnx");
   REQUIRE(config.policy.deploy ==
-          (config_dir / "config/policy/general_tracker/params/deploy.yaml")
+          (config_dir / "config/policy/general_tracker_cln/params/deploy.yaml")
               .lexically_normal()
               .string());
   REQUIRE(config.control.startup_control == "FixStand");
@@ -148,6 +162,14 @@ TEST_CASE("AppConfig default file keeps StandbyVelocity and posture assets app-o
   const auto root = appRoot();
   const auto config = loadAppConfig(root / "config.yaml");
 
+  REQUIRE(config.policy.profile == "GeneralTrackerCLN");
+  REQUIRE(pathIsAtOrWithin(config.policy.policy_dir,
+                           root / "config/policy/general_tracker_cln"));
+  REQUIRE(config.policy.policy_file == "multi_policy_v17c2_70k.onnx");
+  REQUIRE(config.policy.deploy ==
+          (root / "config/policy/general_tracker_cln/params/deploy.yaml")
+              .lexically_normal()
+              .string());
   REQUIRE(pathIsAtOrWithin(config.control.velocity_policy_dir,
                            root / "config/policy/velocity/v0"));
   REQUIRE(config.control.velocity_policy_file == "policy.onnx");
@@ -176,8 +198,14 @@ TEST_CASE("AppConfig simulation example is ready for local MuJoCo acceptance") {
   REQUIRE_FALSE(config.release_motion_mode_on_startup);
   REQUIRE(config.trk.allowlist_dirs ==
           std::vector<std::filesystem::path>{"/home/galbot/works/et1/generated"});
+  REQUIRE(config.policy.profile == "GeneralTrackerCLN");
   REQUIRE(pathIsAtOrWithin(config.policy.policy_dir,
-                           root / "config/policy/general_tracker"));
+                           root / "config/policy/general_tracker_cln"));
+  REQUIRE(config.policy.policy_file == "multi_policy_v17c2_70k.onnx");
+  REQUIRE(config.policy.deploy ==
+          (root / "config/policy/general_tracker_cln/params/deploy.yaml")
+              .lexically_normal()
+              .string());
   REQUIRE(pathIsAtOrWithin(config.control.velocity_policy_dir,
                            root / "config/policy/velocity/v0"));
   REQUIRE(pathIsAtOrWithin(config.control.fixstand_config,
@@ -504,15 +532,27 @@ agentic_et1_tracker:
                       ContainsSubstring("motion_dirs"));
 }
 
-TEST_CASE("AppConfig rejects unsupported policy profiles") {
+TEST_CASE("AppConfig accepts supported policy profiles and rejects unknown profiles") {
   SECTION("GeneralTrackerCLN") {
-    REQUIRE_THROWS_WITH(loadYaml(R"yaml(
+    const auto config = loadYaml(R"yaml(
 agentic_et1_tracker:
   motion_dirs: ["/tmp/motions"]
   policy:
     profile: "GeneralTrackerCLN"
-)yaml"),
-                        ContainsSubstring("policy.profile"));
+)yaml");
+    REQUIRE(config.policy.profile == "GeneralTrackerCLN");
+  }
+
+  SECTION("legacy GeneralTracker") {
+    const auto config = loadYaml(R"yaml(
+agentic_et1_tracker:
+  motion_dirs: ["/tmp/motions"]
+  policy:
+    profile: "GeneralTracker"
+    policy_dir: "config/policy/general_tracker"
+    deploy: "config/policy/general_tracker/params/deploy.yaml"
+)yaml");
+    REQUIRE(config.policy.profile == "GeneralTracker");
   }
 
   SECTION("arbitrary profile") {
@@ -522,6 +562,26 @@ agentic_et1_tracker:
   policy:
     profile: "CustomTracker"
 )yaml"),
+                        ContainsSubstring("policy.profile"));
+  }
+}
+
+TEST_CASE("AppConfig rejects policy profile and deploy observation contract mismatches") {
+  const auto root = appRoot();
+  const auto legacy_policy_dir = root / "config/policy/general_tracker";
+  const auto legacy_deploy = legacy_policy_dir / "params/deploy.yaml";
+  const auto cln_policy_dir = root / "config/policy/general_tracker_cln";
+  const auto cln_deploy = cln_policy_dir / "params/deploy.yaml";
+
+  SECTION("legacy profile with CLN deploy") {
+    REQUIRE_THROWS_WITH(loadYaml(policyYaml("GeneralTracker", cln_policy_dir, cln_deploy)),
+                        ContainsSubstring("policy.profile"));
+  }
+
+  SECTION("CLN profile with legacy deploy") {
+    REQUIRE_THROWS_WITH(loadYaml(policyYaml("GeneralTrackerCLN",
+                                            legacy_policy_dir,
+                                            legacy_deploy)),
                         ContainsSubstring("policy.profile"));
   }
 }

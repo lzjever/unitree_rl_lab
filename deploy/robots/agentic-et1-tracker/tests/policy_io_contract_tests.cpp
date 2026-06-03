@@ -15,6 +15,8 @@ constexpr std::size_t kJointDim = 26;
 constexpr std::size_t kObsCurrentDim = 131;
 constexpr std::size_t kHistoryLength = 25;
 constexpr std::size_t kHistoryWidth = 105;
+constexpr std::size_t kClnObsCurrentDim = 121;
+constexpr std::size_t kClnHistoryWidth = 35;
 
 std::vector<int> intRange(std::size_t count) {
   std::vector<int> values;
@@ -71,6 +73,26 @@ std::vector<ObservationTerm> historyTerms() {
   });
 }
 
+std::vector<ObservationTerm> clnCurrentTerms() {
+  return terms({
+      {"command_yaw", 2},
+      {"command_root_ori_b", 6},
+      {"command_xy_yaw_vel", 3},
+      {"command_jnt_pos", kJointDim},
+      {"projected_gravity", 3},
+      {"base_ang_vel", 3},
+      {"joint_pos_rel", kJointDim},
+      {"joint_vel_rel", kJointDim},
+      {"last_action", kJointDim},
+  });
+}
+
+std::vector<ObservationTerm> clnHistoryTerms() {
+  return terms({
+      {"future_commands", kClnHistoryWidth},
+  });
+}
+
 DeployConfig validConfig() {
   DeployConfig config;
   config.joint_dim = kJointDim;
@@ -91,11 +113,34 @@ DeployConfig validConfig() {
   return config;
 }
 
+DeployConfig validClnConfig() {
+  DeployConfig config = validConfig();
+  config.observation_contract = ObservationContract::GeneralTrackerCLN;
+  config.obs_current_dim = kClnObsCurrentDim;
+  config.obs_history_width = kClnHistoryWidth;
+  config.obs_history_length = kHistoryLength;
+  config.obs_current_terms = clnCurrentTerms();
+  config.obs_history_terms = clnHistoryTerms();
+  return config;
+}
+
 PolicyModelMetadata validMetadata() {
   return {
       {
           {"obs_current", PolicyTensorElementType::Float32, {1, 131}},
           {"obs_history", PolicyTensorElementType::Float32, {1, 25, 105}},
+      },
+      {
+          {"actions", PolicyTensorElementType::Float32, {1, 26}},
+      },
+  };
+}
+
+PolicyModelMetadata validClnMetadata() {
+  return {
+      {
+          {"obs_current", PolicyTensorElementType::Float32, {1, 121}},
+          {"obs_history", PolicyTensorElementType::Float32, {1, 25, 35}},
       },
       {
           {"actions", PolicyTensorElementType::Float32, {1, 26}},
@@ -131,6 +176,11 @@ void requireDeployRejects(const DeployConfig& config,
 TEST_CASE("GA policy IO contract accepts frozen deploy dims and ONNX metadata") {
   REQUIRE_NOTHROW(validateGaDeployConfig(validConfig()));
   REQUIRE_NOTHROW(validateGaPolicyIoContract(validConfig(), validMetadata()));
+}
+
+TEST_CASE("GA policy IO contract accepts GeneralTrackerCLN deploy dims and ONNX metadata") {
+  REQUIRE_NOTHROW(validateGaDeployConfig(validClnConfig()));
+  REQUIRE_NOTHROW(validateGaPolicyIoContract(validClnConfig(), validClnMetadata()));
 }
 
 TEST_CASE("GA policy IO contract rejects input name drift") {

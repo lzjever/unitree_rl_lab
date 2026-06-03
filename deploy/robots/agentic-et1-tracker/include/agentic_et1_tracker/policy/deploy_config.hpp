@@ -14,8 +14,14 @@ struct ObservationTerm {
   std::size_t offset{0};
 };
 
+enum class ObservationContract {
+  GeneralTracker,
+  GeneralTrackerCLN,
+};
+
 struct DeployConfig {
   std::size_t joint_dim{26};
+  ObservationContract observation_contract{ObservationContract::GeneralTracker};
   std::vector<int> joint_ids_map;
   std::vector<int> sdk_joint_ids_map;
   std::vector<int> override_joint_ids;
