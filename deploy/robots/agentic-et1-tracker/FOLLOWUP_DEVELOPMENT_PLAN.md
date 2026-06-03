@@ -1,6 +1,6 @@
 # agentic-et1-tracker 后续开发计划
 
-更新日期：2026-06-03
+更新日期：2026-06-04
 
 ## 1. 目标与范围快照
 
@@ -167,9 +167,11 @@ real robot GA gates 仍 pending；不要声明整体 GA。
 
 - [x] packaged skill tests 通过。
 - [x] 安装到本地 agent/codex skill 位置后的 diff 或版本证据通过。
-- CLI `run --hold --wait`、`status`、`raw` 输出仍为 compact one-line JSON。
-- aarch64 release package 从当前 `HEAD` 克隆构建，包含 app-owned assets、skill、scripts、selftest。
-- 明确记录：未提交 tracked changes、untracked files、本地 config edits 不会进入 release workspace。
+- [x] CLI `run --hold --wait`、`status`、`raw` 输出仍为 compact one-line JSON；skill tests 已覆盖，且 WP6 记录 `run --hold --wait`、`status`、`raw` 合同项。
+- [x] aarch64 release package 从 release workspace commit `39c6ada` 克隆构建，包含 app-owned assets、skill、scripts、selftest。静态验证包路径
+  `deploy/robots/agentic-et1-tracker/packaging/dist/agentic-et1-tracker-head-39c6ada-cln-aarch64.tar.gz`,
+  sha256 `4ef438630326fde4ae3f021e7dddf74dbb64dba3a80c06ddd03eaa38945cf801`。
+- [x] 未提交 tracked changes、untracked files、本地 config edits 不会进入 release workspace；aarch64 release path 使用干净 clone，并在第 8 节记录该边界。
 
 ## 5. TDD 要求
 
@@ -228,8 +230,12 @@ Release package：
   `config/reference/standby/v0/standby_ref.trk` 和
   `config/reference/standby/v0/ASSET_MANIFEST.yaml`；不把
   `CANDIDATE_MANIFEST.json` 当 release manifest。
-- [ ] aarch64 package 从 `HEAD` 构建；所有 release 必要变更已 commit。
-- [x] package selftest 和 skill tests 通过。
+- [x] aarch64 package 从 release workspace commit `39c6ada` 构建；静态验证覆盖 package
+  content、CLN ONNX hash、legacy `general_tracker` absent、
+  `general_tracker_cln`/`velocity/v0`/`standby_ref.trk`/skill/scripts
+  present、config template 指向 CLN ONNX、ARM aarch64 ELF 与 RUNPATH。未在
+  x86 host 直接运行 aarch64 selftest。
+- [x] x86 package selftest 和 skill tests 已有记录；aarch64 package 本次为静态验证，未在 x86 host 直接运行 selftest。
 
 ## 7. 安全约束
 
@@ -240,7 +246,7 @@ Release package：
 
 ## 8. 工作树 / 发布注意
 
-aarch64 release path 会从当前 git commit `HEAD` 准备干净 clone。未提交 tracked changes、untracked files、本地 config edits 都不会进入 release workspace。
+aarch64 release path 会从构建时 git `HEAD` 准备干净 clone。未提交 tracked changes、untracked files、本地 config edits 都不会进入 release workspace。
 
 发布前必须：
 

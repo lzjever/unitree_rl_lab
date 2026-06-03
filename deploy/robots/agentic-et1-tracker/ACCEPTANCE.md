@@ -20,6 +20,27 @@ Environment: local workspace `/home/galbot/works/et1`
 
 ## Docs/skill evidence
 
+2026-06-04 aarch64 release package static verification for release source commit
+`39c6ada`:
+
+- Package:
+  `deploy/robots/agentic-et1-tracker/packaging/dist/agentic-et1-tracker-head-39c6ada-cln-aarch64.tar.gz`;
+  sha256
+  `4ef438630326fde4ae3f021e7dddf74dbb64dba3a80c06ddd03eaa38945cf801`.
+- Static package verification covered packaged content, CLN ONNX hash, legacy
+  `config/policy/general_tracker` absence, and presence of
+  `config/policy/general_tracker_cln`, `config/policy/velocity/v0`,
+  `config/reference/standby/v0/standby_ref.trk`, bundled skill, and scripts.
+- Packaged config template points to `general_tracker_cln` and
+  `multi_policy_v17c2_70k.onnx`.
+- `file` / `readelf` evidence confirms ARM aarch64 ELF and
+  `$ORIGIN/../lib` RUNPATH.
+
+This evidence is static verification of the release source commit `39c6ada`
+aarch64 package. The aarch64 selftest was not run directly on the x86 host.
+This does not claim broader MuJoCo/operator acceptance or real-robot GA
+completion.
+
 2026-06-04 CLN model/release package verification for this CLN release
 packaging change set:
 
