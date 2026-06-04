@@ -6,9 +6,9 @@
 
 namespace agentic_et1_tracker {
 
-// Align only the world-root XY origin. Z and all non-position arrays retain the
-// target track semantics.
-[[nodiscard]] std::optional<TrkTrack> alignTrackRootTranslation(
+// Align target frame-0 root XY and yaw to the source root. Root Z and
+// non-world/local arrays keep the target track semantics.
+[[nodiscard]] std::optional<TrkTrack> alignTrackRootPlanarPose(
     const TrkTrack& target,
     const TrkFrameView& source);
 

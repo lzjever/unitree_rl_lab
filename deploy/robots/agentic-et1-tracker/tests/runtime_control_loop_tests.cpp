@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -62,6 +63,7 @@ struct ArrayFixture {
   TrkDtype dtype{TrkDtype::Float32};
   std::vector<std::uint64_t> shape;
   std::optional<std::array<float, 3>> root_body_position;
+  std::optional<std::array<float, 4>> root_body_quat;
   bool invalid_contact{false};
   std::size_t invalid_contact_index{0};
   std::int64_t invalid_contact_value{3};
@@ -108,6 +110,9 @@ void writePayload(std::ofstream& out, const ArrayFixture& array) {
                       : static_cast<float>(i) * 0.25F;
     if (array.root_body_position && array.name == "body_pos_w" && i < 3) {
       value = array.root_body_position->at(i);
+    }
+    if (array.root_body_quat && array.name == "body_quat_w" && i < 4) {
+      value = array.root_body_quat->at(i);
     }
     writeScalar(out, value);
   }
@@ -162,12 +167,27 @@ std::filesystem::path validTrk(TempTree& tmp, const std::string& name, std::uint
   return path;
 }
 
-std::filesystem::path rootPositionTrk(TempTree& tmp,
-                                      const std::string& name,
-                                      std::uint64_t frames,
-                                      std::array<float, 3> root_body_position) {
+std::array<float, 4> yawQuat(float yaw_rad) {
+  return {std::cos(0.5F * yaw_rad), 0.0F, 0.0F, std::sin(0.5F * yaw_rad)};
+}
+
+float yawFromQuat(std::array<float, 4> quat_wxyz) {
+  const float w = quat_wxyz.at(0);
+  const float x = quat_wxyz.at(1);
+  const float y = quat_wxyz.at(2);
+  const float z = quat_wxyz.at(3);
+  return std::atan2(2.0F * (w * z + x * y),
+                    1.0F - 2.0F * (y * y + z * z));
+}
+
+std::filesystem::path rootPoseTrk(TempTree& tmp,
+                                  const std::string& name,
+                                  std::uint64_t frames,
+                                  std::array<float, 3> root_body_position,
+                                  std::array<float, 4> root_body_quat) {
   auto arrays = requiredArrays(frames);
   arrayNamed(arrays, "body_pos_w").root_body_position = root_body_position;
+  arrayNamed(arrays, "body_quat_w").root_body_quat = root_body_quat;
   const auto path = tmp.allowed / name;
   writeTrk(path, arrays);
   return path;
@@ -1253,7 +1273,8 @@ TEST_CASE("RuntimeControlLoop transition completion starts target user at frame 
   FAIL("target user did not start after synthetic transition");
 }
 
-TEST_CASE("RuntimeControlLoop aligns synthetic transition target root in memory") {
+TEST_CASE("RuntimeControlLoop aligns synthetic transition target root pose in memory") {
+  constexpr float kHalfPi = 1.57079632679F;
   TempTree tmp;
   const RuntimeConfig config = runtimeConfig();
   RuntimeStatusStore store(config);
@@ -1275,9 +1296,17 @@ TEST_CASE("RuntimeControlLoop aligns synthetic transition target root in memory"
                           &reference);
 
   const auto held_path =
-      rootPositionTrk(tmp, "held_five_meters.trk", 1, {5.0F, 0.0F, 0.0F});
+      rootPoseTrk(tmp,
+                  "held_five_meters_yaw90.trk",
+                  1,
+                  {5.0F, 0.0F, 0.0F},
+                  yawQuat(kHalfPi));
   const auto target_path =
-      rootPositionTrk(tmp, "target_origin.trk", 2, {0.0F, 0.0F, 0.0F});
+      rootPoseTrk(tmp,
+                  "target_origin_yaw0.trk",
+                  2,
+                  {0.0F, 0.0F, 0.0F},
+                  yawQuat(0.0F));
   REQUIRE(bridge.submitQueue(
               executeCommand("held-five-meters",
                              held_path,
@@ -1299,6 +1328,8 @@ TEST_CASE("RuntimeControlLoop aligns synthetic transition target root in memory"
   REQUIRE(snapshot.transition.target_id == "target-origin");
   REQUIRE(reference.latest.active);
   REQUIRE(reference.latest.p.at(0) == std::array<float, 3>{{5.0F, 0.0F, 0.0F}});
+  REQUIRE(yawFromQuat(reference.latest.q.at(0)) ==
+          Catch::Approx(kHalfPi).margin(1.0e-5F));
 
   loop.tick();
   REQUIRE_FALSE(tracker_policy.inputs_seen.empty());
@@ -1318,6 +1349,8 @@ TEST_CASE("RuntimeControlLoop aligns synthetic transition target root in memory"
       REQUIRE(reference.latest.id == "target-origin");
       REQUIRE(reference.latest.p.at(0) ==
               std::array<float, 3>{{5.0F, 0.0F, 0.0F}});
+      REQUIRE(yawFromQuat(reference.latest.q.at(0)) ==
+              Catch::Approx(kHalfPi).margin(1.0e-5F));
       return;
     }
   }

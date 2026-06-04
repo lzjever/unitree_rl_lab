@@ -782,7 +782,7 @@ bool RuntimeControlLoop::startTransitionFromIdleToUser(MotionRequest target_requ
   target_request.duration_s = loaded.track->metadata.duration_s;
   auto target_track = std::make_shared<TrkTrack>(std::move(*loaded.track));
   std::optional<TrkTrack> aligned_target_track =
-      alignTrackRootTranslation(*target_track, *source_frame);
+      alignTrackRootPlanarPose(*target_track, *source_frame);
   if (!aligned_target_track) {
     failTarget(std::move(target_request), ErrorCode::InternalError);
     return true;
@@ -1410,7 +1410,7 @@ bool RuntimeControlLoop::startTransitionFromCurrentReferenceToUser(
   target_request.duration_s = loaded.track->metadata.duration_s;
   auto target_track = std::make_shared<TrkTrack>(std::move(*loaded.track));
   std::optional<TrkTrack> aligned_target_track =
-      alignTrackRootTranslation(*target_track, *source_frame);
+      alignTrackRootPlanarPose(*target_track, *source_frame);
   if (!aligned_target_track) {
     target_request.state = MotionState::Failed;
     target_request.err = ErrorCode::InternalError;
@@ -1522,7 +1522,7 @@ bool RuntimeControlLoop::startTransitionFromCompletedIdleToIdle() {
 
   auto target_track = std::make_shared<TrkTrack>(std::move(*loaded.track));
   std::optional<TrkTrack> aligned_target_track =
-      alignTrackRootTranslation(*target_track, *source_frame);
+      alignTrackRootPlanarPose(*target_track, *source_frame);
   if (!aligned_target_track) {
     failTransition();
     return true;
@@ -1727,7 +1727,7 @@ bool RuntimeControlLoop::startSyntheticTransitionFromActiveFrame(
     return false;
   }
   std::optional<TrkTrack> aligned_target_track =
-      alignTrackRootTranslation(*target.target_track, *source_frame);
+      alignTrackRootPlanarPose(*target.target_track, *source_frame);
   if (!aligned_target_track) {
     if (target.target_request && !target.target_request->id.empty()) {
       target.target_request->state = MotionState::Failed;
