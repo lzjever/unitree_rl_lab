@@ -1,3 +1,4 @@
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
@@ -60,6 +61,7 @@ struct ArrayFixture {
   std::string name;
   TrkDtype dtype{TrkDtype::Float32};
   std::vector<std::uint64_t> shape;
+  std::optional<std::array<float, 3>> root_body_position;
   bool invalid_contact{false};
   std::size_t invalid_contact_index{0};
   std::int64_t invalid_contact_value{3};
@@ -101,9 +103,12 @@ void writePayload(std::ofstream& out, const ArrayFixture& array) {
   }
 
   for (std::size_t i = 0; i < elements; ++i) {
-    const float value = array.zero_first_quaternion && i < 4
-                            ? 0.0F
-                            : static_cast<float>(i) * 0.25F;
+    float value = array.zero_first_quaternion && i < 4
+                      ? 0.0F
+                      : static_cast<float>(i) * 0.25F;
+    if (array.root_body_position && array.name == "body_pos_w" && i < 3) {
+      value = array.root_body_position->at(i);
+    }
     writeScalar(out, value);
   }
 }
@@ -154,6 +159,17 @@ void writeTrk(const std::filesystem::path& path, const std::vector<ArrayFixture>
 std::filesystem::path validTrk(TempTree& tmp, const std::string& name, std::uint64_t frames) {
   const auto path = tmp.allowed / name;
   writeTrk(path, requiredArrays(frames));
+  return path;
+}
+
+std::filesystem::path rootPositionTrk(TempTree& tmp,
+                                      const std::string& name,
+                                      std::uint64_t frames,
+                                      std::array<float, 3> root_body_position) {
+  auto arrays = requiredArrays(frames);
+  arrayNamed(arrays, "body_pos_w").root_body_position = root_body_position;
+  const auto path = tmp.allowed / name;
+  writeTrk(path, arrays);
   return path;
 }
 
@@ -1235,6 +1251,78 @@ TEST_CASE("RuntimeControlLoop transition completion starts target user at frame 
   }
 
   FAIL("target user did not start after synthetic transition");
+}
+
+TEST_CASE("RuntimeControlLoop aligns synthetic transition target root in memory") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeReferenceSink reference;
+  RuntimeControlLoop loop(config,
+                          bridge,
+                          store,
+                          TrkLoader(tmp.trkConfig()),
+                          robot,
+                          tracker_policy,
+                          deploy_config,
+                          passiveConfig(),
+                          kExpectedModeMachine,
+                          RuntimeMode::Real,
+                          &reference);
+
+  const auto held_path =
+      rootPositionTrk(tmp, "held_five_meters.trk", 1, {5.0F, 0.0F, 0.0F});
+  const auto target_path =
+      rootPositionTrk(tmp, "target_origin.trk", 2, {0.0F, 0.0F, 0.0F});
+  REQUIRE(bridge.submitQueue(
+              executeCommand("held-five-meters",
+                             held_path,
+                             MotionMode::Queue,
+                             1,
+                             true))
+              .ok());
+  startQueuedRun(loop, store, "held-five-meters");
+  loop.tick();
+  REQUIRE(store.snapshot().exec->state == MotionState::Holding);
+
+  REQUIRE(bridge.submitQueue(
+              executeCommand("target-origin", target_path, MotionMode::Queue, 2))
+              .ok());
+  loop.tick();
+
+  auto snapshot = store.snapshot();
+  REQUIRE(snapshot.active.kind == ActiveKind::Transition);
+  REQUIRE(snapshot.transition.target_id == "target-origin");
+  REQUIRE(reference.latest.active);
+  REQUIRE(reference.latest.p.at(0) == std::array<float, 3>{{5.0F, 0.0F, 0.0F}});
+
+  loop.tick();
+  REQUIRE_FALSE(tracker_policy.inputs_seen.empty());
+  const Vec& transition_obs = tracker_policy.inputs_seen.back().obs_current;
+  REQUIRE(transition_obs.size() > 8);
+  REQUIRE(transition_obs.at(6) == Catch::Approx(0.0F).margin(1.0F));
+
+  const std::size_t transition_frames = snapshot.transition.frames;
+  for (std::size_t i = 0; i < transition_frames + 3; ++i) {
+    loop.tick();
+    snapshot = store.snapshot();
+    if (snapshot.active.kind == ActiveKind::User) {
+      REQUIRE(snapshot.exec.has_value());
+      REQUIRE(snapshot.exec->id == "target-origin");
+      REQUIRE(snapshot.exec->frame == 0);
+      REQUIRE(reference.latest.active);
+      REQUIRE(reference.latest.id == "target-origin");
+      REQUIRE(reference.latest.p.at(0) ==
+              std::array<float, 3>{{5.0F, 0.0F, 0.0F}});
+      return;
+    }
+  }
+
+  FAIL("aligned target user did not start after synthetic transition");
 }
 
 TEST_CASE("RuntimeControlLoop transition abort controls terminate target user") {

@@ -142,9 +142,7 @@ class RuntimeControlLoop final {
   bool startTransitionFromCompletedIdleToIdle();
   bool startTransitionFromCompletedUserToIdle();
   bool startTransitionFromCompletedUserToStandby();
-  bool startSyntheticTransitionFromActiveFrame(PendingTransition target,
-                                               const TrkFrameView& target_frame,
-                                               double target_fps);
+  bool startSyntheticTransitionFromActiveFrame(PendingTransition target);
   bool startInternalTransition(std::shared_ptr<const TrkTrack> track,
                                PendingTransition target,
                                std::optional<LowStateSample> entry_low_state);
