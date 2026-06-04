@@ -64,6 +64,7 @@ struct ArrayFixture {
   std::vector<std::uint64_t> shape;
   std::optional<std::array<float, 3>> root_body_position;
   std::optional<std::array<float, 4>> root_body_quat;
+  bool identity_quaternions{false};
   bool invalid_contact{false};
   std::size_t invalid_contact_index{0};
   std::int64_t invalid_contact_value{3};
@@ -108,6 +109,9 @@ void writePayload(std::ofstream& out, const ArrayFixture& array) {
     float value = array.zero_first_quaternion && i < 4
                       ? 0.0F
                       : static_cast<float>(i) * 0.25F;
+    if (array.identity_quaternions && array.name == "body_quat_w") {
+      value = i % 4 == 0 ? 1.0F : 0.0F;
+    }
     if (array.root_body_position && array.name == "body_pos_w" && i < 3) {
       value = array.root_body_position->at(i);
     }
@@ -200,6 +204,11 @@ std::shared_ptr<const TrkTrack> loadTrack(const TrkValidationConfig& config,
   return std::make_shared<TrkTrack>(std::move(*loaded.track));
 }
 
+std::shared_ptr<const TrkTrack> validStandbyTrack(TempTree& tmp,
+                                                  const std::string& name) {
+  return loadTrack(tmp.trkConfig(), validTrk(tmp, name, 2));
+}
+
 std::filesystem::path invalidContactTrk(TempTree& tmp, const std::string& name) {
   auto arrays = requiredArrays(3);
   auto& left = arrayNamed(arrays, "left_foot_contact_state");
@@ -217,6 +226,16 @@ std::filesystem::path zeroQuaternionTrk(TempTree& tmp,
   auto arrays = requiredArrays(frames);
   auto& quat = arrayNamed(arrays, "body_quat_w");
   quat.zero_first_quaternion = true;
+  const auto path = tmp.allowed / name;
+  writeTrk(path, arrays);
+  return path;
+}
+
+std::filesystem::path identityQuaternionTrk(TempTree& tmp,
+                                           const std::string& name,
+                                           std::uint64_t frames) {
+  auto arrays = requiredArrays(frames);
+  arrayNamed(arrays, "body_quat_w").identity_quaternions = true;
   const auto path = tmp.allowed / name;
   writeTrk(path, arrays);
   return path;
@@ -682,11 +701,42 @@ void requireFixStandHoldMotor(const LowCmdFrame& frame,
   REQUIRE(frame.motors.at(sdk_slot).tau == 0.0F);
 }
 
+enum class StartQueuedRunMode {
+  RequireDirectStart,
+  AllowStandbyTransition,
+};
+
 void startQueuedRun(RuntimeControlLoop& loop,
                     RuntimeStatusStore& store,
-                    const std::string& id) {
+                    const std::string& id,
+                    StartQueuedRunMode mode =
+                        StartQueuedRunMode::RequireDirectStart) {
   loop.tick();
   auto snapshot = store.snapshot();
+  if (snapshot.active.kind == ActiveKind::Transition &&
+      snapshot.transition.active && snapshot.transition.target == "user") {
+    REQUIRE(mode == StartQueuedRunMode::AllowStandbyTransition);
+    REQUIRE(snapshot.ctrl == ControllerState::Running);
+    REQUIRE(snapshot.transition.target_id == id);
+    REQUIRE_FALSE(snapshot.exec.has_value());
+    REQUIRE(store.findRun(id).run->state == MotionState::Queued);
+    const std::size_t transition_frames = snapshot.transition.frames;
+    bool saw_user = false;
+    for (std::size_t i = 0; i < transition_frames * 32 + 32; ++i) {
+      loop.tick();
+      snapshot = store.snapshot();
+      if (snapshot.active.kind == ActiveKind::User) {
+        saw_user = true;
+        break;
+      }
+    }
+    REQUIRE(saw_user);
+    REQUIRE(snapshot.ctrl == ControllerState::Running);
+    REQUIRE(snapshot.exec.has_value());
+    REQUIRE(snapshot.exec->id == id);
+    return;
+  }
+
   REQUIRE(snapshot.ctrl == ControllerState::Preparing);
   REQUIRE(snapshot.exec.has_value());
   REQUIRE(snapshot.exec->id == id);
@@ -703,12 +753,14 @@ void startHoldingRun(RuntimeControlLoop& loop,
                      RuntimeBridge& bridge,
                      TempTree& tmp,
                      const std::string& id,
-                     FakeReferenceSink* reference = nullptr) {
+                     FakeReferenceSink* reference = nullptr,
+                     StartQueuedRunMode mode =
+                         StartQueuedRunMode::RequireDirectStart) {
   const auto path = validTrk(tmp, id + ".trk", 1);
   REQUIRE(bridge.submitQueue(
               executeCommand(id, path, MotionMode::Queue, 1, true))
               .ok());
-  startQueuedRun(loop, store, id);
+  startQueuedRun(loop, store, id, mode);
 
   loop.tick();
   const auto snapshot = store.snapshot();
@@ -734,8 +786,10 @@ void startHoldingToUserTransition(RuntimeControlLoop& loop,
                                   TempTree& tmp,
                                   const std::string& held_id,
                                   const std::string& target_id,
-                                  FakeReferenceSink* reference = nullptr) {
-  startHoldingRun(loop, store, bridge, tmp, held_id, reference);
+                                  FakeReferenceSink* reference = nullptr,
+                                  StartQueuedRunMode held_start_mode =
+                                      StartQueuedRunMode::RequireDirectStart) {
+  startHoldingRun(loop, store, bridge, tmp, held_id, reference, held_start_mode);
   const auto target_path = validTrk(tmp, target_id + ".trk", 2);
   REQUIRE(bridge.submitQueue(
               executeCommand(target_id, target_path, MotionMode::Queue, 2))
@@ -750,6 +804,36 @@ void startHoldingToUserTransition(RuntimeControlLoop& loop,
   REQUIRE(snapshot.transition.target == "user");
   REQUIRE(snapshot.transition.target_id == target_id);
   REQUIRE(snapshot.queue.ids.empty());
+}
+
+void requireStandbyGateFailure(const RuntimeControlLoop& loop,
+                               const RuntimeStatusStore& store,
+                               const FakeReferenceSink& reference,
+                               const FakeRobotIO& robot,
+                               const FakePolicy& tracker_policy,
+                               const FakeVelocityPolicy& velocity_policy,
+                               const std::string& id,
+                               ErrorCode expected_error) {
+  const auto snapshot = store.snapshot();
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Velocity);
+  REQUIRE(snapshot.ctrl == ControllerState::StandbyVelocity);
+  REQUIRE(snapshot.active.kind == ActiveKind::None);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE(snapshot.queue.ids.empty());
+  REQUIRE_FALSE(snapshot.idle.active);
+  REQUIRE_FALSE(reference.latest.active);
+  REQUIRE(reference.publish_calls == 0);
+  REQUIRE(tracker_policy.calls == 0);
+  REQUIRE(velocity_policy.calls == 0);
+  REQUIRE(robot.write_attempts == 0);
+  REQUIRE(robot.writes.empty());
+
+  const auto failed = store.findRun(id);
+  REQUIRE(failed.ok());
+  REQUIRE(failed.run.has_value());
+  REQUIRE(failed.run->state == MotionState::Failed);
+  REQUIRE(failed.run->err == expected_error);
 }
 
 TEST_CASE("PassiveConfig loads app-owned ET1 passive damping asset") {
@@ -1028,7 +1112,7 @@ TEST_CASE("RuntimeControlLoop control commands leave holding with required termi
            {"holding-fixstand", ControlMode::FixStand, MotionState::Stopped,
             ControllerState::FixStand, StopReason::Stop, 2},
            {"holding-standby", ControlMode::StandbyVelocity, MotionState::Done,
-            ControllerState::StandbyVelocity, StopReason::None, 1},
+            ControllerState::StandbyVelocity, StopReason::None, 40},
        }) {
     RuntimeStatusStore store(config);
     RuntimeBridge bridge(config, store);
@@ -1036,6 +1120,8 @@ TEST_CASE("RuntimeControlLoop control commands leave holding with required termi
     FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
     FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
     FakeReferenceSink reference;
+    const auto startup_standby_track =
+        validStandbyTrack(tmp, std::string(item.id) + "_startup_standby.trk");
     auto loop = makeControlLoop(config,
                                 bridge,
                                 store,
@@ -1048,8 +1134,15 @@ TEST_CASE("RuntimeControlLoop control commands leave holding with required termi
                                 fixstand_config,
                                 ControlMode::StandbyVelocity,
                                 passiveConfig(),
-                                &reference);
-    startHoldingRun(loop, store, bridge, tmp, item.id, &reference);
+                                &reference,
+                                startup_standby_track);
+    startHoldingRun(loop,
+                    store,
+                    bridge,
+                    tmp,
+                    item.id,
+                    &reference,
+                    StartQueuedRunMode::AllowStandbyTransition);
 
     if (std::string(item.id) == "holding-stop") {
       REQUIRE(bridge.stop().state == ControllerState::Stopping);
@@ -1104,7 +1197,13 @@ TEST_CASE("RuntimeControlLoop standby velocity from holding gates through standb
                               passiveConfig(),
                               &reference,
                               standby_track);
-  startHoldingRun(loop, store, bridge, tmp, "held-to-standby-ref", &reference);
+  startHoldingRun(loop,
+                  store,
+                  bridge,
+                  tmp,
+                  "held-to-standby-ref",
+                  &reference,
+                  StartQueuedRunMode::AllowStandbyTransition);
 
   REQUIRE(bridge.standbyVelocity().ok());
   loop.tick();
@@ -1386,6 +1485,8 @@ TEST_CASE("RuntimeControlLoop transition abort controls terminate target user") 
     FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
     FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
     FakeReferenceSink reference;
+    const auto startup_standby_track =
+        validStandbyTrack(tmp, std::string(item.target_id) + "_startup_standby.trk");
     auto loop = makeControlLoop(config,
                                 bridge,
                                 store,
@@ -1398,14 +1499,16 @@ TEST_CASE("RuntimeControlLoop transition abort controls terminate target user") 
                                 fixstand_config,
                                 ControlMode::StandbyVelocity,
                                 passiveConfig(),
-                                &reference);
+                                &reference,
+                                startup_standby_track);
     startHoldingToUserTransition(loop,
                                  store,
                                  bridge,
                                  tmp,
                                  std::string(item.target_id) + "-held",
                                  item.target_id,
-                                 &reference);
+                                 &reference,
+                                 StartQueuedRunMode::AllowStandbyTransition);
 
     if (item.mode == ControlMode::Passive) {
       REQUIRE(bridge.passive().ok());
@@ -1800,7 +1903,13 @@ TEST_CASE("RuntimeControlLoop controls abort standby reference gate without resu
                                 passiveConfig(),
                                 &reference,
                                 standby_track);
-    startHoldingRun(loop, store, bridge, tmp, item.id, &reference);
+    startHoldingRun(loop,
+                    store,
+                    bridge,
+                    tmp,
+                    item.id,
+                    &reference,
+                    StartQueuedRunMode::AllowStandbyTransition);
 
     REQUIRE(bridge.standbyVelocity().ok());
     loop.tick();
@@ -3223,6 +3332,7 @@ TEST_CASE("RuntimeControlLoop completed track returns to StandbyVelocity") {
   FakeRobotIO robot(readyLowState(deploy_config));
   FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
   FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  const auto standby_track = validStandbyTrack(tmp, "done_to_standby_ref.trk");
   auto loop = makeControlLoop(config,
                               bridge,
                               store,
@@ -3233,23 +3343,43 @@ TEST_CASE("RuntimeControlLoop completed track returns to StandbyVelocity") {
                               deploy_config,
                               velocity_config,
                               fixstand_config,
-                              ControlMode::StandbyVelocity);
+                              ControlMode::StandbyVelocity,
+                              passiveConfig(),
+                              nullptr,
+                              standby_track);
 
   REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Velocity);
   const auto path = validTrk(tmp, "done_to_standby.trk", 1);
   REQUIRE(bridge.submitQueue(executeCommand("done-standby", path, MotionMode::Queue, 1))
               .ok());
-  startQueuedRun(loop, store, "done-standby");
+  startQueuedRun(loop,
+                 store,
+                 "done-standby",
+                 StartQueuedRunMode::AllowStandbyTransition);
   REQUIRE(loop.internalStateForTest() == RuntimeInternalState::GeneralTrackerActive);
   loop.tick();
 
   auto snapshot = store.snapshot();
-  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::GeneralTrackerIdle);
-  REQUIRE(snapshot.ctrl == ControllerState::StandbyVelocity);
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::GeneralTrackerTransition);
+  REQUIRE(snapshot.ctrl == ControllerState::Running);
+  REQUIRE(snapshot.transition.active);
+  REQUIRE(snapshot.transition.target == "standby");
   REQUIRE_FALSE(snapshot.exec.has_value());
   REQUIRE(store.findRun("done-standby").run->state == MotionState::Done);
-  REQUIRE(robot.writes.size() == 1);
   const LowCmdFrame tracker_frame = robot.writes.back();
+
+  bool reached_standby = false;
+  for (int i = 0; i < 200; ++i) {
+    loop.tick();
+    snapshot = store.snapshot();
+    if (snapshot.active.kind == ActiveKind::None) {
+      reached_standby = true;
+      break;
+    }
+  }
+  REQUIRE(reached_standby);
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::GeneralTrackerIdle);
+  REQUIRE(snapshot.ctrl == ControllerState::StandbyVelocity);
 
   loop.tick();
   snapshot = store.snapshot();
@@ -3260,6 +3390,209 @@ TEST_CASE("RuntimeControlLoop completed track returns to StandbyVelocity") {
   requireVelocityFrame(robot.writes.back(), velocity_config, velocity_policy.next_raw);
   REQUIRE(robot.writes.back().motors.at(12).q != tracker_frame.motors.at(12).q);
   requireFixStandHoldMotor(robot.writes.back(), fixstand_config, 12);
+}
+
+TEST_CASE("RuntimeControlLoop standby no-active user gates through standby reference") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+
+  for (const MotionMode mode : {MotionMode::Queue, MotionMode::Interrupt}) {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeReferenceSink reference;
+    FakeRobotIO robot(readyLowState(deploy_config));
+    FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+    FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+    const auto standby_track =
+        loadTrack(tmp.trkConfig(),
+                  identityQuaternionTrk(
+                      tmp,
+                      std::string("standby_source_") + toString(mode) + ".trk",
+                      3));
+    const auto expected_source =
+        makeReferenceFrameSnapshot("",
+                                   *standby_track,
+                                   standby_track->metadata.frames - 1);
+    REQUIRE(expected_source.has_value());
+    auto loop = makeControlLoop(config,
+                                bridge,
+                                store,
+                                tmp.trkConfig(),
+                                robot,
+                                tracker_policy,
+                                velocity_policy,
+                                deploy_config,
+                                velocity_config,
+                                fixstand_config,
+                                ControlMode::StandbyVelocity,
+                                passiveConfig(),
+                                &reference,
+                                standby_track);
+
+    const std::string id = std::string("standby-first-user-") + toString(mode);
+    const auto user_path =
+        validTrk(tmp, std::string("standby_first_user_") + toString(mode) + ".trk", 2);
+    if (mode == MotionMode::Interrupt) {
+      REQUIRE(bridge.submitInterrupt(executeCommand(id, user_path, mode, 2)).ok());
+    } else {
+      REQUIRE(bridge.submitQueue(executeCommand(id, user_path, mode, 2)).ok());
+    }
+
+    loop.tick();
+
+    auto snapshot = store.snapshot();
+    REQUIRE(snapshot.ctrl == ControllerState::Running);
+    REQUIRE(snapshot.active.kind == ActiveKind::Transition);
+    REQUIRE_FALSE(snapshot.exec.has_value());
+    REQUIRE(snapshot.transition.active);
+    REQUIRE(snapshot.transition.target == "user");
+    REQUIRE(snapshot.transition.target_id == id);
+    REQUIRE(snapshot.transition.target_state == MotionState::Queued);
+    REQUIRE(snapshot.transition.frame == 0);
+    REQUIRE(snapshot.queue.ids.empty());
+    REQUIRE_FALSE(snapshot.idle.active);
+    REQUIRE(reference.latest.active);
+    REQUIRE(reference.latest.id.empty());
+    REQUIRE(reference.latest.frame == 0);
+    REQUIRE(reference.latest.p == expected_source->p);
+    REQUIRE(reference.latest.q == expected_source->q);
+    REQUIRE(reference.latest.c == expected_source->c);
+    REQUIRE(reference.latest.com == expected_source->com);
+    REQUIRE(store.findRun(id).run->state == MotionState::Queued);
+
+    bool saw_user = false;
+    const std::size_t transition_frames = snapshot.transition.frames;
+    for (std::size_t i = 0; i < transition_frames + 3; ++i) {
+      loop.tick();
+      snapshot = store.snapshot();
+      if (snapshot.active.kind == ActiveKind::User) {
+        saw_user = true;
+        REQUIRE(snapshot.ctrl == ControllerState::Running);
+        REQUIRE(snapshot.exec.has_value());
+        REQUIRE(snapshot.exec->id == id);
+        REQUIRE(snapshot.exec->state == MotionState::Running);
+        REQUIRE(snapshot.exec->frame == 0);
+        REQUIRE(snapshot.exec->frames == 2);
+        REQUIRE_FALSE(snapshot.transition.active);
+        REQUIRE(reference.latest.active);
+        REQUIRE(reference.latest.id == id);
+        REQUIRE(reference.latest.frame == 0);
+        break;
+      }
+    }
+    REQUIRE(saw_user);
+  }
+}
+
+TEST_CASE("RuntimeControlLoop standby no-active missing standby track fails user gate") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  auto loop = makeControlLoop(config,
+                              bridge,
+                              store,
+                              tmp.trkConfig(),
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              deploy_config,
+                              velocity_config,
+                              fixstand_config,
+                              ControlMode::StandbyVelocity,
+                              passiveConfig(),
+                              &reference);
+
+  const auto user_path = validTrk(tmp, "missing_standby_first_user.trk", 2);
+  REQUIRE(bridge.submitQueue(
+              executeCommand("missing-standby-first-user", user_path, MotionMode::Queue, 2))
+              .ok());
+
+  loop.tick();
+
+  requireStandbyGateFailure(loop,
+                            store,
+                            reference,
+                            robot,
+                            tracker_policy,
+                            velocity_policy,
+                            "missing-standby-first-user",
+                            ErrorCode::InternalError);
+}
+
+TEST_CASE("RuntimeControlLoop standby no-active user gate failures do not raw start") {
+  TempTree tmp;
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+
+  struct Case {
+    const char* id;
+    bool missing_target;
+    bool invalid_transition_duration;
+    ErrorCode expected_error;
+  };
+
+  for (const auto& item : std::vector<Case>{
+           {"standby-missing-target", true, false, ErrorCode::TrkFileNotFound},
+           {"standby-invalid-duration", false, true, ErrorCode::InternalError},
+       }) {
+    RuntimeConfig config = runtimeConfig();
+    if (item.invalid_transition_duration) {
+      config.transition_duration_s = 6.0;
+    }
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeReferenceSink reference;
+    FakeRobotIO robot(readyLowState(deploy_config));
+    FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+    FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+    const auto standby_track =
+        validStandbyTrack(tmp, std::string(item.id) + "_standby_ref.trk");
+    auto loop = makeControlLoop(config,
+                                bridge,
+                                store,
+                                tmp.trkConfig(),
+                                robot,
+                                tracker_policy,
+                                velocity_policy,
+                                deploy_config,
+                                velocity_config,
+                                fixstand_config,
+                                ControlMode::StandbyVelocity,
+                                passiveConfig(),
+                                &reference,
+                                standby_track);
+
+    const std::filesystem::path user_path =
+        item.missing_target
+            ? tmp.allowed / (std::string(item.id) + ".trk")
+            : validTrk(tmp, std::string(item.id) + ".trk", 2);
+    REQUIRE(bridge.submitQueue(
+                executeCommand(item.id, user_path, MotionMode::Queue, 2))
+                .ok());
+
+    loop.tick();
+
+    requireStandbyGateFailure(loop,
+                              store,
+                              reference,
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              item.id,
+                              item.expected_error);
+  }
 }
 
 TEST_CASE("RuntimeControlLoop idle config stays out of user run and queue state") {
@@ -3319,6 +3652,98 @@ TEST_CASE("RuntimeControlLoop idle config stays out of user run and queue state"
   REQUIRE(snapshot.idle.frames == 2);
   REQUIRE_FALSE(snapshot.exec.has_value());
   REQUIRE(snapshot.queue.ids.empty());
+}
+
+TEST_CASE("RuntimeControlLoop active idle publishes reference and controls clear it") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+
+  struct Case {
+    const char* suffix;
+    ControlMode mode;
+    ControllerState expected_ctrl;
+    bool expect_no_active;
+  };
+
+  for (const auto& item : std::vector<Case>{
+           {"stop", ControlMode::StandbyVelocity, ControllerState::StandbyVelocity,
+            true},
+           {"passive", ControlMode::Passive, ControllerState::Passive, true},
+           {"fixstand", ControlMode::FixStand, ControllerState::FixStand, true},
+           {"standby", ControlMode::StandbyVelocity, ControllerState::Preparing,
+            false},
+       }) {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeReferenceSink reference;
+    FakeRobotIO robot(readyLowState(deploy_config));
+    FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+    FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+    auto loop = makeControlLoop(config,
+                                bridge,
+                                store,
+                                tmp.trkConfig(),
+                                robot,
+                                tracker_policy,
+                                velocity_policy,
+                                deploy_config,
+                                velocity_config,
+                                fixstand_config,
+                                ControlMode::StandbyVelocity,
+                                passiveConfig(),
+                                &reference);
+
+    const auto idle_path =
+        validTrk(tmp, std::string("idle_reference_") + item.suffix + ".trk", 3);
+    REQUIRE(bridge.configureIdle({idleMotion(idle_path, 3)}).ok());
+    loop.tick();
+    loop.tick();
+    loop.tick();
+
+    auto snapshot = store.snapshot();
+    REQUIRE(snapshot.ctrl == ControllerState::Running);
+    REQUIRE(snapshot.active.kind == ActiveKind::Idle);
+    REQUIRE(snapshot.idle.active);
+    REQUIRE(reference.latest.active);
+    REQUIRE(reference.latest.id.empty());
+    REQUIRE(reference.latest.frame == 0);
+    REQUIRE(reference.latest.frames == 3);
+
+    loop.tick();
+    loop.tick();
+    snapshot = store.snapshot();
+    REQUIRE(snapshot.active.kind == ActiveKind::Idle);
+    REQUIRE(reference.latest.active);
+    REQUIRE(reference.latest.id.empty());
+    REQUIRE(reference.latest.frame == 1);
+
+    if (std::string(item.suffix) == "stop") {
+      REQUIRE(bridge.stop().ok());
+    } else if (item.mode == ControlMode::Passive) {
+      REQUIRE(bridge.passive().ok());
+    } else if (item.mode == ControlMode::FixStand) {
+      REQUIRE(bridge.fixStand().ok());
+    } else {
+      REQUIRE(bridge.standbyVelocity().ok());
+    }
+    loop.tick();
+
+    snapshot = store.snapshot();
+    REQUIRE(snapshot.ctrl == item.expected_ctrl);
+    if (item.expect_no_active) {
+      REQUIRE(snapshot.active.kind == ActiveKind::None);
+      REQUIRE_FALSE(snapshot.idle.active);
+    } else {
+      REQUIRE(snapshot.active.kind == ActiveKind::Idle);
+      REQUIRE(snapshot.idle.active);
+    }
+    REQUIRE_FALSE(snapshot.exec.has_value());
+    REQUIRE_FALSE(reference.latest.active);
+    REQUIRE(store.findRun(idle_path.string()).code == ErrorCode::RunNotFound);
+  }
 }
 
 TEST_CASE("RuntimeControlLoop completed idle enters next idle through internal transition") {
@@ -3459,7 +3884,9 @@ TEST_CASE("RuntimeControlLoop stop clears consumed inactive idle config") {
                               deploy_config,
                               velocity_config,
                               fixstand_config,
-                              ControlMode::StandbyVelocity);
+                              ControlMode::StandbyVelocity,
+                              passiveConfig(),
+                              nullptr);
 
   const auto idle_path = validTrk(tmp, "stop_consumed_inactive_idle.trk", 2);
   REQUIRE(bridge.configureIdle({idleMotion(idle_path, 2)}).ok());
@@ -4033,13 +4460,10 @@ TEST_CASE("RuntimeControlLoop active tracker advances one frame per policy perio
   RuntimeConfig config = runtimeConfig();
   config.hz = 1000.0;
   const DeployConfig deploy_config = deployConfig();
-  const VelocityDeployConfig velocity_config = velocityDeployConfig();
-  const FixStandConfig fixstand_config = fixStandConfig();
   RuntimeStatusStore store(config);
   RuntimeBridge bridge(config, store);
   FakeRobotIO robot(readyLowState(deploy_config));
   FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
-  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
   std::vector<std::size_t> frames_at_write;
   robot.on_write = [&](const LowCmdFrame&) {
     const auto found = store.findRun("high-rate-track");
@@ -4047,17 +4471,13 @@ TEST_CASE("RuntimeControlLoop active tracker advances one frame per policy perio
       frames_at_write.push_back(found.run->frame);
     }
   };
-  auto loop = makeControlLoop(config,
-                              bridge,
-                              store,
-                              tmp.trkConfig(),
-                              robot,
-                              tracker_policy,
-                              velocity_policy,
-                              deploy_config,
-                              velocity_config,
-                              fixstand_config,
-                              ControlMode::StandbyVelocity);
+  auto loop = makePolicyLoop(config,
+                             bridge,
+                             store,
+                             tmp.trkConfig(),
+                             robot,
+                             tracker_policy,
+                             deploy_config);
 
   const auto path = validTrk(tmp, "high_rate_track.trk", 3);
   REQUIRE(bridge.submitQueue(executeCommand("high-rate-track", path, MotionMode::Queue, 3))
@@ -4102,6 +4522,7 @@ TEST_CASE("RuntimeControlLoop stop transitions active run to StandbyVelocity") {
   FakeRobotIO robot(readyLowState(deploy_config));
   FakePolicy tracker_policy;
   FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.5F));
+  const auto standby_track = validStandbyTrack(tmp, "stop_to_standby_ref.trk");
   auto loop = makeControlLoop(config,
                               bridge,
                               store,
@@ -4112,11 +4533,17 @@ TEST_CASE("RuntimeControlLoop stop transitions active run to StandbyVelocity") {
                               deploy_config,
                               velocity_config,
                               fixStandConfig(),
-                              ControlMode::StandbyVelocity);
+                              ControlMode::StandbyVelocity,
+                              passiveConfig(),
+                              nullptr,
+                              standby_track);
 
   const auto path = validTrk(tmp, "stop_to_standby.trk", 5);
   REQUIRE(bridge.submitQueue(executeCommand("active", path)).ok());
-  startQueuedRun(loop, store, "active");
+  startQueuedRun(loop,
+                 store,
+                 "active",
+                 StartQueuedRunMode::AllowStandbyTransition);
   REQUIRE(loop.internalStateForTest() == RuntimeInternalState::GeneralTrackerActive);
 
   REQUIRE(bridge.stop().state == ControllerState::Stopping);
@@ -4224,6 +4651,7 @@ TEST_CASE("RuntimeControlLoop queues execute in FixStand until StandbyVelocity e
   FakeRobotIO robot(readyLowState(deploy_config));
   FakePolicy tracker_policy;
   FakeVelocityPolicy velocity_policy;
+  const auto standby_track = validStandbyTrack(tmp, "fixstand_queued_standby_ref.trk");
   auto loop = makeControlLoop(config,
                               bridge,
                               store,
@@ -4234,7 +4662,10 @@ TEST_CASE("RuntimeControlLoop queues execute in FixStand until StandbyVelocity e
                               deploy_config,
                               velocity_config,
                               fixstand_config,
-                              ControlMode::FixStand);
+                              ControlMode::FixStand,
+                              passiveConfig(),
+                              nullptr,
+                              standby_track);
 
   const auto path = validTrk(tmp, "fixstand_queued.trk", 2);
   REQUIRE(bridge.submitQueue(executeCommand("fixstand-queued", path)).ok());
@@ -4257,14 +4688,27 @@ TEST_CASE("RuntimeControlLoop queues execute in FixStand until StandbyVelocity e
   REQUIRE(bridge.standbyVelocity().ok());
   loop.tick();
   snapshot = store.snapshot();
-  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::GeneralTrackerActive);
-  REQUIRE(snapshot.ctrl == ControllerState::Preparing);
-  REQUIRE(snapshot.exec.has_value());
-  REQUIRE(snapshot.exec->id == "fixstand-queued");
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::GeneralTrackerTransition);
+  REQUIRE(snapshot.ctrl == ControllerState::Running);
+  REQUIRE(snapshot.active.kind == ActiveKind::Transition);
+  REQUIRE(snapshot.transition.active);
+  REQUIRE(snapshot.transition.target == "user");
+  REQUIRE(snapshot.transition.target_id == "fixstand-queued");
+  REQUIRE_FALSE(snapshot.exec.has_value());
   REQUIRE(snapshot.queue.ids.empty());
   REQUIRE(store.findRun("fixstand-queued").run->state == MotionState::Queued);
 
-  loop.tick();
+  const std::size_t transition_frames = snapshot.transition.frames;
+  bool saw_user = false;
+  for (std::size_t i = 0; i < transition_frames * 32 + 32; ++i) {
+    loop.tick();
+    snapshot = store.snapshot();
+    if (snapshot.active.kind == ActiveKind::User) {
+      saw_user = true;
+      break;
+    }
+  }
+  REQUIRE(saw_user);
   REQUIRE(store.snapshot().ctrl == ControllerState::Running);
 }
 
@@ -4313,6 +4757,7 @@ TEST_CASE("RuntimeControlLoop fixstand and standby commands cancel queued work a
     FakeRobotIO robot(readyLowState(deploy_config));
     FakePolicy tracker_policy;
     FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.75F));
+    const auto standby_track = validStandbyTrack(tmp, "queued_standby_ref.trk");
     auto loop = makeControlLoop(config,
                                 bridge,
                                 store,
@@ -4323,17 +4768,24 @@ TEST_CASE("RuntimeControlLoop fixstand and standby commands cancel queued work a
                                 deploy_config,
                                 velocity_config,
                                 fixstand_config,
-                                ControlMode::StandbyVelocity);
+                                ControlMode::StandbyVelocity,
+                                passiveConfig(),
+                                nullptr,
+                                standby_track);
     const auto queued_path = validTrk(tmp, "queued_standby.trk", 3);
     REQUIRE(bridge.submitQueue(executeCommand("queued", queued_path)).ok());
     REQUIRE(bridge.standbyVelocity().ok());
 
     loop.tick();
 
-    REQUIRE(store.snapshot().ctrl == ControllerState::Preparing);
-    REQUIRE(store.snapshot().queue.ids.empty());
-    REQUIRE(store.snapshot().exec.has_value());
-    REQUIRE(store.snapshot().exec->id == "queued");
+    const auto snapshot = store.snapshot();
+    REQUIRE(snapshot.ctrl == ControllerState::Running);
+    REQUIRE(snapshot.active.kind == ActiveKind::Transition);
+    REQUIRE(snapshot.transition.active);
+    REQUIRE(snapshot.transition.target == "user");
+    REQUIRE(snapshot.transition.target_id == "queued");
+    REQUIRE(snapshot.queue.ids.empty());
+    REQUIRE_FALSE(snapshot.exec.has_value());
     REQUIRE(store.findRun("queued").run->state == MotionState::Queued);
     REQUIRE(velocity_policy.calls == 0);
   }
@@ -4361,6 +4813,8 @@ TEST_CASE("RuntimeControlLoop control command while running stops active and cle
     FakeRobotIO robot(readyLowState(deploy_config));
     FakePolicy tracker_policy;
     FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.5F));
+    const auto standby_track =
+        validStandbyTrack(tmp, toString(item.expected_ctrl) + "_control_standby_ref.trk");
     auto loop = makeControlLoop(config,
                                 bridge,
                                 store,
@@ -4371,13 +4825,19 @@ TEST_CASE("RuntimeControlLoop control command while running stops active and cle
                                 deploy_config,
                                 velocity_config,
                                 fixstand_config,
-                                ControlMode::StandbyVelocity);
+                                ControlMode::StandbyVelocity,
+                                passiveConfig(),
+                                nullptr,
+                                standby_track);
     const auto active_path =
         validTrk(tmp, toString(item.expected_ctrl) + "_active.trk", 5);
     const auto waiting_path =
         validTrk(tmp, toString(item.expected_ctrl) + "_waiting.trk", 3);
     REQUIRE(bridge.submitQueue(executeCommand("active", active_path)).ok());
-    startQueuedRun(loop, store, "active");
+    startQueuedRun(loop,
+                   store,
+                   "active",
+                   StartQueuedRunMode::AllowStandbyTransition);
     REQUIRE(bridge.submitQueue(executeCommand("waiting", waiting_path)).ok());
 
     if (item.mode == ControlMode::FixStand) {
@@ -4542,6 +5002,8 @@ TEST_CASE("RuntimeControlLoop fixstand after pending stop keeps stop watermark")
   FakeRobotIO robot(readyLowState(deploy_config));
   FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
   FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  const auto standby_track =
+      validStandbyTrack(tmp, "active_stop_then_fixstand_standby_ref.trk");
   auto loop = makeControlLoop(config,
                               bridge,
                               store,
@@ -4552,14 +5014,20 @@ TEST_CASE("RuntimeControlLoop fixstand after pending stop keeps stop watermark")
                               deploy_config,
                               velocity_config,
                               fixstand_config,
-                              ControlMode::StandbyVelocity);
+                              ControlMode::StandbyVelocity,
+                              passiveConfig(),
+                              nullptr,
+                              standby_track);
 
   const auto active_path = validTrk(tmp, "active_stop_then_fixstand.trk", 5);
   const auto old_path = validTrk(tmp, "old_before_fixstand.trk", 3);
   const auto post_path = validTrk(tmp, "post_stop_after_fixstand.trk", 3);
 
   REQUIRE(bridge.submitQueue(executeCommand("active", active_path)).ok());
-  startQueuedRun(loop, store, "active");
+  startQueuedRun(loop,
+                 store,
+                 "active",
+                 StartQueuedRunMode::AllowStandbyTransition);
 
   REQUIRE(bridge.submitQueue(executeCommand("old-before-stop", old_path)).ok());
   loop.tick();

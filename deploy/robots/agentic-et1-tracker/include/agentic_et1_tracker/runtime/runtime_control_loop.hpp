@@ -130,6 +130,10 @@ class RuntimeControlLoop final {
   bool canStartIdle() const;
   void startIdle();
   bool startTransitionFromIdleToUser(MotionRequest target_request);
+  bool shouldStartTransitionFromStandbyToUser() const;
+  void startTransitionFromStandbyToUser(
+      MotionRequest target_request,
+      std::optional<LowStateSample> entry_low_state);
   void completePreparing();
   void advanceActive();
   void advanceActiveWithPolicy();

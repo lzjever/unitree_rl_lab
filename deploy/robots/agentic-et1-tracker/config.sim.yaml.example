@@ -12,6 +12,7 @@ agentic_et1_tracker:
   recent_limit: 32
   max_track_duration_s: 120
   stop_hold_s: 0.0
+  transition_duration_s: 0.7
   idle_mode: "hold_current"
   reference:
     enabled: true
