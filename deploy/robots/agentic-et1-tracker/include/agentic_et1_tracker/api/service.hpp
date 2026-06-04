@@ -16,6 +16,7 @@ namespace agentic_et1_tracker {
 struct AgentApiConfig {
   RuntimeMode mode{RuntimeMode::Unknown};
   std::size_t queue_limit{8};
+  std::string passive_password{"galaxy"};
 };
 
 struct ExecuteCommand {

@@ -378,6 +378,8 @@ AppConfig loadAppConfig(const std::filesystem::path& path) {
     if (config.idle_mode != kIdleModeHoldCurrent) {
       throw error("idle_mode must be hold_current");
     }
+    config.passive_password =
+        optionalString(section, "passive_password", config.passive_password);
     config.lock_path = optionalString(section, "lock_path", config.lock_path, false);
     validateLockPath(config.lock_path);
 

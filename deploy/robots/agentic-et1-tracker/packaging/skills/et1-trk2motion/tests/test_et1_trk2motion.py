@@ -26,6 +26,7 @@ class TrackerState:
         self.run_status = {}
         self.missing_execute_id = False
         self.execute_idle_response = False
+        self.execute_failure = None
         self.control_failures = {}
         self.large_health = False
         self.large_control = False
@@ -168,6 +169,9 @@ class Handler(BaseHTTPRequestHandler):
             )
             self.send_json({"ok": True, "idle": {key: state.idle[key] for key in ("enabled", "n", "active")}})
         elif self.path == "/execute":
+            if state.execute_failure:
+                self.send_json(state.response(state.execute_failure))
+                return
             if state.execute_idle_response:
                 state.active = {"kind": "idle", "id": None}
                 state.idle.update({"enabled": True, "n": 1, "active": True, "current": 0, "frame": 3, "frames": 12, "progress": 0.25})
@@ -200,9 +204,11 @@ class ServerCase(unittest.TestCase):
         self.thread.join(timeout=2)
         self.server.server_close()
 
-    def cli(self, *args):
+    def cli(self, *args, env_extra=None):
         env = os.environ.copy()
         env["ET1_TRACKER_URL"] = self.url
+        if env_extra:
+            env.update(env_extra)
         proc = subprocess.run(
             [sys.executable, str(SCRIPT), *args],
             text=True,
@@ -287,77 +293,77 @@ class ServerCase(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertEqual(out["next"], "wait_robot")
 
-    def test_ready_from_passive_fixstand_then_standby(self):
+    def test_ready_from_passive_is_read_only_and_requires_fixstand(self):
         self.state.ctrl = "passive"
         self.state.ready = False
         proc, out = self.cli("ready")
-        self.assertEqual(proc.returncode, 0)
-        self.assertEqual(out["ctrl"], "standby_velocity")
-        self.assertEqual(
-            [(m, p) for m, p, _ in self.state.records],
-            [("GET", "/status"), ("POST", "/fixstand"), ("GET", "/status"), ("POST", "/standby_velocity"), ("GET", "/status")],
-        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(out["error"]["code"], "not_ready")
+        self.assertEqual(out["next"], "fixstand")
+        self.assertEqual(out["ctrl"], "passive")
+        self.assertEqual(out["ready"], False)
+        self.assertEqual([(m, p) for m, p, _ in self.state.records], [("GET", "/status")])
 
-    def test_ready_waits_for_fixstand_after_passive_before_standby(self):
-        self.state.ctrl = "passive"
-        self.state.ready = False
-        self.state.top_status_queue = [
-            self.state.queued_top_status("passive", False),
-            self.state.queued_top_status("passive", False),
-            self.state.queued_top_status("passive", False),
-            self.state.queued_top_status("fixstand", True),
-            self.state.queued_top_status("standby_velocity", True),
-        ]
-        proc, out = self.cli("ready", "--timeout", "1", "--poll", "0.01")
-        self.assertEqual(proc.returncode, 0)
-        self.assertEqual(out, {"ok": True, "ctrl": "standby_velocity", "ready": True, "err": None})
-        self.assertEqual([p for m, p, _ in self.state.records if m == "POST"], ["/fixstand", "/standby_velocity"])
-
-    def test_ready_waits_for_standby_after_standby_command(self):
+    def test_ready_from_fixstand_is_read_only_and_requires_standby(self):
         self.state.ctrl = "fixstand"
         self.state.ready = True
-        self.state.top_status_queue = [
-            self.state.queued_top_status("fixstand", True),
-            self.state.queued_top_status("fixstand", True),
-            self.state.queued_top_status("fixstand", True),
-            self.state.queued_top_status("standby_velocity", True),
-        ]
-        proc, out = self.cli("ready", "--timeout", "1", "--poll", "0.01")
-        self.assertEqual(proc.returncode, 0)
-        self.assertEqual(out, {"ok": True, "ctrl": "standby_velocity", "ready": True, "err": None})
-        self.assertEqual([p for m, p, _ in self.state.records if m == "POST"], ["/standby_velocity"])
+        proc, out = self.cli("ready")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(out["error"]["code"], "not_ready")
+        self.assertEqual(out["next"], "standby_velocity")
+        self.assertEqual(out["ctrl"], "fixstand")
+        self.assertEqual(out["ready"], True)
+        self.assertEqual([(m, p) for m, p, _ in self.state.records], [("GET", "/status")])
 
     def test_ready_loop_timeout_uses_contract_next_and_compact_detail(self):
-        for ctrl in ("passive", "fixstand"):
-            with self.subTest(ctrl=ctrl):
-                self.state = TrackerState()
-                self.server.state = self.state
-                self.state.ctrl = ctrl
-                self.state.ready = False
-                self.state.top_status_queue = [self.state.queued_top_status(ctrl, False) for _ in range(32)]
-                proc, out = self.cli("ready", "--timeout", "0.08", "--poll", "0.01")
-                self.assertNotEqual(proc.returncode, 0)
-                self.assertFalse(out["ok"])
-                self.assertEqual(out["error"]["code"], "ready_loop")
-                self.assertEqual(out["next"], "status")
-                self.assertIn(out["next"], CONTRACT_NEXT_TOKENS)
-                self.assertEqual(out["ctrl"], ctrl)
-                self.assertEqual(out["ready"], False)
-                self.assertIsNone(out["err"])
-                self.assertEqual(out["last"], {"ctrl": ctrl, "ready": False, "err": None})
-                compact_out = json.dumps(out, separators=(",", ":"))
-                for field in ("pose", "active", "transition", "idle"):
-                    self.assertNotIn(field, compact_out)
+        self.state.ctrl = "standby_velocity"
+        self.state.ready = False
+        self.state.top_status_queue = [self.state.queued_top_status("standby_velocity", False) for _ in range(32)]
+        proc, out = self.cli("ready", "--timeout", "0.08", "--poll", "0.01")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["error"]["code"], "ready_loop")
+        self.assertEqual(out["next"], "status")
+        self.assertIn(out["next"], CONTRACT_NEXT_TOKENS)
+        self.assertEqual(out["ctrl"], "standby_velocity")
+        self.assertEqual(out["ready"], False)
+        self.assertIsNone(out["err"])
+        self.assertEqual(out["last"], {"ctrl": "standby_velocity", "ready": False, "err": None})
+        self.assertNotIn("POST", [method for method, _, _ in self.state.records])
+        compact_out = json.dumps(out, separators=(",", ":"))
+        for field in ("pose", "active", "transition", "idle"):
+            self.assertNotIn(field, compact_out)
 
-    def test_run_wait_auto_ready_execute_wait_status(self):
+    def test_run_wait_defaults_to_execute_without_ready(self):
         proc, out = self.cli("run", TRK, "--wait", "--timeout", "2", "--poll", "0.01")
         self.assertEqual(proc.returncode, 0)
         self.assertEqual(out["state"], "done")
         self.assertEqual(out["ctrl"], "standby_velocity")
         self.assertEqual(
             [(m, p) for m, p, _ in self.state.records],
-            [("GET", "/status"), ("POST", "/execute"), ("GET", "/status?id=r1"), ("GET", "/status")],
+            [("POST", "/execute"), ("GET", "/status?id=r1"), ("GET", "/status")],
         )
+
+    def test_run_from_passive_returns_execute_error_without_recovering(self):
+        self.state.ctrl = "passive"
+        self.state.ready = False
+        self.state.execute_failure = {
+            "ok": False,
+            "error": {"code": "CONTROL_STATE_CONFLICT", "message": "passive cannot execute"},
+            "next": "fixstand",
+        }
+        proc, out = self.cli("run", TRK)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(out["error"]["code"], "CONTROL_STATE_CONFLICT")
+        self.assertEqual(out["next"], "fixstand")
+        self.assertEqual(out["ctrl"], "passive")
+        self.assertEqual(out["ready"], False)
+        self.assertEqual(
+            [(m, p) for m, p, _ in self.state.records],
+            [("POST", "/execute"), ("GET", "/status")],
+        )
+        self.assertNotIn("/fixstand", [p for _, p, _ in self.state.records])
+        self.assertNotIn("/standby_velocity", [p for _, p, _ in self.state.records])
 
     def test_run_hold_sends_hold_true_only_when_requested(self):
         proc, out = self.cli("run", TRK, "--hold", "--recover", "off")
@@ -420,6 +426,36 @@ class ServerCase(unittest.TestCase):
         self.assertEqual(out["done"], 3)
         self.assertNotIn("runs", out)
         self.assertEqual([p for m, p, _ in self.state.records if m == "POST" and p == "/execute"], ["/execute"] * 3)
+
+    def test_repeat_from_fixstand_returns_execute_error_without_recovering(self):
+        self.state.ctrl = "fixstand"
+        self.state.ready = True
+        self.state.execute_failure = {
+            "ok": False,
+            "error": {"code": "CONTROL_STATE_CONFLICT", "message": "fixstand cannot execute"},
+            "next": "standby_velocity",
+        }
+        proc, out = self.cli("repeat", TRK, "-n", "3", "--timeout", "1", "--poll", "0.01")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(out["error"]["code"], "CONTROL_STATE_CONFLICT")
+        self.assertEqual(out["next"], "standby_velocity")
+        self.assertEqual(out["ctrl"], "fixstand")
+        self.assertEqual(out["ready"], True)
+        self.assertEqual(out["i"], 1)
+        self.assertEqual(out["done"], 0)
+        self.assertEqual(out["n"], 3)
+        self.assertEqual(
+            [(m, p) for m, p, _ in self.state.records],
+            [("POST", "/execute"), ("GET", "/status")],
+        )
+        self.assertNotIn("/fixstand", [p for _, p, _ in self.state.records])
+        self.assertNotIn("/standby_velocity", [p for _, p, _ in self.state.records])
+
+    def test_recover_auto_is_not_available(self):
+        proc, out = self.cli("run", TRK, "--recover", "auto")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(out["error"]["code"], "invalid_args")
+        self.assertEqual(self.state.records, [])
 
     def test_raw(self):
         proc, out = self.cli("raw", "POST", "/echo", '{"x":1}')
@@ -540,6 +576,29 @@ class ServerCase(unittest.TestCase):
                 self.assertNotIn("pose", out)
                 self.assertNotIn("samples", out)
                 self.assertLess(len(proc.stdout), 160)
+
+    def test_passive_sends_default_password_without_leaking_it(self):
+        proc, out = self.cli("passive")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual([record for record in self.state.records if record[1] == "/passive"], [("POST", "/passive", {"password": "galaxy"})])
+        self.assertNotIn("galaxy", proc.stdout)
+        self.assertEqual(out["ctrl"], "passive")
+        self.assertEqual(out["ready"], False)
+
+    def test_passive_password_env_and_cli_override_without_leaking_it(self):
+        proc, out = self.cli("passive", env_extra={"ET1_PASSIVE_PASSWORD": "env-secret"})
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual([record for record in self.state.records if record[1] == "/passive"], [("POST", "/passive", {"password": "env-secret"})])
+        self.assertNotIn("env-secret", proc.stdout)
+        self.assertEqual(out["ok"], True)
+
+        self.state.records.clear()
+        proc, out = self.cli("passive", "--password", "cli-secret", env_extra={"ET1_PASSIVE_PASSWORD": "env-secret"})
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual([record for record in self.state.records if record[1] == "/passive"], [("POST", "/passive", {"password": "cli-secret"})])
+        self.assertNotIn("cli-secret", proc.stdout)
+        self.assertNotIn("env-secret", proc.stdout)
+        self.assertEqual(out["ok"], True)
 
     def test_state_short_output_includes_compact_transition(self):
         self.state.ctrl = "running"

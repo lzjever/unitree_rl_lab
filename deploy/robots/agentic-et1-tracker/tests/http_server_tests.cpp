@@ -21,7 +21,7 @@ StatusSnapshot readySnapshot() {
   snapshot.ready = true;
   snapshot.mode = RuntimeMode::Sim;
   snapshot.robot = RobotState::Idle;
-  snapshot.ctrl = ControllerState::Idle;
+  snapshot.ctrl = ControllerState::StandbyVelocity;
   snapshot.queue.limit = 8;
   return snapshot;
 }
@@ -60,7 +60,10 @@ class FakeSink final : public ExecutionCommandSink {
     return stop_result;
   }
 
-  ControlResult passive() override { return {ErrorCode::Ok}; }
+  ControlResult passive() override {
+    ++passive_calls;
+    return passive_result;
+  }
 
   ControlResult fixStand() override {
     ++fixstand_calls;
@@ -85,11 +88,13 @@ class FakeSink final : public ExecutionCommandSink {
   ExecuteResult queue_result{ErrorCode::Ok, "", MotionState::Queued, 1};
   ExecuteResult interrupt_result{ErrorCode::Ok, "", MotionState::Queued, 1};
   StopResult stop_result{ErrorCode::Ok, ControllerState::Stopping, StopReason::Stop, 0};
+  ControlResult passive_result{ErrorCode::Ok};
   ControlResult fixstand_result{ErrorCode::Ok};
   ControlResult standby_velocity_result{ErrorCode::Ok};
   int queue_calls{0};
   int interrupt_calls{0};
   int stop_calls{0};
+  int passive_calls{0};
   int fixstand_calls{0};
   int standby_velocity_calls{0};
   int idle_calls{0};
@@ -509,6 +514,37 @@ TEST_CASE("POST /stop empty body stops and non-empty body is rejected") {
   REQUIRE(body.at("ok") == false);
   REQUIRE(body.at("error").at("code") == "REQUEST_INVALID");
   REQUIRE(r.h.sink.stop_calls == 1);
+}
+
+TEST_CASE("POST /passive enforces password-gated HTTP behavior") {
+  RunningHarness r;
+  httplib::Client client("127.0.0.1", r.h.server.boundPort());
+
+  auto result = client.Post("/passive", R"({})", "application/json");
+  r.requireJson(result, 400);
+  auto body = r.parse(result);
+  REQUIRE(body.at("ok") == false);
+  REQUIRE(body.at("error").at("code") == "REQUEST_INVALID");
+  REQUIRE_FALSE(body.contains("password"));
+  REQUIRE(result->body.find("password") == std::string::npos);
+  REQUIRE(r.h.sink.passive_calls == 0);
+  REQUIRE(r.h.validator.calls == 0);
+  REQUIRE(r.h.ids.calls == 0);
+
+  result = client.Post("/passive", R"({"password":"galaxy"})", "application/json");
+  r.requireJson(result, 200);
+  body = r.parse(result);
+  REQUIRE(body.size() == 2);
+  REQUIRE(body.at("ok") == true);
+  REQUIRE(body.at("state") == "accepted");
+  REQUIRE_FALSE(body.contains("password"));
+  REQUIRE(result->body.find("password") == std::string::npos);
+  REQUIRE(result->body.find("galaxy") == std::string::npos);
+  REQUIRE(r.h.sink.passive_calls == 1);
+  REQUIRE(r.h.sink.fixstand_calls == 0);
+  REQUIRE(r.h.sink.standby_velocity_calls == 0);
+  REQUIRE(r.h.validator.calls == 0);
+  REQUIRE(r.h.ids.calls == 0);
 }
 
 TEST_CASE("POST control routes are installed and reject non-empty bodies") {

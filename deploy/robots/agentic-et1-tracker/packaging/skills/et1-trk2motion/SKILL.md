@@ -19,16 +19,26 @@ Default tracker: `http://127.0.0.1:8083`; override with `ET1_TRACKER_URL`.
 <skill-dir>/scripts/et1-trk2motion idle clear
 <skill-dir>/scripts/et1-trk2motion stop
 <skill-dir>/scripts/et1-trk2motion passive
+<skill-dir>/scripts/et1-trk2motion passive --password "$ET1_PASSIVE_PASSWORD"
 <skill-dir>/scripts/et1-trk2motion fixstand
 <skill-dir>/scripts/et1-trk2motion standby
 ```
 
-`passive` stops active work and clears queued work plus the idle pool.
-`ready` handles `passive -> fixstand -> standby` and `fixstand -> standby`,
-polling until convergence within `--timeout`.
-`run` defaults to `ready` first, then execute. Use `--recover off` only when
-the caller intentionally manages control state. `run PATH --hold` sends
-`hold:true` to `/execute`; omitted `--hold` sends no `hold` field.
+`passive` is an explicit user command that stops active work and clears queued
+work plus the idle pool. It posts `{"password":"..."}` to `/passive`; the
+default is `galaxy`, override with `ET1_PASSIVE_PASSWORD` or
+`passive --password VALUE`. Never echo the password in user-visible output.
+`ready` is read-only. It polls status and returns `ok:true` only when the
+tracker is already `standby_velocity` and ready; it never posts `/fixstand` or
+`/standby_velocity`. If status is `passive`, the user must explicitly call
+`fixstand`, then explicitly call `standby`. If status is `fixstand`, the user
+must explicitly call `standby`. LLM agents must not automatically restore from
+`passive` or `fixstand`.
+`run` and `repeat` post directly to `/execute` by default and do not call
+`ready` or recover control state. If `/execute` rejects the current
+`passive`/`fixstand` state, return the compact server error and `next` as-is.
+`run PATH --hold` sends `hold:true` to `/execute`; omitted `--hold` sends no
+`hold` field.
 `idle set` configures the idle pool only; it returns no run id. `idle clear`
 posts `{"paths":[]}`. Idle never appears in user `exec/queue` or `status?id=`.
 

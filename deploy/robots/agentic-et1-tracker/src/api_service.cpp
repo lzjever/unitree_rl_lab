@@ -125,10 +125,34 @@ bool hasOnlyKeys(const nlohmann::json& input, const std::vector<std::string>& al
   return true;
 }
 
+bool parsePassivePassword(const std::string& body, const std::string& expected) {
+  if (blank(body)) {
+    return false;
+  }
+  auto input = nlohmann::json::parse(body, nullptr, false);
+  if (input.is_discarded() || !input.is_object()) {
+    return false;
+  }
+  if (!hasOnlyKeys(input, {"password"})) {
+    return false;
+  }
+  const auto password_it = input.find("password");
+  if (password_it == input.end() || !password_it->is_string()) {
+    return false;
+  }
+  return password_it->get<std::string>() == expected;
+}
+
 bool executeBlockedByController(ControllerState ctrl) {
-  return ctrl == ControllerState::Starting || ctrl == ControllerState::Passive ||
-         ctrl == ControllerState::FixStand || ctrl == ControllerState::Stopping ||
-         ctrl == ControllerState::Fault;
+  return ctrl == ControllerState::Starting || ctrl == ControllerState::Idle ||
+         ctrl == ControllerState::Passive || ctrl == ControllerState::FixStand ||
+         ctrl == ControllerState::Stopping || ctrl == ControllerState::Fault;
+}
+
+bool idleConfigBlockedByController(ControllerState ctrl) {
+  return ctrl == ControllerState::Starting || ctrl == ControllerState::Idle ||
+         ctrl == ControllerState::Passive || ctrl == ControllerState::FixStand ||
+         ctrl == ControllerState::Stopping || ctrl == ControllerState::Fault;
 }
 
 bool fixStandRecoveryState(ControllerState ctrl) {
@@ -161,6 +185,11 @@ ErrorInfo controlStateConflictInfo(ControllerState ctrl) {
               "ctrl=starting; wait /status",
               false,
               NextAction::Status};
+    case ControllerState::Idle:
+      return {ErrorCode::ControlStateConflict,
+              "wrong ctrl; check /status",
+              false,
+              NextAction::Status};
     case ControllerState::Passive:
       return {ErrorCode::ControlStateConflict,
               "ctrl=passive; /fixstand then /standby_velocity",
@@ -181,7 +210,6 @@ ErrorInfo controlStateConflictInfo(ControllerState ctrl) {
               "ctrl=fault; /fixstand",
               false,
               NextAction::FixStand};
-    case ControllerState::Idle:
     case ControllerState::StandbyVelocity:
     case ControllerState::Preparing:
     case ControllerState::Running:
@@ -377,9 +405,26 @@ ApiResponse AgentApiService::idle(const std::string& body) {
   std::vector<IdleMotion> motions;
   motions.reserve(paths_it->size());
   for (const auto& item : *paths_it) {
-    if (!item.is_string()) {
+    if (!item.is_string() || item.get<std::string>().empty()) {
       return error(ErrorCode::RequestInvalid);
     }
+  }
+
+  if (!paths_it->empty()) {
+    const auto snapshot = status_.snapshot();
+    if (idleConfigBlockedByController(snapshot.ctrl)) {
+      return controlStateConflict(snapshot.ctrl);
+    }
+    const ErrorCode readiness = readinessError(snapshot);
+    if (readiness != ErrorCode::Ok) {
+      if (snapshot.block == "lowcmd_occupied") {
+        return error(manualReadinessInfo(readiness));
+      }
+      return error(readiness);
+    }
+  }
+
+  for (const auto& item : *paths_it) {
     const TrackValidation validation = validator_.validate(item.get<std::string>());
     if (!validation.ok()) {
       return error(validation.code);
@@ -416,7 +461,7 @@ ApiResponse AgentApiService::stop(const std::string& body) {
 }
 
 ApiResponse AgentApiService::passive(const std::string& body) {
-  if (!blank(body)) {
+  if (!parsePassivePassword(body, config_.passive_password)) {
     return error(ErrorCode::RequestInvalid);
   }
 

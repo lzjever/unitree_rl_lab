@@ -53,6 +53,7 @@
 - `/execute` request shape、现有错误 envelope、`.trk` 和 `motion_dirs` allowlist 校验行为不退化。
 - 用户 queue FIFO、`queue.limit`、`queue.ids`、`GET /status?id=<id>` 只代表用户提交的动作。
 - `/fixstand`、`/standby_velocity`、`/stop` 空 body 合同保持。
+- `/passive` 只接受 `{"password":"galaxy"}` 这类 JSON body；默认密码为 `galaxy`，可通过顶层 `passive_password` 配置。
 - 已有 run 状态、stop reason、queue cancel/interrupt 语义保持，除非测试明确围绕新状态链路反转。
 
 ## 3. 目标状态机和转换表
@@ -68,13 +69,13 @@ passive -> fixstand -> standby_velocity -> execute
 
 | 当前状态 | 允许输入 | 目标/行为 | 禁止或冲突 |
 | --- | --- | --- | --- |
-| `passive` | `/fixstand`, `/stop`, `/idle` | `/fixstand` 是软件恢复入口；`/stop` 保持/回到安全 sink；`/idle` 只配置或清空，不播放 | `/standby_velocity`、`/execute` 返回 `CONTROL_STATE_CONFLICT` |
-| `fixstand` | `/standby_velocity`, `/fixstand`, `/stop`, `/idle` | `/standby_velocity` 进入 standby；`/stop` 停止后按 safety 落点；`/idle` 只配置或清空，不播放 | `/execute` 返回冲突 |
-| `standby_velocity` | `/execute`, `/idle`, `/fixstand`, `/stop` | 用户动作优先；无用户 active/queue 且 idle 配置可用时自动播放 idle | 无 |
-| `idle active` | `/execute`, `/stop`, `/fixstand`, `/standby_velocity`, `/idle` | `/execute` 抢占 idle；`/stop` 停 idle 并清空 idle 配置；`/idle` 只更新配置，不进入用户 queue | idle 期间不得阻塞用户 queue/interrupt |
-| `preparing/running` | `/execute`, `/stop`, 控制命令, `/idle` | `queue` 排队；`interrupt` 抢断用户 active；`/stop` 最高优先级；`/idle` 可配置但不立即播放 | 无 |
-| `stopping` | `/stop`, `/status`, `/idle` | 幂等停止；停止完成后按 safety 回 `standby_velocity` 或 `passive/fault`；`/idle {"paths":[]}` 至少可清空 | `/execute` 返回冲突或保持现有策略，不在 stopping 新开 idle |
-| `fault/manual` | `/fixstand`, `/stop`, `/status`, `/idle` | `lowcmd_occupied` 等人工占用需 operator 释放；`/idle` 只配置或清空，不播放；不得自动恢复 | `/execute` 不播放 |
+| `passive` | `/fixstand`, passworded `/passive`, `/stop`, `/idle {"paths":[]}` | `/fixstand` 是软件恢复入口；`/stop` 保持安全 sink；`/idle` 空数组只清空，不播放 | `/standby_velocity`、`/execute`、非空 `/idle` 返回 `CONTROL_STATE_CONFLICT` |
+| `fixstand` | `/standby_velocity`, `/fixstand`, passworded `/passive`, `/stop`, `/idle {"paths":[]}` | `/standby_velocity` 进入 standby；空闲 `/stop` 保持 FixStand；`/idle` 空数组只清空，不播放 | `/execute`、非空 `/idle` 返回冲突 |
+| `standby_velocity` | `/execute`, `/idle`, passworded `/passive`, `/fixstand`, `/stop` | 用户动作优先；无用户 active/queue 且 idle 配置可用时自动播放 idle | 无 |
+| `idle active` | `/execute`, `/stop`, `/fixstand`, `/standby_velocity`, passworded `/passive`, `/idle` | `/execute` 抢占 idle；`/stop` 停 idle 并清空 idle 配置；`/idle` 只更新配置，不进入用户 queue | idle 期间不得阻塞用户 queue/interrupt |
+| `preparing/running` | `/execute`, `/stop`, 控制命令, passworded `/passive`, `/idle` | `queue` 排队；`interrupt` 抢断用户 active；`/stop` 最高优先级；`/idle` 可配置但不立即播放 | 无 |
+| `stopping` | `/stop`, `/status`, passworded `/passive`, `/idle {"paths":[]}` | 幂等停止；停止完成后按 safety 回 `standby_velocity` 或 `passive/fault`；空数组可清空 idle | `/execute`、非空 `/idle` 返回冲突，不在 stopping 新开 idle |
+| `fault/manual` | `/fixstand`, `/stop`, `/status`, passworded `/passive`, `/idle {"paths":[]}` | `lowcmd_occupied` 等人工占用需 operator 释放；空数组可清空 idle；不得自动恢复 | `/execute`、非空 `/idle` 不播放 |
 
 说明：
 
@@ -128,8 +129,8 @@ POST /idle
 - 每个 path 必须复用 `/execute` 的绝对路径、`.trk`、存在性、`motion_dirs` allowlist 校验。
 - 任一路径失败则整个请求失败，旧 idle 配置不变。
 - `/idle` 是配置接口，不是 run 提交接口：配置/清空与播放解耦。
-- 设置配置可在 `passive`、`fixstand`、`standby_velocity`、`preparing/running`、`stopping`、`fault/manual` 接受；实现若需要更保守，至少必须允许 `paths:[]` 在 `passive/fixstand/stopping/fault` 清空。
-- `/idle` 配置不应把 standby 或 robot ready 当作接收前置条件；只有自动播放受 readiness/safety gate 限制。
+- `paths:[]` 可在任意状态接受，用于安全清空，且不做路径校验。
+- 非空设置只在 `standby_velocity` 或用户动作 `preparing/running` 等可接受动作状态生效；`passive/fixstand/fault/starting/stopping` 必须拒绝，避免未来自动播放配置跨越安全链路。
 - 自动播放只在 `standby_velocity` 且 `ready=true`、orientation safe、无用户 active、无用户 queue/interrupt/pending 时发生。
 
 错误响应必须复用现有 envelope，不新增 `err/msg` schema：
@@ -144,13 +145,14 @@ POST /idle
 | --- | --- | --- | --- | --- |
 | body 非 JSON | 400 | `REQUEST_INVALID` | `fix` | 修正 JSON/body 后重试 |
 | `/stop`、`/fixstand`、`/standby_velocity` body 非空 | 400 | `REQUEST_INVALID` | `fix` | 空 body required |
+| `/passive` 空 body、非 JSON、缺少 `password` 或密码错误 | 400 | `REQUEST_INVALID` | `fix` | 不调用 passive sink；密码只约束外部 HTTP 调用 |
 | `/execute` 缺少 `path`、`path` 非字符串、`mode` 非法、出现 `paths` 或其他额外字段 | 400 | `REQUEST_INVALID` | `fix` | schema 失败时不触发 validator/sink/id generator |
 | `/idle` 缺少 `paths`、非数组、元素非字符串 | 400 | `REQUEST_INVALID` | `fix` | schema 失败时旧 idle 配置不变 |
 | path 为空、URL、非绝对路径或非 `.trk` | 400 | `REQUEST_INVALID` | `fix` | 复用现有 validator 映射；真实规则由 trk validator tests 覆盖 |
 | 文件不存在 | 400 | `TRK_FILE_NOT_FOUND` | `fix` | 保持现有 HTTP code |
 | 不在 allowlist | 403 | `TRK_PATH_NOT_ALLOWED` | `fix` | 复用 `/execute` validator |
 | parse/内容校验失败 | 400 | `TRK_PARSE_FAILED`/`TRK_VALIDATION_FAILED` | `fix` | 旧 idle 配置不变 |
-| 状态不允许执行用户动作 | 409 | `CONTROL_STATE_CONFLICT` | `fixstand`/`standby_velocity`/`status` | 仅限制执行，不限制 idle 配置 |
+| 状态不允许执行用户动作或非空 idle 配置 | 409 | `CONTROL_STATE_CONFLICT` | `fixstand`/`standby_velocity`/`status` | `paths:[]` 清空仍可在任意状态接受 |
 | robot/service/model 未 ready | 503 或现有映射 | 复用现有 readiness error | 复用现有 `next` | 不新增错误码 |
 
 `/stop`：
@@ -158,7 +160,7 @@ POST /idle
 - 必须空 body。
 - 最高优先级：停止当前用户 active；取消本次 stop watermark 之前已接受的用户 queued/pending；保留 stop 之后新接受的用户 queue/interrupt。
 - 可无条件停止 idle active 并清空 idle config；idle 没有 run id，不参与 stop watermark。
-- safety 允许时回 `standby_velocity`；bad orientation、lowcmd occupied 等 safety override 不可被绕过。
+- active motion 停止且 safety 允许时回 `standby_velocity`；`passive` 下保持 `passive`，空闲 `fixstand` 下保持 `fixstand`；bad orientation、lowcmd occupied 等 safety override 不可被绕过。
 
 ## 5. `/status` 目标 schema
 
@@ -305,6 +307,7 @@ lowcmd occupied：
 - `/stop` 是 HTTP 控制优先级最高的命令，但不是 safety bypass。
 - `/stop` 可请求停止用户 active，取消 stop watermark 之前的用户 queued/pending，保留 stop 之后新接受的用户 queue/interrupt。
 - `/stop` 可无条件停止 idle active 并清空 idle 配置。
+- `/stop` 在 `passive` 必须保持 `passive`；空闲 `fixstand` 下 `/stop` 必须保持 `fixstand`，不能切到 `standby_velocity`。
 - bad orientation 必须落 `passive`；lowcmd occupied 必须保持 fault/manual，直到 operator 释放。
 
 ## 8. 精确 TDD 计划
@@ -335,7 +338,7 @@ Runtime/store tests：`tests/runtime_bridge_tests.cpp`、`tests/runtime_control_
 - idle active 时 `queue.ids` 仍为空，`queue.limit` 不变。
 - 用户 active/queue 存在时不启动 idle；用户动作完成后回 standby 再按条件启动 idle。
 - `/stop` 停用户 active，取消 stop watermark 之前的用户 queued/pending，保留 stop 后新接受的用户 queue/interrupt，同时停 idle、清 idle 配置。
-- `/idle` 配置/清空与播放解耦；至少 `paths:[]` 在 `passive/fixstand/stopping/fault` 可清空，自动播放只在 standby+ready+safe+无用户工作时发生。
+- `/idle` 配置/清空与播放解耦；`paths:[]` 在任意状态可清空，非空配置在 `passive/fixstand/starting/stopping/fault` 返回冲突，自动播放只在 standby+ready+safe+无用户工作时发生。
 - HTTP/API 层：`passive` 正常只接受 `/fixstand` 执行恢复；`fixstand` 正常只接受 `/standby_velocity` 进入 standby；`/execute` 在 `fixstand` 返回冲突，standby 后才接受 `/execute`/可播放 idle。
 - RuntimeBridge 直连 queue-in-FixStand 仅作为内部/API-only gate 的遗留语义暂保留，用于低层 queue/stop-watermark 覆盖；不扩大到 HTTP/API `/execute` 合同。
 - 反转 active tracking orientation skip 相关测试：standby/idle/user active/preparing/running/stopping 中 bad orientation 进入 `passive`，而不是继续 track 或自动 fault。
@@ -374,7 +377,7 @@ MuJoCo：
 - idle 播放中提交 `/execute mode=queue`：idle 停止，用户 run 获得 id 并执行；`GET /status?id=<id>` 正常。
 - idle 播放中提交 `/execute mode=interrupt`：尽快抢断 idle，用户动作优先。
 - 用户动作排队/运行期间 idle 不启动。
-- `/stop` 空 body：用户 active 停止，stop watermark 之前的用户 queued/pending 取消，stop 之后新接受的用户 queue/interrupt 保留；idle active 和 idle config 全部清空；安全允许时回 `standby_velocity`。
+- `/stop` 空 body：用户 active 停止，stop watermark 之前的用户 queued/pending 取消，stop 之后新接受的用户 queue/interrupt 保留；idle active 和 idle config 全部清空；active motion 后安全允许时回 `standby_velocity`，但 passive/FixStand 空闲态保持原状态。
 - 模拟 bad orientation：standby/idle/user active/preparing/running/stopping 均进入 `passive`，不能继续 idle 或 user track；FixStand 在 lowstate fresh、mode ok、lowcmd 未占用时仍可作为恢复入口。
 
 真机：
@@ -389,11 +392,12 @@ MuJoCo：
 验收标准：
 
 - `/execute` 合同完全保持单 path；传 `paths` 失败。
+- `/passive` HTTP 调用必须带正确 `password`，内部 safety passive 不受密码配置影响。
 - `/idle` 能覆盖/清空 idle pool；任一路径校验失败时旧配置不变。
 - idle 不进入用户 queue/run/status-id 体系。
 - `standby_velocity` 且 ready、安全、无用户工作时才播放 idle。
 - 用户 `/execute` 总是优先；`interrupt` 能尽快抢断 idle。
-- `/stop` 空 body、最高优先级，按 stop watermark 取消用户 queued/pending，保留 stop 后新接受的用户 queue/interrupt，清 idle config，且不绕过 safety。
+- `/stop` 空 body、最高优先级，按 stop watermark 取消用户 queued/pending，保留 stop 后新接受的用户 queue/interrupt，清 idle config，且不绕过 safety；passive 和空闲 FixStand 不被 `/stop` 推到 standby。
 - orientation outside safe limits 在 standby/idle/user active/preparing/running/stopping 进入 `passive`；FixStand 恢复例外保留。
 - `lowcmd_occupied` 保持 fault/manual/operator 语义，`block` 可见且 `next:"manual"`，不自动恢复。
 - 精确测试覆盖 API、HTTP、runtime、robot_io、skill/CLI schema，相关反转测试已更新；`packaging/skills/et1-trk2motion/SKILL.md`、`references/raw-http.md` 和脚本 short status 已同步。

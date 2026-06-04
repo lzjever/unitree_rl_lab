@@ -330,7 +330,6 @@ void RuntimeControlLoop::handleStop(std::uint64_t sequence, bool requires_stoppi
     markActiveStopping(StopReason::Stop);
   } else if (fsm_state_ == RuntimeInternalState::FixStand && waiting_.empty()) {
     policy_runner_.reset();
-    handleInternalEvent(RuntimeInternalEvent::Velocity);
     stop_reason_ = StopReason::None;
     stop_to_idle_pending_ = false;
     stopping_hold_ticks_remaining_ = 0;

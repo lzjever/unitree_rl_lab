@@ -20,7 +20,7 @@ StatusSnapshot readySnapshot() {
   snapshot.ready = true;
   snapshot.mode = RuntimeMode::Sim;
   snapshot.robot = RobotState::Idle;
-  snapshot.ctrl = ControllerState::Idle;
+  snapshot.ctrl = ControllerState::StandbyVelocity;
   snapshot.queue.limit = 8;
   return snapshot;
 }
@@ -347,6 +347,7 @@ TEST_CASE("POST idle rejects invalid JSON contract before ports") {
       R"({})",
       R"({"paths":"/tracks/a.trk"})",
       R"({"paths":[3]})",
+      R"({"paths":[""]})",
       R"({"paths":["/tracks/a.trk"],"mode":"queue"})",
   };
 
@@ -415,23 +416,68 @@ TEST_CASE("POST idle accepts empty paths as an atomic clear without validation")
   REQUIRE(h.ids.calls == 0);
 }
 
-TEST_CASE("POST idle is only a config endpoint and ignores execute readiness gates") {
+TEST_CASE("POST idle clear accepts unsafe states without validation") {
   Harness h;
   h.status.snapshot_value.ready = false;
   h.status.snapshot_value.ctrl = ControllerState::Passive;
   h.status.snapshot_value.robot = RobotState::Fault;
   h.status.snapshot_value.err = ErrorCode::RobotBadOrientation;
+  h.status.snapshot_value.block = "bad_orientation";
 
-  const auto response =
-      h.service.handle({"POST", "/idle", R"({"paths":["/tracks/idle.trk"]})"});
+  const auto response = h.service.handle({"POST", "/idle", R"({"paths":[]})"});
 
   REQUIRE(response.status == 200);
-  REQUIRE(response.body.at("idle").at("enabled") == true);
-  REQUIRE(h.validator.calls == 1);
+  REQUIRE(response.body.at("idle").at("enabled") == false);
+  REQUIRE(h.validator.calls == 0);
   REQUIRE(h.sink.idle_calls == 1);
+  REQUIRE(h.sink.idle_motions.empty());
   REQUIRE(h.sink.queue_calls == 0);
   REQUIRE(h.sink.interrupt_calls == 0);
   REQUIRE(h.ids.calls == 0);
+}
+
+TEST_CASE("POST idle nonempty rejects unsafe controller states before validation") {
+  for (const ControllerState ctrl :
+       {ControllerState::Starting,
+        ControllerState::Idle,
+        ControllerState::Passive,
+        ControllerState::FixStand,
+        ControllerState::Stopping,
+        ControllerState::Fault}) {
+    Harness h;
+    h.status.snapshot_value.ready = true;
+    h.status.snapshot_value.ctrl = ctrl;
+
+    const auto response =
+        h.service.handle({"POST", "/idle", R"({"paths":["/tracks/idle.trk"]})"});
+
+    CAPTURE(toString(ctrl));
+    REQUIRE(response.status == 409);
+    requireFailure(response, "CONTROL_STATE_CONFLICT");
+    REQUIRE(h.validator.calls == 0);
+    REQUIRE(h.sink.idle_calls == 0);
+    REQUIRE(h.ids.calls == 0);
+  }
+}
+
+TEST_CASE("POST idle nonempty accepts standby and active motion states") {
+  for (const ControllerState ctrl :
+       {ControllerState::StandbyVelocity,
+        ControllerState::Preparing,
+        ControllerState::Running}) {
+    Harness h;
+    h.status.snapshot_value.ctrl = ctrl;
+
+    const auto response =
+        h.service.handle({"POST", "/idle", R"({"paths":["/tracks/idle.trk"]})"});
+
+    CAPTURE(toString(ctrl));
+    REQUIRE(response.status == 200);
+    REQUIRE(response.body.at("idle").at("enabled") == true);
+    REQUIRE(h.validator.calls == 1);
+    REQUIRE(h.sink.idle_calls == 1);
+    REQUIRE(h.ids.calls == 0);
+  }
 }
 
 TEST_CASE("POST execute maps validator failures and does not submit commands") {
@@ -569,7 +615,9 @@ TEST_CASE("POST control endpoints report lowcmd occupancy as manual before sink"
       h.status.snapshot_value.err = ErrorCode::RobotNotReady;
       h.status.snapshot_value.block = "lowcmd_occupied";
 
-      const auto response = h.service.handle({"POST", target, ""});
+      const std::string body =
+          std::string(target) == "/passive" ? R"({"password":"galaxy"})" : "";
+      const auto response = h.service.handle({"POST", target, body});
 
       CAPTURE(target);
       CAPTURE(toString(ctrl));
@@ -588,6 +636,7 @@ TEST_CASE("POST control endpoints report lowcmd occupancy as manual before sink"
 TEST_CASE("POST execute rejects controller states that cannot execute queued motion") {
   for (const ControllerState ctrl :
        {ControllerState::Starting,
+        ControllerState::Idle,
         ControllerState::Passive,
         ControllerState::FixStand,
         ControllerState::Stopping,
@@ -613,6 +662,9 @@ TEST_CASE("POST execute rejects controller states that cannot execute queued mot
     } else if (ctrl == ControllerState::Fault) {
       REQUIRE(nextAction(response) == "fixstand");
       REQUIRE(errorMessage(response) == "ctrl=fault; /fixstand");
+    } else if (ctrl == ControllerState::Idle) {
+      REQUIRE(nextAction(response) == "status");
+      REQUIRE(errorMessage(response) == "wrong ctrl; check /status");
     } else {
       REQUIRE(nextAction(response) == "status");
       REQUIRE(errorMessage(response) ==
@@ -647,25 +699,6 @@ TEST_CASE("POST stop with no body only submits stop even when not ready") {
 }
 
 TEST_CASE("POST control endpoints accept empty body without validator or id generator") {
-  SECTION("passive") {
-    Harness h;
-
-    const auto response = h.service.handle({"POST", "/passive", ""});
-
-    REQUIRE(response.status == 200);
-    requireFields(response.body, {"ok", "state"});
-    REQUIRE(response.body.at("ok") == true);
-    REQUIRE(response.body.at("state") == "accepted");
-    REQUIRE(h.sink.passive_calls == 1);
-    REQUIRE(h.sink.fixstand_calls == 0);
-    REQUIRE(h.sink.standby_velocity_calls == 0);
-    REQUIRE(h.sink.stop_calls == 0);
-    REQUIRE(h.sink.queue_calls == 0);
-    REQUIRE(h.sink.interrupt_calls == 0);
-    REQUIRE(h.validator.calls == 0);
-    REQUIRE(h.ids.calls == 0);
-  }
-
   SECTION("fixstand") {
     Harness h;
 
@@ -705,6 +738,63 @@ TEST_CASE("POST control endpoints accept empty body without validator or id gene
   }
 }
 
+TEST_CASE("POST passive requires configured password before command sink") {
+  struct Case {
+    std::string body;
+    int expected_status;
+    int expected_calls;
+  };
+
+  const std::vector<Case> cases{
+      {"", 400, 0},
+      {R"({})", 400, 0},
+      {R"({"password":"wrong"})", 400, 0},
+      {R"({"password":3})", 400, 0},
+      {R"({"password":"galaxy","extra":true})", 400, 0},
+      {R"({"password":"galaxy"})", 200, 1},
+  };
+
+  for (const auto& item : cases) {
+    Harness h;
+    const auto response = h.service.handle({"POST", "/passive", item.body});
+
+    CAPTURE(item.body);
+    REQUIRE(response.status == item.expected_status);
+    REQUIRE(h.sink.passive_calls == item.expected_calls);
+    REQUIRE(h.sink.fixstand_calls == 0);
+    REQUIRE(h.sink.standby_velocity_calls == 0);
+    REQUIRE(h.sink.stop_calls == 0);
+    REQUIRE(h.validator.calls == 0);
+    REQUIRE(h.ids.calls == 0);
+    if (item.expected_status == 200) {
+      requireFields(response.body, {"ok", "state"});
+      REQUIRE(response.body.at("ok") == true);
+      REQUIRE(response.body.at("state") == "accepted");
+    } else {
+      requireFailure(response, "REQUEST_INVALID");
+    }
+  }
+}
+
+TEST_CASE("POST passive uses configured password") {
+  AgentApiConfig config;
+  config.passive_password = "secret";
+  FakeSink sink;
+  FakeStatus status;
+  FakeValidator validator;
+  FakeIds ids;
+  AgentApiService service{config, sink, status, validator, ids};
+
+  auto response = service.handle({"POST", "/passive", R"({"password":"galaxy"})"});
+  REQUIRE(response.status == 400);
+  requireFailure(response, "REQUEST_INVALID");
+  REQUIRE(sink.passive_calls == 0);
+
+  response = service.handle({"POST", "/passive", R"({"password":"secret"})"});
+  REQUIRE(response.status == 200);
+  REQUIRE(sink.passive_calls == 1);
+}
+
 TEST_CASE("POST control endpoints reject static not-ready snapshots before sink") {
   for (const auto& target : {"/passive", "/fixstand", "/standby_velocity"}) {
     Harness h;
@@ -714,7 +804,9 @@ TEST_CASE("POST control endpoints reject static not-ready snapshots before sink"
     h.status.snapshot_value.err = ErrorCode::ModelNotReady;
     h.status.snapshot_value.block = "policy_not_loaded";
 
-    const auto response = h.service.handle({"POST", target, ""});
+    const std::string body =
+        std::string(target) == "/passive" ? R"({"password":"galaxy"})" : "";
+    const auto response = h.service.handle({"POST", target, body});
 
     CAPTURE(target);
     REQUIRE(response.status == 503);
@@ -775,7 +867,8 @@ TEST_CASE("POST passive remains available as bad-orientation safety sink") {
     h.status.snapshot_value.err = ErrorCode::RobotBadOrientation;
     h.status.snapshot_value.block = "bad_orientation";
 
-    const auto response = h.service.handle({"POST", "/passive", ""});
+    const auto response =
+        h.service.handle({"POST", "/passive", R"({"password":"galaxy"})"});
 
     CAPTURE(toString(ctrl));
     REQUIRE(response.status == 200);
@@ -809,7 +902,7 @@ TEST_CASE("POST fixstand rejects non-orientation recovery faults before sink") {
 }
 
 TEST_CASE("POST control endpoints reject non-empty bodies before ports") {
-  for (const auto& target : {"/passive", "/fixstand", "/standby_velocity"}) {
+  for (const auto& target : {"/fixstand", "/standby_velocity"}) {
     Harness h;
 
     const auto response = h.service.handle({"POST", target, R"({})"});

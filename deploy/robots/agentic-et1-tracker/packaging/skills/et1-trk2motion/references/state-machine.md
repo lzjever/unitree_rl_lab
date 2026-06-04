@@ -10,8 +10,10 @@ scripts/et1-trk2motion run /abs/file.trk --hold --wait
 
 Control states:
 
-- `passive`: call `fixstand`, then `standby`.
-- `fixstand`: call `standby`.
+- `passive`: only leave this state when the user explicitly calls `fixstand`,
+  then explicitly calls `standby`.
+- `fixstand`: only enter StandbyVelocity when the user explicitly calls
+  `standby`.
 - `standby_velocity`: ready for `/execute` and idle auto-play.
 - `running` with `active.kind=="idle"`: idle is active; user `run` preempts it.
 - `running` with `active.kind=="user"`: wait by user id.
@@ -26,8 +28,20 @@ Control states:
 - `stopping`: poll `state`; `stop` remains idempotent.
 - `fault` or `block:"lowcmd_occupied"`: manual/operator state.
 
-`ready` performs the transitions above with a finite loop. If it returns
-`ok:false`, follow `next` or ask for operator intervention when `next=manual`.
+`ready` is a read-only precheck with a finite loop. It never posts `/fixstand`
+or `/standby_velocity`. If status is `passive`, it returns `ok:false` with
+`next:"fixstand"`. If status is `fixstand`, it returns `ok:false` with
+`next:"standby_velocity"`. Follow `next` only when the user has explicitly
+requested that control command; otherwise report the server state. Ask for
+operator intervention when `next=manual`.
+
+`run` and `repeat` post directly to `/execute` and do not recover control
+state. If the tracker rejects execution from `passive` or `fixstand`, return
+the compact server error and `next` without calling `fixstand` or `standby`.
+
+`passive` is also explicit. The CLI sends `{"password":"..."}` using default
+`galaxy`, `ET1_PASSIVE_PASSWORD`, or `passive --password VALUE`; do not print
+the password.
 
 `idle set PATH...` only configures an idle pool. `idle clear` clears it.
 Idle never creates a user id and never appears in `status?id=ID`.

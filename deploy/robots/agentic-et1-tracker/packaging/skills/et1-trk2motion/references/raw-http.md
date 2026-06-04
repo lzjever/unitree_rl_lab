@@ -8,7 +8,7 @@ scripts/et1-trk2motion raw POST /execute '{"path":"/abs/file.trk","mode":"interr
 scripts/et1-trk2motion raw POST /execute '{"path":"/abs/file.trk","mode":"interrupt","hold":true}'
 scripts/et1-trk2motion raw POST /idle '{"paths":["/abs/idle.trk"]}'
 scripts/et1-trk2motion raw POST /idle '{"paths":[]}'
-scripts/et1-trk2motion raw POST /passive
+scripts/et1-trk2motion raw POST /passive '{"password":"galaxy"}'
 scripts/et1-trk2motion raw POST /stop
 ```
 
@@ -17,7 +17,7 @@ Tracker endpoints used by the CLI:
 - `GET /health`
 - `GET /status`
 - `GET /status?id=RUN_ID`
-- `POST /passive`
+- `POST /passive` with `{"password":"..."}`
 - `POST /fixstand`
 - `POST /standby_velocity`
 - `POST /stop`
@@ -38,6 +38,13 @@ progress lives under `idle`. Internal synthetic transitions use
 `progress`); `target_state` is `null` or a motion state string. They do not
 enter queue/history and have no run id. `/stop` immediately aborts active user,
 idle, holding, or transition work and does not play `standby_ref.trk`.
+
+The high-level `passive` command sends the passive password body for you. Its
+default password is `galaxy`; override with `ET1_PASSIVE_PASSWORD` or
+`passive --password VALUE`. Do not print the password. `ready` is read-only and
+never posts `/fixstand` or `/standby_velocity`. `run` and `repeat` post
+directly to `/execute`; if the server returns a control-state error and `next`,
+return that compact error without automatic recovery.
 
 `standby_ref.trk` is recorded, simulator accepted, and runtime-gated
 internally; real-robot GA gates remain pending. Direct `/standby_velocity`

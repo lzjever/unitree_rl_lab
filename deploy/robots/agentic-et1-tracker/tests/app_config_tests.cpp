@@ -151,6 +151,7 @@ agentic_et1_tracker:
   REQUIRE(config.release_motion_mode_max_attempts == 3);
   REQUIRE(config.release_motion_mode_retry_interval_ms == 500);
   REQUIRE(config.lock_path.empty());
+  REQUIRE(config.passive_password == "galaxy");
   REQUIRE(config.policy.profile == "GeneralTrackerCLN");
   REQUIRE(config.policy.policy_dir ==
           (config_dir / "config/policy/general_tracker_cln").lexically_normal().string());
@@ -212,6 +213,7 @@ TEST_CASE("AppConfig default file keeps StandbyVelocity and posture assets app-o
   REQUIRE(config.control.startup_control == "FixStand");
   REQUIRE(config.stop_hold_s == 0.0);
   REQUIRE(config.runtime.stop_hold_s == 0.0);
+  REQUIRE(config.passive_password == "galaxy");
   REQUIRE_FALSE(config.reference.enabled);
 }
 
@@ -225,7 +227,7 @@ TEST_CASE("AppConfig simulation example is ready for local MuJoCo acceptance") {
   REQUIRE(config.mode_machine == 0);
   REQUIRE_FALSE(config.release_motion_mode_on_startup);
   REQUIRE(config.trk.allowlist_dirs ==
-          std::vector<std::filesystem::path>{"/home/galbot/works/et1/generated"});
+          std::vector<std::filesystem::path>{"/home/galbot/works/agent-test/generated"});
   REQUIRE(config.policy.profile == "GeneralTrackerCLN");
   REQUIRE(pathIsAtOrWithin(config.policy.policy_dir,
                            root / "config/policy/general_tracker_cln"));
@@ -246,6 +248,7 @@ TEST_CASE("AppConfig simulation example is ready for local MuJoCo acceptance") {
               .string());
   REQUIRE(config.control.startup_control == "FixStand");
   REQUIRE(config.stop_hold_s == 0.0);
+  REQUIRE(config.passive_password == "galaxy");
   REQUIRE(config.reference.enabled);
 }
 
@@ -345,6 +348,7 @@ agentic_et1_tracker:
   max_track_duration_s: 42.5
   stop_hold_s: 0.0
   idle_mode: "hold_current"
+  passive_password: "secret"
   lock_path: "/tmp/agentic-et1-tracker-test.lock"
   policy:
     profile: "GeneralTracker"
@@ -386,6 +390,7 @@ agentic_et1_tracker:
   REQUIRE(config.mode_machine == 0);
   REQUIRE(config.stop_hold_s == 0.0);
   REQUIRE(config.idle_mode == "hold_current");
+  REQUIRE(config.passive_password == "secret");
   REQUIRE(config.lock_path == "/tmp/agentic-et1-tracker-test.lock");
   REQUIRE(config.policy.policy_dir ==
           (config_dir / "config/policy/custom").lexically_normal().string());
@@ -615,6 +620,15 @@ agentic_et1_tracker:
   release_motion_mode_max_attempts: 0
 )yaml"),
                         ContainsSubstring("release_motion_mode_max_attempts"));
+  }
+
+  SECTION("passive password must not be empty") {
+    REQUIRE_THROWS_WITH(loadYaml(R"yaml(
+agentic_et1_tracker:
+  motion_dirs: ["/tmp/motions"]
+  passive_password: ""
+)yaml"),
+                        ContainsSubstring("passive_password"));
   }
 
   SECTION("reference max_rate_hz is unsupported because sim poller owns rate") {

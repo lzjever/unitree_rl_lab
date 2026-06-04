@@ -1,4 +1,4 @@
 interface:
   display_name: "ET1 TRK to Motion"
   short_description: "Execute ET1 .trk files through the local agentic tracker."
-  default_prompt: "Use scripts/et1-trk2motion first: state, ready, run PATH --wait, repeat PATH -n N, idle set PATH..., idle clear, stop, fixstand, standby. Prefer compact one-line JSON and avoid curl. Only active.kind=user has a waitable id; idle is config/progress. For fallback, read references/raw-http.md and use raw METHOD PATH [JSON]."
+  default_prompt: "Use scripts/et1-trk2motion first: state, ready, run PATH --wait, repeat PATH -n N, idle set PATH..., idle clear, stop, passive, fixstand, standby. ready is read-only; run/repeat go directly to /execute and must not auto-recover from passive or fixstand. After passive, only run explicit user-requested fixstand, then explicit standby. passive sends a password body, default galaxy or ET1_PASSIVE_PASSWORD/--password; never print it. Prefer compact one-line JSON and avoid curl. Only active.kind=user has a waitable id; idle is config/progress. For fallback, read references/raw-http.md and use raw METHOD PATH [JSON]."

@@ -47,6 +47,7 @@ struct AppConfig {
   int mode_machine{1};
   double stop_hold_s{0.0};
   std::string idle_mode{"hold_current"};
+  std::string passive_password{"galaxy"};
   std::string lock_path;
   PolicyConfig policy;
   ControlConfig control;

@@ -593,11 +593,13 @@ TEST_CASE("RuntimeBridge stop is accepted before clearing waiting queue on consu
   REQUIRE(snapshot.stop_reason == StopReason::None);
 }
 
-TEST_CASE("RuntimeBridge stop no-op returns current passive and standby state") {
+TEST_CASE("RuntimeBridge stop no-op returns current passive fixstand and standby state") {
   const RuntimeConfig config = runtimeConfig(8);
 
   for (const ControllerState state :
-       {ControllerState::Passive, ControllerState::StandbyVelocity}) {
+       {ControllerState::Passive,
+        ControllerState::FixStand,
+        ControllerState::StandbyVelocity}) {
     RuntimeStatusStore store(config);
     RuntimeBridge bridge(config, store);
     store.publishSnapshot(readySnapshot(state));

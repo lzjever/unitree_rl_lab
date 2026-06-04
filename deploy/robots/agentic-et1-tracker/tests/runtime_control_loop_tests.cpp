@@ -3683,7 +3683,7 @@ TEST_CASE("RuntimeControlLoop stop transitions active run to StandbyVelocity") {
   requireVelocityFrame(robot.writes.back(), velocity_config, velocity_policy.next_raw);
 }
 
-TEST_CASE("RuntimeControlLoop idle FixStand stop switches to StandbyVelocity") {
+TEST_CASE("RuntimeControlLoop idle FixStand stop stays in FixStand") {
   TempTree tmp;
   const RuntimeConfig config = runtimeConfig();
   const DeployConfig deploy_config = deployConfig();
@@ -3710,15 +3710,54 @@ TEST_CASE("RuntimeControlLoop idle FixStand stop switches to StandbyVelocity") {
   REQUIRE_FALSE(store.snapshot().exec.has_value());
   REQUIRE(store.snapshot().queue.ids.empty());
 
-  REQUIRE(bridge.stop().state == ControllerState::Stopping);
+  REQUIRE(bridge.stop().state == ControllerState::FixStand);
   loop.tick();
 
   const auto snapshot = store.snapshot();
-  REQUIRE(snapshot.ctrl == ControllerState::StandbyVelocity);
+  REQUIRE(snapshot.ctrl == ControllerState::FixStand);
   REQUIRE_FALSE(snapshot.exec.has_value());
   REQUIRE(snapshot.queue.ids.empty());
   REQUIRE(velocity_policy.calls == 0);
-  REQUIRE(robot.write_attempts == 0);
+  REQUIRE(robot.write_attempts == 1);
+  requireFixStandFrameFromCurrentQ(robot.writes.back(), fixstand_config,
+                                   *robot.low_state);
+}
+
+TEST_CASE("RuntimeControlLoop stop in Passive remains Passive") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.5F));
+  auto loop = makeControlLoop(config,
+                              bridge,
+                              store,
+                              tmp.trkConfig(),
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              deploy_config,
+                              velocity_config,
+                              fixstand_config,
+                              ControlMode::StandbyVelocity);
+
+  REQUIRE(bridge.passive().ok());
+  loop.tick();
+  REQUIRE(store.snapshot().ctrl == ControllerState::Passive);
+
+  REQUIRE(bridge.stop().state == ControllerState::Passive);
+  loop.tick();
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Passive);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.queue.ids.empty());
+  REQUIRE(velocity_policy.calls == 0);
 }
 
 TEST_CASE("RuntimeControlLoop queues execute in FixStand until StandbyVelocity event") {

@@ -26,10 +26,20 @@ Failure shape:
 {"ok":false,"error":{"code":"run_failed","message":"state=failed"},"next":"status","ctrl":"standby_velocity","ready":true,"err":null}
 ```
 
+Control-state execution rejection shape:
+
+```json
+{"ok":false,"error":{"code":"CONTROL_STATE_CONFLICT","message":"passive cannot execute"},"next":"fixstand","ctrl":"passive","ready":false,"err":null}
+```
+
 Use exit code `0` only when `ok:true`; `holding` is `ok:true` for `wait` and
 `run --hold --wait`. Nonzero means inspect `error.code` and `next`.
 `state`/`status` default to short output and omit large pose arrays. Use
 `status --full` only when the user needs raw tracker details.
+`ready` is read-only and can return `next:"fixstand"` or
+`next:"standby_velocity"` without performing those commands. `run` and
+`repeat` return compact `/execute` errors and `next` without automatic control
+recovery. `passive` output never includes the password.
 
 `active.kind` is `none|user|idle|transition`. Only `active.kind=="user"` with a
 non-null `id` is waitable. Idle status is compact progress only and is not a

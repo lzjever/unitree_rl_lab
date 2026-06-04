@@ -102,6 +102,7 @@ void AgentHttpServer::installHandler() {
   server_->Post("/execute", handler);
   server_->Post("/idle", handler);
   server_->Post("/stop", handler);
+  server_->Post("/passive", handler);
   server_->Post("/fixstand", handler);
   server_->Post("/standby_velocity", handler);
   server_->set_error_handler(

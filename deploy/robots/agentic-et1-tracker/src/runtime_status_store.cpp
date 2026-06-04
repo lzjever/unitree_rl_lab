@@ -273,9 +273,6 @@ StopResult RuntimeStatusStore::acceptStop() {
 
   if (waiting == 0 && !hasActiveOrStopping(snapshot_) &&
       !hasActivePublishedRun(accepted_) && !hasActivePublishedRun(recent_)) {
-    if (snapshot_.ctrl == ControllerState::FixStand) {
-      return {ErrorCode::Ok, ControllerState::Stopping, StopReason::Stop, 0};
-    }
     return {ErrorCode::Ok, snapshot_.ctrl, StopReason::None, 0};
   }
 

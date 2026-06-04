@@ -7,7 +7,7 @@ agentic_et1_tracker:
   release_motion_mode_on_startup: false
   mode_machine: 0
   motion_dirs:
-    - "/home/galbot/works/et1/generated"
+    - "/home/galbot/works/agent-test/generated"
   queue_limit: 8
   recent_limit: 32
   max_track_duration_s: 120
