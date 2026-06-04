@@ -188,6 +188,23 @@ TEST_CASE("RuntimeBridge configureIdle publishes status without user queue state
   REQUIRE(store.snapshot().idle.enabled);
 }
 
+TEST_CASE("RuntimeStatusStore disabled snapshots do not overwrite configured idle") {
+  const RuntimeConfig config = runtimeConfig(8);
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  store.publishSnapshot(readySnapshot());
+
+  REQUIRE(bridge.configureIdle({idleMotion("/tmp/idle.trk")}).ok());
+  REQUIRE(store.snapshot().idle.enabled);
+
+  store.publishSnapshot(readySnapshot());
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.idle.enabled);
+  REQUIRE(snapshot.idle.n == 1);
+  REQUIRE_FALSE(snapshot.idle.active);
+}
+
 TEST_CASE("RuntimeBridge stop clears idle status and emits stop for idle config") {
   const RuntimeConfig config = runtimeConfig(8);
   RuntimeStatusStore store(config);

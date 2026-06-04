@@ -17,7 +17,7 @@
 namespace agentic_et1_tracker {
 namespace {
 
-constexpr double kSyntheticTransitionDurationS = 0.30;
+constexpr double kMaxTransitionDurationS = 5.0;
 
 bool isStartupOrWaitingError(ErrorCode error) {
   switch (error) {
@@ -252,7 +252,13 @@ bool RuntimeControlLoop::consumePendingCommands() {
         return fsm_state_ == RuntimeInternalState::Stopping;
       case CommandKind::Queue:
         if (active_kind_ == ActiveKind::Idle) {
+          MotionRequest request = std::move(command->request);
+          if (startTransitionFromIdleToUser(request)) {
+            return true;
+          }
           stopIdleActive();
+          waiting_.push_back(std::move(request));
+          break;
         }
         waiting_.push_back(std::move(command->request));
         break;
@@ -447,6 +453,9 @@ void RuntimeControlLoop::handleIdleConfig(std::vector<IdleMotion> motions) {
 void RuntimeControlLoop::handleInterrupt(MotionRequest request) {
   cancelWaiting(StopReason::Interrupt);
   if (active_kind_ == ActiveKind::Idle) {
+    if (startTransitionFromIdleToUser(request)) {
+      return;
+    }
     stopIdleActive();
   }
   if (active_kind_ == ActiveKind::Transition) {
@@ -733,6 +742,95 @@ void RuntimeControlLoop::startIdle() {
   handleInternalEvent(RuntimeInternalEvent::MotionRequest);
 }
 
+bool RuntimeControlLoop::startTransitionFromIdleToUser(MotionRequest target_request) {
+  if (active_kind_ != ActiveKind::Idle || !active_ || !active_track_) {
+    return false;
+  }
+
+  const std::optional<TrkFrameView> source_frame = active_track_->frame(active_->frame);
+  if (!source_frame) {
+    return false;
+  }
+
+  auto failTarget = [this](MotionRequest request, ErrorCode error) {
+    request.state = MotionState::Failed;
+    request.frame = 0;
+    request.err = error;
+    request.stop_reason = StopReason::None;
+    request.ended_at = std::chrono::steady_clock::now();
+    status_.publishRunStatus(toStatus(request));
+    if (active_kind_ == ActiveKind::Idle) {
+      stopIdleActive();
+    }
+    clearIdleConfig();
+  };
+
+  target_request.state = MotionState::Queued;
+  target_request.frame = 0;
+  target_request.err = ErrorCode::Ok;
+  target_request.stop_reason = StopReason::None;
+
+  TrkLoadResult loaded = loader_.load(target_request.path);
+  if (!loaded.ok()) {
+    failTarget(std::move(target_request), toCoreErrorCode(loaded.code));
+    return true;
+  }
+
+  target_request.frames = loaded.track->metadata.frames;
+  target_request.fps = loaded.track->metadata.fps;
+  target_request.duration_s = loaded.track->metadata.duration_s;
+  auto target_track = std::make_shared<TrkTrack>(std::move(*loaded.track));
+  const std::optional<TrkFrameView> target_frame = target_track->frame(0);
+  if (!target_frame) {
+    failTarget(std::move(target_request), ErrorCode::InternalError);
+    return true;
+  }
+
+  const std::optional<double> transition_duration_s = transitionDurationForUse();
+  if (!transition_duration_s) {
+    failTarget(std::move(target_request), ErrorCode::InternalError);
+    return true;
+  }
+
+  std::optional<TrkTrack> transition_track =
+      makeSyntheticTransitionTrk(*source_frame,
+                                 *target_frame,
+                                 target_track->metadata.fps,
+                                 *transition_duration_s);
+  if (!transition_track) {
+    failTarget(std::move(target_request), ErrorCode::InternalError);
+    return true;
+  }
+
+  PendingTransition target;
+  target.target_kind = TransitionTargetKind::User;
+  target.target_id = target_request.id;
+  target.target_state = MotionState::Queued;
+  target.target_track = std::move(target_track);
+  target.target_request = std::move(target_request);
+
+  auto transition_track_ptr =
+      std::make_shared<TrkTrack>(std::move(*transition_track));
+  std::optional<LowStateSample> entry_low_state;
+  if (hasPolicyRuntime()) {
+    entry_low_state = latest_low_state_;
+    if (!entry_low_state) {
+      entry_low_state = readLowStateForStatus();
+    }
+  }
+
+  const bool started = startInternalTransition(std::move(transition_track_ptr),
+                                               std::move(target),
+                                               std::move(entry_low_state));
+  if (!started) {
+    if (active_kind_ == ActiveKind::Idle) {
+      stopIdleActive();
+    }
+    clearIdleConfig();
+  }
+  return true;
+}
+
 void RuntimeControlLoop::completePreparing() {
   if (!active_) {
     active_track_.reset();
@@ -936,6 +1034,9 @@ void RuntimeControlLoop::advanceActive() {
     if (active_kind_ == ActiveKind::User && startTransitionFromCompletedUserToStandby()) {
       return;
     }
+    if (active_kind_ == ActiveKind::Idle && startTransitionFromCompletedIdleToIdle()) {
+      return;
+    }
     finishActive(MotionState::Done, StopReason::None, ErrorCode::Ok);
     post_stop_control_ = ControlMode::StandbyVelocity;
     enterGeneralTrackerIdleState();
@@ -1074,6 +1175,9 @@ void RuntimeControlLoop::advanceActiveWithPolicy() {
       return;
     }
     if (active_kind_ == ActiveKind::User && startTransitionFromCompletedUserToStandby()) {
+      return;
+    }
+    if (active_kind_ == ActiveKind::Idle && startTransitionFromCompletedIdleToIdle()) {
       return;
     }
     finishActive(MotionState::Done, StopReason::None, ErrorCode::Ok);
@@ -1313,11 +1417,14 @@ bool RuntimeControlLoop::startTransitionFromCurrentReferenceToUser(
     return true;
   }
 
+  const std::optional<double> transition_duration_s = transitionDurationForUse();
   std::optional<TrkTrack> transition_track =
-      makeSyntheticTransitionTrk(*source_frame,
-                                 *target_frame,
-                                 target_track->metadata.fps,
-                                 kSyntheticTransitionDurationS);
+      transition_duration_s
+          ? makeSyntheticTransitionTrk(*source_frame,
+                                       *target_frame,
+                                       target_track->metadata.fps,
+                                       *transition_duration_s)
+          : std::nullopt;
   if (!transition_track) {
     target_request.state = MotionState::Failed;
     target_request.err = ErrorCode::InternalError;
@@ -1350,6 +1457,103 @@ bool RuntimeControlLoop::startTransitionFromCurrentReferenceToUser(
                                                std::move(entry_low_state));
   if (!started) {
     abortTransition(MotionState::Canceled, replaced_reason, ErrorCode::Ok);
+  }
+  return true;
+}
+
+bool RuntimeControlLoop::startTransitionFromCompletedIdleToIdle() {
+  if (!active_ || active_kind_ != ActiveKind::Idle || !active_track_ ||
+      !waiting_.empty() || idle_config_.empty()) {
+    return false;
+  }
+
+  const std::optional<TrkFrameView> source_frame = active_track_->frame(active_->frame);
+  if (!source_frame) {
+    stopIdleActive();
+    clearIdleConfig();
+    return true;
+  }
+
+  if (idle_next_index_ >= idle_config_.size()) {
+    idle_next_index_ = 0;
+  }
+  const std::size_t index = idle_next_index_;
+  idle_next_index_ = (idle_next_index_ + 1) % idle_config_.size();
+  const IdleMotion& motion = idle_config_.at(index);
+
+  auto failTransition = [this] {
+    if (active_kind_ == ActiveKind::Idle) {
+      stopIdleActive();
+    }
+    clearIdleConfig();
+  };
+
+  TrkLoadResult loaded = loader_.load(motion.path);
+  if (!loaded.ok()) {
+    failTransition();
+    return true;
+  }
+
+  MotionRequest idle_request;
+  idle_request.id.clear();
+  idle_request.path = motion.path;
+  idle_request.state = MotionState::Queued;
+  idle_request.frame = 0;
+  idle_request.frames = loaded.track->metadata.frames;
+  idle_request.fps = loaded.track->metadata.fps;
+  idle_request.duration_s = loaded.track->metadata.duration_s;
+  idle_request.err = ErrorCode::Ok;
+  idle_request.stop_reason = StopReason::None;
+
+  auto target_track = std::make_shared<TrkTrack>(std::move(*loaded.track));
+  const std::optional<TrkFrameView> target_frame = target_track->frame(0);
+  if (!target_frame) {
+    failTransition();
+    return true;
+  }
+
+  const std::optional<double> transition_duration_s = transitionDurationForUse();
+  if (!transition_duration_s) {
+    failTransition();
+    return true;
+  }
+
+  std::optional<TrkTrack> transition_track =
+      makeSyntheticTransitionTrk(*source_frame,
+                                 *target_frame,
+                                 target_track->metadata.fps,
+                                 *transition_duration_s);
+  if (!transition_track) {
+    failTransition();
+    return true;
+  }
+
+  PendingTransition target;
+  target.target_kind = TransitionTargetKind::Idle;
+  target.target_id.clear();
+  target.target_state = MotionState::Running;
+  target.target_track = std::move(target_track);
+  target.target_request = std::move(idle_request);
+  target.idle_index = index;
+
+  auto transition_track_ptr =
+      std::make_shared<TrkTrack>(std::move(*transition_track));
+  std::optional<LowStateSample> entry_low_state;
+  if (hasPolicyRuntime()) {
+    entry_low_state = latest_low_state_;
+    if (!entry_low_state) {
+      entry_low_state = readLowStateForStatus();
+    }
+  }
+
+  const bool started = startInternalTransition(std::move(transition_track_ptr),
+                                               std::move(target),
+                                               std::move(entry_low_state));
+  if (!started) {
+    if (active_kind_ == ActiveKind::Idle) {
+      stopIdleActive();
+    }
+    clearIdleConfig();
   }
   return true;
 }
@@ -1505,11 +1709,14 @@ bool RuntimeControlLoop::startSyntheticTransitionFromActiveFrame(
     return false;
   }
 
+  const std::optional<double> transition_duration_s = transitionDurationForUse();
   std::optional<TrkTrack> transition_track =
-      makeSyntheticTransitionTrk(*source_frame,
-                                 target_frame,
-                                 target_fps,
-                                 kSyntheticTransitionDurationS);
+      transition_duration_s
+          ? makeSyntheticTransitionTrk(*source_frame,
+                                       target_frame,
+                                       target_fps,
+                                       *transition_duration_s)
+          : std::nullopt;
   if (!transition_track) {
     if (target.target_request && !target.target_request->id.empty()) {
       target.target_request->state = MotionState::Failed;
@@ -2286,6 +2493,13 @@ void RuntimeControlLoop::stopIdleActive() {
   }
 }
 
+void RuntimeControlLoop::clearIdleConfig() {
+  idle_config_.clear();
+  idle_next_index_ = 0;
+  idle_current_index_.reset();
+  status_.clearIdleConfig();
+}
+
 void RuntimeControlLoop::enterStopping(StopReason reason) {
   if (fsm_state_ == RuntimeInternalState::Stopping) {
     return;
@@ -2352,6 +2566,15 @@ std::size_t RuntimeControlLoop::activePolicyIntervalTicks() const {
 
 std::size_t RuntimeControlLoop::stopHoldTicks() const {
   return 0;
+}
+
+std::optional<double> RuntimeControlLoop::transitionDurationForUse() const {
+  if (!std::isfinite(config_.transition_duration_s) ||
+      config_.transition_duration_s <= 0.0 ||
+      config_.transition_duration_s > kMaxTransitionDurationS) {
+    return std::nullopt;
+  }
+  return config_.transition_duration_s;
 }
 
 void RuntimeControlLoop::publishActive() {

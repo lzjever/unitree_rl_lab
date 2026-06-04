@@ -28,6 +28,7 @@ constexpr int kMinDomainId = 0;
 constexpr int kMaxDomainId = 232;
 constexpr double kMinRuntimeRate = 1.0;
 constexpr double kMaxRuntimeRate = 1000.0;
+constexpr double kMaxTransitionDurationS = 5.0;
 constexpr const char* kInternalStandbyReference = "reference/standby/v0/standby_ref.trk";
 
 ConfigError error(const std::string& message) { return ConfigError("config error: " + message); }
@@ -139,6 +140,23 @@ double optionalRuntimeRate(const YAML::Node& section, const char* key, double cu
   if (!std::isfinite(value) || value < kMinRuntimeRate || value > kMaxRuntimeRate) {
     std::ostringstream out;
     out << key << " must be in the range " << kMinRuntimeRate << ".." << kMaxRuntimeRate;
+    throw error(out.str());
+  }
+  return value;
+}
+
+double optionalBoundedPositiveDouble(const YAML::Node& section,
+                                     const char* key,
+                                     double current,
+                                     double max_value) {
+  const YAML::Node node = section[key];
+  if (!node) {
+    return current;
+  }
+  const double value = scalarAs<double>(node, key);
+  if (!std::isfinite(value) || value <= 0.0 || value > max_value) {
+    std::ostringstream out;
+    out << key << " must be in the range 0.." << max_value << " exclusive of 0";
     throw error(out.str());
   }
   return value;
@@ -374,6 +392,12 @@ AppConfig loadAppConfig(const std::filesystem::path& path) {
       throw error("stop_hold_s must be 0.0");
     }
     config.runtime.stop_hold_s = config.stop_hold_s;
+    config.transition_duration_s =
+        optionalBoundedPositiveDouble(section,
+                                      "transition_duration_s",
+                                      config.transition_duration_s,
+                                      kMaxTransitionDurationS);
+    config.runtime.transition_duration_s = config.transition_duration_s;
     config.idle_mode = optionalString(section, "idle_mode", config.idle_mode);
     if (config.idle_mode != kIdleModeHoldCurrent) {
       throw error("idle_mode must be hold_current");

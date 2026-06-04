@@ -46,6 +46,7 @@ struct AppConfig {
   std::size_t release_motion_mode_retry_interval_ms{500};
   int mode_machine{1};
   double stop_hold_s{0.0};
+  double transition_duration_s{0.30};
   std::string idle_mode{"hold_current"};
   std::string passive_password{"galaxy"};
   std::string lock_path;

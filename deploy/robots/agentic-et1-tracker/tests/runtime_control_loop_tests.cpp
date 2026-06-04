@@ -1490,6 +1490,28 @@ TEST_CASE("RuntimeControlLoop interrupt transition restarts from current transit
   REQUIRE(reference.latest.comv == interrupted_frame.comv);
 }
 
+TEST_CASE("RuntimeControlLoop transition duration config controls synthetic frame count") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 1.0;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  RuntimeControlLoop loop(config, bridge, store, TrkLoader(tmp.trkConfig()), &reference);
+
+  startHoldingToUserTransition(loop,
+                               store,
+                               bridge,
+                               tmp,
+                               "held-duration-config",
+                               "target-duration-config",
+                               &reference);
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.active.kind == ActiveKind::Transition);
+  REQUIRE(snapshot.transition.frames == 51);
+}
+
 TEST_CASE("RuntimeControlLoop completed user enters idle through internal transition") {
   TempTree tmp;
   const RuntimeConfig config = runtimeConfig();
@@ -3178,6 +3200,123 @@ TEST_CASE("RuntimeControlLoop idle config stays out of user run and queue state"
   REQUIRE(snapshot.queue.ids.empty());
 }
 
+TEST_CASE("RuntimeControlLoop completed idle enters next idle through internal transition") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  auto loop = makeControlLoop(config,
+                              bridge,
+                              store,
+                              tmp.trkConfig(),
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              deploy_config,
+                              velocity_config,
+                              fixstand_config,
+                              ControlMode::StandbyVelocity,
+                              passiveConfig(),
+                              &reference);
+
+  const auto idle_a = validTrk(tmp, "idle_to_idle_a.trk", 2);
+  const auto idle_b = validTrk(tmp, "idle_to_idle_b.trk", 2);
+  REQUIRE(bridge.configureIdle({idleMotion(idle_a, 2), idleMotion(idle_b, 2)}).ok());
+  loop.tick();
+  loop.tick();
+  loop.tick();
+  REQUIRE(store.snapshot().active.kind == ActiveKind::Idle);
+  REQUIRE(store.snapshot().idle.current == 0);
+
+  bool saw_transition = false;
+  for (int i = 0; i < 6; ++i) {
+    loop.tick();
+    const auto snapshot = store.snapshot();
+    if (snapshot.active.kind == ActiveKind::Transition) {
+      saw_transition = true;
+      REQUIRE(snapshot.transition.active);
+      REQUIRE(snapshot.transition.target == "idle");
+      REQUIRE(snapshot.transition.target_id.empty());
+      REQUIRE_FALSE(snapshot.exec.has_value());
+      REQUIRE_FALSE(snapshot.idle.active);
+      REQUIRE(snapshot.queue.ids.empty());
+      REQUIRE(store.findRun(idle_a.string()).code == ErrorCode::RunNotFound);
+      REQUIRE(store.findRun(idle_b.string()).code == ErrorCode::RunNotFound);
+      break;
+    }
+  }
+  REQUIRE(saw_transition);
+}
+
+TEST_CASE("RuntimeControlLoop idle to idle transition build failure does not stick or record history") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  auto loop = makeControlLoop(config,
+                              bridge,
+                              store,
+                              tmp.trkConfig(),
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              deploy_config,
+                              velocity_config,
+                              fixstand_config,
+                              ControlMode::StandbyVelocity,
+                              passiveConfig(),
+                              &reference);
+
+  const auto idle_a = validTrk(tmp, "idle_to_bad_idle_a.trk", 2);
+  const auto idle_bad = zeroQuaternionTrk(tmp, "idle_to_bad_idle_b.trk", 2);
+  REQUIRE(bridge.configureIdle({idleMotion(idle_a, 2), idleMotion(idle_bad, 2)}).ok());
+  loop.tick();
+  loop.tick();
+  loop.tick();
+  REQUIRE(store.snapshot().active.kind == ActiveKind::Idle);
+
+  bool stopped_idle = false;
+  for (int i = 0; i < 6; ++i) {
+    loop.tick();
+    const auto snapshot = store.snapshot();
+    REQUIRE(snapshot.active.kind != ActiveKind::Transition);
+    REQUIRE_FALSE(snapshot.transition.active);
+    REQUIRE_FALSE(snapshot.exec.has_value());
+    REQUIRE(snapshot.queue.ids.empty());
+    REQUIRE(store.findRun(idle_a.string()).code == ErrorCode::RunNotFound);
+    REQUIRE(store.findRun(idle_bad.string()).code == ErrorCode::RunNotFound);
+    if (snapshot.active.kind == ActiveKind::None) {
+      REQUIRE_FALSE(snapshot.idle.enabled);
+      REQUIRE_FALSE(snapshot.idle.active);
+      stopped_idle = true;
+      break;
+    }
+  }
+  REQUIRE(stopped_idle);
+
+  loop.tick();
+  const auto next = store.snapshot();
+  REQUIRE(next.active.kind == ActiveKind::None);
+  REQUIRE_FALSE(next.idle.enabled);
+  REQUIRE_FALSE(next.idle.active);
+  REQUIRE_FALSE(next.transition.active);
+  REQUIRE_FALSE(next.exec.has_value());
+}
+
 TEST_CASE("RuntimeControlLoop stop clears consumed inactive idle config") {
   TempTree tmp;
   const RuntimeConfig config = runtimeConfig();
@@ -3292,6 +3431,7 @@ TEST_CASE("RuntimeControlLoop user execute preempts active idle without idle run
   for (const MotionMode mode : {MotionMode::Queue, MotionMode::Interrupt}) {
     RuntimeStatusStore store(config);
     RuntimeBridge bridge(config, store);
+    FakeReferenceSink reference;
     FakeRobotIO robot(readyLowState(deploy_config));
     FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
     FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
@@ -3305,7 +3445,9 @@ TEST_CASE("RuntimeControlLoop user execute preempts active idle without idle run
                                 deploy_config,
                                 velocity_config,
                                 fixstand_config,
-                                ControlMode::StandbyVelocity);
+                                ControlMode::StandbyVelocity,
+                                passiveConfig(),
+                                &reference);
     const auto idle_path = validTrk(tmp, std::string("preempt_idle_") +
                                              toString(mode) + ".trk", 3);
     const auto user_path = validTrk(tmp, std::string("preempt_user_") +
@@ -3317,6 +3459,10 @@ TEST_CASE("RuntimeControlLoop user execute preempts active idle without idle run
     REQUIRE(store.snapshot().active.kind == ActiveKind::Idle);
     REQUIRE(store.snapshot().idle.active);
     REQUIRE_FALSE(store.snapshot().exec.has_value());
+    const auto idle_track = loadTrack(tmp.trkConfig(), idle_path);
+    const auto expected_source =
+        makeReferenceFrameSnapshot("", *idle_track, store.snapshot().idle.frame);
+    REQUIRE(expected_source.has_value());
 
     if (mode == MotionMode::Interrupt) {
       REQUIRE(bridge.submitInterrupt(executeCommand("user", user_path, mode, 2)).ok());
@@ -3326,16 +3472,202 @@ TEST_CASE("RuntimeControlLoop user execute preempts active idle without idle run
     loop.tick();
 
     const auto snapshot = store.snapshot();
-    REQUIRE(snapshot.ctrl == ControllerState::Preparing);
-    REQUIRE(snapshot.active.kind == ActiveKind::User);
-    REQUIRE(snapshot.active.id == "user");
+    REQUIRE(snapshot.ctrl == ControllerState::Running);
+    REQUIRE(snapshot.active.kind == ActiveKind::Transition);
+    REQUIRE(snapshot.transition.active);
+    REQUIRE(snapshot.transition.target == "user");
+    REQUIRE(snapshot.transition.target_id == "user");
+    REQUIRE(snapshot.transition.target_state == MotionState::Queued);
+    REQUIRE(reference.latest.active);
+    REQUIRE(reference.latest.frame == 0);
+    REQUIRE(reference.latest.p == expected_source->p);
+    REQUIRE(reference.latest.c == expected_source->c);
+    REQUIRE(reference.latest.com == expected_source->com);
     REQUIRE_FALSE(snapshot.idle.active);
-    REQUIRE(snapshot.exec.has_value());
-    REQUIRE(snapshot.exec->id == "user");
+    REQUIRE_FALSE(snapshot.exec.has_value());
     REQUIRE(snapshot.queue.ids.empty());
     REQUIRE(store.findRun("user").ok());
     REQUIRE(store.findRun(idle_path.string()).code == ErrorCode::RunNotFound);
   }
+}
+
+TEST_CASE("RuntimeControlLoop idle to user transition target load failure publishes user failed") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  auto loop = makeControlLoop(config,
+                              bridge,
+                              store,
+                              tmp.trkConfig(),
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              deploy_config,
+                              velocity_config,
+                              fixstand_config,
+                              ControlMode::StandbyVelocity,
+                              passiveConfig(),
+                              &reference);
+
+  const auto idle_path = validTrk(tmp, "idle_to_bad_user_idle.trk", 3);
+  const auto bad_user_path = invalidContactTrk(tmp, "idle_to_bad_user.trk");
+  REQUIRE(bridge.configureIdle({idleMotion(idle_path, 3)}).ok());
+  loop.tick();
+  loop.tick();
+  loop.tick();
+  REQUIRE(store.snapshot().active.kind == ActiveKind::Idle);
+
+  REQUIRE(bridge.submitQueue(executeCommand("bad-user", bad_user_path)).ok());
+  loop.tick();
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.active.kind == ActiveKind::None);
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  const auto failed = store.findRun("bad-user");
+  REQUIRE(failed.ok());
+  REQUIRE(failed.run.has_value());
+  REQUIRE(failed.run->state == MotionState::Failed);
+  REQUIRE(failed.run->err == ErrorCode::TrkValidationFailed);
+  REQUIRE(store.findRun(idle_path.string()).code == ErrorCode::RunNotFound);
+
+  loop.tick();
+  const auto next = store.snapshot();
+  REQUIRE(next.active.kind == ActiveKind::None);
+  REQUIRE_FALSE(next.idle.enabled);
+  REQUIRE_FALSE(next.idle.active);
+  REQUIRE_FALSE(next.transition.active);
+  REQUIRE_FALSE(next.exec.has_value());
+}
+
+TEST_CASE("RuntimeControlLoop idle to user transition interrupt failure does not resume idle") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  auto loop = makeControlLoop(config,
+                              bridge,
+                              store,
+                              tmp.trkConfig(),
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              deploy_config,
+                              velocity_config,
+                              fixstand_config,
+                              ControlMode::StandbyVelocity,
+                              passiveConfig(),
+                              &reference);
+
+  const auto idle_path = validTrk(tmp, "idle_interrupt_bad_user_idle.trk", 3);
+  const auto bad_user_path = invalidContactTrk(tmp, "idle_interrupt_bad_user.trk");
+  REQUIRE(bridge.configureIdle({idleMotion(idle_path, 3)}).ok());
+  loop.tick();
+  loop.tick();
+  loop.tick();
+  REQUIRE(store.snapshot().active.kind == ActiveKind::Idle);
+
+  REQUIRE(bridge.submitInterrupt(
+              executeCommand("bad-interrupt-user",
+                             bad_user_path,
+                             MotionMode::Interrupt,
+                             3))
+              .ok());
+  loop.tick();
+
+  auto snapshot = store.snapshot();
+  REQUIRE(snapshot.active.kind == ActiveKind::None);
+  REQUIRE_FALSE(snapshot.idle.enabled);
+  REQUIRE_FALSE(snapshot.idle.active);
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  const auto failed = store.findRun("bad-interrupt-user");
+  REQUIRE(failed.ok());
+  REQUIRE(failed.run.has_value());
+  REQUIRE(failed.run->state == MotionState::Failed);
+  REQUIRE(failed.run->err == ErrorCode::TrkValidationFailed);
+  REQUIRE(store.findRun(idle_path.string()).code == ErrorCode::RunNotFound);
+
+  loop.tick();
+  snapshot = store.snapshot();
+  REQUIRE(snapshot.active.kind == ActiveKind::None);
+  REQUIRE_FALSE(snapshot.idle.enabled);
+  REQUIRE_FALSE(snapshot.idle.active);
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+}
+
+TEST_CASE("RuntimeControlLoop invalid transition duration safely fails idle to user transition") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 6.0;
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  auto loop = makeControlLoop(config,
+                              bridge,
+                              store,
+                              tmp.trkConfig(),
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              deploy_config,
+                              velocity_config,
+                              fixstand_config,
+                              ControlMode::StandbyVelocity,
+                              passiveConfig(),
+                              &reference);
+
+  const auto idle_path = validTrk(tmp, "idle_invalid_transition_duration.trk", 3);
+  const auto user_path = validTrk(tmp, "user_invalid_transition_duration.trk", 2);
+  REQUIRE(bridge.configureIdle({idleMotion(idle_path, 3)}).ok());
+  loop.tick();
+  loop.tick();
+  loop.tick();
+  REQUIRE(store.snapshot().active.kind == ActiveKind::Idle);
+
+  REQUIRE(bridge.submitQueue(executeCommand("duration-invalid-user", user_path)).ok());
+  loop.tick();
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.active.kind == ActiveKind::None);
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  const auto failed = store.findRun("duration-invalid-user");
+  REQUIRE(failed.ok());
+  REQUIRE(failed.run.has_value());
+  REQUIRE(failed.run->state == MotionState::Failed);
+  REQUIRE(failed.run->err == ErrorCode::InternalError);
+  REQUIRE(store.findRun(idle_path.string()).code == ErrorCode::RunNotFound);
+
+  loop.tick();
+  const auto next = store.snapshot();
+  REQUIRE(next.active.kind == ActiveKind::None);
+  REQUIRE_FALSE(next.idle.enabled);
+  REQUIRE_FALSE(next.idle.active);
+  REQUIRE_FALSE(next.transition.active);
+  REQUIRE_FALSE(next.exec.has_value());
 }
 
 TEST_CASE("RuntimeControlLoop stop clears idle config and active idle without stop history") {

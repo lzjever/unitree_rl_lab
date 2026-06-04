@@ -141,6 +141,7 @@ agentic_et1_tracker:
   REQUIRE(config.runtime.recent_limit == 32);
   REQUIRE(config.runtime.hz == 1000.0);
   REQUIRE(config.runtime.stop_hold_s == 0.0);
+  REQUIRE(config.runtime.transition_duration_s == 0.30);
   REQUIRE(config.trk.fps == 50.0);
   REQUIRE(config.trk.max_duration_s == 120.0);
   REQUIRE(config.trk.allowlist_dirs == std::vector<std::filesystem::path>{"/home/galbot/motions"});
@@ -213,6 +214,7 @@ TEST_CASE("AppConfig default file keeps StandbyVelocity and posture assets app-o
   REQUIRE(config.control.startup_control == "FixStand");
   REQUIRE(config.stop_hold_s == 0.0);
   REQUIRE(config.runtime.stop_hold_s == 0.0);
+  REQUIRE(config.runtime.transition_duration_s == 0.30);
   REQUIRE(config.passive_password == "galaxy");
   REQUIRE_FALSE(config.reference.enabled);
 }
@@ -248,6 +250,7 @@ TEST_CASE("AppConfig simulation example is ready for local MuJoCo acceptance") {
               .string());
   REQUIRE(config.control.startup_control == "FixStand");
   REQUIRE(config.stop_hold_s == 0.0);
+  REQUIRE(config.runtime.transition_duration_s == 0.30);
   REQUIRE(config.passive_password == "galaxy");
   REQUIRE(config.reference.enabled);
 }
@@ -346,6 +349,7 @@ agentic_et1_tracker:
   queue_limit: 3
   recent_limit: 9
   max_track_duration_s: 42.5
+  transition_duration_s: 1.0
   stop_hold_s: 0.0
   idle_mode: "hold_current"
   passive_password: "secret"
@@ -376,6 +380,7 @@ agentic_et1_tracker:
   REQUIRE(config.runtime.recent_limit == 9);
   REQUIRE(config.runtime.hz == 1000.0);
   REQUIRE(config.runtime.stop_hold_s == 0.0);
+  REQUIRE(config.runtime.transition_duration_s == 1.0);
   REQUIRE(config.trk.allowlist_dirs ==
           std::vector<std::filesystem::path>{"/srv/motions/a", "/srv/motions/b"});
   REQUIRE(config.trk.max_duration_s == 42.5);
@@ -639,6 +644,17 @@ agentic_et1_tracker:
     max_rate_hz: 60
 )yaml"),
                         ContainsSubstring("max_rate_hz"));
+  }
+
+  SECTION("transition duration must be bounded positive") {
+    for (const char* value : {"0.0", "-0.1", "6.0", ".nan"}) {
+      CAPTURE(value);
+      REQUIRE_THROWS_WITH(loadYaml(std::string("agentic_et1_tracker:\n"
+                                              "  motion_dirs: [\"/tmp/motions\"]\n"
+                                              "  transition_duration_s: ") +
+                                   value + "\n"),
+                          ContainsSubstring("transition_duration_s"));
+    }
   }
 }
 

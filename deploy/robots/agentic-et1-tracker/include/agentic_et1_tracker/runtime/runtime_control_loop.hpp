@@ -129,6 +129,7 @@ class RuntimeControlLoop final {
   bool hasIdleStartCandidate() const;
   bool canStartIdle() const;
   void startIdle();
+  bool startTransitionFromIdleToUser(MotionRequest target_request);
   void completePreparing();
   void advanceActive();
   void advanceActiveWithPolicy();
@@ -138,6 +139,7 @@ class RuntimeControlLoop final {
   bool startTransitionFromHoldingToStandby();
   bool startTransitionFromCurrentReferenceToUser(MotionRequest target_request,
                                                 StopReason replaced_reason);
+  bool startTransitionFromCompletedIdleToIdle();
   bool startTransitionFromCompletedUserToIdle();
   bool startTransitionFromCompletedUserToStandby();
   bool startSyntheticTransitionFromActiveFrame(PendingTransition target,
@@ -173,6 +175,7 @@ class RuntimeControlLoop final {
                                             StopReason reason,
                                             ErrorCode error);
   void stopIdleActive();
+  void clearIdleConfig();
   void enterStopping(StopReason reason);
   std::size_t ticksForPeriod(double seconds) const;
   std::size_t ticksForRate(double rate_hz) const;
@@ -180,6 +183,7 @@ class RuntimeControlLoop final {
   std::size_t velocityPolicyIntervalTicks() const;
   std::size_t activePolicyIntervalTicks() const;
   std::size_t stopHoldTicks() const;
+  std::optional<double> transitionDurationForUse() const;
   void publishActive();
   void publishReferenceActive();
   void publishReferenceTransition();

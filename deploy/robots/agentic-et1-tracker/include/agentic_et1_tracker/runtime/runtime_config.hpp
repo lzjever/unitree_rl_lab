@@ -9,6 +9,7 @@ struct RuntimeConfig {
   std::size_t recent_limit{32};
   double hz{1000.0};
   double stop_hold_s{0.0};
+  double transition_duration_s{0.30};
 };
 
 }  // namespace agentic_et1_tracker

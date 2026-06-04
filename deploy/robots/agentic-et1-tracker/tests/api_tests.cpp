@@ -321,6 +321,7 @@ TEST_CASE("POST execute rejects invalid JSON contract before ports") {
       R"({"path":"/tracks/a.trk","hold":"true"})",
       R"({"path":"/tracks/a.trk","hold":1})",
       R"({"path":"/tracks/a.trk","paths":["/tracks/b.trk"]})",
+      R"({"path":"/tracks/a.trk","transition_duration_s":1.0})",
       R"({"path":"/tracks/a.trk","extra":true})",
       R"({"paths":["/tracks/a.trk"]})",
   };
@@ -349,6 +350,7 @@ TEST_CASE("POST idle rejects invalid JSON contract before ports") {
       R"({"paths":[3]})",
       R"({"paths":[""]})",
       R"({"paths":["/tracks/a.trk"],"mode":"queue"})",
+      R"({"paths":["/tracks/a.trk"],"transition_duration_s":1.0})",
   };
 
   for (const auto& body : bodies) {

@@ -24,6 +24,7 @@ class RuntimeStatusStore final : public StatusReader {
 
  private:
   friend class RuntimeBridge;
+  friend class RuntimeControlLoop;
 
   ExecuteResult acceptQueued(const ExecuteCommand& command, std::uint64_t sequence);
   ExecuteResult acceptInterrupt(const ExecuteCommand& command, std::uint64_t sequence);
