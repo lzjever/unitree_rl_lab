@@ -124,6 +124,8 @@ class RuntimeControlLoop final {
   void enterTrackActiveState();
   bool isMotionAcceptingState() const;
   bool isControlPublishingState() const;
+  bool isUserOwnedTransition() const;
+  bool isBackgroundOwnedTransitionOrPlayback() const;
   void runPassiveState();
   void startNext();
   bool hasIdleStartCandidate() const;

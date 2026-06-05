@@ -806,6 +806,145 @@ void startHoldingToUserTransition(RuntimeControlLoop& loop,
   REQUIRE(snapshot.queue.ids.empty());
 }
 
+void requireUserTransitionStatus(const RuntimeStatusStore& store,
+                                 const std::string& target_id) {
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Running);
+  REQUIRE(snapshot.active.kind == ActiveKind::Transition);
+  REQUIRE_FALSE(snapshot.idle.active);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.transition.active);
+  REQUIRE(snapshot.transition.target == "user");
+  REQUIRE(snapshot.transition.target_id == target_id);
+  REQUIRE(snapshot.transition.target_state == MotionState::Queued);
+  REQUIRE(snapshot.transition.frame == 0);
+  REQUIRE(snapshot.queue.ids.empty());
+}
+
+void requireNoActiveWorkOrBackground(const RuntimeStatusStore& store) {
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.active.kind == ActiveKind::None);
+  REQUIRE_FALSE(snapshot.idle.enabled);
+  REQUIRE_FALSE(snapshot.idle.active);
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.queue.ids.empty());
+}
+
+void requireReferenceStartsFrom(const FakeReferenceSink& reference,
+                                const ReferenceFrameSnapshot& source) {
+  REQUIRE(reference.latest.active);
+  REQUIRE(reference.latest.frame == 0);
+  REQUIRE(reference.latest.p == source.p);
+  REQUIRE(reference.latest.q.size() == source.q.size());
+  for (std::size_t body = 0; body < reference.latest.q.size(); ++body) {
+    for (std::size_t axis = 0; axis < reference.latest.q.at(body).size(); ++axis) {
+      REQUIRE(reference.latest.q.at(body).at(axis) ==
+              Catch::Approx(source.q.at(body).at(axis)).margin(1.0e-5F));
+    }
+  }
+  REQUIRE(reference.latest.c == source.c);
+  REQUIRE(reference.latest.com == source.com);
+}
+
+std::filesystem::path startCompletedUserToIdleTransition(
+    RuntimeControlLoop& loop,
+    RuntimeStatusStore& store,
+    RuntimeBridge& bridge,
+    TempTree& tmp,
+    const std::string& id_prefix) {
+  const auto idle_path = validTrk(tmp, id_prefix + "_idle.trk", 3);
+  REQUIRE(bridge.configureIdle({idleMotion(idle_path, 3)}).ok());
+  loop.tick();
+
+  const auto user_path = validTrk(tmp, id_prefix + "_user.trk", 1);
+  REQUIRE(bridge.submitQueue(
+              executeCommand(id_prefix + "-source-user",
+                             user_path,
+                             MotionMode::Queue,
+                             1))
+              .ok());
+  startQueuedRun(loop, store, id_prefix + "-source-user");
+  loop.tick();
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.active.kind == ActiveKind::Transition);
+  REQUIRE(snapshot.transition.active);
+  REQUIRE(snapshot.transition.target == "idle");
+  REQUIRE(snapshot.transition.target_id.empty());
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.queue.ids.empty());
+  REQUIRE(store.findRun(id_prefix + "-source-user").run->state == MotionState::Done);
+  return idle_path;
+}
+
+void startCompletedUserToStandbyTransition(RuntimeControlLoop& loop,
+                                           RuntimeStatusStore& store,
+                                           RuntimeBridge& bridge,
+                                           TempTree& tmp,
+                                           const std::string& id_prefix) {
+  const auto user_path = validTrk(tmp, id_prefix + "_user.trk", 1);
+  REQUIRE(bridge.submitQueue(
+              executeCommand(id_prefix + "-source-user",
+                             user_path,
+                             MotionMode::Queue,
+                             1))
+              .ok());
+  startQueuedRun(loop, store, id_prefix + "-source-user");
+  loop.tick();
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.active.kind == ActiveKind::Transition);
+  REQUIRE(snapshot.transition.active);
+  REQUIRE(snapshot.transition.target == "standby");
+  REQUIRE(snapshot.transition.target_id.empty());
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.queue.ids.empty());
+  REQUIRE(store.findRun(id_prefix + "-source-user").run->state == MotionState::Done);
+}
+
+void advanceBackgroundTransition(RuntimeControlLoop& loop,
+                                 RuntimeStatusStore& store,
+                                 const std::string& target) {
+  for (int i = 0; i < 16; ++i) {
+    loop.tick();
+    const auto snapshot = store.snapshot();
+    if (snapshot.active.kind == ActiveKind::Transition &&
+        snapshot.transition.active && snapshot.transition.target == target &&
+        snapshot.transition.target_id.empty() && snapshot.transition.frame > 0) {
+      REQUIRE_FALSE(snapshot.exec.has_value());
+      REQUIRE(snapshot.queue.ids.empty());
+      return;
+    }
+  }
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.active.kind == ActiveKind::Transition);
+  REQUIRE(snapshot.transition.active);
+  REQUIRE(snapshot.transition.target == target);
+  REQUIRE(snapshot.transition.target_id.empty());
+  REQUIRE(snapshot.transition.frame > 0);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.queue.ids.empty());
+}
+
+void advanceToStandbyPlayback(RuntimeControlLoop& loop,
+                              RuntimeStatusStore& store,
+                              std::size_t standby_frames) {
+  for (int i = 0; i < 96; ++i) {
+    loop.tick();
+    const auto snapshot = store.snapshot();
+    if (snapshot.active.kind == ActiveKind::Transition &&
+        snapshot.transition.active && snapshot.transition.target == "standby" &&
+        snapshot.transition.frames == standby_frames) {
+      REQUIRE(snapshot.transition.target_id.empty());
+      REQUIRE_FALSE(snapshot.exec.has_value());
+      REQUIRE(snapshot.queue.ids.empty());
+      return;
+    }
+  }
+  FAIL("standby playback did not start");
+}
+
 void requireStandbyGateFailure(const RuntimeControlLoop& loop,
                                const RuntimeStatusStore& store,
                                const FakeReferenceSink& reference,
@@ -4039,6 +4178,305 @@ TEST_CASE("RuntimeControlLoop user execute preempts active idle without idle run
   }
 }
 
+TEST_CASE("RuntimeControlLoop queue preempts background transition and playback to user",
+          "[runtime-p1]") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+
+  SECTION("transition target idle") {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeReferenceSink reference;
+    RuntimeControlLoop loop(config, bridge, store, TrkLoader(tmp.trkConfig()), &reference);
+
+    startCompletedUserToIdleTransition(loop, store, bridge, tmp, "queue-idle");
+    advanceBackgroundTransition(loop, store, "idle");
+    const ReferenceFrameSnapshot source = reference.latest;
+    REQUIRE(source.active);
+
+    const auto user_path = validTrk(tmp, "queue_idle_preempt_user.trk", 2);
+    REQUIRE(bridge.submitQueue(
+                executeCommand("queue-idle-preempt-user",
+                               user_path,
+                               MotionMode::Queue,
+                               2))
+                .ok());
+    loop.tick();
+
+    requireUserTransitionStatus(store, "queue-idle-preempt-user");
+    requireReferenceStartsFrom(reference, source);
+    REQUIRE(store.findRun("queue-idle-preempt-user").run->state ==
+            MotionState::Queued);
+  }
+
+  SECTION("transition target standby") {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeReferenceSink reference;
+    const auto standby_track = validStandbyTrack(tmp, "queue_standby_ref.trk");
+    RuntimeControlLoop loop(config,
+                            bridge,
+                            store,
+                            TrkLoader(tmp.trkConfig()),
+                            &reference,
+                            standby_track);
+
+    startCompletedUserToStandbyTransition(
+        loop, store, bridge, tmp, "queue-standby");
+    advanceBackgroundTransition(loop, store, "standby");
+    const ReferenceFrameSnapshot source = reference.latest;
+    REQUIRE(source.active);
+
+    const auto user_path = validTrk(tmp, "queue_standby_preempt_user.trk", 2);
+    REQUIRE(bridge.submitQueue(
+                executeCommand("queue-standby-preempt-user",
+                               user_path,
+                               MotionMode::Queue,
+                               2))
+                .ok());
+    loop.tick();
+
+    requireUserTransitionStatus(store, "queue-standby-preempt-user");
+    requireReferenceStartsFrom(reference, source);
+  }
+
+  SECTION("standby playback") {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeReferenceSink reference;
+    const auto standby_track = validStandbyTrack(tmp, "queue_playback_ref.trk");
+    RuntimeControlLoop loop(config,
+                            bridge,
+                            store,
+                            TrkLoader(tmp.trkConfig()),
+                            &reference,
+                            standby_track);
+
+    startCompletedUserToStandbyTransition(
+        loop, store, bridge, tmp, "queue-playback");
+    advanceToStandbyPlayback(loop, store, standby_track->metadata.frames);
+    const ReferenceFrameSnapshot source = reference.latest;
+    REQUIRE(source.active);
+
+    const auto user_path = validTrk(tmp, "queue_playback_preempt_user.trk", 2);
+    REQUIRE(bridge.submitQueue(
+                executeCommand("queue-playback-preempt-user",
+                               user_path,
+                               MotionMode::Queue,
+                               2))
+                .ok());
+    loop.tick();
+
+    requireUserTransitionStatus(store, "queue-playback-preempt-user");
+    requireReferenceStartsFrom(reference, source);
+  }
+}
+
+TEST_CASE("RuntimeControlLoop queue during user transition waits behind existing target",
+          "[runtime-p1]") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  RuntimeControlLoop loop(config, bridge, store, TrkLoader(tmp.trkConfig()), &reference);
+
+  startHoldingToUserTransition(loop,
+                               store,
+                               bridge,
+                               tmp,
+                               "queue-user-owned-held",
+                               "queue-user-owned-old",
+                               &reference);
+
+  const auto user_path = validTrk(tmp, "queue_user_owned_new.trk", 2);
+  REQUIRE(bridge.submitQueue(
+              executeCommand("queue-user-owned-new",
+                             user_path,
+                             MotionMode::Queue,
+                             2))
+              .ok());
+  loop.tick();
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Running);
+  REQUIRE(snapshot.active.kind == ActiveKind::Transition);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.transition.active);
+  REQUIRE(snapshot.transition.target == "user");
+  REQUIRE(snapshot.transition.target_id == "queue-user-owned-old");
+  REQUIRE(snapshot.queue.ids == std::vector<std::string>{"queue-user-owned-new"});
+  REQUIRE(store.findRun("queue-user-owned-old").run->state == MotionState::Queued);
+  REQUIRE(store.findRun("queue-user-owned-new").run->state == MotionState::Queued);
+}
+
+TEST_CASE("RuntimeControlLoop failed queue preempt of standby playback drops background",
+          "[runtime-p1]") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  const auto standby_track = validStandbyTrack(tmp, "queue_fail_playback_ref.trk");
+  RuntimeControlLoop loop(config,
+                          bridge,
+                          store,
+                          TrkLoader(tmp.trkConfig()),
+                          &reference,
+                          standby_track);
+
+  startCompletedUserToStandbyTransition(
+      loop, store, bridge, tmp, "queue-fail-playback");
+  advanceToStandbyPlayback(loop, store, standby_track->metadata.frames);
+
+  const auto invalid_path = invalidContactTrk(tmp, "queue_fail_bad_user.trk");
+  REQUIRE(bridge.submitQueue(
+              executeCommand("queue-fail-bad-user",
+                             invalid_path,
+                             MotionMode::Queue,
+                             3))
+              .ok());
+  loop.tick();
+
+  requireNoActiveWorkOrBackground(store);
+
+  const auto failed = store.findRun("queue-fail-bad-user");
+  REQUIRE(failed.ok());
+  REQUIRE(failed.run.has_value());
+  REQUIRE(failed.run->state == MotionState::Failed);
+  REQUIRE(failed.run->err == ErrorCode::TrkValidationFailed);
+  REQUIRE(failed.run->stop_reason == StopReason::None);
+
+  loop.tick();
+  requireNoActiveWorkOrBackground(store);
+}
+
+TEST_CASE("RuntimeControlLoop failed queue preempt of idle transition drops background",
+          "[runtime-p1]") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  RuntimeControlLoop loop(config, bridge, store, TrkLoader(tmp.trkConfig()), &reference);
+
+  startCompletedUserToIdleTransition(loop, store, bridge, tmp, "queue-fail-idle");
+  advanceBackgroundTransition(loop, store, "idle");
+
+  const auto invalid_path = invalidContactTrk(tmp, "queue_fail_idle_bad_user.trk");
+  REQUIRE(bridge.submitQueue(
+              executeCommand("queue-fail-idle-bad-user",
+                             invalid_path,
+                             MotionMode::Queue,
+                             3))
+              .ok());
+  loop.tick();
+
+  requireNoActiveWorkOrBackground(store);
+
+  const auto failed = store.findRun("queue-fail-idle-bad-user");
+  REQUIRE(failed.ok());
+  REQUIRE(failed.run.has_value());
+  REQUIRE(failed.run->state == MotionState::Failed);
+  REQUIRE(failed.run->err == ErrorCode::TrkValidationFailed);
+  REQUIRE(failed.run->stop_reason == StopReason::None);
+
+  loop.tick();
+  requireNoActiveWorkOrBackground(store);
+}
+
+TEST_CASE("RuntimeControlLoop interrupt preempts background transition and playback from current reference",
+          "[runtime-p1]") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+
+  SECTION("transition target idle") {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeReferenceSink reference;
+    RuntimeControlLoop loop(config, bridge, store, TrkLoader(tmp.trkConfig()), &reference);
+
+    startCompletedUserToIdleTransition(loop, store, bridge, tmp, "interrupt-idle");
+    advanceBackgroundTransition(loop, store, "idle");
+    const ReferenceFrameSnapshot source = reference.latest;
+    REQUIRE(source.active);
+
+    const auto user_path = validTrk(tmp, "interrupt_idle_user.trk", 2);
+    REQUIRE(bridge.submitInterrupt(
+                executeCommand("interrupt-idle-user",
+                               user_path,
+                               MotionMode::Interrupt,
+                               2))
+                .ok());
+    loop.tick();
+
+    requireUserTransitionStatus(store, "interrupt-idle-user");
+    requireReferenceStartsFrom(reference, source);
+  }
+
+  SECTION("transition target standby") {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeReferenceSink reference;
+    const auto standby_track = validStandbyTrack(tmp, "interrupt_standby_ref.trk");
+    RuntimeControlLoop loop(config,
+                            bridge,
+                            store,
+                            TrkLoader(tmp.trkConfig()),
+                            &reference,
+                            standby_track);
+
+    startCompletedUserToStandbyTransition(
+        loop, store, bridge, tmp, "interrupt-standby");
+    advanceBackgroundTransition(loop, store, "standby");
+    const ReferenceFrameSnapshot source = reference.latest;
+    REQUIRE(source.active);
+
+    const auto user_path = validTrk(tmp, "interrupt_standby_user.trk", 2);
+    REQUIRE(bridge.submitInterrupt(
+                executeCommand("interrupt-standby-user",
+                               user_path,
+                               MotionMode::Interrupt,
+                               2))
+                .ok());
+    loop.tick();
+
+    requireUserTransitionStatus(store, "interrupt-standby-user");
+    requireReferenceStartsFrom(reference, source);
+  }
+
+  SECTION("standby playback") {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeReferenceSink reference;
+    const auto standby_track = validStandbyTrack(tmp, "interrupt_playback_ref.trk");
+    RuntimeControlLoop loop(config,
+                            bridge,
+                            store,
+                            TrkLoader(tmp.trkConfig()),
+                            &reference,
+                            standby_track);
+
+    startCompletedUserToStandbyTransition(
+        loop, store, bridge, tmp, "interrupt-playback");
+    advanceToStandbyPlayback(loop, store, standby_track->metadata.frames);
+    const ReferenceFrameSnapshot source = reference.latest;
+    REQUIRE(source.active);
+
+    const auto user_path = validTrk(tmp, "interrupt_playback_user.trk", 2);
+    REQUIRE(bridge.submitInterrupt(
+                executeCommand("interrupt-playback-user",
+                               user_path,
+                               MotionMode::Interrupt,
+                               2))
+                .ok());
+    loop.tick();
+
+    requireUserTransitionStatus(store, "interrupt-playback-user");
+    requireReferenceStartsFrom(reference, source);
+  }
+}
+
 TEST_CASE("RuntimeControlLoop idle to user transition target load failure publishes user failed") {
   TempTree tmp;
   const RuntimeConfig config = runtimeConfig();
@@ -5095,6 +5533,50 @@ TEST_CASE("RuntimeControlLoop stop watermark preserves post-stop interrupt reaso
   REQUIRE(store.snapshot().queue.ids == std::vector<std::string>{"urgent"});
 
   startQueuedRun(loop, store, "urgent");
+}
+
+TEST_CASE("RuntimeControlLoop interrupt during preparing uses controlled stop",
+          "[runtime-p1]") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  auto loop = makeLoop(config, bridge, store, tmp.trkConfig());
+
+  const auto active_path = validTrk(tmp, "preparing_interrupt_active.trk", 5);
+  const auto urgent_path = validTrk(tmp, "preparing_interrupt_urgent.trk", 3);
+
+  REQUIRE(bridge.submitQueue(executeCommand("preparing-active", active_path)).ok());
+  loop.tick();
+  auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Preparing);
+  REQUIRE(snapshot.active.kind == ActiveKind::User);
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->id == "preparing-active");
+  REQUIRE_FALSE(snapshot.transition.active);
+
+  REQUIRE(bridge.submitInterrupt(
+              executeCommand("preparing-urgent",
+                             urgent_path,
+                             MotionMode::Interrupt,
+                             3))
+              .ok());
+  loop.tick();
+
+  snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Stopping);
+  REQUIRE(snapshot.stop_reason == StopReason::Interrupt);
+  REQUIRE(snapshot.active.kind == ActiveKind::User);
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->id == "preparing-active");
+  REQUIRE(snapshot.exec->state == MotionState::Stopping);
+  REQUIRE(snapshot.queue.ids == std::vector<std::string>{"preparing-urgent"});
+  REQUIRE(store.findRun("preparing-active").run->state == MotionState::Stopping);
+  REQUIRE(store.findRun("preparing-active").run->stop_reason ==
+          StopReason::Interrupt);
+  REQUIRE(store.findRun("preparing-urgent").run->state == MotionState::Queued);
+  REQUIRE(store.findRun("preparing-urgent").run->stop_reason == StopReason::None);
 }
 
 TEST_CASE("RuntimeControlLoop interrupt stops active, cancels local waiting, then starts urgent") {

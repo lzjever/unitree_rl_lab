@@ -261,6 +261,11 @@ bool RuntimeControlLoop::consumePendingCommands() {
           waiting_.push_back(std::move(request));
           break;
         }
+        if (isBackgroundOwnedTransitionOrPlayback()) {
+          startTransitionFromCurrentReferenceToUser(std::move(command->request),
+                                                    StopReason::None);
+          return true;
+        }
         waiting_.push_back(std::move(command->request));
         break;
     }
@@ -460,8 +465,9 @@ void RuntimeControlLoop::handleInterrupt(MotionRequest request) {
     stopIdleActive();
   }
   if (active_kind_ == ActiveKind::Transition) {
-    startTransitionFromCurrentReferenceToUser(std::move(request),
-                                              StopReason::Interrupt);
+    const StopReason replaced_reason =
+        isUserOwnedTransition() ? StopReason::Interrupt : StopReason::None;
+    startTransitionFromCurrentReferenceToUser(std::move(request), replaced_reason);
     return;
   }
   waiting_.push_back(std::move(request));
@@ -618,6 +624,17 @@ bool RuntimeControlLoop::isControlPublishingState() const {
   return fsm_state_ == RuntimeInternalState::FixStand ||
          fsm_state_ == RuntimeInternalState::Velocity ||
          fsm_state_ == RuntimeInternalState::GeneralTrackerIdle;
+}
+
+bool RuntimeControlLoop::isUserOwnedTransition() const {
+  return active_kind_ == ActiveKind::Transition && transition_ &&
+         transition_->target_kind == TransitionTargetKind::User;
+}
+
+bool RuntimeControlLoop::isBackgroundOwnedTransitionOrPlayback() const {
+  return active_kind_ == ActiveKind::Transition && transition_ &&
+         (transition_->target_kind == TransitionTargetKind::Idle ||
+          transition_->target_kind == TransitionTargetKind::Standby);
 }
 
 void RuntimeControlLoop::runPassiveState() {
@@ -1463,6 +1480,16 @@ bool RuntimeControlLoop::startTransitionFromCurrentReferenceToUser(
     return false;
   }
 
+  const bool preempted_idle_background =
+      transition_ && transition_->target_kind == TransitionTargetKind::Idle;
+  auto abortPreemptedTransition = [this, replaced_reason, preempted_idle_background] {
+    abortTransition(MotionState::Canceled, replaced_reason, ErrorCode::Ok);
+    if (preempted_idle_background) {
+      clearIdleConfig();
+    }
+    enterGeneralTrackerIdleState();
+  };
+
   const std::optional<TrkFrameView> source_frame = active_track_->frame(active_->frame);
   if (!source_frame) {
     target_request.state = MotionState::Failed;
@@ -1470,8 +1497,7 @@ bool RuntimeControlLoop::startTransitionFromCurrentReferenceToUser(
     target_request.err = ErrorCode::InternalError;
     target_request.ended_at = std::chrono::steady_clock::now();
     status_.publishRunStatus(toStatus(target_request));
-    abortTransition(MotionState::Canceled, replaced_reason, ErrorCode::Ok);
-    enterGeneralTrackerIdleState();
+    abortPreemptedTransition();
     return true;
   }
 
@@ -1487,8 +1513,7 @@ bool RuntimeControlLoop::startTransitionFromCurrentReferenceToUser(
     target_request.err = toCoreErrorCode(loaded.code);
     target_request.ended_at = std::chrono::steady_clock::now();
     status_.publishRunStatus(toStatus(target_request));
-    abortTransition(MotionState::Canceled, replaced_reason, ErrorCode::Ok);
-    enterGeneralTrackerIdleState();
+    abortPreemptedTransition();
     return true;
   }
 
@@ -1503,8 +1528,7 @@ bool RuntimeControlLoop::startTransitionFromCurrentReferenceToUser(
     target_request.err = ErrorCode::InternalError;
     target_request.ended_at = std::chrono::steady_clock::now();
     status_.publishRunStatus(toStatus(target_request));
-    abortTransition(MotionState::Canceled, replaced_reason, ErrorCode::Ok);
-    enterGeneralTrackerIdleState();
+    abortPreemptedTransition();
     return true;
   }
   target_track = std::make_shared<TrkTrack>(std::move(*aligned_target_track));
@@ -1514,8 +1538,7 @@ bool RuntimeControlLoop::startTransitionFromCurrentReferenceToUser(
     target_request.err = ErrorCode::InternalError;
     target_request.ended_at = std::chrono::steady_clock::now();
     status_.publishRunStatus(toStatus(target_request));
-    abortTransition(MotionState::Canceled, replaced_reason, ErrorCode::Ok);
-    enterGeneralTrackerIdleState();
+    abortPreemptedTransition();
     return true;
   }
 
@@ -1532,8 +1555,7 @@ bool RuntimeControlLoop::startTransitionFromCurrentReferenceToUser(
     target_request.err = ErrorCode::InternalError;
     target_request.ended_at = std::chrono::steady_clock::now();
     status_.publishRunStatus(toStatus(target_request));
-    abortTransition(MotionState::Canceled, replaced_reason, ErrorCode::Ok);
-    enterGeneralTrackerIdleState();
+    abortPreemptedTransition();
     return true;
   }
 
@@ -1559,6 +1581,9 @@ bool RuntimeControlLoop::startTransitionFromCurrentReferenceToUser(
                                                std::move(entry_low_state));
   if (!started) {
     abortTransition(MotionState::Canceled, replaced_reason, ErrorCode::Ok);
+    if (preempted_idle_background) {
+      clearIdleConfig();
+    }
   }
   return true;
 }
