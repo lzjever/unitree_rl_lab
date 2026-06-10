@@ -20,7 +20,7 @@ Options:
   --cmake-prefix-path PATH      Extra CMAKE_PREFIX_PATH.
   --onnxruntime-root DIR        ONNX Runtime root.
   --unitree-sdk2-root DIR       Unitree SDK2 install root.
-  --skill-dir DIR               et1-trk2motion skill dir.
+  --skill-dir DIR               et1-action skill dir.
   --cmake-arg ARG               Extra CMake argument, repeatable.
   -h, --help                    Show help.
 USAGE
@@ -37,9 +37,9 @@ cmake_toolchain=""
 cmake_prefix_path=""
 onnxruntime_root=""
 unitree_sdk2_root=""
-skill_dir="${ET1_TRK2MOTION_SKILL_DIR:-$SCRIPT_DIR/skills/et1-trk2motion}"
-if [[ ! -d "$skill_dir" && -d /home/galbot/.agents/skills/et1-trk2motion ]]; then
-  skill_dir="/home/galbot/.agents/skills/et1-trk2motion"
+skill_dir="${ET1_ACTION_SKILL_DIR:-$SCRIPT_DIR/skills/et1-action}"
+if [[ ! -d "$skill_dir" && -d /home/galbot/.agents/skills/et1-action ]]; then
+  skill_dir="/home/galbot/.agents/skills/et1-action"
 fi
 extra_cmake_args=()
 
@@ -224,9 +224,9 @@ printf '%s\n' "$version" > "$package_root/VERSION"
 cp -a "$TRACKER_DIR/config" "$package_root/share/agentic-et1-tracker/"
 rm -rf "$package_root/share/agentic-et1-tracker/config/policy/general_tracker"
 cp -a "$SCRIPT_DIR/scripts/." "$package_root/scripts/"
-cp -a "$skill_dir" "$package_root/skills/et1-trk2motion"
+cp -a "$skill_dir" "$package_root/skills/et1-action"
 chmod +x "$package_root"/scripts/*.sh
-chmod +x "$package_root/skills/et1-trk2motion/scripts/et1-trk2motion"
+chmod +x "$package_root/skills/et1-action/scripts/et1-action"
 
 make_bin_wrapper() {
   local name="$1"
@@ -245,7 +245,24 @@ make_bin_wrapper stop-tracker scripts/stop.sh
 make_bin_wrapper status-tracker scripts/status.sh
 make_bin_wrapper selftest scripts/selftest.sh
 make_bin_wrapper install-release scripts/install.sh
-make_bin_wrapper et1-trk2motion skills/et1-trk2motion/scripts/et1-trk2motion
+cat > "$package_root/bin/et1-action" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+release_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+detect_prefix() {
+  local parent
+  parent="$(basename "$(dirname "$release_dir")")"
+  if [[ "$parent" == "releases" ]]; then
+    cd "$release_dir/../.." && pwd -P
+  else
+    printf '%s\n' "$release_dir"
+  fi
+}
+prefix="${ET1_PREFIX:-$(detect_prefix)}"
+export ET1_ACTION_STAGE_DIR="${ET1_ACTION_STAGE_DIR:-$prefix/shared/motions}"
+exec "$release_dir/skills/et1-action/scripts/et1-action" "$@"
+EOF
+chmod 0755 "$package_root/bin/et1-action"
 
 copy_shared_libs_from_dir() {
   local dir="$1"

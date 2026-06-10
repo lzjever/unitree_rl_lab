@@ -13,7 +13,7 @@ PREFIX/
     lib/
     config/config.robot.yaml.template
     share/agentic-et1-tracker/config/
-    skills/et1-trk2motion/
+    skills/et1-action/
     scripts/{install,start,stop,status,selftest}.sh
   shared/config/config.robot.yaml
   shared/logs/
@@ -171,7 +171,7 @@ deployment. The default HTTP bind remains `127.0.0.1:8083`.
 /path/to/prefix/current/scripts/stop.sh
 ```
 
-`status.sh` uses the bundled `skills/et1-trk2motion/scripts/et1-trk2motion`
+`status.sh` and `selftest.sh --online` use the bundled `bin/et1-action status`
 client. Override the URL with `ET1_TRACKER_URL` or `status.sh --url URL`.
 
 ## OTA switch

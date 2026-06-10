@@ -1,0 +1,53 @@
+---
+name: et1-action
+description: Generate and run ET1 robot actions from text or .trk files, load idle motions, enter standby, perform explicit urgent stop, and manage local async action sequences.
+---
+
+# ET1 Action
+
+Use this skill for ET1 robot motion. The agent uses the bash tool only; the entry point is:
+
+```bash
+scripts/et1-action ...
+```
+
+Do not depend on typed tools, plugins, curl, or multi-tool parallel calls.
+
+Prefer natural-language commands through `run-text`; it checks bundled presets first, falls back to text-to-TRK generation, then runs the resulting `.trk`. Use `run-trk` only when the `.trk` path is already known. Direct `run-text`, `run-trk`, `sequence-start`, and `standby` cancel any active local sequence before continuing; new user intent must not leave old background generation running.
+For generated motions, translate user intent to a concise English Kimodo-style prompt and choose a short physical duration. Use `--seed` when the user asks to retry/compare variants or reproduce a result; use `--diffusion-steps` only when explicitly needed.
+For precise left/right limb actions or final-pose requests, use `run-text ... --hold --no-preset`. The command also auto-detects common "hold the pose" phrasing and bypasses risky presets for precise left/right limb prompts.
+
+Common commands:
+
+```bash
+scripts/et1-action run-text "<concise English motion prompt>" --duration 3
+scripts/et1-action run-text "<concise English final-pose prompt>" --duration 4 --hold --no-preset
+scripts/et1-action run-trk /abs/path/motion.trk
+scripts/et1-action status
+scripts/et1-action standby
+scripts/et1-action fixstand  # explicit "enter stand configuration" only
+scripts/et1-action urgent-stop --urgent
+scripts/et1-action idle-load
+scripts/et1-action cache-clear
+scripts/et1-action sequence-start --plan-json '{"segments":[{"text":"<segment prompt>","duration":3}]}'
+scripts/et1-action sequence-status SEQ_ID
+```
+
+Normal stop requests map to `standby` or `sequence-cancel`; do not use `urgent-stop` unless the user clearly asks for emergency stop, abort, or kill. Use `fixstand` only when the user explicitly asks to enter the stand configuration. `passive` is not part of the hot path.
+`standby` cancels active local sequences and tracker queued motions, but does not clear idle configuration. If idle motions are loaded, the tracker may enter idle background motion; if no idle is loaded, it stays in velocity0 standby. Trust the command JSON `state/ctrl/active/idle` fields instead of assuming pure velocity0.
+Only clear generation cache when the user explicitly asks to clear/reset cache. Run `scripts/et1-action cache-clear`; add `--root PATH` only when clearing a non-default text-to-TRK root. Do not clear cache as a normal retry or motion-control step.
+
+For long or multi-part requests, use `sequence-start` and return to the user immediately. The workflow has a background worker that prepares and submits a small queue-ahead window so motion generation overlaps current playback.
+When a later user message asks for a new action, call `run-text` or a new `sequence-start`; do not append to the old sequence unless the user explicitly says to append/continue after current work.
+Each generated segment may include `duration`, `seed`, and `diffusion_steps` in `--plan-json`.
+Do not block the turn with `sleep && sequence-status`; poll status only when the user explicitly asks for progress or after a short non-blocking check is operationally necessary.
+
+The skill writes generated/staged `.trk` files to `ET1_ACTION_STAGE_DIR` when set; otherwise it prefers the running tracker's first configured `motion_dirs` entry, then common local generated directories. If the tracker returns `TRK_PATH_NOT_ALLOWED`, set `ET1_ACTION_STAGE_DIR` to a tracker-readable `motion_dirs` directory and retry.
+
+Read references only as needed:
+
+- `references/motion-generation.md` for prompt, duration, seed, and sequence drafting.
+- `references/intent-mapping.md` for user interruption mapping.
+- `references/sequence-workflow.md` for sequence state and async behavior.
+- `references/output-contract.md` for compact JSON output.
+- `references/compatibility.md` for migration from older ET1 skills.

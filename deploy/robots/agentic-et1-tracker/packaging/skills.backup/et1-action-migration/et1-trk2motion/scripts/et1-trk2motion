@@ -10,7 +10,6 @@ import urllib.request
 
 
 DEFAULT_URL = "http://127.0.0.1:8083"
-DEFAULT_PASSIVE_PASSWORD = "galaxy"
 TERMINAL = {"done", "stopped", "canceled", "failed"}
 GOOD_TERMINAL = {"done"}
 HELD = {"holding"}
@@ -125,6 +124,20 @@ def short_transition(transition):
     return {key: transition.get(key) for key in keys if key in transition}
 
 
+def short_exec(exec_doc):
+    if not isinstance(exec_doc, dict):
+        return exec_doc
+    keys = ("id", "state", "frame", "frames", "progress")
+    return {key: exec_doc.get(key) for key in keys if key in exec_doc}
+
+
+def short_queue(queue):
+    if not isinstance(queue, dict):
+        return queue
+    keys = ("ids", "n", "size", "limit")
+    return {key: queue.get(key) for key in keys if key in queue}
+
+
 def short_status(doc, extra=None):
     out = {"ok": bool(doc.get("ok", False))}
     for key in ("id", "state", "ctrl", "ready", "err", "next", "frame", "frames", "progress"):
@@ -136,6 +149,10 @@ def short_status(doc, extra=None):
         out["transition"] = short_transition(doc["transition"])
     if "idle" in doc:
         out["idle"] = short_idle(doc["idle"])
+    if "exec" in doc:
+        out["exec"] = short_exec(doc["exec"])
+    if "queue" in doc:
+        out["queue"] = short_queue(doc["queue"])
     if "error" in doc:
         out["error"] = doc["error"]
     if extra:
@@ -345,6 +362,17 @@ def control_cmd(base, path, timeout, body=None):
     return copy_top_fields({"ok": True}, top)
 
 
+def passive_password(cli_password):
+    if cli_password:
+        return cli_password
+    if cli_password is not None:
+        raise CliError("missing_passive_password", "passive requires non-empty password", next_step="manual")
+    env_password = os.environ.get("ET1_PASSIVE_PASSWORD")
+    if env_password:
+        return env_password
+    raise CliError("missing_passive_password", "passive requires --password or ET1_PASSIVE_PASSWORD", next_step="manual")
+
+
 def add_timing(parser):
     parser.add_argument("--timeout", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--poll", type=float, default=argparse.SUPPRESS)
@@ -374,13 +402,14 @@ def parse(argv):
     add_timing(pf)
 
     pp = sub.add_parser("passive")
-    pp.add_argument("--password", default=os.environ.get("ET1_PASSIVE_PASSWORD", DEFAULT_PASSIVE_PASSWORD))
+    pp.add_argument("--password")
     add_timing(pp)
 
     psv = sub.add_parser("standby")
     add_timing(psv)
 
     pstop = sub.add_parser("stop")
+    pstop.add_argument("--urgent", action="store_true")
     add_timing(pstop)
 
     pidle = sub.add_parser("idle")
@@ -393,14 +422,14 @@ def parse(argv):
 
     pe = sub.add_parser("exec")
     pe.add_argument("path")
-    pe.add_argument("--mode", choices=("queue", "interrupt"), default="interrupt")
+    pe.add_argument("--mode", choices=("queue", "interrupt"), default="queue")
     pe.add_argument("--wait", action="store_true")
     pe.add_argument("--allow-terminal", action="store_true")
     add_timing(pe)
 
     prun = sub.add_parser("run")
     prun.add_argument("path")
-    prun.add_argument("--mode", choices=("queue", "interrupt"), default="interrupt")
+    prun.add_argument("--mode", choices=("queue", "interrupt"), default="queue")
     prun.add_argument("--hold", action="store_true")
     prun.add_argument("--wait", action="store_true")
     prun.add_argument("--recover", choices=("off",), default="off")
@@ -414,7 +443,7 @@ def parse(argv):
     prep = sub.add_parser("repeat")
     prep.add_argument("path")
     prep.add_argument("-n", "--count", type=int)
-    prep.add_argument("--mode", choices=("queue", "interrupt"), default="interrupt")
+    prep.add_argument("--mode", choices=("queue", "interrupt"), default="queue")
     prep.add_argument("--recover", choices=("off",), default="off")
     prep.add_argument("--verbose", action="store_true")
     add_timing(prep)
@@ -438,6 +467,11 @@ def timing(args):
 def main(argv):
     try:
         args = parse(argv)
+        passive_body = None
+        if args.cmd == "stop" and not args.urgent:
+            raise CliError("stop_requires_urgent", "stop requires --urgent", next_step="standby_velocity")
+        if args.cmd == "passive":
+            passive_body = {"password": passive_password(args.password)}
         base = tracker_url(args.url)
         timeout, poll = timing(args)
         if args.cmd == "health":
@@ -449,7 +483,7 @@ def main(argv):
         elif args.cmd == "fixstand":
             out = control_cmd(base, "/fixstand", timeout)
         elif args.cmd == "passive":
-            out = control_cmd(base, "/passive", timeout, {"password": args.password})
+            out = control_cmd(base, "/passive", timeout, passive_body)
         elif args.cmd == "standby":
             out = control_cmd(base, "/standby_velocity", timeout)
         elif args.cmd == "stop":

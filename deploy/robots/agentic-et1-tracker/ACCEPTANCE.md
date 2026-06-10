@@ -1,7 +1,7 @@
 # Agentic ET1 Tracker Acceptance Evidence
 
 Date: 2026-05-29
-Latest targeted update: 2026-06-04
+Latest targeted update: 2026-06-05
 Environment: local workspace `/home/galbot/works/et1`
 
 ## Build/test evidence
@@ -19,6 +19,32 @@ Environment: local workspace `/home/galbot/works/et1`
 - `git diff --check`: passed.
 
 ## Docs/skill evidence
+
+2026-06-05 et1-action active skill migration verification:
+
+- Active release skill directory is now only
+  `deploy/robots/agentic-et1-tracker/packaging/skills/et1-action`.
+- Active installed skill roots `/home/galbot/.agents/skills` and
+  `/home/galbot/.codex/skills` contain only `et1-action`; old ET1 skills were
+  moved to `skills.backup/et1-action-migration-20260605172058/`.
+- `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover deploy/robots/agentic-et1-tracker/packaging/skills/et1-action/tests`:
+  16/16 passed.
+- `python3 -m py_compile deploy/robots/agentic-et1-tracker/packaging/skills/et1-action/scripts/et1-action deploy/robots/agentic-et1-tracker/packaging/skills/et1-action/tests/test_et1_action.py`:
+  passed.
+- `git diff --check`: passed.
+- Temporary x86_64 release build succeeded at
+  `/tmp/agentic-et1-action-release-test-1780651803/agentic-et1-tracker-et1-action-test-x86_64.tar.gz`;
+  extracted offline `scripts/selftest.sh` passed.
+- Release tarball active skills contain only `skills/et1-action` and
+  `bin/et1-action`; old `nl2trk`/`preset` appear only under
+  `skills/et1-action/vendor` as internal implementation.
+- After final active-skill sync, installed `et1-action` should match the repo
+  by `diff -rq` against both `/home/galbot/.agents/skills/et1-action` and
+  `/home/galbot/.codex/skills/et1-action`.
+
+Earlier dated `et1-trk2motion` entries below are historical evidence from
+before the active skill migration and are not current release active-skill
+requirements.
 
 2026-06-04 aarch64 release package static verification for release source commit
 `39c6ada`:

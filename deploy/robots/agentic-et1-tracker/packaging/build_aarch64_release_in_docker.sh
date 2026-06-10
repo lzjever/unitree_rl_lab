@@ -165,7 +165,7 @@ repo="/work/unitree_rl_lab"
 toolchain="$repo/deploy/robots/agentic-et1-tracker/packaging/toolchains/aarch64-linux-gnu.cmake"
 unitree_sdk2="/work/third_party/unitree_sdk2_install_aarch64"
 onnxruntime="$repo/deploy/thirdparty/onnxruntime-linux-aarch64-1.26.0"
-skill_dir="$repo/deploy/robots/agentic-et1-tracker/packaging/skills/et1-trk2motion"
+skill_dir="$repo/deploy/robots/agentic-et1-tracker/packaging/skills/et1-action"
 
 AGENTIC_ET1_YAML_CPP_AARCH64_ROOT="$ET1_YAML_CPP_ROOT" \
 AGENTIC_ET1_UNITREE_SDK2_AARCH64_ROOT="$unitree_sdk2" \

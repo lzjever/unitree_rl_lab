@@ -1,0 +1,1578 @@
+#!/usr/bin/env python3
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+
+DEFAULT_URL = "http://127.0.0.1:8083"
+TERMINAL = {"done", "stopped", "canceled", "failed"}
+GOOD_TERMINAL = {"done"}
+ACTIVE_STATES = {"starting", "running", "waiting_for_generation", "canceling"}
+INACTIVE_STATES = {"canceled", "completed", "failed"}
+P0_NEXT = {
+    "run-text",
+    "run-trk",
+    "sequence-start",
+    "sequence-status",
+    "sequence-append",
+    "sequence-replace-tail",
+    "sequence-cancel",
+    "sequence-interrupt",
+    "standby",
+    "fixstand",
+    "status",
+    "urgent-stop",
+    "idle-load",
+    "cache-clear",
+}
+
+
+class CliError(Exception):
+    def __init__(self, code, message, status=2, next_step="run-text"):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status = status
+        self.next = next_step
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise CliError("REQUEST_INVALID", message)
+
+
+def skill_dir():
+    return Path(__file__).resolve().parents[1]
+
+
+def compact(value):
+    return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+
+
+def print_json(value):
+    print(compact(value))
+
+
+def p0_next(value, default="run-text"):
+    return value if value in P0_NEXT else default
+
+
+def ok_doc(cmd, next_step, **fields):
+    out = {"ok": True, "cmd": cmd}
+    for key, value in fields.items():
+        if value is not None:
+            out[key] = value
+    out["next"] = p0_next(next_step)
+    return out
+
+
+def err_doc(cmd, code, message, next_step="run-text", **fields):
+    out = {"ok": False, "cmd": cmd}
+    for key, value in fields.items():
+        if value is not None:
+            out[key] = value
+    out["error"] = {"code": code, "message": message}
+    out["next"] = p0_next(next_step)
+    return out
+
+
+def fail(cmd, code, message, status=2, next_step="run-text", **fields):
+    print_json(err_doc(cmd, code, message, next_step, **fields))
+    return status
+
+
+def now():
+    return time.time()
+
+
+def state_dir():
+    raw = os.environ.get("ET1_ACTION_STATE_DIR")
+    if raw:
+        root = Path(raw)
+    else:
+        root = skill_dir() / ".state"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def default_stage_dir():
+    root = os.environ.get("ET1_ACTION_STAGE_DIR")
+    if root:
+        return ensure_stage_dir(Path(root))
+    for path in default_stage_dir_candidates():
+        try:
+            return ensure_stage_dir(path)
+        except OSError:
+            continue
+    raise CliError("REQUEST_INVALID", "no writable stage dir", next_step="run-text")
+
+
+def ensure_stage_dir(path):
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def default_stage_dir_candidates():
+    out = []
+    discovered = discover_tracker_motion_dir()
+    if discovered:
+        out.append(discovered)
+    for path in (
+        Path("/home/galbot/works/agent-test/generated"),
+        Path("/home/galbot/works/et1/generated"),
+        Path("/home/galbot/motions"),
+        Path.home() / "lzj" / "agentic-et1-tracker" / "shared" / "motions",
+    ):
+        out.append(path)
+    workspace = workspace_generated_dir()
+    if workspace:
+        out.append(workspace)
+    out.extend([Path.cwd() / "generated", state_dir() / "stage"])
+    seen = set()
+    deduped = []
+    for path in out:
+        key = str(path)
+        if key not in seen:
+            deduped.append(path)
+            seen.add(key)
+    return deduped
+
+
+def workspace_generated_dir():
+    cwd = Path.cwd().resolve()
+    for root in (cwd, *cwd.parents):
+        if (root / "unitree_rl_lab").is_dir():
+            return root / "generated"
+    return None
+
+
+def discover_tracker_motion_dir():
+    if os.environ.get("ET1_ACTION_DISABLE_TRACKER_CONFIG_DISCOVERY"):
+        return None
+    candidates = []
+    env_config = os.environ.get("ET1_TRACKER_CONFIG")
+    if env_config:
+        candidates.append(Path(env_config))
+    candidates.extend(running_tracker_configs())
+    for path in candidates:
+        motion_dir = first_motion_dir_from_config(path)
+        if motion_dir:
+            return motion_dir
+    return None
+
+
+def running_tracker_configs():
+    proc_root = Path("/proc")
+    if not proc_root.exists():
+        return []
+    configs = []
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        if not raw:
+            continue
+        argv = [part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part]
+        if not argv or not any("agentic-et1-tracker" in part for part in argv):
+            continue
+        for idx, item in enumerate(argv):
+            config = None
+            if item == "--config" and idx + 1 < len(argv):
+                config = argv[idx + 1]
+            elif item.startswith("--config="):
+                config = item.split("=", 1)[1]
+            if not config:
+                continue
+            path = Path(config)
+            if not path.is_absolute():
+                try:
+                    cwd = Path(os.readlink(entry / "cwd"))
+                except OSError:
+                    cwd = Path.cwd()
+                path = cwd / path
+            configs.append(path)
+    return configs
+
+
+def first_motion_dir_from_config(path):
+    path = Path(path)
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    in_motion_dirs = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("motion_dirs:"):
+            in_motion_dirs = True
+            inline = stripped.split(":", 1)[1].strip()
+            if inline.startswith("[") and inline.endswith("]"):
+                first = inline.strip("[]").split(",", 1)[0].strip().strip("'\"")
+                if first.startswith("/"):
+                    return Path(first)
+            continue
+        if in_motion_dirs:
+            if stripped.startswith("-"):
+                first = stripped[1:].strip().strip("'\"")
+                if first.startswith("/"):
+                    return Path(first)
+            if not line.startswith((" ", "\t")):
+                in_motion_dirs = False
+    return None
+
+
+def state_path(seq_id):
+    return state_dir() / f"{seq_id}.json"
+
+
+def lock_path(seq_id):
+    return state_dir() / f"{seq_id}.lock"
+
+
+@contextlib.contextmanager
+def with_state_lock(seq_id):
+    path = lock_path(seq_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def read_json(path):
+    with Path(path).open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_json(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    value["updated_at"] = now()
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(value, ensure_ascii=True, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def load_state(seq_id):
+    path = state_path(seq_id)
+    with with_state_lock(seq_id):
+        if not path.exists():
+            raise CliError("SEQUENCE_NOT_FOUND", "sequence does not exist", next_step="sequence-status")
+        return read_json(path)
+
+
+def update_state(seq_id, mutator, create=False):
+    path = state_path(seq_id)
+    with with_state_lock(seq_id):
+        if path.exists():
+            state = read_json(path)
+        elif create:
+            state = {"seq_id": seq_id}
+        else:
+            raise CliError("SEQUENCE_NOT_FOUND", "sequence does not exist", next_step="sequence-status")
+        mutator(state)
+        write_json(path, state)
+        return state
+
+
+def tracker_url(raw):
+    raw = (raw or DEFAULT_URL).strip().rstrip("/")
+    parsed = urllib.parse.urlsplit(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise CliError("REQUEST_INVALID", "ET1_TRACKER_URL must be absolute http(s)")
+    return raw
+
+
+def http_request(base, method, path, body=None, timeout=10.0):
+    data = None
+    headers = {}
+    if body is not None:
+        data = json.dumps(body, separators=(",", ":")).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(base + path, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            text = resp.read().decode("utf-8")
+            return json.loads(text) if text else {"ok": True}
+    except urllib.error.HTTPError as e:
+        text = e.read().decode("utf-8", errors="replace")
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return {"ok": False, "error": {"code": "HTTP_ERROR", "message": f"http {e.code}"}}
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        msg = getattr(e, "reason", e)
+        return {"ok": False, "error": {"code": "NETWORK_ERROR", "message": str(msg)}}
+    except json.JSONDecodeError:
+        return {"ok": False, "error": {"code": "BAD_RESPONSE", "message": "tracker returned non-json"}}
+
+
+def validate_trk(path):
+    path = Path(path)
+    if not path.is_absolute():
+        raise CliError("REQUEST_INVALID", "path must be absolute", next_step="run-trk")
+    if path.suffix != ".trk":
+        raise CliError("REQUEST_INVALID", "path must end with .trk", next_step="run-trk")
+    if not path.exists():
+        raise CliError("REQUEST_INVALID", "path does not exist", next_step="run-trk")
+    return str(path)
+
+
+def execute_trk(base, path, mode, wait, timeout, poll, hold=False):
+    path = validate_trk(path)
+    started = http_request(
+        base,
+        "POST",
+        "/execute",
+        {"path": path, "mode": mode, "hold": bool(hold)},
+        timeout,
+    )
+    if not started.get("ok"):
+        return started
+    run_id = started.get("id")
+    if not wait or not run_id:
+        return started
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() <= deadline:
+        last = http_request(base, "GET", "/status?id=" + urllib.parse.quote(run_id, safe=""), timeout=timeout)
+        if not last.get("ok"):
+            return last
+        state = last.get("state")
+        if state in TERMINAL:
+            if state in GOOD_TERMINAL:
+                return last
+            return {"ok": False, "error": {"code": "TRACKER_RUN_FAILED", "message": f"state={state}"}}
+        time.sleep(poll)
+    return {"ok": False, "error": {"code": "WAIT_TIMEOUT", "message": f"id={run_id}"}}
+
+
+def tracker_standby(base, timeout):
+    return http_request(base, "POST", "/standby_velocity", timeout=timeout)
+
+
+def tracker_status(base, timeout):
+    return http_request(base, "GET", "/status", timeout=timeout)
+
+
+def tracker_fixstand(base, timeout):
+    return http_request(base, "POST", "/fixstand", timeout=timeout)
+
+
+def tracker_stop(base, timeout):
+    return http_request(base, "POST", "/stop", timeout=timeout)
+
+
+def tracker_idle_set(base, paths, timeout):
+    for path in paths:
+        validate_trk(path)
+    return http_request(base, "POST", "/idle", {"paths": paths}, timeout)
+
+
+def env_path(name):
+    raw = os.environ.get(name)
+    if raw:
+        path = Path(raw)
+        if path.exists():
+            return str(path)
+    return None
+
+
+def preset_finder():
+    return env_path("ET1_ACTION_PRESET_FINDER") or str(skill_dir() / "vendor" / "et1-nl2trk-preset" / "scripts" / "find_preset.py")
+
+
+def nl2trk_bin():
+    return env_path("ET1_ACTION_NL2TRK_BIN") or str(skill_dir() / "vendor" / "et1-nl2trk" / "bin" / "et1-nl2trk")
+
+
+def nl2trk_root(raw=None):
+    return (Path(raw) if raw else Path.cwd() / "generated" / "et1-nl2trk").resolve()
+
+
+def run_subprocess(argv):
+    try:
+        return subprocess.run(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=None)
+    except OSError as e:
+        return subprocess.CompletedProcess(argv, 127, "", str(e))
+
+
+def staged_name(prefix, text, identity=None):
+    payload = text if identity is None else json.dumps(identity, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:10]
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in text[:28]).strip("._-")
+    return f"{prefix}-{safe or 'motion'}-{digest}.trk"
+
+
+def unique_stage_path(stage_dir, prefix, text, identity=None):
+    first = Path(stage_dir) / staged_name(prefix, text, identity)
+    if not first.exists():
+        return first
+    stem = first.stem
+    for idx in range(2, 10000):
+        candidate = first.with_name(f"{stem}-{idx}.trk")
+        if not candidate.exists():
+            return candidate
+    raise CliError("SEGMENT_GENERATION_FAILED", "could not allocate output path", status=1, next_step="run-text")
+
+
+def find_preset(text, stage_dir):
+    finder = preset_finder()
+    if not Path(finder).exists():
+        return None
+    proc = run_subprocess([finder, "--query", text, "--path-only", "--stage", str(stage_dir)])
+    if proc.returncode != 0:
+        miss_text = (proc.stdout + proc.stderr).lower()
+        if "no matching" in miss_text or "not found" in miss_text:
+            return None
+        return None
+    out = proc.stdout.strip().splitlines()
+    if not out:
+        return None
+    candidate = Path(out[-1].strip())
+    if candidate.suffix == ".trk" and candidate.exists():
+        return str(candidate.resolve())
+    return None
+
+
+def generate_trk(text, duration, stage_dir, serial_id=None, seed=None, diffusion_steps=None):
+    bin_path = nl2trk_bin()
+    if not Path(bin_path).exists():
+        raise CliError("SEGMENT_GENERATION_FAILED", "internal nl2trk vendor is not installed", next_step="run-text")
+    identity = {
+        "text": text,
+        "duration": duration,
+        "serial_id": serial_id,
+        "seed": seed,
+        "diffusion_steps": diffusion_steps,
+        "t": time.time_ns() if serial_id else None,
+    }
+    out = unique_stage_path(stage_dir, "et1-generated", text, identity)
+    argv = [bin_path, "--prompt", text, "--out", str(out)]
+    if duration is not None:
+        argv += ["--duration", str(duration)]
+    if serial_id:
+        argv += ["--serial-id", serial_id]
+    if seed is not None:
+        argv += ["--seed", str(seed)]
+    if diffusion_steps is not None:
+        argv += ["--diffusion-steps", str(diffusion_steps)]
+    proc = run_subprocess(argv)
+    if proc.returncode != 0 or not out.exists():
+        message = proc.stderr.strip() or proc.stdout.strip() or "nl2trk failed"
+        raise CliError("SEGMENT_GENERATION_FAILED", message, status=1, next_step="run-text")
+    return str(out.resolve())
+
+
+def text_requests_hold(text):
+    query = text.lower()
+    return any(
+        phrase in query
+        for phrase in (
+            "hold the pose",
+            "holds the pose",
+            "hold this pose",
+            "holds this pose",
+            "keep the pose",
+            "keeps the pose",
+            "remain in the pose",
+            "保持",
+        )
+    )
+
+
+def text_requests_precise_limb(text):
+    query = text.lower()
+    side_words = ("right", "left", "右", "左")
+    limb_words = ("arm", "hand", "wrist", "elbow", "手", "臂")
+    return any(side in query for side in side_words) and any(
+        limb in query for limb in limb_words
+    )
+
+
+def should_bypass_preset(text, hold=False):
+    return bool(hold) or text_requests_hold(text) or text_requests_precise_limb(text)
+
+
+def resolve_text_to_trk(text, duration, stage_dir, serial_id=None, seed=None, diffusion_steps=None, use_preset=True):
+    stage_dir = Path(stage_dir)
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    if use_preset and seed is None and diffusion_steps is None:
+        preset = find_preset(text, stage_dir)
+        if preset:
+            return preset, "preset"
+    return generate_trk(text, duration, stage_dir, serial_id, seed, diffusion_steps), "nl2trk"
+
+
+def run_text_cmd(args, base, timeout, poll):
+    cancel_active_sequences("run-text")
+    stage = Path(args.stage_dir) if args.stage_dir else default_stage_dir()
+    hold = bool(args.hold or text_requests_hold(args.text))
+    use_preset = not args.no_preset and not should_bypass_preset(args.text, hold)
+    path, _source = resolve_text_to_trk(
+        args.text,
+        args.duration,
+        stage,
+        seed=args.seed,
+        diffusion_steps=args.diffusion_steps,
+        use_preset=use_preset,
+    )
+    started = execute_trk(base, path, args.mode, args.wait, timeout, poll, hold=hold)
+    if not started.get("ok"):
+        error = started.get("error", {})
+        return err_doc("run-text", error.get("code", "TRACKER_RUN_FAILED"), error.get("message", "tracker run failed"), "run-text")
+    active = {"run_id": started.get("id")} if started.get("id") else None
+    return ok_doc("run-text", "standby", intent="run_text", state="running", active=active, segments={"submitted": 1}, hold=hold)
+
+
+def run_trk_cmd(args, base, timeout, poll):
+    cancel_active_sequences("run-trk")
+    started = execute_trk(base, args.path, args.mode, args.wait, timeout, poll, hold=args.hold)
+    if not started.get("ok"):
+        error = started.get("error", {})
+        return err_doc("run-trk", error.get("code", "TRACKER_RUN_FAILED"), error.get("message", "tracker run failed"), "run-trk")
+    active = {"run_id": started.get("id")} if started.get("id") else None
+    return ok_doc("run-trk", "standby", intent="run_trk", state="running", active=active, segments={"submitted": 1}, hold=args.hold)
+
+
+def compact_tracker_state(status):
+    ctrl = status.get("ctrl") or status.get("state")
+    active = status.get("active") if isinstance(status.get("active"), dict) else {}
+    idle = status.get("idle") if isinstance(status.get("idle"), dict) else {}
+    active_kind = active.get("kind")
+    idle_active = bool(idle.get("active"))
+    if active_kind == "idle" or idle_active:
+        state = "idle"
+    elif ctrl in {"standby", "standby_velocity"}:
+        state = "standby"
+    else:
+        state = ctrl or "standby"
+
+    out = {"state": state}
+    if ctrl:
+        out["ctrl"] = ctrl
+    if active_kind:
+        out["active"] = {"kind": active_kind}
+    if idle:
+        out["idle"] = {
+            "enabled": bool(idle.get("enabled")),
+            "active": idle_active,
+            "n": int(idle.get("n") or 0),
+        }
+    return out
+
+
+def standby_confirm_seconds(timeout):
+    raw = os.environ.get("ET1_ACTION_STANDBY_CONFIRM_S", "2.0")
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 2.0
+    if value <= 0:
+        return 0.0
+    return min(timeout, value)
+
+
+def standby_confirmed(status):
+    active = status.get("active") if isinstance(status.get("active"), dict) else {}
+    return active.get("kind") not in {"user", "transition"}
+
+
+def standby_cmd(base, timeout, poll):
+    cancel_active_sequences("standby")
+    out = tracker_standby(base, timeout)
+    if not out.get("ok"):
+        error = out.get("error", {})
+        return err_doc("standby", error.get("code", "TRACKER_STATE_CONFLICT"), error.get("message", "standby failed"), "standby")
+    fields = {"intent": "cancel_to_standby", "state": "standby"}
+    deadline = time.monotonic() + standby_confirm_seconds(timeout)
+    status = None
+    while True:
+        status = tracker_status(base, timeout)
+        if status.get("ok"):
+            fields.update(compact_tracker_state(status))
+            if standby_confirmed(status):
+                return ok_doc("standby", "run-text", **fields)
+        if time.monotonic() >= deadline:
+            if status and status.get("ok"):
+                fields.update(compact_tracker_state(status))
+            fields["state"] = "stopping"
+            return err_doc(
+                "standby",
+                "STOP_NOT_CONFIRMED",
+                "standby sent; motion still active",
+                "status",
+                **fields,
+            )
+        time.sleep(poll)
+
+
+def fixstand_cmd(base, timeout):
+    out = tracker_fixstand(base, timeout)
+    if not out.get("ok"):
+        error = out.get("error", {})
+        return err_doc("fixstand", error.get("code", "TRACKER_STATE_CONFLICT"), error.get("message", "fixstand failed"), "fixstand")
+    return ok_doc("fixstand", "standby", intent="explicit_stand_configuration", state="fixstand")
+
+
+def urgent_stop_cmd(args, base, timeout):
+    if not args.urgent:
+        return err_doc("urgent-stop", "REQUEST_INVALID", "urgent-stop requires --urgent", "standby")
+    out = tracker_stop(base, timeout)
+    if not out.get("ok"):
+        error = out.get("error", {})
+        return err_doc("urgent-stop", error.get("code", "TRACKER_STATE_CONFLICT"), error.get("message", "urgent stop failed"), "urgent-stop")
+    return ok_doc("urgent-stop", "standby", intent="urgent_stop", state="stopped")
+
+
+def default_idle_roots():
+    roots = []
+    vendor_assets = skill_dir() / "vendor" / "et1-nl2trk-preset" / "assets"
+    if vendor_assets.exists():
+        for child in vendor_assets.iterdir():
+            name = child.name.casefold()
+            if "idle" in name or "ldle" in name or "standby" in name or "rest" in name:
+                roots.append(child)
+    for child in ("idle", "standby", "rest"):
+        roots.append(vendor_assets / child)
+    return roots
+
+
+def idle_candidates(preset_dir):
+    roots = [Path(preset_dir)] if preset_dir else default_idle_roots()
+    out = []
+    for root in roots:
+        if root.exists():
+            out.extend(sorted(root.rglob("*.trk")))
+    return out
+
+
+def stage_file(path, stage_dir, prefix):
+    path = Path(path)
+    stage_dir = Path(stage_dir)
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha1(str(path).encode("utf-8")).hexdigest()[:8]
+    target = stage_dir / f"{prefix}-{path.stem}-{digest}.trk"
+    shutil.copy2(path, target)
+    return str(target.resolve())
+
+
+def idle_load_cmd(args, base, timeout):
+    stage = Path(args.stage_dir) if args.stage_dir else default_stage_dir()
+    candidates = idle_candidates(args.preset_dir)
+    if not candidates:
+        return err_doc("idle-load", "REQUEST_INVALID", "no idle .trk files found", "idle-load")
+    staged = [stage_file(path, stage, "et1-idle") for path in candidates]
+    out = tracker_idle_set(base, staged, timeout)
+    if not out.get("ok"):
+        error = out.get("error", {})
+        return err_doc("idle-load", error.get("code", "TRACKER_STATE_CONFLICT"), error.get("message", "idle set failed"), "idle-load")
+    return ok_doc("idle-load", "run-text", intent="idle_load", state="idle_loaded", segments={"ready": len(staged)})
+
+
+def plan_value(item, *keys):
+    for key in keys:
+        if item.get(key) is not None:
+            return item.get(key)
+    return None
+
+
+def parse_positive_float(value, field):
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        raise CliError("REQUEST_INVALID", f"{field} must be a number", next_step="sequence-start")
+    if parsed <= 0:
+        raise CliError("REQUEST_INVALID", f"{field} must be >0", next_step="sequence-start")
+    return parsed
+
+
+def parse_positive_int(value, field):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise CliError("REQUEST_INVALID", f"{field} must be an integer", next_step="sequence-start")
+    if parsed <= 0:
+        raise CliError("REQUEST_INVALID", f"{field} must be >0", next_step="sequence-start")
+    return parsed
+
+
+def parse_seed(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise CliError("REQUEST_INVALID", "seed must be an integer", next_step="sequence-start")
+
+
+def parse_plan(raw):
+    try:
+        doc = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise CliError("REQUEST_INVALID", f"invalid plan json: {e}", next_step="sequence-start")
+    if isinstance(doc, list):
+        items = doc
+    elif isinstance(doc, dict):
+        items = doc.get("segments")
+    else:
+        items = None
+    if not isinstance(items, list) or not items:
+        raise CliError("REQUEST_INVALID", "plan must contain non-empty segments", next_step="sequence-start")
+    segments = []
+    for idx, item in enumerate(items, 1):
+        if isinstance(item, str):
+            item = {"text": item}
+        if not isinstance(item, dict):
+            raise CliError("REQUEST_INVALID", "each segment must be an object or text", next_step="sequence-start")
+        text = item.get("text") or item.get("prompt")
+        trk = item.get("trk") or item.get("path")
+        if bool(text) == bool(trk):
+            raise CliError("REQUEST_INVALID", "each segment must have exactly one of text/trk", next_step="sequence-start")
+        seg = {
+            "segment_id": item.get("segment_id") or f"s{idx}",
+            "status": "pending",
+            "submitted": False,
+        }
+        if text:
+            seg["text"] = str(text)
+            if item.get("duration") is not None:
+                seg["duration"] = parse_positive_float(item.get("duration"), "duration")
+            seed = plan_value(item, "seed")
+            if seed is not None:
+                seg["seed"] = parse_seed(seed)
+            diffusion_steps = plan_value(item, "diffusion_steps", "diffusion-steps")
+            if diffusion_steps is not None:
+                seg["diffusion_steps"] = parse_positive_int(diffusion_steps, "diffusion_steps")
+        else:
+            seg["trk"] = validate_trk(str(trk))
+            seg["ready_path"] = seg["trk"]
+            seg["status"] = "ready"
+        segments.append(seg)
+    return segments
+
+
+def summarize_segments(segments):
+    counts = {
+        "done": 0,
+        "running": 0,
+        "queued": 0,
+        "ready": 0,
+        "generating": 0,
+        "submitting": 0,
+        "pending": 0,
+        "submitted": 0,
+        "failed": 0,
+        "canceled": 0,
+    }
+    for seg in segments:
+        status = seg.get("status", "pending")
+        if status in counts:
+            counts[status] += 1
+        if seg.get("submitted"):
+            counts["submitted"] += 1
+    return counts
+
+
+def state_epoch(state):
+    return int(state.get("op_epoch", state.get("version", 0)) or 0)
+
+
+def bump_epoch(state):
+    epoch = state_epoch(state) + 1
+    state["op_epoch"] = epoch
+    state["version"] = epoch
+    return epoch
+
+
+def next_submit_token(state):
+    value = int(state.get("next_submit_token", 0) or 0) + 1
+    state["next_submit_token"] = value
+    return f"{state.get('seq_id')}:{value}"
+
+
+def segment_is_unfinished_submission(seg):
+    return bool(seg.get("submitted")) and seg.get("status") in {"submitting", "running", "queued"}
+
+
+def unfinished_submission_count(state):
+    return sum(1 for seg in state.get("segments", []) if segment_is_unfinished_submission(seg))
+
+
+def any_segment_submitted(state):
+    return any(seg.get("submitted") for seg in state.get("segments", []))
+
+
+def queue_ahead_limit():
+    raw = os.environ.get("ET1_ACTION_QUEUE_AHEAD", "3")
+    try:
+        value = int(raw)
+    except ValueError:
+        return 3
+    return max(1, value)
+
+
+def promote_next_queued_active(state):
+    active = state.get("active") or {}
+    if active.get("run_id"):
+        return
+    for seg in state.get("segments", []):
+        if seg.get("submitted") and seg.get("status") == "queued" and seg.get("run_id"):
+            seg["status"] = "running"
+            state["active"] = {"segment_id": seg["segment_id"], "run_id": seg["run_id"]}
+            return
+    state["active"] = None
+
+
+def sequence_is_active(state):
+    return state.get("state") not in INACTIVE_STATES
+
+
+def terminate_sequence_worker(pid):
+    if not pid:
+        return
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return
+    if pid <= 0 or pid == os.getpid():
+        return
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        return
+    except OSError:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            return
+
+
+def cancel_active_sequences(last_cmd, exclude_seq_id=None):
+    canceled = 0
+    for path in sorted(state_dir().glob("*.json")):
+        seq_id = path.stem
+        if exclude_seq_id and seq_id == exclude_seq_id:
+            continue
+        worker_pid = {"value": None}
+        changed = {"value": False}
+
+        def cancel(state):
+            if not sequence_is_active(state):
+                return
+            bump_epoch(state)
+            for seg in state.get("segments", []):
+                if seg.get("status") not in {"done", "canceled", "failed"}:
+                    seg["status"] = "canceled"
+            state["state"] = "canceled"
+            state["active"] = None
+            state["last_cmd"] = last_cmd
+            state["next"] = "run-text"
+            state["heartbeat_at"] = now()
+            worker_pid["value"] = state.get("pid")
+            changed["value"] = True
+
+        try:
+            update_state(seq_id, cancel)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if changed["value"]:
+            canceled += 1
+            terminate_sequence_worker(worker_pid["value"])
+    return canceled
+
+
+def segment_plan_key(seg):
+    return {
+        "segment_id": seg.get("segment_id"),
+        "text": seg.get("text"),
+        "trk": seg.get("trk"),
+        "duration": seg.get("duration"),
+        "seed": seg.get("seed"),
+        "diffusion_steps": seg.get("diffusion_steps"),
+    }
+
+
+def find_matching_segment(state, segment_id, plan_key, epoch, allow_submitted=False):
+    if not sequence_is_active(state) or state_epoch(state) != epoch:
+        return None
+    for seg in state.get("segments", []):
+        if seg.get("segment_id") != segment_id:
+            continue
+        if segment_plan_key(seg) != plan_key:
+            return None
+        if seg.get("status") in {"canceled", "failed"}:
+            return None
+        if seg.get("submitted") and not allow_submitted:
+            return None
+        return seg
+    return None
+
+
+def sequence_output(state, ok=True, error=None, intent=None):
+    out = {
+        "ok": ok,
+        "cmd": state.get("last_cmd", "sequence-status"),
+        "seq_id": state["seq_id"],
+        "state": state.get("state"),
+        "segments": summarize_segments(state.get("segments", [])),
+        "next": p0_next(state.get("next", "sequence-status"), "sequence-status"),
+    }
+    if intent:
+        out["intent"] = intent
+    if state.get("active"):
+        out["active"] = state["active"]
+    if error:
+        out["error"] = error
+    elif state.get("last_error"):
+        out["error"] = state["last_error"]
+    return out
+
+
+def new_seq_id():
+    return "seq_" + time.strftime("%Y%m%d%H%M%S") + "_" + hashlib.sha1(os.urandom(8)).hexdigest()[:6]
+
+
+def spawn_worker(seq_id, args):
+    argv = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--url",
+        args.url,
+        "--timeout",
+        str(args.timeout),
+        "--poll",
+        str(args.poll),
+        "_worker",
+        seq_id,
+    ]
+    kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "start_new_session": True}
+    proc = subprocess.Popen(argv, **kwargs)
+    return proc.pid
+
+
+def sequence_start_cmd(args):
+    cancel_active_sequences("sequence-start")
+    segments = parse_plan(args.plan_json)
+    seq_id = new_seq_id()
+    def create(state):
+        state.update(
+            {
+                "state": "starting",
+                "segments": segments,
+                "active": None,
+                "serial_id": args.serial_id or seq_id,
+                "stage_dir": str(Path(args.stage_dir) if args.stage_dir else default_stage_dir()),
+                "op_epoch": 0,
+                "version": 0,
+                "next_submit_token": 0,
+                "pid": None,
+                "heartbeat_at": now(),
+                "last_error": None,
+                "last_cmd": "sequence-start",
+                "next": "sequence-status",
+            }
+        )
+    update_state(seq_id, create, create=True)
+    pid = spawn_worker(seq_id, args)
+    def started(state):
+        state["pid"] = pid
+        state["state"] = "running"
+        state["heartbeat_at"] = now()
+    state = update_state(seq_id, started)
+    return sequence_output(state)
+
+
+def pid_alive(pid):
+    if not pid:
+        return None
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (TypeError, ValueError):
+        return None
+
+
+def sequence_status_cmd(args):
+    error = None
+    stale_after = float(os.environ.get("ET1_ACTION_STALE_SECONDS", "30"))
+
+    def mark_status(state):
+        nonlocal error
+        state["last_cmd"] = "sequence-status"
+        heartbeat = float(state.get("heartbeat_at") or 0)
+        if state.get("state") not in ACTIVE_STATES or not heartbeat or now() - heartbeat <= stale_after:
+            return
+        alive = pid_alive(state.get("pid"))
+        if alive is False:
+            error = {"code": "WORKER_DIED", "message": "sequence worker process is not running"}
+            state["state"] = "failed"
+        else:
+            error = {"code": "WORKER_STALE", "message": "sequence worker heartbeat is stale"}
+            state["state"] = "stale"
+        state["last_error"] = error
+        state["next"] = "sequence-status"
+
+    state = update_state(args.seq_id, mark_status)
+    if error:
+        return sequence_output(state, ok=False, error=error)
+    return sequence_output(state, ok=not bool(state.get("last_error")))
+
+
+def sequence_cancel_cmd(args, base, timeout):
+    def cancel(state):
+        bump_epoch(state)
+        for seg in state.get("segments", []):
+            if not seg.get("submitted"):
+                seg["status"] = "canceled"
+        state.update({"state": "canceled", "active": None, "last_cmd": "sequence-cancel", "next": "run-text", "heartbeat_at": now()})
+    state = update_state(args.seq_id, cancel)
+    tracker_standby(base, timeout)
+    return sequence_output(state, intent="cancel_to_standby")
+
+
+def sequence_append_cmd(args):
+    incoming = parse_plan(args.plan_json)
+    def append(state):
+        bump_epoch(state)
+        start = len(state.get("segments", [])) + 1
+        for offset, seg in enumerate(incoming):
+            seg["segment_id"] = f"s{start + offset}"
+            state["segments"].append(seg)
+        state.update({"last_cmd": "sequence-append", "next": "sequence-status", "heartbeat_at": now()})
+    state = update_state(args.seq_id, append)
+    return sequence_output(state, intent="append")
+
+
+def sequence_replace_tail_cmd(args):
+    incoming = parse_plan(args.plan_json)
+    def replace(state):
+        bump_epoch(state)
+        kept = [seg for seg in state.get("segments", []) if seg.get("submitted")]
+        start = len(kept) + 1
+        for offset, seg in enumerate(incoming):
+            seg["segment_id"] = f"s{start + offset}"
+            kept.append(seg)
+        state["segments"] = kept
+        state.update({"last_cmd": "sequence-replace-tail", "next": "sequence-status", "heartbeat_at": now()})
+    state = update_state(args.seq_id, replace)
+    return sequence_output(state, intent="replace_tail")
+
+
+def sequence_interrupt_cmd(args, base, timeout, poll):
+    cancel_active_sequences("sequence-interrupt", exclude_seq_id=args.seq_id)
+    interrupt_epoch = {"value": None}
+    def begin_interrupt(state):
+        interrupt_epoch["value"] = bump_epoch(state)
+        for seg in state.get("segments", []):
+            if not seg.get("submitted"):
+                seg["status"] = "canceled"
+        state["last_cmd"] = "sequence-interrupt"
+        state["next"] = "sequence-status"
+        state["heartbeat_at"] = now()
+    state = update_state(args.seq_id, begin_interrupt)
+
+    def interrupt_still_current():
+        current = load_state(args.seq_id)
+        if not sequence_is_active(current) or state_epoch(current) != interrupt_epoch["value"]:
+            return None
+        return current
+
+    def changed_output():
+        current = load_state(args.seq_id)
+        error = {"code": "SEQUENCE_CHANGED", "message": "sequence changed before interrupt could finish"}
+        return sequence_output(current, ok=False, error=error, intent="interrupt")
+
+    if args.trk:
+        path = validate_trk(args.trk)
+        if not interrupt_still_current():
+            return changed_output()
+        started = execute_trk(base, path, "interrupt", False, timeout, poll)
+        if not started.get("ok"):
+            error = started.get("error", {"code": "TRACKER_RUN_FAILED", "message": "interrupt run failed"})
+            applied = {"value": False}
+            def fail_interrupt(state):
+                if not sequence_is_active(state) or state_epoch(state) != interrupt_epoch["value"]:
+                    return
+                state["state"] = "failed"
+                state["last_error"] = error
+                state["heartbeat_at"] = now()
+                applied["value"] = True
+            state = update_state(args.seq_id, fail_interrupt)
+            if not applied["value"]:
+                return changed_output()
+            return sequence_output(state, ok=False, error=error, intent="interrupt")
+        applied = {"value": False}
+        def finish_trk_interrupt(state):
+            if not sequence_is_active(state) or state_epoch(state) != interrupt_epoch["value"]:
+                return
+            seg = {"segment_id": "interrupt", "trk": path, "ready_path": path, "status": "running", "submitted": True}
+            state["segments"].append(seg)
+            state["state"] = "running"
+            state["active"] = {"segment_id": "interrupt", "run_id": started.get("id")}
+            state["last_cmd"] = "sequence-interrupt"
+            state["next"] = "sequence-status"
+            state["heartbeat_at"] = now()
+            applied["value"] = True
+        state = update_state(args.seq_id, finish_trk_interrupt)
+        if not applied["value"]:
+            return changed_output()
+        return sequence_output(state, intent="interrupt")
+    if not args.text:
+        raise CliError("REQUEST_INVALID", "sequence-interrupt requires --trk or --text", next_step="sequence-interrupt")
+    tracker_standby(base, timeout)
+    current = load_state(args.seq_id)
+    stage = Path(current.get("stage_dir") or default_stage_dir())
+    path, _source = resolve_text_to_trk(args.text, args.duration, stage, current.get("serial_id"), args.seed, args.diffusion_steps)
+    if not interrupt_still_current():
+        return changed_output()
+    started = execute_trk(base, path, "interrupt", False, timeout, poll)
+    if not started.get("ok"):
+        error = started.get("error", {"code": "TRACKER_RUN_FAILED", "message": "interrupt follow-up run failed"})
+        applied = {"value": False}
+        def fail_text_interrupt(state):
+            if not sequence_is_active(state) or state_epoch(state) != interrupt_epoch["value"]:
+                return
+            state["state"] = "failed"
+            state["last_error"] = error
+            state["heartbeat_at"] = now()
+            applied["value"] = True
+        state = update_state(args.seq_id, fail_text_interrupt)
+        if not applied["value"]:
+            return changed_output()
+        return sequence_output(state, ok=False, error=error, intent="interrupt")
+    applied = {"value": False}
+    def finish_text_interrupt(state):
+        if not sequence_is_active(state) or state_epoch(state) != interrupt_epoch["value"]:
+            return
+        seg = {"segment_id": "interrupt", "text": args.text, "ready_path": path, "status": "running", "submitted": True}
+        if args.duration is not None:
+            seg["duration"] = args.duration
+        if args.seed is not None:
+            seg["seed"] = args.seed
+        if args.diffusion_steps is not None:
+            seg["diffusion_steps"] = args.diffusion_steps
+        state["segments"].append(seg)
+        state["state"] = "running"
+        state["active"] = {"segment_id": "interrupt", "run_id": started.get("id")}
+        state["last_cmd"] = "sequence-interrupt"
+        state["next"] = "sequence-status"
+        state["heartbeat_at"] = now()
+        applied["value"] = True
+    state = update_state(args.seq_id, finish_text_interrupt)
+    if not applied["value"]:
+        return changed_output()
+    return sequence_output(state, intent="interrupt")
+
+
+def prepare_segment(seg, stage_dir, serial_id):
+    if seg.get("ready_path"):
+        seg["status"] = "ready"
+        return seg["ready_path"]
+    seg["status"] = "generating"
+    path, source = resolve_text_to_trk(
+        seg["text"],
+        seg.get("duration"),
+        stage_dir,
+        serial_id,
+        seg.get("seed"),
+        seg.get("diffusion_steps"),
+    )
+    seg["ready_path"] = path
+    seg["source"] = source
+    seg["status"] = "ready"
+    return path
+
+
+def worker_cmd(args, base, timeout, poll):
+    seq_id = args.seq_id
+    max_polls = int(os.environ.get("ET1_ACTION_WORKER_MAX_POLLS", "0"))
+    poll_count = 0
+    queue_limit = queue_ahead_limit()
+    while True:
+        def heartbeat(state):
+            state["heartbeat_at"] = now()
+            state["pid"] = os.getpid()
+            state["last_cmd"] = "sequence-status"
+        state = update_state(seq_id, heartbeat)
+        if state.get("state") in {"canceled", "completed", "failed"}:
+            return 0
+
+        def promote_if_idle(state):
+            promote_next_queued_active(state)
+            state["heartbeat_at"] = now()
+        state = update_state(seq_id, promote_if_idle)
+
+        active = state.get("active") or {}
+        run_id = active.get("run_id")
+        if run_id:
+            status = http_request(base, "GET", "/status?id=" + urllib.parse.quote(run_id, safe=""), timeout=timeout)
+            if status.get("ok") and status.get("state") in GOOD_TERMINAL:
+                def mark_done(state):
+                    current = state.get("active") or {}
+                    if current.get("run_id") != run_id or current.get("segment_id") != active.get("segment_id"):
+                        state["heartbeat_at"] = now()
+                        return
+                    for seg in state.get("segments", []):
+                        if seg.get("segment_id") == current.get("segment_id"):
+                            seg["status"] = "done"
+                    state["active"] = None
+                    promote_next_queued_active(state)
+                    state["heartbeat_at"] = now()
+                update_state(seq_id, mark_done)
+            elif status.get("ok") and status.get("state") in TERMINAL:
+                error = {"code": "TRACKER_RUN_FAILED", "message": f"state={status.get('state')}"}
+                def mark_failed(state):
+                    current = state.get("active") or {}
+                    if current.get("run_id") != run_id or current.get("segment_id") != active.get("segment_id"):
+                        state["heartbeat_at"] = now()
+                        return
+                    state["state"] = "failed"
+                    state["last_error"] = error
+                    state["heartbeat_at"] = now()
+                update_state(seq_id, mark_failed)
+                return 1
+
+        made_progress = False
+        while True:
+            selected = {}
+            selected_epoch = {"value": None}
+            selected_plan = {"value": None}
+            def select_next(state):
+                nonlocal selected
+                if not sequence_is_active(state):
+                    state["heartbeat_at"] = now()
+                    return
+                if unfinished_submission_count(state) >= queue_limit:
+                    state["heartbeat_at"] = now()
+                    return
+                for seg in state.get("segments", []):
+                    if not seg.get("submitted") and seg.get("status") not in {"canceled", "failed"}:
+                        selected = dict(seg)
+                        selected_epoch["value"] = state_epoch(state)
+                        selected_plan["value"] = segment_plan_key(seg)
+                        if not seg.get("ready_path"):
+                            seg["status"] = "generating"
+                        state["heartbeat_at"] = now()
+                        return
+                if unfinished_submission_count(state) == 0:
+                    state["state"] = "completed"
+                    state["active"] = None
+                state["heartbeat_at"] = now()
+            state = update_state(seq_id, select_next)
+            if state.get("state") in {"completed", "canceled", "failed"}:
+                return 0
+            if not selected:
+                break
+
+            try:
+                if selected.get("ready_path"):
+                    path = selected["ready_path"]
+                else:
+                    path = prepare_segment(selected, Path(state.get("stage_dir") or default_stage_dir()), state.get("serial_id"))
+                    prepared = {"path": path, "source": selected.get("source")}
+                    still_current = {"value": False}
+                    def mark_ready(state):
+                        seg = find_matching_segment(
+                            state,
+                            selected.get("segment_id"),
+                            selected_plan["value"],
+                            selected_epoch["value"],
+                        )
+                        if seg is not None:
+                            seg["ready_path"] = prepared["path"]
+                            if prepared["source"]:
+                                seg["source"] = prepared["source"]
+                            seg["status"] = "ready"
+                            state["heartbeat_at"] = now()
+                            still_current["value"] = True
+                            return
+                        state["heartbeat_at"] = now()
+                    update_state(seq_id, mark_ready)
+                    if not still_current["value"]:
+                        continue
+                submit_token = {"value": None}
+                submit_allowed = {"value": False}
+                def mark_submitting(state):
+                    seg = find_matching_segment(
+                        state,
+                        selected.get("segment_id"),
+                        selected_plan["value"],
+                        selected_epoch["value"],
+                    )
+                    if seg is None:
+                        state["heartbeat_at"] = now()
+                        return
+                    if seg.get("ready_path") != path:
+                        state["heartbeat_at"] = now()
+                        return
+                    token = next_submit_token(state)
+                    seg["submitted"] = True
+                    seg["status"] = "submitting"
+                    seg["submitting_token"] = token
+                    state["state"] = "running"
+                    active = state.get("active") or {}
+                    if not active.get("run_id"):
+                        state["active"] = {"segment_id": seg["segment_id"], "run_id": None, "submitting_token": token}
+                    state["heartbeat_at"] = now()
+                    submit_token["value"] = token
+                    submit_allowed["value"] = True
+                update_state(seq_id, mark_submitting)
+                if not submit_allowed["value"]:
+                    continue
+                submit_mode = "queue"
+                if not any_segment_submitted(state):
+                    submit_mode = "interrupt"
+                started = execute_trk(base, path, submit_mode, False, timeout, poll)
+                if not started.get("ok"):
+                    error = started.get("error", {"code": "TRACKER_RUN_FAILED", "message": "tracker run failed"})
+                    applied = {"value": False}
+                    def fail_segment(state):
+                        if not sequence_is_active(state) or state_epoch(state) != selected_epoch["value"]:
+                            state["heartbeat_at"] = now()
+                            return
+                        for seg in state.get("segments", []):
+                            if (
+                                seg.get("segment_id") == selected.get("segment_id")
+                                and segment_plan_key(seg) == selected_plan["value"]
+                                and seg.get("submitted")
+                                and seg.get("status") == "submitting"
+                                and seg.get("submitting_token") == submit_token["value"]
+                            ):
+                                seg["status"] = "failed"
+                                state["state"] = "failed"
+                                state["last_error"] = error
+                                applied["value"] = True
+                                break
+                        state["heartbeat_at"] = now()
+                    update_state(seq_id, fail_segment)
+                    if not applied["value"]:
+                        return 0
+                    return 1
+                def mark_running_or_queued(state):
+                    if not sequence_is_active(state) or state_epoch(state) != selected_epoch["value"]:
+                        state["heartbeat_at"] = now()
+                        return
+                    active = state.get("active") or {}
+                    active_slot = active.get("submitting_token") == submit_token["value"] or not active.get("run_id")
+                    for seg in state.get("segments", []):
+                        if (
+                            seg.get("segment_id") == selected.get("segment_id")
+                            and segment_plan_key(seg) == selected_plan["value"]
+                            and seg.get("submitted")
+                            and seg.get("status") == "submitting"
+                            and seg.get("submitting_token") == submit_token["value"]
+                        ):
+                            seg["ready_path"] = path
+                            seg["run_id"] = started.get("id")
+                            seg["status"] = "running" if active_slot else "queued"
+                            state["state"] = "running"
+                            if active_slot:
+                                state["active"] = {"segment_id": seg["segment_id"], "run_id": started.get("id")}
+                            break
+                    state["heartbeat_at"] = now()
+                update_state(seq_id, mark_running_or_queued)
+                made_progress = True
+            except CliError as e:
+                def fail_generation(state):
+                    seg = find_matching_segment(
+                        state,
+                        selected.get("segment_id"),
+                        selected_plan["value"],
+                        selected_epoch["value"],
+                    )
+                    if seg is not None:
+                        seg["status"] = "failed"
+                        state["state"] = "failed"
+                        state["last_error"] = {"code": e.code, "message": e.message}
+                    state["heartbeat_at"] = now()
+                update_state(seq_id, fail_generation)
+                return e.status
+
+        if made_progress:
+            poll_count = 0
+            continue
+        poll_count += 1
+        if max_polls and poll_count >= max_polls:
+            return 0
+        time.sleep(poll)
+
+
+def tracker_status_cmd(base, timeout, cmd="tracker-status"):
+    out = http_request(base, "GET", "/status", timeout=timeout)
+    if not out.get("ok"):
+        error = out.get("error", {})
+        return err_doc(cmd, error.get("code", "TRACKER_STATE_CONFLICT"), error.get("message", "status failed"), "standby")
+    return ok_doc(cmd, "standby", state=out.get("state") or out.get("ctrl"))
+
+
+def cache_clear_cmd(args):
+    root = nl2trk_root(args.root)
+    for name in ("cache", "tmp"):
+        path = root / name
+        if not path.exists() and not path.is_symlink():
+            continue
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        else:
+            shutil.rmtree(path)
+    return ok_doc("cache-clear", "run-text", intent="cache_clear", state="cleared")
+
+
+def parse(argv):
+    parser = Parser(prog="et1-action")
+    parser.add_argument("--url", default=os.environ.get("ET1_TRACKER_URL", DEFAULT_URL))
+    parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument("--poll", type=float, default=0.2)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    rt = sub.add_parser("run-text")
+    rt.add_argument("text")
+    rt.add_argument("--duration", type=float)
+    rt.add_argument("--seed", type=int)
+    rt.add_argument("--diffusion-steps", type=int)
+    rt.add_argument("--wait", action="store_true")
+    rt.add_argument("--mode", choices=("queue", "interrupt"), default="interrupt")
+    rt.add_argument("--hold", action="store_true")
+    rt.add_argument("--no-preset", action="store_true")
+    rt.add_argument("--stage-dir")
+
+    rk = sub.add_parser("run-trk")
+    rk.add_argument("path")
+    rk.add_argument("--wait", action="store_true")
+    rk.add_argument("--mode", choices=("queue", "interrupt"), default="interrupt")
+    rk.add_argument("--hold", action="store_true")
+
+    sub.add_parser("standby")
+    sub.add_parser("fixstand")
+    sub.add_parser("status")
+
+    us = sub.add_parser("urgent-stop")
+    us.add_argument("--urgent", action="store_true")
+
+    idle = sub.add_parser("idle-load")
+    idle.add_argument("--preset-dir")
+    idle.add_argument("--stage-dir")
+
+    cc = sub.add_parser("cache-clear")
+    cc.add_argument("--root")
+
+    ss = sub.add_parser("sequence-start")
+    ss.add_argument("--plan-json", required=True)
+    ss.add_argument("--stage-dir")
+    ss.add_argument("--serial-id")
+
+    st = sub.add_parser("sequence-status")
+    st.add_argument("seq_id")
+
+    sc = sub.add_parser("sequence-cancel")
+    sc.add_argument("seq_id")
+
+    sa = sub.add_parser("sequence-append")
+    sa.add_argument("seq_id")
+    sa.add_argument("--plan-json", required=True)
+
+    sr = sub.add_parser("sequence-replace-tail")
+    sr.add_argument("seq_id")
+    sr.add_argument("--plan-json", required=True)
+
+    si = sub.add_parser("sequence-interrupt")
+    si.add_argument("seq_id")
+    group = si.add_mutually_exclusive_group(required=True)
+    group.add_argument("--trk")
+    group.add_argument("--text")
+    si.add_argument("--duration", type=float)
+    si.add_argument("--seed", type=int)
+    si.add_argument("--diffusion-steps", type=int)
+
+    worker = sub.add_parser("_worker", help=argparse.SUPPRESS)
+    worker.add_argument("seq_id")
+
+    hidden = sub.add_parser("tracker-status", help=argparse.SUPPRESS)
+    hidden.set_defaults(hidden=True)
+
+    args = parser.parse_args(argv)
+    if args.timeout <= 0 or args.poll <= 0:
+        raise CliError("REQUEST_INVALID", "timeout and poll must be >0")
+    if getattr(args, "duration", None) is not None and args.duration <= 0:
+        raise CliError("REQUEST_INVALID", "duration must be >0")
+    if getattr(args, "diffusion_steps", None) is not None and args.diffusion_steps <= 0:
+        raise CliError("REQUEST_INVALID", "diffusion_steps must be >0")
+    return args
+
+
+def main(argv):
+    cmd = argv[0] if argv else "et1-action"
+    try:
+        args = parse(argv)
+        base = tracker_url(args.url)
+        if args.cmd == "run-text":
+            out = run_text_cmd(args, base, args.timeout, args.poll)
+        elif args.cmd == "run-trk":
+            out = run_trk_cmd(args, base, args.timeout, args.poll)
+        elif args.cmd == "standby":
+            out = standby_cmd(base, args.timeout, args.poll)
+        elif args.cmd == "fixstand":
+            out = fixstand_cmd(base, args.timeout)
+        elif args.cmd == "urgent-stop":
+            out = urgent_stop_cmd(args, base, args.timeout)
+        elif args.cmd == "idle-load":
+            out = idle_load_cmd(args, base, args.timeout)
+        elif args.cmd == "cache-clear":
+            out = cache_clear_cmd(args)
+        elif args.cmd == "sequence-start":
+            out = sequence_start_cmd(args)
+        elif args.cmd == "sequence-status":
+            out = sequence_status_cmd(args)
+        elif args.cmd == "sequence-cancel":
+            out = sequence_cancel_cmd(args, base, args.timeout)
+        elif args.cmd == "sequence-append":
+            out = sequence_append_cmd(args)
+        elif args.cmd == "sequence-replace-tail":
+            out = sequence_replace_tail_cmd(args)
+        elif args.cmd == "sequence-interrupt":
+            out = sequence_interrupt_cmd(args, base, args.timeout, args.poll)
+        elif args.cmd == "_worker":
+            return worker_cmd(args, base, args.timeout, args.poll)
+        elif args.cmd == "status":
+            out = tracker_status_cmd(base, args.timeout, "status")
+        elif args.cmd == "tracker-status":
+            out = tracker_status_cmd(base, args.timeout)
+        else:
+            raise CliError("REQUEST_INVALID", "unknown command")
+        print_json(out)
+        return 0 if out.get("ok", False) else 1
+    except CliError as e:
+        return fail(cmd, e.code, e.message, e.status, e.next)
+    except KeyboardInterrupt:
+        return fail(cmd, "INTERRUPTED", "interrupted", 130, "sequence-status")
+    except Exception as e:
+        return fail(cmd, "INTERNAL_ERROR", str(e), 1, "run-text")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

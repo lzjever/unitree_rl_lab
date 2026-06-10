@@ -31,6 +31,8 @@ class TrackerState:
         self.large_health = False
         self.large_control = False
         self.active = {"kind": "none", "id": None}
+        self.exec = {"id": None, "state": None, "frame": 0, "frames": 0, "progress": 0}
+        self.queue = {"ids": [], "n": 0, "limit": 8}
         self.transition = {
             "active": False,
             "target": None,
@@ -64,6 +66,8 @@ class TrackerState:
             "active": dict(self.active),
             "transition": dict(self.transition),
             "idle": dict(self.idle),
+            "exec": dict(self.exec),
+            "queue": dict(self.queue),
             "pose": list(range(64)),
         }
 
@@ -206,6 +210,7 @@ class ServerCase(unittest.TestCase):
 
     def cli(self, *args, env_extra=None):
         env = os.environ.copy()
+        env.pop("ET1_PASSIVE_PASSWORD", None)
         env["ET1_TRACKER_URL"] = self.url
         if env_extra:
             env.update(env_extra)
@@ -250,6 +255,8 @@ class ServerCase(unittest.TestCase):
                     "frames": 0,
                     "progress": 0,
                 },
+                "exec": {"id": None, "state": None, "frame": 0, "frames": 0, "progress": 0},
+                "queue": {"ids": [], "n": 0, "limit": 8},
             },
         )
 
@@ -269,16 +276,16 @@ class ServerCase(unittest.TestCase):
 
     def test_control_failure_with_top_fields_preserves_contract_next_tokens(self):
         cases = (
-            ("fixstand", "/fixstand", "fixstand"),
-            ("standby", "/standby_velocity", "standby_velocity"),
-            ("stop", "/stop", "stop"),
+            (("fixstand",), "/fixstand", "fixstand"),
+            (("standby",), "/standby_velocity", "standby_velocity"),
+            (("stop", "--urgent"), "/stop", "stop"),
         )
         for command, path, token in cases:
-            with self.subTest(command=command, token=token):
+            with self.subTest(command=" ".join(command), token=token):
                 self.state.control_failures = {
                     path: {"ok": False, "error": {"code": "CONTROL_STATE_CONFLICT", "message": path}, "next": token}
                 }
-                proc, out = self.cli(command)
+                proc, out = self.cli(*command)
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertEqual(out["next"], token)
                 self.assertIn(out["next"], CONTRACT_NEXT_TOKENS)
@@ -289,9 +296,22 @@ class ServerCase(unittest.TestCase):
             "/stop": {"ok": False, "error": {"code": "ROBOT_NOT_READY", "message": "not ready"}}
         }
         self.state.top_status_queue = [dict(self.state.top_status(), next="wait_robot")]
-        proc, out = self.cli("stop")
+        proc, out = self.cli("stop", "--urgent")
         self.assertNotEqual(proc.returncode, 0)
         self.assertEqual(out["next"], "wait_robot")
+
+    def test_stop_without_urgent_is_rejected_before_http(self):
+        proc, out = self.cli("stop")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(out["error"]["code"], "stop_requires_urgent")
+        self.assertEqual(out["next"], "standby_velocity")
+        self.assertEqual(self.state.records, [])
+
+    def test_stop_with_urgent_posts_stop(self):
+        proc, out = self.cli("stop", "--urgent")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(out["ok"], True)
+        self.assertEqual([record for record in self.state.records if record[1] == "/stop"], [("POST", "/stop", None)])
 
     def test_ready_from_passive_is_read_only_and_requires_fixstand(self):
         self.state.ctrl = "passive"
@@ -371,7 +391,7 @@ class ServerCase(unittest.TestCase):
         self.assertEqual(out["id"], "r1")
         self.assertEqual(
             [(m, p, b) for m, p, b in self.state.records],
-            [("POST", "/execute", {"path": TRK, "mode": "interrupt", "hold": True})],
+            [("POST", "/execute", {"path": TRK, "mode": "queue", "hold": True})],
         )
 
     def test_run_without_hold_does_not_send_hold_false(self):
@@ -380,7 +400,46 @@ class ServerCase(unittest.TestCase):
         self.assertEqual(out["id"], "r1")
         self.assertEqual(
             [(m, p, b) for m, p, b in self.state.records],
+            [("POST", "/execute", {"path": TRK, "mode": "queue"})],
+        )
+
+    def test_run_explicit_interrupt_mode(self):
+        proc, out = self.cli("run", TRK, "--mode", "interrupt")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(out["id"], "r1")
+        self.assertEqual(
+            [(m, p, b) for m, p, b in self.state.records],
             [("POST", "/execute", {"path": TRK, "mode": "interrupt"})],
+        )
+
+    def test_exec_defaults_to_queue_and_explicit_interrupt_overrides(self):
+        proc, out = self.cli("exec", TRK)
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(out["id"], "r1")
+        self.assertEqual(
+            [(m, p, b) for m, p, b in self.state.records],
+            [("POST", "/execute", {"path": TRK, "mode": "queue"})],
+        )
+
+        self.state.records.clear()
+        proc, out = self.cli("exec", TRK, "--mode", "interrupt")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(out["id"], "r2")
+        self.assertEqual(
+            [(m, p, b) for m, p, b in self.state.records],
+            [("POST", "/execute", {"path": TRK, "mode": "interrupt"})],
+        )
+
+    def test_repeat_defaults_to_queue(self):
+        proc, out = self.cli("repeat", TRK, "-n", "2", "--timeout", "2", "--poll", "0.01")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(out["done"], 2)
+        self.assertEqual(
+            [(m, p, b) for m, p, b in self.state.records if m == "POST" and p == "/execute"],
+            [
+                ("POST", "/execute", {"path": TRK, "mode": "queue"}),
+                ("POST", "/execute", {"path": TRK, "mode": "queue"}),
+            ],
         )
 
     def test_run_hold_wait_returns_compact_holding_status(self):
@@ -565,9 +624,9 @@ class ServerCase(unittest.TestCase):
     def test_health_control_commands_omit_large_fields(self):
         self.state.large_health = True
         self.state.large_control = True
-        for command in ("health", "passive", "fixstand", "standby", "stop"):
-            with self.subTest(command=command):
-                proc, out = self.cli(command)
+        for command in (("health",), ("fixstand",), ("standby",), ("stop", "--urgent")):
+            with self.subTest(command=" ".join(command)):
+                proc, out = self.cli(*command)
                 self.assertEqual(proc.returncode, 0)
                 self.assertEqual(out["ok"], True)
                 self.assertIn("ctrl", out)
@@ -577,13 +636,23 @@ class ServerCase(unittest.TestCase):
                 self.assertNotIn("samples", out)
                 self.assertLess(len(proc.stdout), 160)
 
-    def test_passive_sends_default_password_without_leaking_it(self):
-        proc, out = self.cli("passive")
+        proc, out = self.cli("passive", env_extra={"ET1_PASSIVE_PASSWORD": "large-secret"})
         self.assertEqual(proc.returncode, 0)
-        self.assertEqual([record for record in self.state.records if record[1] == "/passive"], [("POST", "/passive", {"password": "galaxy"})])
-        self.assertNotIn("galaxy", proc.stdout)
-        self.assertEqual(out["ctrl"], "passive")
-        self.assertEqual(out["ready"], False)
+        self.assertEqual(out["ok"], True)
+        self.assertIn("ctrl", out)
+        self.assertIn("ready", out)
+        self.assertIn("err", out)
+        self.assertNotIn("pose", out)
+        self.assertNotIn("samples", out)
+        self.assertLess(len(proc.stdout), 160)
+
+    def test_passive_without_password_is_rejected_before_http(self):
+        proc, out = self.cli("passive")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(out["error"]["code"], "missing_passive_password")
+        self.assertEqual(out["next"], "manual")
+        self.assertEqual(self.state.records, [])
+        self.assertEqual(proc.stdout.count("\n"), 1)
 
     def test_passive_password_env_and_cli_override_without_leaking_it(self):
         proc, out = self.cli("passive", env_extra={"ET1_PASSIVE_PASSWORD": "env-secret"})
@@ -599,6 +668,53 @@ class ServerCase(unittest.TestCase):
         self.assertNotIn("cli-secret", proc.stdout)
         self.assertNotIn("env-secret", proc.stdout)
         self.assertEqual(out["ok"], True)
+
+    def test_docs_restrict_stop_and_passive_recovery(self):
+        skill = (ROOT / "SKILL.md").read_text()
+        state_machine = (ROOT / "references" / "state-machine.md").read_text()
+        raw_http = (ROOT / "references" / "raw-http.md").read_text()
+        prompt = (ROOT / "agents" / "openai.yaml").read_text()
+        docs = "\n".join((skill, state_machine, raw_http, prompt))
+        self.assertIn("Never infer `stop` or `/stop`", skill)
+        self.assertIn("Normal requests to stand", skill)
+        self.assertIn("preserve idle config", skill)
+        self.assertIn("with idle preserved", skill)
+        self.assertIn("normal way to leave motion and stand", skill)
+        self.assertIn("recover, relax", skill)
+        self.assertIn("stop --urgent", skill)
+        self.assertIn("`preset-trk/idle/`", skill)
+        self.assertIn("tracker-readable motion directory", skill)
+        self.assertIn("configured `generated`/`motion_dirs`", skill)
+        self.assertIn("idle set /path/to/idle-a.trk", skill)
+        self.assertIn("This only sets the idle", skill)
+        self.assertIn("After `passive`, never auto-restore", skill)
+        self.assertIn("fixstand  # explicit stand configuration/control prep only", skill)
+        self.assertIn("fixed-configuration control step", skill)
+        self.assertIn("stand-still/velocity", skill)
+        self.assertIn("configuration/进入站立构型", skill)
+        self.assertIn("fixed configuration / preparation state", state_machine)
+        self.assertIn("not normal stand-still", state_machine)
+        self.assertIn("不要动/站着别动", state_machine)
+        self.assertIn("preserves idle config", state_machine)
+        self.assertIn("`idle clear` then `standby`", state_machine)
+        self.assertIn("do not infer idle clearing", state_machine)
+        self.assertIn("Preset idle loading", state_machine)
+        self.assertIn("preset-trk/idle/*.trk", state_machine)
+        self.assertIn("tracker-readable allowed/generated motion dir", state_machine)
+        self.assertIn("POST /fixstand` for explicit fixed-configuration", raw_http)
+        self.assertIn("`/fixstand` is not normal stand-still", raw_http)
+        self.assertIn("`/standby_velocity` preserves idle", raw_http)
+        self.assertIn("explicit clear-idle flow", raw_http)
+        self.assertIn("transition.target==\"user\"", state_machine)
+        self.assertIn("Use scripts/et1-trk2motion first for normal work", prompt)
+        self.assertIn("normal stop => standby preserving idle config", prompt)
+        self.assertIn("clear idle only when explicit", prompt)
+        self.assertIn("preset-trk/idle/*.trk", prompt)
+        self.assertIn("copy to tracker-readable generated/motion_dirs", prompt)
+        self.assertIn("then idle set copied paths", prompt)
+        self.assertIn("fixstand only for explicit enter stand configuration/control prep", prompt)
+        self.assertNotIn("idle clear, fixstand, standby", prompt)
+        self.assertNotIn("gal" + "axy", docs)
 
     def test_state_short_output_includes_compact_transition(self):
         self.state.ctrl = "running"

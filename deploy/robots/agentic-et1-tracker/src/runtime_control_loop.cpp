@@ -404,7 +404,7 @@ void RuntimeControlLoop::handleControl(ControlMode mode) {
     return;
   }
 
-  if (mode == ControlMode::FixStand) {
+  if (mode == ControlMode::FixStand || mode == ControlMode::StandbyVelocity) {
     cancelWaiting(StopReason::Stop);
   }
   post_stop_control_ = mode;

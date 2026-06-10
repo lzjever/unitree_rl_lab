@@ -5078,7 +5078,7 @@ TEST_CASE("RuntimeControlLoop stop in Passive remains Passive") {
   REQUIRE(velocity_policy.calls == 0);
 }
 
-TEST_CASE("RuntimeControlLoop queues execute in FixStand until StandbyVelocity event") {
+TEST_CASE("RuntimeControlLoop standby in FixStand cancels queued work") {
   TempTree tmp;
   const RuntimeConfig config = runtimeConfig();
   const DeployConfig deploy_config = deployConfig();
@@ -5126,28 +5126,15 @@ TEST_CASE("RuntimeControlLoop queues execute in FixStand until StandbyVelocity e
   REQUIRE(bridge.standbyVelocity().ok());
   loop.tick();
   snapshot = store.snapshot();
-  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::GeneralTrackerTransition);
-  REQUIRE(snapshot.ctrl == ControllerState::Running);
-  REQUIRE(snapshot.active.kind == ActiveKind::Transition);
-  REQUIRE(snapshot.transition.active);
-  REQUIRE(snapshot.transition.target == "user");
-  REQUIRE(snapshot.transition.target_id == "fixstand-queued");
-  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Velocity);
+  REQUIRE(snapshot.ctrl == ControllerState::StandbyVelocity);
+  REQUIRE(snapshot.active.kind == ActiveKind::None);
+  REQUIRE_FALSE(snapshot.transition.active);
   REQUIRE(snapshot.queue.ids.empty());
-  REQUIRE(store.findRun("fixstand-queued").run->state == MotionState::Queued);
-
-  const std::size_t transition_frames = snapshot.transition.frames;
-  bool saw_user = false;
-  for (std::size_t i = 0; i < transition_frames * 32 + 32; ++i) {
-    loop.tick();
-    snapshot = store.snapshot();
-    if (snapshot.active.kind == ActiveKind::User) {
-      saw_user = true;
-      break;
-    }
-  }
-  REQUIRE(saw_user);
-  REQUIRE(store.snapshot().ctrl == ControllerState::Running);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(store.findRun("fixstand-queued").run->state == MotionState::Canceled);
+  REQUIRE(store.findRun("fixstand-queued").run->stop_reason == StopReason::Stop);
+  REQUIRE(velocity_policy.calls == 1);
 }
 
 TEST_CASE("RuntimeControlLoop fixstand and standby commands cancel queued work and target control") {
@@ -5217,15 +5204,14 @@ TEST_CASE("RuntimeControlLoop fixstand and standby commands cancel queued work a
     loop.tick();
 
     const auto snapshot = store.snapshot();
-    REQUIRE(snapshot.ctrl == ControllerState::Running);
-    REQUIRE(snapshot.active.kind == ActiveKind::Transition);
-    REQUIRE(snapshot.transition.active);
-    REQUIRE(snapshot.transition.target == "user");
-    REQUIRE(snapshot.transition.target_id == "queued");
+    REQUIRE(snapshot.ctrl == ControllerState::StandbyVelocity);
+    REQUIRE(snapshot.active.kind == ActiveKind::None);
+    REQUIRE_FALSE(snapshot.transition.active);
     REQUIRE(snapshot.queue.ids.empty());
     REQUIRE_FALSE(snapshot.exec.has_value());
-    REQUIRE(store.findRun("queued").run->state == MotionState::Queued);
-    REQUIRE(velocity_policy.calls == 0);
+    REQUIRE(store.findRun("queued").run->state == MotionState::Canceled);
+    REQUIRE(store.findRun("queued").run->stop_reason == StopReason::Stop);
+    REQUIRE(velocity_policy.calls == 1);
   }
 }
 
@@ -5289,22 +5275,15 @@ TEST_CASE("RuntimeControlLoop control command while running stops active and cle
     REQUIRE(snapshot.ctrl == ControllerState::Stopping);
     REQUIRE(snapshot.exec.has_value());
     REQUIRE(snapshot.exec->state == MotionState::Stopping);
-    if (item.mode == ControlMode::FixStand) {
-      REQUIRE(snapshot.queue.ids.empty());
-      REQUIRE(store.findRun("waiting").run->state == MotionState::Canceled);
-      REQUIRE(store.findRun("waiting").run->stop_reason == StopReason::Stop);
-    } else {
-      REQUIRE(snapshot.queue.ids == std::vector<std::string>{"waiting"});
-      REQUIRE(store.findRun("waiting").run->state == MotionState::Queued);
-    }
+    REQUIRE(snapshot.queue.ids.empty());
+    REQUIRE(store.findRun("waiting").run->state == MotionState::Canceled);
+    REQUIRE(store.findRun("waiting").run->stop_reason == StopReason::Stop);
 
     loop.tick();
     snapshot = store.snapshot();
     REQUIRE(snapshot.ctrl == item.expected_ctrl);
     REQUIRE_FALSE(snapshot.exec.has_value());
-    if (item.mode == ControlMode::StandbyVelocity) {
-      REQUIRE(snapshot.queue.ids == std::vector<std::string>{"waiting"});
-    }
+    REQUIRE(snapshot.queue.ids.empty());
     REQUIRE(store.findRun("active").run->state == MotionState::Stopped);
     REQUIRE(store.findRun("active").run->stop_reason == StopReason::Stop);
   }

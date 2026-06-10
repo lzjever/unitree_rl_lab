@@ -119,6 +119,7 @@ ControlResult RuntimeBridge::standbyVelocity() {
     return result;
   }
 
+  clearPendingMotions();
   MotionRequest request;
   request.sequence = sequence;
   push(CommandKind::StandbyVelocity, request, sequence);

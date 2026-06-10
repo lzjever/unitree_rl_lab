@@ -1,0 +1,736 @@
+#!/usr/bin/env python3
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+CACHE_SCHEMA_VERSION = "et1-nl2trk-cache-v1"
+CLI_VERSION = "et1-nl2trk-cli-v1"
+DEFAULT_TIMEOUT = 900.0
+DEFAULT_POLL = 0.2
+RUNNING_STATUSES = {"created", "queued", "running"}
+SERIAL_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+RETRYABLE_CODES = {
+    "queue_full",
+    "artifact_not_ready",
+    "model_load_failed",
+    "generation_failed",
+    "gpu_unavailable",
+    "out_of_memory",
+    "ram_limit_exceeded",
+    "worker_internal_error",
+    "timeout",
+    "http_500",
+    "http_502",
+    "http_503",
+    "http_504",
+}
+TRK_MAGIC = b"ET1TRK1\0"
+
+
+class CliError(Exception):
+    def __init__(self, code, stage, message, retryable=False, metadata_path=None):
+        super().__init__(message)
+        self.code = str(code)
+        self.stage = str(stage)
+        self.message = str(message)
+        self.retryable = bool(retryable)
+        self.metadata_path = str(metadata_path) if metadata_path else None
+
+
+class ArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        raise CliError("invalid_args", "args", message)
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def canonical_json(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def write_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(value, sort_keys=True, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def sha256_bytes(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def file_sha256(path):
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def parse_args(argv):
+    parser = ArgumentParser(prog="et1-nl2trk")
+    parser.add_argument("positional_prompt", nargs="?")
+    parser.add_argument("--prompt")
+    parser.add_argument("--out")
+    parser.add_argument("--duration", type=float)
+    parser.add_argument("--diffusion-steps", type=int)
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--serial-id")
+    parser.add_argument("--fresh", action="store_true")
+    parser.add_argument("--root")
+    parser.add_argument("--timeout", type=float)
+    parser.add_argument("--poll", type=float)
+    parser.add_argument("--actual-human-height", type=float)
+    parser.add_argument("--start-frame", type=int)
+    parser.add_argument("--height-window", type=int)
+    parser.add_argument("--target-ground-z", type=float)
+    parser.add_argument("--output-fps", type=float)
+    args = parser.parse_args(argv)
+
+    if args.prompt and args.positional_prompt:
+        raise CliError("invalid_args", "args", "provide prompt either positionally or with --prompt, not both")
+    prompt = args.prompt if args.prompt is not None else args.positional_prompt
+    if not prompt:
+        raise CliError("invalid_args", "args", "missing prompt")
+    if args.timeout is not None and args.timeout <= 0:
+        raise CliError("invalid_args", "args", "--timeout must be greater than zero")
+    if args.poll is not None and args.poll <= 0:
+        raise CliError("invalid_args", "args", "--poll must be greater than zero")
+    if args.duration is not None and args.duration <= 0:
+        raise CliError("invalid_args", "args", "--duration must be greater than zero")
+    if args.diffusion_steps is not None and args.diffusion_steps <= 0:
+        raise CliError("invalid_args", "args", "--diffusion-steps must be greater than zero")
+    if args.serial_id is not None and not SERIAL_ID_RE.fullmatch(args.serial_id):
+        raise CliError("invalid_args", "args", "--serial-id must match [A-Za-z0-9_-]{1,64}")
+
+    return args, prompt
+
+
+def explicit_options(args):
+    items = {}
+    for key in (
+        "out",
+        "duration",
+        "diffusion_steps",
+        "seed",
+        "serial_id",
+        "root",
+        "timeout",
+        "poll",
+        "actual_human_height",
+        "start_frame",
+        "height_window",
+        "target_ground_z",
+        "output_fps",
+    ):
+        value = getattr(args, key)
+        if value is not None:
+            items[key] = value
+    if args.fresh:
+        items["fresh"] = True
+    if args.prompt is not None:
+        items["prompt_flag"] = True
+    return items
+
+
+def require_env(name):
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        raise CliError("missing_env", "config", f"missing required environment variable {name}")
+    return value
+
+
+def normalize_base_url(raw, name):
+    raw = raw.strip()
+    parsed = urllib.parse.urlsplit(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise CliError("invalid_config", "config", f"{name} must be an absolute http(s) URL")
+    if parsed.query or parsed.fragment:
+        raise CliError("invalid_config", "config", f"{name} must not include query or fragment")
+    if parsed.username is not None or parsed.password is not None:
+        raise CliError("invalid_config", "config", f"{name} must not include username/password; use ET1_AUTH_HEADER")
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        raise CliError("invalid_config", "config", f"{name} must include a host")
+    netloc = hostname
+    if parsed.port is not None:
+        netloc = f"{netloc}:{parsed.port}"
+    path = parsed.path.rstrip("/")
+    return urllib.parse.urlunsplit((parsed.scheme.lower(), netloc, path, "", ""))
+
+
+def resolve_url(base_url, candidate):
+    if not candidate:
+        return None
+    return urllib.parse.urljoin(base_url.rstrip("/") + "/", str(candidate))
+
+
+def parse_auth_header(raw):
+    if not raw:
+        return None
+    if ":" not in raw:
+        raise CliError("invalid_config", "config", "ET1_AUTH_HEADER must be a single HTTP header in 'Name: value' form")
+    name, value = raw.split(":", 1)
+    name = name.strip()
+    value = value.strip()
+    if not name or not value or "\n" in name or "\r" in name or "\n" in value or "\r" in value:
+        raise CliError("invalid_config", "config", "ET1_AUTH_HEADER must be a single HTTP header in 'Name: value' form")
+    return name, value
+
+
+def root_dirs(args):
+    if args.root:
+        root = Path(args.root)
+    else:
+        root = Path.cwd() / "generated" / "et1-nl2trk"
+    root = root.resolve()
+    dirs = {
+        "root": root,
+        "generated": root / "generated",
+        "cache": root / "cache",
+        "keys": root / "cache" / "keys",
+        "runs": root / "cache" / "runs",
+        "tmp": root / "tmp",
+        "hits": root / "cache" / "hits",
+    }
+    for path in dirs.values():
+        path.mkdir(parents=True, exist_ok=True)
+    return dirs
+
+
+def kimodo_request(prompt, args):
+    body = {"prompt": prompt}
+    if args.duration is not None:
+        body["duration"] = args.duration
+    if args.seed is not None:
+        body["seed"] = args.seed
+    if args.serial_id is not None:
+        body["serial_id"] = args.serial_id
+    if args.diffusion_steps is not None:
+        body["generation"] = {"diffusion_steps": args.diffusion_steps}
+    return body
+
+
+def motion_query_params(args):
+    params = {}
+    mapping = (
+        ("actual_human_height", args.actual_human_height),
+        ("start_frame", args.start_frame),
+        ("height_window", args.height_window),
+        ("target_ground_z", args.target_ground_z),
+        ("output_fps", args.output_fps),
+    )
+    for key, value in mapping:
+        if value is not None:
+            params[key] = value
+    return params
+
+
+def cache_key_payload(kimodo_url, motion_url, kimodo_body, motion_params):
+    kimodo_body_text = canonical_json(kimodo_body)
+    return {
+        "cache_schema_version": CACHE_SCHEMA_VERSION,
+        "cli_schema_version": CLI_VERSION,
+        "services": {
+            "kimodo_url": kimodo_url,
+            "motion2trk_url": motion_url,
+        },
+        "kimodo": {
+            "request_json": kimodo_body_text,
+        },
+        "motion2trk": {
+            "query_params": motion_params,
+        },
+    }
+
+
+def build_cache_key(payload):
+    return sha256_bytes(canonical_json(payload).encode("utf-8"))
+
+
+class HttpClient:
+    def __init__(self, auth_header, request_timeout):
+        self.auth_header = auth_header
+        self.request_timeout = request_timeout
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def _headers(self, extra=None):
+        headers = {}
+        if extra:
+            headers.update(extra)
+        if self.auth_header:
+            headers[self.auth_header[0]] = self.auth_header[1]
+        return headers
+
+    def request_bytes(self, method, url, data=None, headers=None, stage="http"):
+        req = urllib.request.Request(url, data=data, method=method, headers=self._headers(headers))
+        try:
+            with self.opener.open(req, timeout=self.request_timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as exc:
+            body = exc.read()
+            code, message = parse_error_body(body, f"HTTP {exc.code}")
+            retryable = code in RETRYABLE_CODES or 500 <= exc.code <= 599
+            if code == "error":
+                code = f"http_{exc.code}"
+            raise CliError(code, stage, message, retryable=retryable) from None
+        except urllib.error.URLError as exc:
+            raise CliError("network_error", stage, str(exc.reason), retryable=True) from None
+        except TimeoutError as exc:
+            raise CliError("timeout", stage, str(exc), retryable=True) from None
+
+    def request_json(self, method, url, data=None, headers=None, stage="http"):
+        raw = self.request_bytes(method, url, data=data, headers=headers, stage=stage)
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except Exception:
+            raise CliError("invalid_response", stage, "response was not valid JSON") from None
+
+
+def parse_error_value(parsed, default_code, default_message):
+    if isinstance(parsed, dict):
+        error = parsed.get("error")
+        if isinstance(error, dict):
+            code = (
+                error.get("error_code")
+                or parsed.get("error_code")
+                or error.get("code")
+                or parsed.get("code")
+                or default_code
+            )
+            message = error.get("message") or parsed.get("message") or default_message
+        else:
+            code = parsed.get("error_code") or parsed.get("code") or default_code
+            message = parsed.get("message") or (str(error) if error else default_message)
+        return str(code), str(message)
+    return default_code, str(parsed or default_message)
+
+
+def parse_error_body(body, default_message):
+    try:
+        parsed = json.loads(body.decode("utf-8"))
+    except Exception:
+        text = body.decode("utf-8", errors="replace").strip()
+        return "error", text or default_message
+    return parse_error_value(parsed, "error", default_message)
+
+
+def require_job_id(stage, submit_response):
+    job_id = submit_response.get("job_id") if isinstance(submit_response, dict) else None
+    if not isinstance(job_id, str) or not job_id:
+        raise CliError("invalid_response", stage, "submit response did not include job_id")
+    return job_id
+
+
+def response_serial_id(response):
+    if not isinstance(response, dict):
+        return None
+    serial_id = response.get("serial_id")
+    if isinstance(serial_id, str) and serial_id:
+        return serial_id
+    result = response.get("result")
+    if isinstance(result, dict):
+        serial_id = result.get("serial_id")
+        if isinstance(serial_id, str) and serial_id:
+            return serial_id
+    request = response.get("request")
+    if isinstance(request, dict):
+        serial_id = request.get("serial_id")
+        if isinstance(serial_id, str) and serial_id:
+            return serial_id
+    return None
+
+
+def poll_job(client, stage, base_url, submit_response, timeout, poll, final_path):
+    job_id = require_job_id(stage, submit_response)
+    status_url = resolve_url(base_url, submit_response.get("status_url") or f"/v1/jobs/{job_id}")
+    download_url = resolve_url(base_url, submit_response.get("download_url") or f"/v1/jobs/{job_id}/download")
+    serial_id = response_serial_id(submit_response)
+    deadline = time.monotonic() + timeout
+    last = None
+
+    while True:
+        last = client.request_json("GET", status_url, stage=f"{stage}.poll")
+        status = last.get("status") if isinstance(last, dict) else None
+        if status == "succeeded":
+            write_json(final_path, last)
+            result = last.get("result") if isinstance(last.get("result"), dict) else {}
+            final_download_url = result.get("download_url") or download_url
+            serial_id = response_serial_id(last) or serial_id
+            job = {
+                "job_id": job_id,
+                "status_url": status_url,
+                "download_url": resolve_url(base_url, final_download_url),
+                "final_status": status,
+            }
+            if serial_id:
+                job["serial_id"] = serial_id
+            return job
+        if status == "failed":
+            write_json(final_path, last)
+            code, message = parse_error_value(last, f"{stage}_failed", f"{stage} failed")
+            raise CliError(code, f"{stage}.poll", message, retryable=code in RETRYABLE_CODES)
+        if status not in RUNNING_STATUSES:
+            if last is not None:
+                write_json(final_path, last)
+            raise CliError("invalid_status", f"{stage}.poll", f"unexpected status {status!r}")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            if last is not None:
+                write_json(final_path, last)
+            raise CliError("timeout", f"{stage}.poll", f"timed out waiting for {job_id}", retryable=True)
+        time.sleep(min(poll, remaining))
+
+
+def download_to_file(client, url, path, stage):
+    data = client.request_bytes("GET", url, stage=stage)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+    return data
+
+
+def build_metadata_base(prompt, args, cache_key, key_payload, kimodo_url, motion_url, auth_present, started_at):
+    metadata = {
+        "schema_version": CACHE_SCHEMA_VERSION,
+        "cli_schema_version": CLI_VERSION,
+        "original_prompt": prompt,
+        "explicit_options": explicit_options(args),
+        "cache_key": cache_key,
+        "cache_key_payload": key_payload,
+        "cache_hit": False,
+        "services": {
+            "kimodo_url": kimodo_url,
+            "motion2trk_url": motion_url,
+            "auth_header_present": auth_present,
+        },
+        "jobs": {},
+        "artifact_paths": {},
+        "output": None,
+        "timestamps": {
+            "started_at": started_at,
+            "completed_at": None,
+        },
+        "error": None,
+    }
+    if args.seed is None and args.serial_id is not None:
+        metadata["stochastic_cache_reuse"] = (
+            "serial_id supplied; cache lookup is bypassed so Kimodo can update sequence continuity; "
+            "cache pointer is still updated after success"
+        )
+    elif args.seed is None:
+        metadata["stochastic_cache_reuse"] = (
+            "seed omitted; default cache reuse returns the first sampled artifact for this exact request; "
+            "use --fresh to sample again"
+        )
+    return metadata
+
+
+def write_failure_metadata(path, metadata, error):
+    if metadata is None or path is None:
+        return None
+    metadata["timestamps"]["completed_at"] = utc_now()
+    metadata["error"] = {
+        "code": error.code,
+        "stage": error.stage,
+        "message": error.message,
+        "retryable": error.retryable,
+    }
+    write_json(path, metadata)
+    return path
+
+
+def cache_pointer_path(dirs, cache_key):
+    return dirs["keys"] / f"{cache_key}.json"
+
+
+def load_cache_hit(dirs, cache_key):
+    pointer = cache_pointer_path(dirs, cache_key)
+    if not pointer.exists():
+        return None
+    try:
+        data = json.loads(pointer.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    output = Path(data.get("output_trk", ""))
+    run_dir = Path(data.get("run_dir", ""))
+    metadata = Path(data.get("metadata_path", ""))
+    if output.is_file() and run_dir.is_dir():
+        return {
+            "pointer": pointer,
+            "run_dir": run_dir,
+            "output_trk": output,
+            "metadata_path": metadata if metadata.exists() else None,
+            "run_id": data.get("run_id"),
+        }
+    return None
+
+
+def explicit_output_target(args):
+    if not args.out:
+        return None
+    target = Path(args.out).resolve()
+    if target.exists():
+        raise CliError("output_exists", "output", f"output path already exists: {target}")
+    return target
+
+
+def generated_output_path(dirs, run_id):
+    return (dirs["generated"] / f"{run_id}.trk").resolve()
+
+
+def copy_output(source, target, allow_existing=False):
+    source = Path(source).resolve()
+    target = Path(target).resolve()
+    if target.exists():
+        if allow_existing:
+            return target
+        raise CliError("output_exists", "output", f"output path already exists: {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if source == target:
+        return target
+    shutil.copy2(source, target)
+    return target
+
+
+def ensure_generated_output(dirs, run_id, cached_output):
+    generated_path = generated_output_path(dirs, run_id)
+    if not generated_path.exists():
+        copy_output(cached_output, generated_path, allow_existing=True)
+    return generated_path
+
+
+def write_hit_metadata(
+    dirs,
+    prompt,
+    args,
+    cache_key,
+    key_payload,
+    kimodo_url,
+    motion_url,
+    auth_present,
+    hit,
+    generated_path,
+    returned_path,
+):
+    started = utc_now()
+    hit_dir = Path(tempfile.mkdtemp(prefix=f"{started.replace(':', '').replace('-', '')}-{cache_key[:12]}-", dir=dirs["hits"]))
+    output_path = Path(hit["output_trk"])
+    metadata = build_metadata_base(prompt, args, cache_key, key_payload, kimodo_url, motion_url, auth_present, started)
+    metadata["cache_hit"] = True
+    metadata["artifact_paths"] = {
+        "cached_run_dir": str(Path(hit["run_dir"]).resolve()),
+        "cache_output_trk": str(output_path.resolve()),
+        "generated_output_trk": str(generated_path.resolve()),
+        "returned_output_trk": str(returned_path.resolve()),
+        "source_metadata": str(hit["metadata_path"].resolve()) if hit.get("metadata_path") else None,
+    }
+    metadata["output"] = {
+        "bytes": output_path.stat().st_size,
+        "sha256": file_sha256(output_path),
+        "format": "ET1TRK1",
+    }
+    metadata["timestamps"]["completed_at"] = utc_now()
+    write_json(hit_dir / "metadata.json", metadata)
+
+
+def update_cache_pointer(dirs, cache_key, run_dir, output_path, generated_path, metadata_path):
+    pointer = {
+        "cache_key": cache_key,
+        "run_id": run_dir.name,
+        "run_dir": str(run_dir.resolve()),
+        "output_trk": str(output_path.resolve()),
+        "generated_output_trk": str(generated_path.resolve()),
+        "metadata_path": str(metadata_path.resolve()),
+        "updated_at": utc_now(),
+    }
+    path = cache_pointer_path(dirs, cache_key)
+    tmp = path.with_name(path.name + ".tmp")
+    write_json(tmp, pointer)
+    os.replace(tmp, path)
+
+
+def submit_and_convert(args, prompt, dirs, explicit_target, cache_key, key_payload, kimodo_url, motion_url, auth_header):
+    started_at = utc_now()
+    run_dir = Path(tempfile.mkdtemp(prefix=f"{started_at.replace(':', '').replace('-', '')}-{cache_key[:12]}-", dir=dirs["runs"]))
+    raw_dir = run_dir / "raw"
+    metadata_path = run_dir / "metadata.json"
+    metadata = build_metadata_base(prompt, args, cache_key, key_payload, kimodo_url, motion_url, bool(auth_header), started_at)
+    metadata["artifact_paths"]["run_dir"] = str(run_dir.resolve())
+    metadata["artifact_paths"]["raw_dir"] = str(raw_dir.resolve())
+    metadata["artifact_paths"]["metadata"] = str(metadata_path.resolve())
+
+    client = HttpClient(auth_header, request_timeout=min(30.0, max(1.0, args.timeout or DEFAULT_TIMEOUT)))
+    timeout = args.timeout if args.timeout is not None else DEFAULT_TIMEOUT
+    poll = args.poll if args.poll is not None else DEFAULT_POLL
+
+    kimodo_body = kimodo_request(prompt, args)
+    kimodo_body_text = canonical_json(kimodo_body)
+    kimodo_url_actions = resolve_url(kimodo_url, "/v1/actions")
+    write_json(
+        raw_dir / "kimodo.request.json",
+        {
+            "method": "POST",
+            "url": kimodo_url_actions,
+            "headers": {
+                "content-type": "application/json",
+                "auth_header_present": bool(auth_header),
+            },
+            "body": kimodo_body,
+            "body_json": kimodo_body_text,
+        },
+    )
+
+    try:
+        kimodo_submit = client.request_json(
+            "POST",
+            kimodo_url_actions,
+            data=kimodo_body_text.encode("utf-8"),
+            headers={"content-type": "application/json"},
+            stage="kimodo.submit",
+        )
+        write_json(raw_dir / "kimodo.submit.json", kimodo_submit)
+        kimodo_job = poll_job(client, "kimodo", kimodo_url, kimodo_submit, timeout, poll, raw_dir / "kimodo.final.json")
+        metadata["jobs"]["kimodo"] = kimodo_job
+
+        tmp_dir = Path(tempfile.mkdtemp(prefix=f"{run_dir.name}-", dir=dirs["tmp"]))
+        bvh_path = tmp_dir / "action.bvh"
+        bvh_data = download_to_file(client, kimodo_job["download_url"], bvh_path, "kimodo.download")
+
+        motion_params = motion_query_params(args)
+        query = urllib.parse.urlencode(motion_params)
+        motion_endpoint = resolve_url(motion_url, "/v1/bvh-to-trk")
+        motion_submit_url = motion_endpoint + (f"?{query}" if query else "")
+        write_json(
+            raw_dir / "motion2trk.request.json",
+            {
+                "method": "POST",
+                "url": motion_submit_url,
+                "headers": {
+                    "content-type": "application/octet-stream",
+                    "x-filename": "action.bvh",
+                    "auth_header_present": bool(auth_header),
+                },
+                "query_params": motion_params,
+                "input": {
+                    "bytes": len(bvh_data),
+                    "sha256": sha256_bytes(bvh_data),
+                    "filename": "action.bvh",
+                },
+            },
+        )
+        motion_submit = client.request_json(
+            "POST",
+            motion_submit_url,
+            data=bvh_data,
+            headers={"content-type": "application/octet-stream", "x-filename": "action.bvh"},
+            stage="motion2trk.submit",
+        )
+        write_json(raw_dir / "motion2trk.submit.json", motion_submit)
+        motion_job = poll_job(client, "motion2trk", motion_url, motion_submit, timeout, poll, raw_dir / "motion2trk.final.json")
+        metadata["jobs"]["motion2trk"] = motion_job
+
+        output_path = run_dir / "output.trk"
+        output_data = download_to_file(client, motion_job["download_url"], output_path, "motion2trk.download")
+        if not output_data.startswith(TRK_MAGIC):
+            raise CliError("invalid_trk", "motion2trk.download", "downloaded TRK did not start with ET1TRK1\\0")
+
+        generated_path = ensure_generated_output(dirs, run_dir.name, output_path)
+        returned_path = generated_path if explicit_target is None else copy_output(output_path, explicit_target)
+        metadata["artifact_paths"].update(
+            {
+                "cache_output_trk": str(output_path.resolve()),
+                "generated_output_trk": str(generated_path.resolve()),
+                "returned_output_trk": str(returned_path.resolve()),
+                "tmp_bvh": str(bvh_path.resolve()),
+            }
+        )
+        metadata["output"] = {
+            "bytes": output_path.stat().st_size,
+            "sha256": file_sha256(output_path),
+            "format": "ET1TRK1",
+        }
+        metadata["timestamps"]["completed_at"] = utc_now()
+        write_json(metadata_path, metadata)
+        update_cache_pointer(dirs, cache_key, run_dir, output_path, generated_path, metadata_path)
+        return returned_path
+    except CliError as exc:
+        exc.metadata_path = str(write_failure_metadata(metadata_path, metadata, exc) or metadata_path)
+        raise
+    finally:
+        if "tmp_dir" in locals():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def main(argv):
+    metadata_path = None
+    try:
+        args, prompt = parse_args(argv)
+        kimodo_url = normalize_base_url(require_env("KIMODO_URL"), "KIMODO_URL")
+        motion_url = normalize_base_url(require_env("MOTION2TRK_URL"), "MOTION2TRK_URL")
+        auth_header = parse_auth_header(os.environ.get("ET1_AUTH_HEADER"))
+        explicit_target = explicit_output_target(args)
+        dirs = root_dirs(args)
+
+        kimodo_body = kimodo_request(prompt, args)
+        motion_params = motion_query_params(args)
+        key_payload = cache_key_payload(kimodo_url, motion_url, kimodo_body, motion_params)
+        cache_key = build_cache_key(key_payload)
+
+        if not args.fresh and args.serial_id is None:
+            hit = load_cache_hit(dirs, cache_key)
+            if hit:
+                run_id = hit.get("run_id") or Path(hit["run_dir"]).name
+                generated_path = ensure_generated_output(dirs, run_id, hit["output_trk"])
+                returned_path = generated_path if explicit_target is None else copy_output(hit["output_trk"], explicit_target)
+                write_hit_metadata(
+                    dirs,
+                    prompt,
+                    args,
+                    cache_key,
+                    key_payload,
+                    kimodo_url,
+                    motion_url,
+                    bool(auth_header),
+                    hit,
+                    generated_path,
+                    returned_path,
+                )
+                sys.stdout.write(str(returned_path.resolve()) + "\n")
+                return 0
+
+        returned_path = submit_and_convert(args, prompt, dirs, explicit_target, cache_key, key_payload, kimodo_url, motion_url, auth_header)
+        sys.stdout.write(str(returned_path.resolve()) + "\n")
+        return 0
+    except CliError as exc:
+        metadata_path = exc.metadata_path
+        parts = [
+            "ERROR",
+            f"code={exc.code}",
+            f"stage={exc.stage}",
+            f"message={json.dumps(exc.message, ensure_ascii=True)}",
+            f"retryable={'true' if exc.retryable else 'false'}",
+        ]
+        if metadata_path:
+            parts.append(f"metadata={metadata_path}")
+        sys.stderr.write(" ".join(parts) + "\n")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

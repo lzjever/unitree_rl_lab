@@ -20,7 +20,7 @@ ET1_URL="${ET1_TRACKER_URL:-http://127.0.0.1:8083}"
 ET1_PID_FILE="${ET1_PID_FILE:-$ET1_PREFIX/shared/run/agentic-et1-tracker.pid}"
 ET1_LOG_FILE="${ET1_LOG_FILE:-$ET1_PREFIX/shared/logs/agentic-et1-tracker.log}"
 ET1_BIN="$ET1_RELEASE_DIR/bin/agentic-et1-tracker"
-ET1_CLI="$ET1_RELEASE_DIR/skills/et1-trk2motion/scripts/et1-trk2motion"
+ET1_CLI="$ET1_RELEASE_DIR/bin/et1-action"
 ET1_LIB_DIR="$ET1_RELEASE_DIR/lib"
 
 die() {

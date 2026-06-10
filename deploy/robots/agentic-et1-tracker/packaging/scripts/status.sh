@@ -5,16 +5,16 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/lib.sh"
 
 usage() {
   cat <<'USAGE'
-Usage: status.sh [--url URL] [--process-only] [--full] [--id RUN_ID]
+Usage: status.sh [--url URL] [--process-only]
 
-Prints local process state, then queries the bundled et1-trk2motion CLI unless
+Prints local process state, then queries the bundled et1-action CLI unless
 --process-only is used.
 USAGE
 }
 
 url="$ET1_URL"
 process_only=0
-cli_args=(status)
+cli_args=(tracker-status)
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --url)
@@ -25,15 +25,6 @@ while [[ $# -gt 0 ]]; do
     --process-only)
       process_only=1
       shift
-      ;;
-    --full)
-      cli_args+=(--full)
-      shift
-      ;;
-    --id)
-      [[ $# -ge 2 ]] || die "--id requires a run id"
-      cli_args+=(--id "$2")
-      shift 2
       ;;
     -h|--help)
       usage

@@ -8,7 +8,7 @@ usage() {
 Usage: selftest.sh [--online] [--url URL]
 
 Runs offline release layout checks. With --online, also queries /status through
-the bundled et1-trk2motion CLI.
+the bundled et1-action CLI.
 USAGE
 }
 
