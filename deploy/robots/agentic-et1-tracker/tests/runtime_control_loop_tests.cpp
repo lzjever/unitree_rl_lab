@@ -21,6 +21,7 @@
 #include "agentic_et1_tracker/runtime/runtime_status_store.hpp"
 #include "agentic_et1_tracker/control/fixstand.hpp"
 #include "agentic_et1_tracker/control/passive.hpp"
+#include "agentic_et1_tracker/policy/policy_math.hpp"
 #include "agentic_et1_tracker/policy/velocity_deploy_config.hpp"
 #include "agentic_et1_tracker/policy/velocity_policy_runner.hpp"
 #include "agentic_et1_tracker/trk/schema.hpp"
@@ -33,7 +34,9 @@ constexpr std::size_t kPolicyJointDim = TrkSchema::kJointDim;
 constexpr std::uint8_t kExpectedModeMachine = 7;
 constexpr std::size_t kObsCurrentRootOffset = 0;
 constexpr std::size_t kObsCurrentCommandJointOffset = 9;
-constexpr std::size_t kStartupHoldPolicyStepsAt50Fps = 5;
+constexpr std::size_t kStartupHoldPolicyStepsAt50Fps = 25;
+constexpr std::size_t kStartupUpperBodyFirstPolicyJoint = 14;
+constexpr std::size_t kStartupUpperBodyLastPolicyJointExclusive = 26;
 
 struct TempTree {
   TempTree() {
@@ -674,6 +677,56 @@ void requireVelocityFrame(const LowCmdFrame& frame,
     REQUIRE(frame.motors.at(sdk_slot).dq == 0.0F);
     REQUIRE(frame.motors.at(sdk_slot).kp == static_cast<float>(config.stiffness.at(i)));
     REQUIRE(frame.motors.at(sdk_slot).kd == static_cast<float>(config.damping.at(i)));
+    REQUIRE(frame.motors.at(sdk_slot).tau == 0.0F);
+  }
+}
+
+Vec fixtureFirstFrameJointPos() {
+  Vec out;
+  out.reserve(kPolicyJointDim);
+  for (std::size_t policy_joint = 0; policy_joint < kPolicyJointDim; ++policy_joint) {
+    out.push_back(static_cast<float>(policy_joint) * 0.25F);
+  }
+  return out;
+}
+
+void requireStartupHoldInterpolatedFrame(const LowCmdFrame& frame,
+                                         const DeployConfig& config,
+                                         const LowStateSample& startup_low_state,
+                                         const Vec& raw_action,
+                                         const Vec& first_frame_joint_pos,
+                                         std::size_t write_index) {
+  REQUIRE(first_frame_joint_pos.size() == kPolicyJointDim);
+  const PolicyOutput policy_output = scaleAction(config, raw_action);
+  const float alpha =
+      kStartupHoldPolicyStepsAt50Fps <= 1
+          ? 1.0F
+          : static_cast<float>(write_index) /
+                static_cast<float>(kStartupHoldPolicyStepsAt50Fps - 1);
+
+  REQUIRE(frame.mode_machine == kExpectedModeMachine);
+  REQUIRE(frame.mode_pr == 0);
+  for (std::size_t policy_joint = 0; policy_joint < kPolicyJointDim; ++policy_joint) {
+    const auto sdk_slot =
+        static_cast<std::size_t>(config.sdk_joint_ids_map.at(policy_joint));
+    const bool startup_upper_body =
+        policy_joint >= kStartupUpperBodyFirstPolicyJoint &&
+        policy_joint < kStartupUpperBodyLastPolicyJointExclusive;
+    const float expected_q =
+        startup_upper_body
+            ? startup_low_state.motors.at(sdk_slot).q +
+                  alpha * (first_frame_joint_pos.at(policy_joint) -
+                           startup_low_state.motors.at(sdk_slot).q)
+            : policy_output.target_q.at(policy_joint);
+
+    REQUIRE(frame.motors.at(sdk_slot).mode == 1);
+    REQUIRE(frame.motors.at(sdk_slot).q ==
+            Catch::Approx(expected_q).margin(1.0e-5F));
+    REQUIRE(frame.motors.at(sdk_slot).dq == 0.0F);
+    REQUIRE(frame.motors.at(sdk_slot).kp ==
+            Catch::Approx(policy_output.kp.at(policy_joint)).margin(1.0e-5F));
+    REQUIRE(frame.motors.at(sdk_slot).kd ==
+            Catch::Approx(policy_output.kd.at(policy_joint)).margin(1.0e-5F));
     REQUIRE(frame.motors.at(sdk_slot).tau == 0.0F);
   }
 }
@@ -2460,18 +2513,22 @@ TEST_CASE("RuntimeControlLoop user policy startup holds frame zero then reanchor
   RuntimeBridge bridge(config, store);
   const DeployConfig deploy_config = deployConfig();
   LowStateSample low = readyLowState(deploy_config);
+  const Vec raw_action = floatSeq(0.0F, kPolicyJointDim);
+  const Vec first_frame_joint_pos = fixtureFirstFrameJointPos();
   low.motors.at(static_cast<std::size_t>(deploy_config.sdk_joint_ids_map.at(12))).q =
       0.0F;
   low.motors.at(static_cast<std::size_t>(deploy_config.sdk_joint_ids_map.at(13))).q =
       0.0F;
+  const LowStateSample startup_low = low;
   FakeRobotIO robot(low);
-  FakePolicy policy(floatSeq(0.0F, kPolicyJointDim));
+  FakePolicy policy(raw_action);
   auto loop = makePolicyLoop(config, bridge, store, tmp.trkConfig(), robot, policy,
                              deploy_config);
 
   const auto path = identityQuaternionTrk(tmp, "startup_hold_user.trk", 3);
   REQUIRE(bridge.submitQueue(executeCommand("startup-hold-user", path)).ok());
   startQueuedRun(loop, store, "startup-hold-user");
+  REQUIRE(kStartupHoldPolicyStepsAt50Fps == 25);
 
   for (std::size_t tick = 0; tick < kStartupHoldPolicyStepsAt50Fps; ++tick) {
     if (tick == kStartupHoldPolicyStepsAt50Fps / 2) {
@@ -2487,6 +2544,13 @@ TEST_CASE("RuntimeControlLoop user policy startup holds frame zero then reanchor
     REQUIRE(policy.calls == static_cast<int>(tick + 1));
     REQUIRE(policy.inputs_seen.back().obs_current.at(kObsCurrentCommandJointOffset) ==
             0.0F);
+    REQUIRE(robot.writes.size() == tick + 1);
+    requireStartupHoldInterpolatedFrame(robot.writes.back(),
+                                        deploy_config,
+                                        startup_low,
+                                        raw_action,
+                                        first_frame_joint_pos,
+                                        tick);
   }
 
   loop.tick();
@@ -2609,8 +2673,11 @@ TEST_CASE("RuntimeControlLoop synthetic transition is not held but target user s
   RuntimeStatusStore store(config);
   RuntimeBridge bridge(config, store);
   const DeployConfig deploy_config = deployConfig();
-  FakeRobotIO robot(readyLowState(deploy_config));
-  FakePolicy policy(floatSeq(0.0F, kPolicyJointDim));
+  const LowStateSample startup_low = readyLowState(deploy_config);
+  const Vec raw_action = floatSeq(0.0F, kPolicyJointDim);
+  const Vec first_frame_joint_pos = fixtureFirstFrameJointPos();
+  FakeRobotIO robot(startup_low);
+  FakePolicy policy(raw_action);
   FakeReferenceSink reference;
   RuntimeControlLoop loop(config,
                           bridge,
@@ -2651,6 +2718,7 @@ TEST_CASE("RuntimeControlLoop synthetic transition is not held but target user s
   REQUIRE(store.snapshot().exec->id == "startup-target-user");
   REQUIRE(store.snapshot().exec->frame == 0);
   const int calls_at_target_start = policy.calls;
+  const std::size_t writes_at_target_start = robot.writes.size();
 
   for (std::size_t tick = 0; tick < kStartupHoldPolicyStepsAt50Fps; ++tick) {
     loop.tick();
@@ -2661,6 +2729,13 @@ TEST_CASE("RuntimeControlLoop synthetic transition is not held but target user s
     REQUIRE(policy.calls == calls_at_target_start + static_cast<int>(tick + 1));
     REQUIRE(policy.inputs_seen.back().obs_current.at(kObsCurrentCommandJointOffset) ==
             0.0F);
+    REQUIRE(robot.writes.size() == writes_at_target_start + tick + 1);
+    requireStartupHoldInterpolatedFrame(robot.writes.back(),
+                                        deploy_config,
+                                        startup_low,
+                                        raw_action,
+                                        first_frame_joint_pos,
+                                        tick);
   }
 
   loop.tick();

@@ -121,9 +121,11 @@ class RuntimeControlLoop final {
   void enterVelocityState();
   void enterGeneralTrackerIdleState();
   void enterTrackPreparingState();
-  void enterTrackActiveState();
-  void resetPolicyStartupHoldForActiveUser();
+  void enterTrackActiveState(const std::optional<LowStateSample>& entry_low_state);
+  void resetPolicyStartupHoldForActiveUser(
+      const std::optional<LowStateSample>& entry_low_state);
   void clearPolicyStartupHold();
+  void applyPolicyStartupUpperBodyInterpolation(LowCmdFrame& frame) const;
   bool isMotionAcceptingState() const;
   bool isControlPublishingState() const;
   bool isUserOwnedTransition() const;
@@ -254,7 +256,10 @@ class RuntimeControlLoop final {
   bool active_first_advance_{false};
   std::size_t stopping_hold_ticks_remaining_{0};
   std::size_t active_policy_ticks_until_next_{0};
+  std::size_t policy_startup_hold_total_steps_{0};
   std::size_t policy_startup_hold_steps_remaining_{0};
+  std::vector<float> policy_startup_upper_body_start_q_;
+  std::vector<float> policy_startup_upper_body_target_q_;
   std::size_t velocity_policy_ticks_until_next_{0};
   bool fail_next_transition_start_for_test_{false};
   std::optional<LowCmdFrame> lowcmd_buffer_;

@@ -19,7 +19,9 @@ namespace agentic_et1_tracker {
 namespace {
 
 constexpr double kMaxTransitionDurationS = 5.0;
-constexpr double kPolicyStartupHoldDurationS = 0.1;
+constexpr double kPolicyStartupHoldDurationS = 0.5;
+constexpr std::size_t kStartupUpperBodyFirstPolicyJoint = 14;
+constexpr std::size_t kStartupUpperBodyLastPolicyJointExclusive = 26;
 
 bool isStartupOrWaitingError(ErrorCode error) {
   switch (error) {
@@ -622,20 +624,97 @@ void RuntimeControlLoop::enterTrackPreparingState() {
   ctrl_ = ControllerState::Preparing;
 }
 
-void RuntimeControlLoop::enterTrackActiveState() {
+void RuntimeControlLoop::enterTrackActiveState(
+    const std::optional<LowStateSample>& entry_low_state) {
   enterInternalState(RuntimeInternalState::GeneralTrackerActive);
-  resetPolicyStartupHoldForActiveUser();
+  resetPolicyStartupHoldForActiveUser(entry_low_state);
 }
 
-void RuntimeControlLoop::resetPolicyStartupHoldForActiveUser() {
-  policy_startup_hold_steps_remaining_ =
-      hasPolicyRuntime() && active_kind_ == ActiveKind::User
-          ? policyStartupHoldPolicySteps()
-          : 0;
+void RuntimeControlLoop::resetPolicyStartupHoldForActiveUser(
+    const std::optional<LowStateSample>& entry_low_state) {
+  clearPolicyStartupHold();
+  if (!hasPolicyRuntime() || active_kind_ != ActiveKind::User) {
+    return;
+  }
+
+  policy_startup_hold_total_steps_ = policyStartupHoldPolicySteps();
+  policy_startup_hold_steps_remaining_ = policy_startup_hold_total_steps_;
+
+  const std::optional<LowStateSample>& hold_low_state =
+      entry_low_state ? entry_low_state : latest_low_state_;
+  if (!hold_low_state || !active_track_ || !deploy_config_ ||
+      deploy_config_->sdk_joint_ids_map.size() <
+          kStartupUpperBodyLastPolicyJointExclusive) {
+    return;
+  }
+
+  const std::optional<TrkFrameView> first_frame = active_track_->frame(0);
+  if (!first_frame ||
+      first_frame->joint_pos.size < kStartupUpperBodyLastPolicyJointExclusive) {
+    return;
+  }
+
+  const std::size_t upper_body_count =
+      std::min(kStartupUpperBodyLastPolicyJointExclusive, kPolicyJointCount) -
+      kStartupUpperBodyFirstPolicyJoint;
+  policy_startup_upper_body_start_q_.assign(upper_body_count, 0.0F);
+  policy_startup_upper_body_target_q_.assign(upper_body_count, 0.0F);
+  for (std::size_t i = 0; i < upper_body_count; ++i) {
+    const std::size_t policy_joint = kStartupUpperBodyFirstPolicyJoint + i;
+    const int sdk_slot_raw = deploy_config_->sdk_joint_ids_map.at(policy_joint);
+    if (sdk_slot_raw < 0 || sdk_slot_raw >= static_cast<int>(kSdkMotorCount)) {
+      continue;
+    }
+    const auto sdk_slot = static_cast<std::size_t>(sdk_slot_raw);
+    policy_startup_upper_body_start_q_.at(i) =
+        hold_low_state->motors.at(sdk_slot).q;
+    policy_startup_upper_body_target_q_.at(i) =
+        first_frame->joint_pos.ptr[policy_joint];
+  }
 }
 
 void RuntimeControlLoop::clearPolicyStartupHold() {
+  policy_startup_hold_total_steps_ = 0;
   policy_startup_hold_steps_remaining_ = 0;
+  policy_startup_upper_body_start_q_.clear();
+  policy_startup_upper_body_target_q_.clear();
+}
+
+void RuntimeControlLoop::applyPolicyStartupUpperBodyInterpolation(
+    LowCmdFrame& frame) const {
+  if (!deploy_config_ || active_kind_ != ActiveKind::User ||
+      policy_startup_hold_steps_remaining_ == 0 ||
+      policy_startup_hold_total_steps_ == 0 ||
+      policy_startup_upper_body_start_q_.empty() ||
+      policy_startup_upper_body_start_q_.size() !=
+          policy_startup_upper_body_target_q_.size()) {
+    return;
+  }
+
+  const std::size_t completed_steps =
+      policy_startup_hold_total_steps_ - policy_startup_hold_steps_remaining_;
+  const float alpha =
+      policy_startup_hold_total_steps_ <= 1
+          ? 1.0F
+          : std::clamp(static_cast<float>(completed_steps) /
+                           static_cast<float>(policy_startup_hold_total_steps_ - 1),
+                       0.0F,
+                       1.0F);
+
+  for (std::size_t i = 0; i < policy_startup_upper_body_start_q_.size(); ++i) {
+    const std::size_t policy_joint = kStartupUpperBodyFirstPolicyJoint + i;
+    if (policy_joint >= deploy_config_->sdk_joint_ids_map.size()) {
+      continue;
+    }
+    const int sdk_slot_raw = deploy_config_->sdk_joint_ids_map.at(policy_joint);
+    if (sdk_slot_raw < 0 || sdk_slot_raw >= static_cast<int>(kSdkMotorCount)) {
+      continue;
+    }
+    const float start_q = policy_startup_upper_body_start_q_.at(i);
+    const float target_q = policy_startup_upper_body_target_q_.at(i);
+    frame.motors.at(static_cast<std::size_t>(sdk_slot_raw)).q =
+        start_q + alpha * (target_q - start_q);
+  }
 }
 
 bool RuntimeControlLoop::isMotionAcceptingState() const {
@@ -1104,7 +1183,7 @@ void RuntimeControlLoop::completePreparing() {
   active_->err = ErrorCode::Ok;
   active_->stop_reason = StopReason::None;
   active_->started_at = std::chrono::steady_clock::now();
-  enterTrackActiveState();
+  enterTrackActiveState(entry_low_state);
   publishReferenceActive();
   publishActive();
 }
@@ -1379,6 +1458,7 @@ bool RuntimeControlLoop::advanceUserPolicyStartupHold() {
   }
 
   try {
+    applyPolicyStartupUpperBodyInterpolation(step.low_cmd);
     writeLowCmdFrame(step.low_cmd);
   } catch (const std::exception&) {
     failActiveWithFault(ErrorCode::InternalError,
@@ -2364,7 +2444,7 @@ void RuntimeControlLoop::completeTransition() {
   idle_current_index_ = target.target_kind == TransitionTargetKind::Idle
                             ? target.idle_index
                             : std::optional<std::size_t>{};
-  enterTrackActiveState();
+  enterTrackActiveState(entry_low_state);
   publishReferenceActive();
   if (active_kind_ == ActiveKind::User) {
     publishActive();
