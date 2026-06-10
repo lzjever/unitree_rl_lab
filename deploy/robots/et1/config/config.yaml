@@ -17,9 +17,6 @@ FSM:
     JointStepTest:
       id: 8
       type: JointStepTest
-    GeneralTracker:
-      id: 4
-      type: Track
     GeneralTrackerCJM:
       id: 5
       type: Track
@@ -121,7 +118,7 @@ FSM:
   Velocity:
     transitions:
       Passive: LT + B.on_pressed
-      GeneralTracker: LT(2s) + up.on_pressed
+      GeneralTrackerCLN: LT(2s) + up.on_pressed
       Dance1: LT(2s) + down.on_pressed
       Dance2: LT(2s) + right.on_pressed
       NoHeadPokerFace: LT(2s) + left.on_pressed
@@ -133,7 +130,7 @@ FSM:
       Dance2: "5"
       NoHeadPokerFace: "6"
       GeneralTrackerCLN: "9"
-    policy_dir: config/policy/velocity/v0
+    policy_dir: config/policy/velocity/et1_v0
     live_stream_trigger:
       enabled: true
       endpoint: tcp://127.0.0.1:5557
@@ -236,39 +233,6 @@ FSM:
     hold_final_zero_s: 2.0
     log_dir: debug/joint_step_test
 
-  GeneralTracker:
-    transitions:
-      Passive: LT + B.on_pressed
-      Velocity: RB + X.on_pressed
-    keyboard_transitions:
-      Passive: "0"
-      Velocity: "2"
-      Dance1: "4"
-      Dance2: "5"
-      NoHeadPokerFace: "6"
-    override_joint_ids: [24, 25]   # 覆盖第25、26关节（头部）
-    policy_dir: config/policy/general_tracker
-    policy_file: self_collision_footmesh_15k.onnx
-    deploy_file: deploy.yaml
-    motion_file: config/policy/general_tracker/params/PokerFace004_et1_1.et1trk  # fallback only; one-shot requests must specify another file
-    request_file: debug/general_tracker_request.txt
-    live_stream:
-      enabled: false
-      endpoint: tcp://127.0.0.1:5557
-      topic: et1_track
-      max_queue_frames: 2000
-    one_shot_mode: true
-    require_requested_motion: true
-    hybrid_locomotion: true
-    locomotion_policy_dir: config/policy/velocity/v0
-    locomotion_policy_file: policy.onnx
-    locomotion_deploy_file: deploy.yaml
-    no_global_mode: true
-    use_motion_root_command: true
-    use_motion_velocity_command: true
-    debug_dump_first_frame: false
-    debug_dump_dir: debug/et1_track_first_frame
-
   GeneralTrackerCJM:
     transitions:
       Passive: LT + B.on_pressed
@@ -282,12 +246,13 @@ FSM:
       Dance2: "5"
       NoHeadPokerFace: "6"
     override_joint_ids: [24, 25]
-    policy_dir: config/policy/general_tracker
+    policy_dir: config/policy/general_tracker_cjm
     policy_file: self_collision_footmesh_15k.onnx
     deploy_file: deploy.yaml
-    motion_file: config/policy/general_tracker/params/walk-2_et1_kpts.et1trk
+    motion_file: config/policy/general_tracker_cjm/params/GVHMR_dance-3.et1trk
+    request_file: debug/general_tracker_request.txt
     live_stream:
-      enabled: true
+      enabled: false
       endpoint: tcp://127.0.0.1:5557
       topic: et1_track
       max_queue_frames: 2000
@@ -312,11 +277,11 @@ FSM:
       Dance2: "5"
       NoHeadPokerFace: "6"
     policy_dir: config/policy/general_tracker_cln
-    policy_file: multi_policy_v17c2_70k.onnx
-    deploy_file: deploy.yaml
-    motion_file: config/policy/general_tracker_cln/params/walk-cln-1_et1.et1trk
+    policy_file: multi_policy_footstate3.onnx
+    deploy_file: deploy_fut_multi_footstate.yaml
+    motion_file: config/policy/general_tracker_cln/params/585_jiaxin.et1trk
     live_stream:
-      enabled: true
+      enabled: false
       endpoint: tcp://127.0.0.1:5557
       topic: et1_track
       max_queue_frames: 2000
@@ -324,10 +289,12 @@ FSM:
     require_requested_motion: false
     hybrid_locomotion: false
     no_global_mode: true
-    use_motion_root_command: true
-    use_motion_velocity_command: true
+    use_motion_root_command: false
+    use_motion_velocity_command: false
     debug_dump_first_frame: false
     debug_dump_dir: debug/et1_general_tracker_cln_first_frame
+    dump_qpos_visualizer: false
+    qpos_visualizer_dump_file: debug/qpos_visualizer/general_tracker_cln_qpos_visualizer.csv
 
   Dance1:
     transitions:

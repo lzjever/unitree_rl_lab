@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <cstdlib>
 #include <ctime>
@@ -13,6 +14,7 @@
 #include <spdlog/spdlog.h>
 #include <zmq.hpp>
 
+#include "LinearInterpolator.h"
 #include "unitree_articulation.h"
 #include "isaaclab/envs/mdp/observations/observations.h"
 #include "isaaclab/envs/mdp/actions/joint_actions.h"
@@ -27,6 +29,8 @@ constexpr char kLiveMagic[8] = {'E', 'T', '1', 'L', 'I', 'V', 'E', '1'};
 constexpr uint32_t kLiveVersion = 1;
 constexpr uint32_t kLiveFlagReset = 1u << 0;
 constexpr uint32_t kLiveFlagEnd = 1u << 1;
+constexpr int kUpperBodyStartIndex = 14;
+constexpr int kMaxUpperBodyJointCount = 12;
 
 struct LiveWireHeader
 {
@@ -95,10 +99,10 @@ std::string trim_copy(const std::string& value)
 std::string tracker_target_from_token(const std::string& token)
 {
     static const std::unordered_map<std::string, std::string> aliases = {
-        {"general", "GeneralTracker"},
-        {"tracker", "GeneralTracker"},
-        {"generaltracker", "GeneralTracker"},
-        {"GeneralTracker", "GeneralTracker"},
+        {"general", "GeneralTrackerCLN"},
+        {"tracker", "GeneralTrackerCLN"},
+        {"generaltracker", "GeneralTrackerCLN"},
+        {"GeneralTracker", "GeneralTrackerCLN"},
         {"debug", "GeneralTrackerCJM"},
         {"cjm", "GeneralTrackerCJM"},
         {"general_tracker_cjm", "GeneralTrackerCJM"},
@@ -133,7 +137,7 @@ TrackerRequestLine parse_tracker_request_line(const std::string& raw_line)
     ss >> first_token;
     request.target_state = tracker_target_from_token(first_token);
     if (request.target_state.empty()) {
-        request.target_state = "GeneralTracker";
+        request.target_state = "GeneralTrackerCLN";
         request.motion_file = line;
         request.has_profile = false;
         return request;
@@ -169,9 +173,34 @@ std::optional<YAML::Node> find_yaml_key(const YAML::Node& node, const std::strin
     return std::nullopt;
 }
 
+void write_foot_support_onehot(int left_state,
+                               int right_state,
+                               std::vector<float>& data,
+                               size_t offset)
+{
+    if (data.size() < offset + State_Track::ReferenceLoader::kFootSupportStateDim) {
+        throw std::runtime_error("Foot support one-hot output buffer is too small.");
+    }
+    std::fill(data.begin() + static_cast<std::ptrdiff_t>(offset),
+              data.begin() + static_cast<std::ptrdiff_t>(offset + State_Track::ReferenceLoader::kFootSupportStateDim),
+              0.0f);
+    if (left_state >= 0 && left_state <= 2) {
+        data[offset + static_cast<size_t>(left_state)] = 1.0f;
+    }
+    if (right_state >= 0 && right_state <= 2) {
+        data[offset + 3 + static_cast<size_t>(right_state)] = 1.0f;
+    }
+}
+
 size_t infer_future_horizon(const YAML::Node& deploy_cfg)
 {
-    const auto future_commands = find_yaml_key(deploy_cfg["observations"], "future_commands");
+    auto future_commands = find_yaml_key(deploy_cfg["observations"], "future_commands");
+    if (!future_commands) {
+        future_commands = find_yaml_key(deploy_cfg["observations"], "future_command_with_foot_support_state");
+    }
+    if (!future_commands) {
+        future_commands = find_yaml_key(deploy_cfg["observations"], "future_command_foot_support_state");
+    }
     if (!future_commands) {
         return 0;
     }
@@ -289,6 +318,43 @@ REGISTER_OBSERVATION(future_commands)
     return State_Track::reference->future_commands();
 }
 
+REGISTER_OBSERVATION(future_command_with_foot_support_state)
+{
+    if (!State_Track::reference) {
+        throw std::runtime_error("State_Track::reference is null while computing future_command_with_foot_support_state.");
+    }
+    const int horizon = params["horizon"] ? params["horizon"].as<int>() : State_Track::ReferenceLoader::kDefaultFutureHorizon;
+    const auto& data = State_Track::reference->future_command_with_foot_support_state();
+    const size_t dim = State_Track::ReferenceLoader::kFutureCommandWithFootSupportDim;
+    const size_t available_horizon = data.size() / dim;
+    const size_t requested_horizon = horizon > 0 ? static_cast<size_t>(horizon) : 0;
+    const size_t output_horizon = std::min(requested_horizon, available_horizon);
+    return std::vector<float>(data.begin(), data.begin() + static_cast<std::ptrdiff_t>(output_horizon * dim));
+}
+
+REGISTER_OBSERVATION(future_command_foot_support_state)
+{
+    if (!State_Track::reference) {
+        throw std::runtime_error("State_Track::reference is null while computing future_command_foot_support_state.");
+    }
+    const int horizon = params["horizon"] ? params["horizon"].as<int>() : State_Track::ReferenceLoader::kDefaultFutureHorizon;
+    const auto& data = State_Track::reference->future_command_with_foot_support_state();
+    const size_t dim = State_Track::ReferenceLoader::kFutureCommandWithFootSupportDim;
+    const size_t foot_dim = State_Track::ReferenceLoader::kFootSupportStateDim;
+    const size_t available_horizon = data.size() / dim;
+    const size_t requested_horizon = horizon > 0 ? static_cast<size_t>(horizon) : 0;
+    const size_t output_horizon = std::min(requested_horizon, available_horizon);
+    std::vector<float> foot_support;
+    foot_support.reserve(output_horizon * foot_dim);
+    for (size_t i = 0; i < output_horizon; ++i) {
+        const size_t offset = i * dim + State_Track::ReferenceLoader::kFutureCommandDim;
+        foot_support.insert(foot_support.end(),
+                            data.begin() + static_cast<std::ptrdiff_t>(offset),
+                            data.begin() + static_cast<std::ptrdiff_t>(offset + foot_dim));
+    }
+    return foot_support;
+}
+
 REGISTER_OBSERVATION(motion_anchor_ori_b)
 {
     if (!State_Track::reference) {
@@ -339,6 +405,9 @@ State_Track::ReferenceLoader::ReferenceLoader(const std::filesystem::path& motio
     joint_pos_ = Eigen::VectorXf::Zero(kJointDim);
     joint_vel_ = Eigen::VectorXf::Zero(kJointDim);
     future_commands_.assign(future_horizon_ * kFutureCommandDim, 0.0f);
+    future_command_with_foot_support_state_.assign(
+        future_horizon_ * kFutureCommandWithFootSupportDim,
+        0.0f);
     duration_ = frame_count_ > 0 ? static_cast<float>(frame_count_ - 1) / fps_ : 0.0f;
     spdlog::info("Track: reference loaded with {} frames, duration {:.3f}s", frame_count_, duration_);
 }
@@ -353,6 +422,9 @@ State_Track::ReferenceLoader::ReferenceLoader(const LiveStreamConfig& live_confi
     joint_pos_ = Eigen::VectorXf::Zero(kJointDim);
     joint_vel_ = Eigen::VectorXf::Zero(kJointDim);
     future_commands_.assign(future_horizon_ * kFutureCommandDim, 0.0f);
+    future_command_with_foot_support_state_.assign(
+        future_horizon_ * kFutureCommandWithFootSupportDim,
+        0.0f);
     spdlog::info("Track: initializing live reference stream from '{}' topic '{}' future_horizon={}",
                  live_config_.endpoint,
                  live_config_.topic,
@@ -378,9 +450,13 @@ void State_Track::ReferenceLoader::reset(const Eigen::VectorXf& default_joint_po
     joint_vel_ = Eigen::VectorXf::Zero(kJointDim);
     yaw_command_ << 1.0f, 0.0f;
     std::fill(future_commands_.begin(), future_commands_.end(), 0.0f);
+    std::fill(future_command_with_foot_support_state_.begin(),
+              future_command_with_foot_support_state_.end(),
+              0.0f);
     ref_com_rel_navi_.setZero();
     ref_com_vel_navi_.setZero();
     initial_ref_yaw_bias_ = 0.0f;
+    anchor_frame_offset_q_ = Eigen::Quaternionf::Identity();
     if (live_stream_enabled_) {
         joint_pos_ = default_joint_pos_.size() == kJointDim
             ? default_joint_pos_
@@ -391,6 +467,9 @@ void State_Track::ReferenceLoader::reset(const Eigen::VectorXf& default_joint_po
         xy_yaw_vel_.setZero();
         foot_support_state_.setZero();
         std::fill(future_commands_.begin(), future_commands_.end(), 0.0f);
+        std::fill(future_command_with_foot_support_state_.begin(),
+                  future_command_with_foot_support_state_.end(),
+                  0.0f);
         std::lock_guard<std::mutex> lock(live_mutex_);
         live_has_last_frame_ = false;
         current_frame_index_ = 0;
@@ -413,7 +492,70 @@ void State_Track::ReferenceLoader::reset(const Eigen::VectorXf& default_joint_po
            Eigen::Vector2f::Zero(),
            0.0f,
            Eigen::Quaternionf::Identity(),
-           Eigen::Quaternionf::Identity());
+           Eigen::Quaternionf::Identity(),
+           Eigen::VectorXf::Zero(kJointDim));
+}
+
+Eigen::Quaternionf State_Track::ReferenceLoader::anchor_quat_w(const Eigen::Quaternionf& root_quat,
+                                                               const Eigen::VectorXf& joint_pos) const
+{
+    Eigen::Quaternionf q = root_quat.normalized();
+    if (joint_pos.size() >= 14) {
+        q = q
+            * Eigen::AngleAxisf(joint_pos[12], Eigen::Vector3f::UnitX())
+            * Eigen::AngleAxisf(joint_pos[13], Eigen::Vector3f::UnitZ());
+    }
+    q.normalize();
+    return q;
+}
+
+void State_Track::ReferenceLoader::calibrate_anchor_frame(float time_s,
+                                                          const Eigen::VectorXf& robot_joint_pos,
+                                                          const Eigen::Quaternionf& robot_root_quat,
+                                                          bool yaw_only)
+{
+    if (live_stream_enabled_ || frame_count_ == 0) {
+        anchor_frame_offset_q_ = Eigen::Quaternionf::Identity();
+        return;
+    }
+
+    const float clamped_time = duration_ > 0.0f ? std::clamp(time_s, 0.0f, duration_) : 0.0f;
+    const size_t frame_index = std::min(static_cast<size_t>(std::round(clamped_time * fps_)), frame_count_ - 1);
+    const size_t anchor_quat_offset = (frame_index * kBodyCount + kAnchorBodyIndex) * 4;
+    Eigen::Quaternionf ref_anchor_q(
+        body_quat_w_seq_[anchor_quat_offset + 0],
+        body_quat_w_seq_[anchor_quat_offset + 1],
+        body_quat_w_seq_[anchor_quat_offset + 2],
+        body_quat_w_seq_[anchor_quat_offset + 3]
+    );
+    ref_anchor_q.normalize();
+
+    const Eigen::Quaternionf robot_anchor_q = anchor_quat_w(robot_root_quat, robot_joint_pos);
+    Eigen::Quaternionf offset_q = robot_anchor_q * ref_anchor_q.conjugate();
+    offset_q.normalize();
+
+    if (yaw_only) {
+        const float yaw_offset = quat_to_yaw(offset_q.w(), offset_q.x(), offset_q.y(), offset_q.z());
+        offset_q = Eigen::Quaternionf(Eigen::AngleAxisf(yaw_offset, Eigen::Vector3f::UnitZ()));
+    }
+
+    anchor_frame_offset_q_ = offset_q.normalized();
+}
+
+Eigen::VectorXf State_Track::ReferenceLoader::sample_joint_pos(float time_s) const
+{
+    Eigen::VectorXf joint_pos = Eigen::VectorXf::Zero(kJointDim);
+    if (live_stream_enabled_ || frame_count_ == 0 || joint_pos_seq_.empty()) {
+        return joint_pos;
+    }
+
+    const float clamped_time = duration_ > 0.0f ? std::clamp(time_s, 0.0f, duration_) : 0.0f;
+    const size_t frame_index = std::min(static_cast<size_t>(std::round(clamped_time * fps_)), frame_count_ - 1);
+    const size_t joint_offset = frame_index * kJointDim;
+    for (int i = 0; i < kJointDim; ++i) {
+        joint_pos[i] = joint_pos_seq_[joint_offset + i];
+    }
+    return joint_pos;
 }
 
 void State_Track::ReferenceLoader::update(float time_s,
@@ -423,6 +565,7 @@ void State_Track::ReferenceLoader::update(float time_s,
                                           float current_root_yaw,
                                           const Eigen::Quaternionf& current_root_quat,
                                           const Eigen::Quaternionf& current_root_quat_unbiased,
+                                          const Eigen::VectorXf& current_joint_pos,
                                           bool use_motion_root_command,
                                           bool use_motion_velocity_command,
                                           bool loop_reference)
@@ -458,6 +601,7 @@ void State_Track::ReferenceLoader::update(float time_s,
                              current_root_yaw,
                              current_root_quat,
                              current_root_quat_unbiased,
+                             current_joint_pos,
                              use_motion_root_command,
                              use_motion_velocity_command);
             update_live_future_commands(queue_snapshot,
@@ -480,6 +624,9 @@ void State_Track::ReferenceLoader::update(float time_s,
             ref_com_rel_navi_.setZero();
             ref_com_vel_navi_.setZero();
             std::fill(future_commands_.begin(), future_commands_.end(), 0.0f);
+            std::fill(future_command_with_foot_support_state_.begin(),
+                      future_command_with_foot_support_state_.end(),
+                      0.0f);
         }
         return;
     }
@@ -513,10 +660,7 @@ void State_Track::ReferenceLoader::update(float time_s,
     ref_root_q.normalize();
     Eigen::Quaternionf ref_world_align_q = Eigen::Quaternionf::Identity();
     if (no_global_mode) {
-        const Eigen::Quaternionf initial_ref_yaw_q(
-            Eigen::AngleAxisf(initial_ref_yaw_bias_, Eigen::Vector3f::UnitZ())
-        );
-        ref_world_align_q = initial_ref_yaw_q.conjugate();
+        ref_world_align_q = anchor_frame_offset_q_;
         ref_root_q = (ref_world_align_q * ref_root_q).normalized();
     }
 
@@ -568,6 +712,12 @@ void State_Track::ReferenceLoader::update(float time_s,
     if (future_commands_.size() != static_cast<size_t>(future_horizon_ * kFutureCommandDim)) {
         future_commands_.assign(future_horizon_ * kFutureCommandDim, 0.0f);
     }
+    if (future_command_with_foot_support_state_.size()
+        != static_cast<size_t>(future_horizon_ * kFutureCommandWithFootSupportDim)) {
+        future_command_with_foot_support_state_.assign(
+            future_horizon_ * kFutureCommandWithFootSupportDim,
+            0.0f);
+    }
     for (size_t horizon_idx = 0; horizon_idx < future_horizon_; ++horizon_idx) {
         const size_t future_frame = std::min(frame_index + static_cast<size_t>(horizon_idx + 1), frame_count_ - 1);
         const size_t future_body_offset = future_frame * kBodyCount;
@@ -581,44 +731,52 @@ void State_Track::ReferenceLoader::update(float time_s,
         future_ref_root_q.normalize();
         future_ref_root_q = (ref_world_align_q * future_ref_root_q).normalized();
 
+        const Eigen::Matrix3f motion_future_root_rot_b =
+            (current_root_quat.normalized().conjugate() * future_ref_root_q).toRotationMatrix();
+        Eigen::Matrix<float, 6, 1> motion_future_root_ori_b;
+        motion_future_root_ori_b << motion_future_root_rot_b(0, 0), motion_future_root_rot_b(0, 1),
+                                    motion_future_root_rot_b(1, 0), motion_future_root_rot_b(1, 1),
+                                    motion_future_root_rot_b(2, 0), motion_future_root_rot_b(2, 1);
+
+        const float future_yaw_ref = quat_to_yaw(
+            future_ref_root_q.w(),
+            future_ref_root_q.x(),
+            future_ref_root_q.y(),
+            future_ref_root_q.z()
+        );
+        const Eigen::Quaternionf future_ref_yaw_q =
+            Eigen::AngleAxisf(future_yaw_ref, Eigen::Vector3f::UnitZ()) * Eigen::Quaternionf::Identity();
+        const size_t future_lin_vel_offset = future_body_offset * 3;
+        const size_t future_ang_vel_offset = future_body_offset * 3;
+        const Eigen::Vector3f future_lin_vel_w_raw(
+            body_lin_vel_w_seq_[future_lin_vel_offset + 0],
+            body_lin_vel_w_seq_[future_lin_vel_offset + 1],
+            body_lin_vel_w_seq_[future_lin_vel_offset + 2]
+        );
+        const Eigen::Vector3f future_ang_vel_w_raw(
+            body_ang_vel_w_seq_[future_ang_vel_offset + 0],
+            body_ang_vel_w_seq_[future_ang_vel_offset + 1],
+            body_ang_vel_w_seq_[future_ang_vel_offset + 2]
+        );
+        const Eigen::Vector3f motion_future_lin_vel_navi =
+            future_ref_yaw_q.conjugate() * (ref_world_align_q * future_lin_vel_w_raw);
+        const Eigen::Vector3f motion_future_ang_vel_navi =
+            future_ref_yaw_q.conjugate() * (ref_world_align_q * future_ang_vel_w_raw);
+        const Eigen::Vector3f motion_future_xy_yaw_vel(
+            motion_future_lin_vel_navi.x(),
+            motion_future_lin_vel_navi.y(),
+            motion_future_ang_vel_navi.z());
+
         Eigen::Matrix<float, 6, 1> future_root_ori_b;
         if (use_motion_root_command) {
-            const Eigen::Matrix3f future_root_rot_b =
-                (current_root_quat.normalized().conjugate() * future_ref_root_q).toRotationMatrix();
-            future_root_ori_b << future_root_rot_b(0, 0), future_root_rot_b(0, 1),
-                                 future_root_rot_b(1, 0), future_root_rot_b(1, 1),
-                                 future_root_rot_b(2, 0), future_root_rot_b(2, 1);
+            future_root_ori_b = motion_future_root_ori_b;
         } else {
             future_root_ori_b << 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f;
         }
 
         Eigen::Vector3f future_xy_yaw_vel = Eigen::Vector3f::Zero();
         if (use_motion_velocity_command) {
-            const float future_yaw_ref = quat_to_yaw(
-                future_ref_root_q.w(),
-                future_ref_root_q.x(),
-                future_ref_root_q.y(),
-                future_ref_root_q.z()
-            );
-            const Eigen::Quaternionf future_ref_yaw_q =
-                Eigen::AngleAxisf(future_yaw_ref, Eigen::Vector3f::UnitZ()) * Eigen::Quaternionf::Identity();
-            const size_t future_lin_vel_offset = future_body_offset * 3;
-            const size_t future_ang_vel_offset = future_body_offset * 3;
-            const Eigen::Vector3f future_lin_vel_w_raw(
-                body_lin_vel_w_seq_[future_lin_vel_offset + 0],
-                body_lin_vel_w_seq_[future_lin_vel_offset + 1],
-                body_lin_vel_w_seq_[future_lin_vel_offset + 2]
-            );
-            const Eigen::Vector3f future_ang_vel_w_raw(
-                body_ang_vel_w_seq_[future_ang_vel_offset + 0],
-                body_ang_vel_w_seq_[future_ang_vel_offset + 1],
-                body_ang_vel_w_seq_[future_ang_vel_offset + 2]
-            );
-            const Eigen::Vector3f future_lin_vel_navi =
-                future_ref_yaw_q.conjugate() * (ref_world_align_q * future_lin_vel_w_raw);
-            const Eigen::Vector3f future_ang_vel_navi =
-                future_ref_yaw_q.conjugate() * (ref_world_align_q * future_ang_vel_w_raw);
-            future_xy_yaw_vel << future_lin_vel_navi.x(), future_lin_vel_navi.y(), future_ang_vel_navi.z();
+            future_xy_yaw_vel = motion_future_xy_yaw_vel;
         }
 
         size_t out_offset = horizon_idx * kFutureCommandDim;
@@ -632,6 +790,29 @@ void State_Track::ReferenceLoader::update(float time_s,
         for (int i = 0; i < kJointDim; ++i) {
             future_commands_[out_offset++] = joint_pos_seq_[future_joint_offset + i];
         }
+
+        const size_t command_with_foot_offset = horizon_idx * kFutureCommandWithFootSupportDim;
+        size_t with_foot_offset = command_with_foot_offset;
+        for (int i = 0; i < 6; ++i) {
+            future_command_with_foot_support_state_[with_foot_offset++] = motion_future_root_ori_b[i];
+        }
+        for (int i = 0; i < 3; ++i) {
+            future_command_with_foot_support_state_[with_foot_offset++] = motion_future_xy_yaw_vel[i];
+        }
+        for (int i = 0; i < kJointDim; ++i) {
+            future_command_with_foot_support_state_[with_foot_offset++] = joint_pos_seq_[future_joint_offset + i];
+        }
+
+        int left_state = -1;
+        int right_state = -1;
+        if (!left_foot_contact_state_seq_.empty() && !right_foot_contact_state_seq_.empty()) {
+            left_state = static_cast<int>(left_foot_contact_state_seq_[future_frame]);
+            right_state = static_cast<int>(right_foot_contact_state_seq_[future_frame]);
+        }
+        write_foot_support_onehot(left_state,
+                                  right_state,
+                                  future_command_with_foot_support_state_,
+                                  command_with_foot_offset + kFutureCommandDim);
     }
 
     foot_support_state_.setZero();
@@ -815,6 +996,7 @@ void State_Track::ReferenceLoader::apply_live_frame(const LiveFrame& frame,
                                                     float current_root_yaw,
                                                     const Eigen::Quaternionf& current_root_quat,
                                                     const Eigen::Quaternionf& current_root_quat_unbiased,
+                                                    const Eigen::VectorXf& current_joint_pos,
                                                     bool use_motion_root_command,
                                                     bool use_motion_velocity_command)
 {
@@ -832,11 +1014,15 @@ void State_Track::ReferenceLoader::apply_live_frame(const LiveFrame& frame,
     Eigen::Quaternionf ref_root_q = frame.root_quat_w.normalized();
     Eigen::Quaternionf ref_world_align_q = Eigen::Quaternionf::Identity();
     if (no_global_mode) {
-        if (current_frame_index_ == 0) {
-            initial_ref_yaw_bias_ = quat_to_yaw(ref_root_q.w(), ref_root_q.x(), ref_root_q.y(), ref_root_q.z());
+        if (current_frame_index_ == 0 || frame.reset) {
+            const Eigen::Quaternionf ref_anchor_q = anchor_quat_w(ref_root_q, joint_pos_);
+            const Eigen::Quaternionf robot_anchor_q = anchor_quat_w(current_root_quat, current_joint_pos);
+            Eigen::Quaternionf offset_q = robot_anchor_q * ref_anchor_q.conjugate();
+            offset_q.normalize();
+            const float yaw_offset = quat_to_yaw(offset_q.w(), offset_q.x(), offset_q.y(), offset_q.z());
+            anchor_frame_offset_q_ = Eigen::Quaternionf(Eigen::AngleAxisf(yaw_offset, Eigen::Vector3f::UnitZ()));
         }
-        ref_world_align_q =
-            Eigen::Quaternionf(Eigen::AngleAxisf(initial_ref_yaw_bias_, Eigen::Vector3f::UnitZ())).conjugate();
+        ref_world_align_q = anchor_frame_offset_q_;
         ref_root_q = (ref_world_align_q * ref_root_q).normalized();
     }
 
@@ -891,9 +1077,15 @@ void State_Track::ReferenceLoader::update_live_future_commands(const std::deque<
     if (future_commands_.size() != static_cast<size_t>(future_horizon_ * kFutureCommandDim)) {
         future_commands_.assign(future_horizon_ * kFutureCommandDim, 0.0f);
     }
+    if (future_command_with_foot_support_state_.size()
+        != static_cast<size_t>(future_horizon_ * kFutureCommandWithFootSupportDim)) {
+        future_command_with_foot_support_state_.assign(
+            future_horizon_ * kFutureCommandWithFootSupportDim,
+            0.0f);
+    }
 
     const Eigen::Quaternionf ref_world_align_q = no_global_mode
-        ? Eigen::Quaternionf(Eigen::AngleAxisf(initial_ref_yaw_bias_, Eigen::Vector3f::UnitZ())).conjugate()
+        ? anchor_frame_offset_q_
         : Eigen::Quaternionf::Identity();
 
     for (size_t horizon_idx = 0; horizon_idx < future_horizon_; ++horizon_idx) {
@@ -901,31 +1093,39 @@ void State_Track::ReferenceLoader::update_live_future_commands(const std::deque<
             ? queue_snapshot[horizon_idx]
             : fill_frame;
         Eigen::Quaternionf future_ref_root_q = (ref_world_align_q * frame.root_quat_w).normalized();
+        const Eigen::Matrix3f motion_future_root_rot_b =
+            (current_root_quat.normalized().conjugate() * future_ref_root_q).toRotationMatrix();
+        Eigen::Matrix<float, 6, 1> motion_future_root_ori_b;
+        motion_future_root_ori_b << motion_future_root_rot_b(0, 0), motion_future_root_rot_b(0, 1),
+                                    motion_future_root_rot_b(1, 0), motion_future_root_rot_b(1, 1),
+                                    motion_future_root_rot_b(2, 0), motion_future_root_rot_b(2, 1);
+
+        const float future_yaw_ref = quat_to_yaw(
+            future_ref_root_q.w(),
+            future_ref_root_q.x(),
+            future_ref_root_q.y(),
+            future_ref_root_q.z());
+        const Eigen::Quaternionf future_ref_yaw_q =
+            Eigen::AngleAxisf(future_yaw_ref, Eigen::Vector3f::UnitZ()) * Eigen::Quaternionf::Identity();
+        const Eigen::Vector3f motion_future_lin_vel_navi =
+            future_ref_yaw_q.conjugate() * (ref_world_align_q * frame.root_lin_vel_w);
+        const Eigen::Vector3f motion_future_ang_vel_navi =
+            future_ref_yaw_q.conjugate() * (ref_world_align_q * frame.root_ang_vel_w);
+        Eigen::Vector3f motion_future_xy_yaw_vel;
+        motion_future_xy_yaw_vel << motion_future_lin_vel_navi.x(),
+                                    motion_future_lin_vel_navi.y(),
+                                    motion_future_ang_vel_navi.z();
+
         Eigen::Matrix<float, 6, 1> future_root_ori_b;
         if (use_motion_root_command) {
-            const Eigen::Matrix3f future_root_rot_b =
-                (current_root_quat.normalized().conjugate() * future_ref_root_q).toRotationMatrix();
-            future_root_ori_b << future_root_rot_b(0, 0), future_root_rot_b(0, 1),
-                                 future_root_rot_b(1, 0), future_root_rot_b(1, 1),
-                                 future_root_rot_b(2, 0), future_root_rot_b(2, 1);
+            future_root_ori_b = motion_future_root_ori_b;
         } else {
             future_root_ori_b << 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f;
         }
 
         Eigen::Vector3f future_xy_yaw_vel = Eigen::Vector3f::Zero();
         if (use_motion_velocity_command) {
-            const float future_yaw_ref = quat_to_yaw(
-                future_ref_root_q.w(),
-                future_ref_root_q.x(),
-                future_ref_root_q.y(),
-                future_ref_root_q.z());
-            const Eigen::Quaternionf future_ref_yaw_q =
-                Eigen::AngleAxisf(future_yaw_ref, Eigen::Vector3f::UnitZ()) * Eigen::Quaternionf::Identity();
-            const Eigen::Vector3f future_lin_vel_navi =
-                future_ref_yaw_q.conjugate() * (ref_world_align_q * frame.root_lin_vel_w);
-            const Eigen::Vector3f future_ang_vel_navi =
-                future_ref_yaw_q.conjugate() * (ref_world_align_q * frame.root_ang_vel_w);
-            future_xy_yaw_vel << future_lin_vel_navi.x(), future_lin_vel_navi.y(), future_ang_vel_navi.z();
+            future_xy_yaw_vel = motion_future_xy_yaw_vel;
         }
 
         size_t out_offset = horizon_idx * kFutureCommandDim;
@@ -938,6 +1138,22 @@ void State_Track::ReferenceLoader::update_live_future_commands(const std::deque<
         for (int i = 0; i < kJointDim; ++i) {
             future_commands_[out_offset++] = frame.joint_pos[i];
         }
+
+        const size_t command_with_foot_offset = horizon_idx * kFutureCommandWithFootSupportDim;
+        size_t with_foot_offset = command_with_foot_offset;
+        for (int i = 0; i < 6; ++i) {
+            future_command_with_foot_support_state_[with_foot_offset++] = motion_future_root_ori_b[i];
+        }
+        for (int i = 0; i < 3; ++i) {
+            future_command_with_foot_support_state_[with_foot_offset++] = motion_future_xy_yaw_vel[i];
+        }
+        for (int i = 0; i < kJointDim; ++i) {
+            future_command_with_foot_support_state_[with_foot_offset++] = frame.joint_pos[i];
+        }
+        write_foot_support_onehot(frame.left_foot_contact_state,
+                                  frame.right_foot_contact_state,
+                                  future_command_with_foot_support_state_,
+                                  command_with_foot_offset + kFutureCommandDim);
     }
 }
 
@@ -1276,6 +1492,18 @@ State_Track::State_Track(int state_mode, std::string state_string)
         spdlog::info("Track: per-frame observation dump enabled at '{}'", observation_dump_file_.string());
     }
 
+    qpos_visualizer_dump_enabled_ = cfg["dump_qpos_visualizer"].as<bool>(false);
+    qpos_visualizer_dump_base_file_ = cfg["qpos_visualizer_dump_file"]
+        ? std::filesystem::path(cfg["qpos_visualizer_dump_file"].as<std::string>())
+        : std::filesystem::path("debug/qpos_visualizer/et1_track_qpos_visualizer.csv");
+    if (!qpos_visualizer_dump_base_file_.is_absolute()) {
+        qpos_visualizer_dump_base_file_ = param::proj_dir / qpos_visualizer_dump_base_file_;
+    }
+    qpos_visualizer_dump_file_ = qpos_visualizer_dump_base_file_;
+    if (qpos_visualizer_dump_enabled_) {
+        spdlog::info("Track: qpos visualizer CSV dump enabled at '{}'", qpos_visualizer_dump_file_.string());
+    }
+
     if (cfg["head_hold_sdk_slots"]) {
         head_hold_sdk_slots_ = cfg["head_hold_sdk_slots"].as<std::vector<int>>();
         head_hold_q_ = cfg["head_hold_q"]
@@ -1371,6 +1599,7 @@ State_Track::State_Track(int state_mode, std::string state_string)
             : live_config.high_water_mark;
         live_config.initial_buffer_frames = std::max<size_t>(1, live_config.initial_buffer_frames);
         live_config.max_queue_frames = std::max(live_config.initial_buffer_frames, live_config.max_queue_frames);
+        live_initial_buffer_frames_ = live_config.initial_buffer_frames;
         spdlog::info("Track: live stream enabled endpoint='{}' topic='{}' queue={} initial_buffer={} future_horizon={}",
                      live_config.endpoint,
                      live_config.topic,
@@ -1435,7 +1664,6 @@ State_Track::State_Track(int state_mode, std::string state_string)
     }
 
     const std::vector<std::string> tracker_targets = {
-        "GeneralTracker",
         "GeneralTrackerCJM",
         "GeneralTrackerCLN",
     };
@@ -1461,6 +1689,63 @@ State_Track::State_Track(int state_mode, std::string state_string)
     // Temporarily disable bad_orientation-triggered state switch in Track.
 }
 
+long long State_Track::active_motion_duration_ms() const
+{
+    const float duration_s = reference_ ? std::max(0.0f, reference_->duration()) : 0.0f;
+    return static_cast<long long>(std::round(duration_s * 1000.0f));
+}
+
+bool State_Track::consume_app_start_request()
+{
+    if (!param::is_app_dance_debug_mode() || getStateString() != "GeneralTrackerCLN") {
+        return false;
+    }
+
+    Et1DanceCommand app_command;
+    if (!Et1DanceBridge::Instance().ConsumeStart(app_command)) {
+        return false;
+    }
+
+    stop_locomotion_policy_thread();
+    active_app_command_ = app_command;
+    active_app_request_ = true;
+    active_tracking_ = false;
+
+    try {
+        active_tracking_ = start_requested_motion(app_command.motion_path);
+        if (active_tracking_) {
+            Et1DanceBridge::Instance().PublishStatusWithProgress(
+                active_app_command_.request_id,
+                active_app_command_.dance_id,
+                "play_start",
+                active_motion_duration_ms(),
+                0,
+                0.0,
+                active_app_command_.motion_path);
+            spdlog::info("Track: app requested motion started; waiting for playback completion before returning to idle");
+        } else {
+            Et1DanceBridge::Instance().PublishStatus(
+                active_app_command_.request_id,
+                active_app_command_.dance_id,
+                "play_failed",
+                "failed to load requested ET1 track motion");
+            active_app_request_ = false;
+        }
+    } catch (const std::exception& e) {
+        Et1DanceBridge::Instance().PublishStatus(
+            active_app_command_.request_id,
+            active_app_command_.dance_id,
+            "play_failed",
+            e.what());
+        spdlog::error("Track: failed to load app requested motion '{}': {}",
+                      app_command.motion_path,
+                      e.what());
+        active_app_request_ = false;
+        active_tracking_ = false;
+    }
+    return true;
+}
+
 void State_Track::enter()
 {
     spdlog::info("Track: enter");
@@ -1470,18 +1755,43 @@ void State_Track::enter()
     first_frame_debug_dumped_ = false;
     playback_complete_ = false;
     active_tracking_ = false;
+    active_app_request_ = false;
+    active_app_command_ = Et1DanceCommand{};
+    startup_alignment_pending_ = false;
+    startup_upper_body_interp_active_ = false;
+    tracking_playback_time_ = 0.0f;
 
-    if (auto requested_motion = consume_pending_motion_file()) {
+    if (consume_app_start_request()) {
+        if (!active_tracking_ && !hybrid_locomotion_enabled_) {
+            playback_complete_ = true;
+            return;
+        }
+    } else if (auto requested_motion = consume_pending_motion_file()) {
         active_tracking_ = start_requested_motion(*requested_motion);
         if (!active_tracking_ && !hybrid_locomotion_enabled_) {
             playback_complete_ = true;
             return;
         }
     } else if (live_stream_enabled_) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        size_t live_buffer_size = reference_ ? reference_->live_buffer_size() : 0;
+        while (live_buffer_size < live_initial_buffer_frames_
+               && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            live_buffer_size = reference_ ? reference_->live_buffer_size() : 0;
+        }
+        if (live_buffer_size < live_initial_buffer_frames_) {
+            spdlog::warn(
+                "Track: live stream has only {} buffered frames, need {}; returning to Velocity without running policy",
+                live_buffer_size,
+                live_initial_buffer_frames_);
+            playback_complete_ = true;
+            return;
+        }
         reference = reference_;
         active_tracking_ = true;
     } else if (require_requested_motion_ && !hybrid_locomotion_enabled_) {
-        spdlog::warn("Track: no requested motion is pending; GeneralTracker will return to Velocity without running fallback motion_file");
+        spdlog::warn("Track: no requested motion is pending; tracker will return to Velocity without running fallback motion_file");
         playback_complete_ = true;
         return;
     } else if (!hybrid_locomotion_enabled_) {
@@ -1496,6 +1806,7 @@ void State_Track::enter()
     }
 
     open_observation_dump();
+    open_qpos_visualizer_dump();
     auto* active_env = active_tracking_ ? env.get() : locomotion_env_.get();
     const auto& active_kp = active_tracking_ ? policy_kp_ : locomotion_policy_kp_;
     const auto& active_kd = active_tracking_ ? policy_kd_ : locomotion_policy_kd_;
@@ -1529,7 +1840,22 @@ void State_Track::enter()
             live_state.root_quat_w.z()
         );
         has_initial_yaw_bias_ = true;
-        spdlog::info("Track: no_global_mode yaw-zero bias initialized: {:.6f} rad", initial_yaw_bias_);
+        if (active_tracking_ && reference_) {
+            reference_->calibrate_anchor_frame(
+                0.0f,
+                active_env->robot->data.joint_pos,
+                live_state.root_quat_w,
+                true);
+            if (!reference_->is_live_stream()) {
+                startup_alignment_pending_ = true;
+                startup_alignment_start_time_s_ =
+                    static_cast<double>(unitree::common::GetCurrentTimeMillisecond()) * 1e-3;
+                tracking_playback_time_ = 0.0f;
+                begin_startup_upper_body_interpolation(sample_reference_joint_pos(0.0f));
+                spdlog::info("Track: startup playback hold enabled for {:.3f}s", startup_alignment_duration_s_);
+            }
+        }
+        spdlog::info("Track: no_global_mode anchor yaw alignment initialized at robot yaw {:.6f} rad", initial_yaw_bias_);
     }
 }
 
@@ -1539,13 +1865,48 @@ void State_Track::run()
         return;
     }
 
+    Et1DanceCommand stop_command;
+    if (active_app_request_
+        && Et1DanceBridge::Instance().ConsumeStop(stop_command)
+        && active_tracking_) {
+        Et1DanceBridge::Instance().PublishStatus(
+            stop_command.request_id.empty() ? active_app_command_.request_id : stop_command.request_id,
+            stop_command.dance_id != 0 ? stop_command.dance_id : active_app_command_.dance_id,
+            "play_stopping");
+        active_tracking_ = false;
+        close_observation_dump();
+        if (hybrid_locomotion_enabled_ && locomotion_env_) {
+            locomotion_env_->reset();
+            start_locomotion_policy_thread();
+        } else {
+            playback_complete_ = true;
+        }
+        Et1DanceBridge::Instance().PublishStatusWithProgress(
+            stop_command.request_id.empty() ? active_app_command_.request_id : stop_command.request_id,
+            stop_command.dance_id != 0 ? stop_command.dance_id : active_app_command_.dance_id,
+            "play_stopped",
+            active_motion_duration_ms(),
+            active_motion_duration_ms(),
+            1.0);
+        active_app_request_ = false;
+        return;
+    }
+
     if (hybrid_locomotion_enabled_ && !active_tracking_) {
-        poll_motion_request_file();
-        if (auto requested_motion = consume_pending_motion_file()) {
-            stop_locomotion_policy_thread();
-            active_tracking_ = start_requested_motion(*requested_motion);
+        if (consume_app_start_request()) {
             if (!active_tracking_ && locomotion_env_) {
                 start_locomotion_policy_thread();
+            }
+        } else {
+            poll_motion_request_file();
+        }
+        if (!active_tracking_ && !active_app_request_) {
+            if (auto requested_motion = consume_pending_motion_file()) {
+                stop_locomotion_policy_thread();
+                active_tracking_ = start_requested_motion(*requested_motion);
+                if (!active_tracking_ && locomotion_env_) {
+                    start_locomotion_policy_thread();
+                }
             }
         }
         if (!active_tracking_) {
@@ -1568,15 +1929,9 @@ void State_Track::run_tracking_policy()
         live_state.root_quat_w.z()
     );
     float current_root_yaw_used = current_root_yaw;
-    if (no_global_mode_) {
-        if (!has_initial_yaw_bias_) {
-            initial_yaw_bias_ = current_root_yaw;
-            has_initial_yaw_bias_ = true;
-        }
-        current_root_yaw_used = std::atan2(
-            std::sin(current_root_yaw - initial_yaw_bias_),
-            std::cos(current_root_yaw - initial_yaw_bias_)
-        );
+    if (no_global_mode_ && !has_initial_yaw_bias_) {
+        initial_yaw_bias_ = current_root_yaw;
+        has_initial_yaw_bias_ = true;
     }
     const bool has_current_root_xy = (!no_global_mode_) && live_state.has_highstate;
     Eigen::Vector2f current_root_xy = Eigen::Vector2f::Zero();
@@ -1584,15 +1939,9 @@ void State_Track::run_tracking_policy()
         current_root_xy = live_state.root_pos_w.head<2>();
     }
     Eigen::Quaternionf current_root_quat_used = live_state.root_quat_w;
-    if (no_global_mode_ && has_initial_yaw_bias_) {
-        const Eigen::Quaternionf yaw_bias_q(
-            Eigen::AngleAxisf(initial_yaw_bias_, Eigen::Vector3f::UnitZ())
-        );
-        current_root_quat_used = (yaw_bias_q.conjugate() * live_state.root_quat_w).normalized();
-    }
-    const Eigen::Quaternionf current_root_quat_unbiased_used =
-        (no_global_mode_ && has_initial_yaw_bias_) ? current_root_quat_used : live_state.root_quat_w;
-    const float track_time_s = (env->episode_length + 1) * env->step_dt;
+    const Eigen::Quaternionf current_root_quat_unbiased_used = current_root_quat_used;
+    const bool was_startup_alignment_pending = startup_alignment_pending_;
+    const float track_time_s = startup_alignment_pending_ ? 0.0f : tracking_playback_time_;
     reference_->update(track_time_s,
                        no_global_mode_,
                        has_current_root_xy,
@@ -1600,6 +1949,7 @@ void State_Track::run_tracking_policy()
                        current_root_yaw_used,
                        current_root_quat_used,
                        current_root_quat_unbiased_used,
+                       env->robot->data.joint_pos,
                        use_motion_root_command_,
                        use_motion_velocity_command_,
                        !one_shot_mode_);
@@ -1628,6 +1978,9 @@ void State_Track::run_tracking_policy()
     const auto action = env->alg->act(obs);
     env->action_manager->process_action(action);
     auto target_q = env->action_manager->processed_actions();
+    if (startup_alignment_pending_) {
+        apply_startup_upper_body_interpolation(target_q);
+    }
     if (env->episode_length <= 5) {
         const auto& joint_pos = env->robot->data.joint_pos;
         float max_abs_target_delta = 0.0f;
@@ -1652,6 +2005,7 @@ void State_Track::run_tracking_policy()
                      max_delta_sdk_slot);
     }
     dump_control_frame(obs, action, target_q);
+    dump_qpos_visualizer_frame(target_q);
     for (int i = 0; i < env->robot->data.joint_ids_map.size(); ++i) {
         const int sdk_slot = env->robot->data.policy_joint_to_sdk_slot(i);
 
@@ -1670,7 +2024,38 @@ void State_Track::run_tracking_policy()
         first_frame_debug_dumped_ = true;
     }
 
+    if (was_startup_alignment_pending) {
+        tracking_playback_time_ = 0.0f;
+        const double now = static_cast<double>(unitree::common::GetCurrentTimeMillisecond()) * 1e-3;
+        if (now - startup_alignment_start_time_s_ >= startup_alignment_duration_s_) {
+            env->robot->update();
+            const auto& refreshed_live_state = env->robot->data.live_state;
+            reference_->calibrate_anchor_frame(
+                0.0f,
+                env->robot->data.joint_pos,
+                refreshed_live_state.root_quat_w,
+                true);
+            startup_alignment_pending_ = false;
+            startup_upper_body_interp_active_ = false;
+            spdlog::info("Track: startup playback hold complete; anchor yaw alignment refreshed");
+        }
+    } else {
+        tracking_playback_time_ = reference_
+            ? std::min(tracking_playback_time_ + env->step_dt, reference_->duration())
+            : tracking_playback_time_ + env->step_dt;
+    }
+
     if (one_shot_mode_ && reference_ && track_time_s >= reference_->duration()) {
+        if (active_app_request_) {
+            Et1DanceBridge::Instance().PublishStatusWithProgress(
+                active_app_command_.request_id,
+                active_app_command_.dance_id,
+                "play_finished",
+                active_motion_duration_ms(),
+                active_motion_duration_ms(),
+                1.0);
+            active_app_request_ = false;
+        }
         if (hybrid_locomotion_enabled_) {
             active_tracking_ = false;
             close_observation_dump();
@@ -1683,6 +2068,7 @@ void State_Track::run_tracking_policy()
             playback_complete_ = true;
             spdlog::info("Track: one-shot playback complete at {:.3f}s, returning to Velocity", track_time_s);
         }
+        close_qpos_visualizer_dump();
     }
 }
 
@@ -1789,6 +2175,9 @@ bool State_Track::start_requested_motion(const std::filesystem::path& requested_
     apply_head_hold_command();
     has_initial_yaw_bias_ = false;
     initial_yaw_bias_ = 0.0f;
+    startup_alignment_pending_ = false;
+    startup_upper_body_interp_active_ = false;
+    tracking_playback_time_ = 0.0f;
     if (no_global_mode_) {
         env->robot->update();
         const auto& live_state = env->robot->data.live_state;
@@ -1799,9 +2188,20 @@ bool State_Track::start_requested_motion(const std::filesystem::path& requested_
             live_state.root_quat_w.z()
         );
         has_initial_yaw_bias_ = true;
-        spdlog::info("Track: requested motion yaw-zero bias reset: {:.6f} rad", initial_yaw_bias_);
+        reference_->calibrate_anchor_frame(
+            0.0f,
+            env->robot->data.joint_pos,
+            live_state.root_quat_w,
+            true);
+        startup_alignment_pending_ = true;
+        startup_alignment_start_time_s_ =
+            static_cast<double>(unitree::common::GetCurrentTimeMillisecond()) * 1e-3;
+        begin_startup_upper_body_interpolation(sample_reference_joint_pos(0.0f));
+        spdlog::info("Track: requested motion anchor yaw alignment reset at robot yaw {:.6f} rad", initial_yaw_bias_);
+        spdlog::info("Track: requested motion startup playback hold enabled for {:.3f}s", startup_alignment_duration_s_);
     }
     open_observation_dump();
+    open_qpos_visualizer_dump();
     return true;
 }
 
@@ -1966,6 +2366,7 @@ void State_Track::exit()
     spdlog::info("Track: exit");
     stop_locomotion_policy_thread();
     close_observation_dump();
+    close_qpos_visualizer_dump();
 }
 
 void State_Track::configure_pd_gain_randomization()
@@ -2075,6 +2476,65 @@ void State_Track::apply_head_hold_command()
         motor.kp() = head_hold_kp_[i];
         motor.kd() = head_hold_kd_[i];
         motor.tau() = 0.0f;
+    }
+}
+
+Eigen::VectorXf State_Track::sample_reference_joint_pos(float time_s) const
+{
+    if (!reference_) {
+        return Eigen::VectorXf::Zero(0);
+    }
+    return reference_->sample_joint_pos(time_s);
+}
+
+void State_Track::begin_startup_upper_body_interpolation(const Eigen::VectorXf& target_q)
+{
+    const int joint_count = static_cast<int>(env->robot->data.joint_ids_map.size());
+    const int upper_body_joint_count = std::clamp(
+        joint_count - kUpperBodyStartIndex,
+        0,
+        kMaxUpperBodyJointCount);
+    if (upper_body_joint_count <= 0 || target_q.size() <= kUpperBodyStartIndex) {
+        startup_upper_body_interp_active_ = false;
+        return;
+    }
+
+    startup_upper_body_interp_active_ = true;
+    startup_upper_body_interp_t0_ = static_cast<double>(unitree::common::GetCurrentTimeMillisecond()) * 1e-3;
+    startup_upper_body_interp_ts_ = {0.0f, startup_alignment_duration_s_};
+    startup_upper_body_interp_qs_.assign(2, std::vector<float>(upper_body_joint_count, 0.0f));
+
+    const int motor_state_count = static_cast<int>(lowstate->msg_.motor_state().size());
+    for (int i = 0; i < upper_body_joint_count; ++i) {
+        const int policy_index = kUpperBodyStartIndex + i;
+        const int sdk_slot = env->robot->data.policy_joint_to_sdk_slot(policy_index);
+        if (sdk_slot < 0 || sdk_slot >= motor_state_count || policy_index >= target_q.size()) {
+            continue;
+        }
+
+        startup_upper_body_interp_qs_[0][i] = lowstate->msg_.motor_state()[sdk_slot].q();
+        startup_upper_body_interp_qs_[1][i] = target_q[policy_index];
+    }
+}
+
+void State_Track::apply_startup_upper_body_interpolation(std::vector<float>& target_q)
+{
+    if (!startup_upper_body_interp_active_ || startup_upper_body_interp_qs_.empty()) {
+        return;
+    }
+
+    const float t = static_cast<double>(unitree::common::GetCurrentTimeMillisecond()) * 1e-3
+        - startup_upper_body_interp_t0_;
+    const auto upper_body_q = linear_interpolate(t, startup_upper_body_interp_ts_, startup_upper_body_interp_qs_);
+    for (size_t i = 0; i < upper_body_q.size(); ++i) {
+        const size_t policy_index = static_cast<size_t>(kUpperBodyStartIndex) + i;
+        if (policy_index < target_q.size()) {
+            target_q[policy_index] = upper_body_q[i];
+        }
+    }
+
+    if (!startup_upper_body_interp_ts_.empty() && t >= startup_upper_body_interp_ts_.back()) {
+        startup_upper_body_interp_active_ = false;
     }
 }
 
@@ -2217,6 +2677,93 @@ void State_Track::close_observation_dump()
                      observation_dump_file_.string(),
                      observation_dump_frame_);
         observation_dump_stream_.close();
+    }
+}
+
+void State_Track::open_qpos_visualizer_dump()
+{
+    qpos_visualizer_dump_frame_ = 0;
+    if (!qpos_visualizer_dump_enabled_) {
+        return;
+    }
+
+    try {
+        qpos_visualizer_dump_file_ = timestamped_dump_path(qpos_visualizer_dump_base_file_);
+        std::filesystem::create_directories(qpos_visualizer_dump_file_.parent_path());
+        qpos_visualizer_dump_stream_.open(qpos_visualizer_dump_file_, std::ios::out | std::ios::trunc);
+        if (!qpos_visualizer_dump_stream_) {
+            throw std::runtime_error("Failed to open qpos visualizer CSV: " + qpos_visualizer_dump_file_.string());
+        }
+
+        qpos_visualizer_dump_stream_ << std::setprecision(9);
+        qpos_visualizer_dump_stream_ << "time";
+        for (int i = 0; i < ReferenceLoader::kJointDim; ++i) {
+            qpos_visualizer_dump_stream_ << ",target_" << i;
+        }
+        for (int i = 0; i < ReferenceLoader::kJointDim; ++i) {
+            qpos_visualizer_dump_stream_ << ",measured_" << i;
+        }
+        for (int i = 0; i < ReferenceLoader::kJointDim; ++i) {
+            qpos_visualizer_dump_stream_ << ",motion_joint_pos_" << i;
+        }
+        qpos_visualizer_dump_stream_ << "\n";
+
+        spdlog::info("Track: writing qpos visualizer CSV to '{}'", qpos_visualizer_dump_file_.string());
+    } catch (const std::exception& e) {
+        qpos_visualizer_dump_enabled_ = false;
+        spdlog::error("Track: disabling qpos visualizer dump: {}", e.what());
+    }
+}
+
+void State_Track::dump_qpos_visualizer_frame(const std::vector<float>& target_q)
+{
+    if (!qpos_visualizer_dump_enabled_ || !qpos_visualizer_dump_stream_) {
+        return;
+    }
+
+    const float time_s = reference_ ? reference_->current_time_s() : static_cast<float>(qpos_visualizer_dump_frame_) * env->step_dt;
+    qpos_visualizer_dump_stream_ << time_s;
+
+    for (int i = 0; i < ReferenceLoader::kJointDim; ++i) {
+        const float value = i < static_cast<int>(target_q.size())
+            ? target_q[static_cast<size_t>(i)]
+            : std::numeric_limits<float>::quiet_NaN();
+        qpos_visualizer_dump_stream_ << "," << value;
+    }
+
+    const auto& measured_q = env->robot->data.joint_pos;
+    for (int i = 0; i < ReferenceLoader::kJointDim; ++i) {
+        const float value = i < measured_q.size()
+            ? measured_q[i]
+            : std::numeric_limits<float>::quiet_NaN();
+        qpos_visualizer_dump_stream_ << "," << value;
+    }
+
+    if (reference_) {
+        const auto& motion_q = reference_->command_joint_pos();
+        for (int i = 0; i < ReferenceLoader::kJointDim; ++i) {
+            const float value = i < motion_q.size()
+                ? motion_q[i]
+                : std::numeric_limits<float>::quiet_NaN();
+            qpos_visualizer_dump_stream_ << "," << value;
+        }
+    } else {
+        for (int i = 0; i < ReferenceLoader::kJointDim; ++i) {
+            qpos_visualizer_dump_stream_ << "," << std::numeric_limits<float>::quiet_NaN();
+        }
+    }
+
+    qpos_visualizer_dump_stream_ << "\n";
+    ++qpos_visualizer_dump_frame_;
+}
+
+void State_Track::close_qpos_visualizer_dump()
+{
+    if (qpos_visualizer_dump_stream_) {
+        spdlog::info("Track: closed qpos visualizer CSV '{}' after {} frames",
+                     qpos_visualizer_dump_file_.string(),
+                     qpos_visualizer_dump_frame_);
+        qpos_visualizer_dump_stream_.close();
     }
 }
 

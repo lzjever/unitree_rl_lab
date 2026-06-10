@@ -66,10 +66,10 @@ std::string trim_copy(const std::string& value)
 std::string tracker_target_from_token(const std::string& token)
 {
     static const std::unordered_map<std::string, std::string> aliases = {
-        {"general", "GeneralTracker"},
-        {"tracker", "GeneralTracker"},
-        {"generaltracker", "GeneralTracker"},
-        {"GeneralTracker", "GeneralTracker"},
+        {"general", "GeneralTrackerCLN"},
+        {"tracker", "GeneralTrackerCLN"},
+        {"generaltracker", "GeneralTrackerCLN"},
+        {"GeneralTracker", "GeneralTrackerCLN"},
         {"debug", "GeneralTrackerCJM"},
         {"cjm", "GeneralTrackerCJM"},
         {"general_tracker_cjm", "GeneralTrackerCJM"},
@@ -91,7 +91,7 @@ bool State_Velocity::prepare_general_tracker_request()
         return true;
     }
     if (State_Track::has_pending_motion_request()) {
-        pending_tracker_target_state_ = "GeneralTracker";
+        pending_tracker_target_state_ = "GeneralTrackerCLN";
         return true;
     }
     if (general_tracker_request_file_.empty()
@@ -109,7 +109,7 @@ bool State_Velocity::prepare_general_tracker_request()
 
     line = trim_copy(line);
     if (line.empty()) {
-        spdlog::warn("Velocity: ignored empty GeneralTracker request file '{}'",
+        spdlog::warn("Velocity: ignored empty tracker request file '{}'",
                      general_tracker_request_file_.string());
         return false;
     }
@@ -120,7 +120,7 @@ bool State_Velocity::prepare_general_tracker_request()
     std::string target_state = tracker_target_from_token(first_token);
     std::string motion_file;
     if (target_state.empty()) {
-        target_state = "GeneralTracker";
+        target_state = "GeneralTrackerCLN";
         motion_file = line;
     } else {
         std::getline(ss, motion_file);
@@ -128,17 +128,17 @@ bool State_Velocity::prepare_general_tracker_request()
     }
 
     if (motion_file.empty()) {
-        spdlog::warn("Velocity: ignored GeneralTracker request without motion path: '{}'", line);
+        spdlog::warn("Velocity: ignored tracker request without motion path: '{}'", line);
         return false;
     }
     if (!FSMStringMap.right.count(target_state)) {
-        spdlog::warn("Velocity: ignored GeneralTracker request for unavailable target '{}'", target_state);
+        spdlog::warn("Velocity: ignored tracker request for unavailable target '{}'", target_state);
         return false;
     }
 
     State_Track::request_motion_file(motion_file);
     pending_tracker_target_state_ = target_state;
-    spdlog::info("Velocity: routed GeneralTracker request to {} with motion '{}'",
+    spdlog::info("Velocity: routed tracker request to {} with motion '{}'",
                  target_state,
                  motion_file);
     return true;
@@ -198,8 +198,8 @@ State_Velocity::State_Velocity(int state_mode, std::string state_string)
             live_stream_trigger_target_state_);
     }
 
-    if (FSMStringMap.right.count("GeneralTracker")) {
-        auto tracker_cfg = param::config["FSM"]["GeneralTracker"];
+    if (FSMStringMap.right.count("GeneralTrackerCJM") || FSMStringMap.right.count("GeneralTrackerCLN")) {
+        auto tracker_cfg = param::config["FSM"]["GeneralTrackerCJM"];
         const std::string request_file = tracker_cfg["request_file"]
             ? tracker_cfg["request_file"].as<std::string>()
             : "debug/general_tracker_request.txt";
@@ -209,7 +209,6 @@ State_Velocity::State_Velocity(int state_mode, std::string state_string)
         }
 
         const std::vector<std::string> tracker_targets = {
-            "GeneralTracker",
             "GeneralTrackerCJM",
             "GeneralTrackerCLN",
         };

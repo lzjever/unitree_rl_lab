@@ -43,6 +43,14 @@ inline std::filesystem::path bin_path;
 inline std::filesystem::path proj_dir;
 inline std::filesystem::path config_dir;
 inline YAML::Node config;
+inline std::string et1_dance_control_topic = "et1/dance/control";
+inline std::string et1_dance_status_topic = "et1/dance/status";
+inline std::string dance_debug_mode = "keyboard";
+
+inline bool is_app_dance_debug_mode()
+{
+    return dance_debug_mode == "app";
+}
 
 inline std::filesystem::path get_bin_path() {
     std::vector<char> path(1024);
@@ -139,7 +147,11 @@ inline po::variables_map helper(int argc, char** argv)
         ("help,h", "produce help message")
         ("version,v", "show version")
         ("log", "record log file")
-        ("network,n", po::value<std::string>()->default_value(""), "dds network interface")
+        ("network,n", po::value<std::string>()->default_value("eth0"), "dds network interface")
+        ("dance-debug-mode", po::value<std::string>()->default_value("keyboard"), "dance debug mode: keyboard or app")
+        ("et1-dance-control-topic", po::value<std::string>()->default_value("et1/dance/control"), "ET1 dance control DDS topic")
+        ("et1-dance-status-topic", po::value<std::string>()->default_value("et1/dance/status"), "ET1 dance status DDS topic")
+        ("skip-loco-handover", "skip high-level StandUp/Damp handover before lowcmd takeover")
         ("sim-auto", "automatically switch Passive -> FixStand -> Velocity for sim2sim only")
         ("sim-auto-port", po::value<int>()->default_value(8090), "localhost UDP port of unitree_mujoco sim control")
         ("sim-auto-contact-timeout", po::value<double>()->default_value(8.0), "seconds to wait for both feet contact before holding FixStand")
@@ -159,6 +171,14 @@ inline po::variables_map helper(int argc, char** argv)
         std::cout << "Version: " << VERSION << std::endl;
         exit(0);
     }
+
+    dance_debug_mode = vm["dance-debug-mode"].as<std::string>();
+    if (dance_debug_mode != "keyboard" && dance_debug_mode != "app") {
+        spdlog::error("Invalid --dance-debug-mode '{}'. Expected 'keyboard' or 'app'.", dance_debug_mode);
+        exit(1);
+    }
+    et1_dance_control_topic = vm["et1-dance-control-topic"].as<std::string>();
+    et1_dance_status_topic = vm["et1-dance-status-topic"].as<std::string>();
 
 #ifndef NDEBUG
     spdlog::set_level(spdlog::level::debug);

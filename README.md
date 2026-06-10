@@ -111,6 +111,25 @@ cmake .. && make
 
 Installing the [unitree_mujoco](https://github.com/unitreerobotics/unitree_mujoco?tab=readme-ov-file#installation).
 
+Latest convenient ET1 Sim2Sim launcher:
+
+```bash
+cd deploy/robots/et1
+./run_sim2sim.sh
+```
+
+This script starts both required nodes automatically:
+
+- `unitree_mujoco`
+- `et1_ctrl --sim-auto`
+
+It uses `lo`, `et1_v2`, and `scene.xml` by default. Extra controller arguments
+can be passed after `--`, for example:
+
+```bash
+./run_sim2sim.sh --network lo -- --log
+```
+
 For a complete `G1-29dof` keyboard-based Sim2Sim runbook, see [doc/g1_sim2sim_keyboard.md](doc/g1_sim2sim_keyboard.md).
 中文说明见 [doc/g1_sim2sim_keyboard_zh.md](doc/g1_sim2sim_keyboard_zh.md).
 `R1` tracking 策略键盘版中文说明见 [doc/r1_sim2sim_keyboard_zh.md](doc/r1_sim2sim_keyboard_zh.md).
@@ -152,3 +171,11 @@ This repository is built upon the support and contributions of the following ope
 - [mujoco](https://github.com/google-deepmind/mujoco.git): Providing powerful simulation functionalities.
 - [robot_lab](https://github.com/fan-ziqi/robot_lab): Referenced for project structure and parts of the implementation.
 - [whole_body_tracking](https://github.com/HybridRobotics/whole_body_tracking): Versatile humanoid control framework for motion tracking.
+
+
+轨迹转换
+```bash
+python3 unitree_rl_lab/scripts/et1/convert_track_npz.py \
+    --input /home/galbot/galbot_rl_mjlab/src/mjlab/storage/mocap/general_tracker_test_footstate/585_jiaxin.npz \
+    --output /home/galbot/ET_Deploy/unitree_rl_lab/deploy/robots/et1/config/policy/general_tracker_cln/params/585_jiaxin.et1trk 
+   ```

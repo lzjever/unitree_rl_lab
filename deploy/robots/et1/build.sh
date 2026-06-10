@@ -6,32 +6,47 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 usage() {
   cat <<EOF
 Usage:
-  ./build.sh [x86|arm64] [--no-clean]
+  ./build.sh [x86|arm64] [--no-clean] [--jobs N]
 
 Examples:
   ./build.sh
   ./build.sh x86
   ./build.sh arm64
   ./build.sh arm64 --no-clean
+  ./build.sh arm64 --jobs 4
 EOF
 }
 
 target=""
 clean=1
+jobs="${BUILD_JOBS:-8}"
 
-for arg in "$@"; do
+while [[ $# -gt 0 ]]; do
+  arg="$1"
   case "$arg" in
     x86|x86_64)
       target="x86-release"
+      shift
       ;;
     arm64|aarch64|arm)
       target="arm64-release"
+      shift
       ;;
     --clean|clean)
       clean=1
+      shift
       ;;
     --no-clean|no-clean)
       clean=0
+      shift
+      ;;
+    -j|--jobs)
+      if [[ $# -lt 2 || ! "$2" =~ ^[0-9]+$ || "$2" -lt 1 ]]; then
+        echo "Invalid jobs value. Usage: --jobs N" >&2
+        exit 1
+      fi
+      jobs="$2"
+      shift 2
       ;;
     -h|--help)
       usage
@@ -89,6 +104,6 @@ cmake \
   -DCMAKE_BUILD_TYPE=Release \
   -DONNXRUNTIME_ROOT="$onnxruntime_root"
 
-cmake --build "$build_dir" --parallel
+cmake --build "$build_dir" --parallel "$jobs"
 
 echo "Built: $build_dir/et1_ctrl"

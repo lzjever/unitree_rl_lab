@@ -2,8 +2,8 @@
 """Convert an ET1 tracking NPZ file into a raw binary cache for deployment.
 
 The cache stores selected arrays from the source NPZ without preprocessing.
-The default auto profile accepts both the base mjlab motion arrays and the
-newer GeneralTracker arrays with foot-support/reference-COM observations.
+The default footstate profile requires and stores foot-support labels used by
+newer GeneralTracker policies. Reference-COM arrays are stored when present.
 """
 
 from __future__ import annotations
@@ -35,9 +35,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True, help="Path to the output .et1trk file.")
     parser.add_argument(
         "--profile",
-        choices=("auto", "latest_general_tracker", "legacy"),
-        default="auto",
+        choices=("footstate", "auto", "latest_general_tracker", "legacy"),
+        default="footstate",
         help=(
+            "footstate requires left/right foot-support arrays and keeps optional ref-COM arrays when present. "
             "auto requires base motion arrays and keeps optional foot/ref-COM arrays when present. "
             "latest_general_tracker requires foot-support and ref-COM arrays. "
             "legacy only requires the original motion arrays."
@@ -59,15 +60,19 @@ def main() -> None:
         "body_lin_vel_w",
         "body_ang_vel_w",
     }
-    required_latest = {
+    required_footstate = {
         "left_foot_contact_state",
         "right_foot_contact_state",
+    }
+    required_com = {
         "ref_com_rel_navi",
         "ref_com_vel_navi",
     }
     required = set(required_base)
+    if args.profile in ("footstate", "latest_general_tracker"):
+        required.update(required_footstate)
     if args.profile == "latest_general_tracker":
-        required.update(required_latest)
+        required.update(required_com)
 
     data = np.load(src, allow_pickle=False)
     missing = required.difference(data.files)

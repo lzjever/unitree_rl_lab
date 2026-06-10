@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "FSM/State_RLBase.h"
+#include "Et1DanceBridge.h"
 
 class State_Track : public FSMState
 {
@@ -25,8 +26,11 @@ public:
     public:
         static constexpr int kJointDim = 26;
         static constexpr int kBodyCount = 27;
+        static constexpr int kAnchorBodyIndex = 14;
         static constexpr int kDefaultFutureHorizon = 25;
         static constexpr int kFutureCommandDim = 6 + 3 + kJointDim;
+        static constexpr int kFootSupportStateDim = 6;
+        static constexpr int kFutureCommandWithFootSupportDim = kFutureCommandDim + kFootSupportStateDim;
         static constexpr uint32_t kCacheVersion = 1;
 
         // A compact runtime cache generated from the original NPZ track.
@@ -52,6 +56,10 @@ public:
         ~ReferenceLoader();
 
         void reset(const Eigen::VectorXf& default_joint_pos);
+        void calibrate_anchor_frame(float time_s,
+                                    const Eigen::VectorXf& robot_joint_pos,
+                                    const Eigen::Quaternionf& robot_root_quat,
+                                    bool yaw_only = true);
         void update(float time_s,
                     bool no_global_mode,
                     bool has_current_root_xy,
@@ -59,6 +67,7 @@ public:
                     float current_root_yaw,
                     const Eigen::Quaternionf& current_root_quat,
                     const Eigen::Quaternionf& current_root_quat_unbiased,
+                    const Eigen::VectorXf& current_joint_pos,
                     bool use_motion_root_command = true,
                     bool use_motion_velocity_command = true,
                     bool loop_reference = true);
@@ -70,9 +79,11 @@ public:
         const Eigen::Vector3f& command_xy_yaw_vel() const { return xy_yaw_vel_; }
         const Eigen::Vector2f& command_yaw() const { return yaw_command_; }
         const std::vector<float>& future_commands() const { return future_commands_; }
+        const std::vector<float>& future_command_with_foot_support_state() const { return future_command_with_foot_support_state_; }
         const Eigen::Matrix<float, 6, 1>& command_foot_support_state() const { return foot_support_state_; }
         const Eigen::Vector3f& ref_com_rel_navi() const { return ref_com_rel_navi_; }
         const Eigen::Vector3f& ref_com_vel_navi() const { return ref_com_vel_navi_; }
+        Eigen::VectorXf sample_joint_pos(float time_s) const;
         size_t current_frame_index() const { return current_frame_index_; }
         float current_time_s() const { return current_time_s_; }
         float duration() const { return duration_; }
@@ -109,6 +120,7 @@ public:
                               float current_root_yaw,
                               const Eigen::Quaternionf& current_root_quat,
                               const Eigen::Quaternionf& current_root_quat_unbiased,
+                              const Eigen::VectorXf& current_joint_pos,
                               bool use_motion_root_command,
                               bool use_motion_velocity_command);
         void update_live_future_commands(const std::deque<LiveFrame>& queue_snapshot,
@@ -117,6 +129,8 @@ public:
                                          const Eigen::Quaternionf& current_root_quat,
                                          bool use_motion_root_command,
                                          bool use_motion_velocity_command);
+        Eigen::Quaternionf anchor_quat_w(const Eigen::Quaternionf& root_quat,
+                                         const Eigen::VectorXf& joint_pos) const;
 
         float fps_ = 50.0f;
         float duration_ = 0.0f;
@@ -141,6 +155,7 @@ public:
         Eigen::Vector3f xy_yaw_vel_ = Eigen::Vector3f::Zero();
         Eigen::Vector2f yaw_command_ = Eigen::Vector2f(1.0f, 0.0f);
         std::vector<float> future_commands_;
+        std::vector<float> future_command_with_foot_support_state_;
         Eigen::Matrix<float, 6, 1> foot_support_state_ = Eigen::Matrix<float, 6, 1>::Zero();
         Eigen::Vector3f ref_com_rel_navi_ = Eigen::Vector3f::Zero();
         Eigen::Vector3f ref_com_vel_navi_ = Eigen::Vector3f::Zero();
@@ -148,6 +163,7 @@ public:
         size_t current_frame_index_ = 0;
         float current_time_s_ = 0.0f;
         float initial_ref_yaw_bias_ = 0.0f;
+        Eigen::Quaternionf anchor_frame_offset_q_ = Eigen::Quaternionf::Identity();
 
         bool live_stream_enabled_ = false;
         LiveStreamConfig live_config_;
@@ -192,11 +208,18 @@ private:
                             const std::vector<float>& action,
                             const std::vector<float>& target_q);
     void close_observation_dump();
+    void open_qpos_visualizer_dump();
+    void dump_qpos_visualizer_frame(const std::vector<float>& target_q);
+    void close_qpos_visualizer_dump();
     void apply_head_hold_command();
+    Eigen::VectorXf sample_reference_joint_pos(float time_s) const;
+    void begin_startup_upper_body_interpolation(const Eigen::VectorXf& target_q);
+    void apply_startup_upper_body_interpolation(std::vector<float>& target_q);
     void configure_pd_gain_randomization();
     void reset_pd_gain_scales();
     bool poll_motion_request_file();
     bool route_profile_request_to(const std::string& target_state);
+    bool consume_app_start_request();
     bool start_requested_motion(const std::filesystem::path& motion_file);
     void run_tracking_policy();
     void run_locomotion_policy();
@@ -211,6 +234,7 @@ private:
     void apply_hybrid_idle_hold();
     void start_locomotion_policy_thread();
     void stop_locomotion_policy_thread();
+    long long active_motion_duration_ms() const;
 
     std::unique_ptr<isaaclab::ManagerBasedRLEnv> env;
     std::unique_ptr<isaaclab::ManagerBasedRLEnv> locomotion_env_;
@@ -219,6 +243,7 @@ private:
     std::filesystem::path request_file_;
     float reference_fps_ = 50.0f;
     size_t reference_future_horizon_ = ReferenceLoader::kDefaultFutureHorizon;
+    size_t live_initial_buffer_frames_ = 1;
     std::vector<int> override_joint_ids_;  // Joints whose positions are overridden by reference motion
     std::vector<float> policy_kp_;
     std::vector<float> policy_kd_;
@@ -253,12 +278,27 @@ private:
     bool locomotion_policy_thread_running_ = false;
     bool has_initial_yaw_bias_ = false;
     float initial_yaw_bias_ = 0.0f;
+    bool startup_alignment_pending_ = false;
+    double startup_alignment_start_time_s_ = 0.0;
+    float startup_alignment_duration_s_ = 0.5f;
+    float tracking_playback_time_ = 0.0f;
+    bool startup_upper_body_interp_active_ = false;
+    double startup_upper_body_interp_t0_ = 0.0;
+    std::vector<float> startup_upper_body_interp_ts_;
+    std::vector<std::vector<float>> startup_upper_body_interp_qs_;
     bool observation_dump_enabled_ = false;
     bool live_stream_enabled_ = false;
+    Et1DanceCommand active_app_command_;
+    bool active_app_request_ = false;
     std::filesystem::path observation_dump_base_file_;
     std::filesystem::path observation_dump_file_;
     std::ofstream observation_dump_stream_;
     size_t observation_dump_frame_ = 0;
+    bool qpos_visualizer_dump_enabled_ = false;
+    std::filesystem::path qpos_visualizer_dump_base_file_;
+    std::filesystem::path qpos_visualizer_dump_file_;
+    std::ofstream qpos_visualizer_dump_stream_;
+    size_t qpos_visualizer_dump_frame_ = 0;
     std::thread locomotion_policy_thread_;
 
     static std::mutex pending_motion_mutex_;
