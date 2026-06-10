@@ -1,7 +1,7 @@
 # Agentic ET1 Tracker Acceptance Evidence
 
 Date: 2026-05-29
-Latest targeted update: 2026-06-05
+Latest targeted update: 2026-06-10
 Environment: local workspace `/home/galbot/works/et1`
 
 ## Build/test evidence
@@ -17,6 +17,26 @@ Environment: local workspace `/home/galbot/works/et1`
 - `/tmp/agentic-et1-tracker-verify-perf`: perf smoke target compiled
   successfully.
 - `git diff --check`: passed.
+
+2026-06-10 footstate3 asset/config switch verification in this working tree:
+
+- `ctest --test-dir deploy/robots/agentic-et1-tracker/build -R 'agentic_et1_tracker_(policy_tests|policy_step_runner_tests|policy_onnx_tests|app_tests)' --output-on-failure`:
+  4/4 passed.
+- `ctest --test-dir deploy/robots/agentic-et1-tracker/build --output-on-failure`:
+  12/12 passed.
+- Local release package build succeeded with
+  `deploy/robots/agentic-et1-tracker/packaging/build_release.sh --version footstate3-local-test --build-dir /tmp/agentic-et1-tracker-footstate3-release-build --out-dir /tmp/agentic-et1-tracker-footstate3-release-out --jobs 4`.
+- Package path:
+  `/tmp/agentic-et1-tracker-footstate3-release-out/agentic-et1-tracker-footstate3-local-test-x86_64.tar.gz`.
+- Extracted offline `scripts/selftest.sh` passed, verifying the template
+  includes `GeneralTrackerCLNFootstate`, `multi_policy_footstate3.onnx`, and
+  `deploy_fut_multi_footstate.yaml`; it also verified the footstate3 ONNX/YAML
+  sha and old CLN compatibility assets sha.
+- `git diff --check`: passed.
+- MuJoCo/real robot: not run / pending.
+
+This records targeted local unit/release selftest verification only. It does
+not claim MuJoCo or real-robot acceptance.
 
 ## Docs/skill evidence
 
@@ -146,10 +166,15 @@ App-local release assets live under
 `deploy/robots/agentic-et1-tracker/config` and must be used at runtime without
 fallback to the ET1 app tree:
 
-- Default CLN policy: `GeneralTrackerCLN` at
-  `config/policy/general_tracker_cln`
-- Release packages carry this CLN tracker policy and omit the unused legacy
-  `config/policy/general_tracker` tracker policy directory.
+- Default CLN footstate policy: `GeneralTrackerCLNFootstate` at
+  `config/policy/general_tracker_cln`, using `multi_policy_footstate3.onnx`
+  and `deploy_fut_multi_footstate.yaml`.
+- Old CLN compatibility remains available as explicit `GeneralTrackerCLN`
+  config in the same directory with `multi_policy_v17c2_70k.onnx` and
+  `deploy.yaml`.
+- Release packages carry this `general_tracker_cln` tracker policy directory
+  and omit the unused legacy `config/policy/general_tracker` tracker policy
+  directory.
 - StandbyVelocity: `config/policy/velocity/v0`
 - FixStand posture: `config/posture/fixstand/v0/fixstand.yaml`
 - Passive posture: `config/posture/passive/v0/passive.yaml`

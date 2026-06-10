@@ -146,21 +146,32 @@ RobotReadinessStatus mapRobotReadiness(const std::optional<LowStateSample>& low_
 LowCmdFrame makeLowCmdFrame(const DeployConfig& config,
                             const PolicyOutput& output,
                             std::uint8_t expected_mode_machine,
-                            const LowCmdFrame* base_frame) {
+                            const LowCmdFrame* base_frame,
+                            LowCmdBaseBehavior base_behavior) {
   return makeLowCmdFrame(config.sdk_joint_ids_map,
                          output,
                          expected_mode_machine,
-                         base_frame);
+                         base_frame,
+                         base_behavior);
 }
 
 LowCmdFrame makeLowCmdFrame(const std::vector<int>& sdk_joint_ids_map,
                             const PolicyOutput& output,
                             std::uint8_t expected_mode_machine,
-                            const LowCmdFrame* base_frame) {
+                            const LowCmdFrame* base_frame,
+                            LowCmdBaseBehavior base_behavior) {
   validateSdkMap(sdk_joint_ids_map);
   validatePolicyOutput(output);
 
   LowCmdFrame frame = base_frame == nullptr ? LowCmdFrame{} : *base_frame;
+  if (base_behavior == LowCmdBaseBehavior::Clear) {
+    for (MotorCommand& motor : frame.motors) {
+      motor.dq = 0.0F;
+      motor.kp = 0.0F;
+      motor.kd = 0.0F;
+      motor.tau = 0.0F;
+    }
+  }
   frame.mode_machine = expected_mode_machine;
   frame.mode_pr = 0;
 

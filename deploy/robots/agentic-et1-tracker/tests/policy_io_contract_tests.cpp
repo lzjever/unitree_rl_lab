@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <cstdint>
 #include <cstddef>
 #include <limits>
@@ -17,6 +18,9 @@ constexpr std::size_t kHistoryLength = 25;
 constexpr std::size_t kHistoryWidth = 105;
 constexpr std::size_t kClnObsCurrentDim = 121;
 constexpr std::size_t kClnHistoryWidth = 35;
+constexpr std::size_t kClnFootstateObsCurrentDim = 127;
+constexpr std::size_t kClnFootstateHistoryLength = 5;
+constexpr std::size_t kClnFootstateHistoryWidth = 41;
 
 std::vector<int> intRange(std::size_t count) {
   std::vector<int> values;
@@ -93,6 +97,27 @@ std::vector<ObservationTerm> clnHistoryTerms() {
   });
 }
 
+std::vector<ObservationTerm> clnFootstateCurrentTerms() {
+  return terms({
+      {"command_yaw", 2},
+      {"command_root_ori_b", 6},
+      {"command_xy_yaw_vel", 3},
+      {"command_jnt_pos", kJointDim},
+      {"projected_gravity", 3},
+      {"base_ang_vel", 3},
+      {"joint_pos_rel", kJointDim},
+      {"joint_vel_rel", kJointDim},
+      {"last_action", kJointDim},
+      {"command_foot_support_state", 6},
+  });
+}
+
+std::vector<ObservationTerm> clnFootstateHistoryTerms() {
+  return terms({
+      {"future_command_with_foot_support_state", kClnFootstateHistoryWidth},
+  });
+}
+
 DeployConfig validConfig() {
   DeployConfig config;
   config.joint_dim = kJointDim;
@@ -124,6 +149,17 @@ DeployConfig validClnConfig() {
   return config;
 }
 
+DeployConfig validClnFootstateConfig() {
+  DeployConfig config = validConfig();
+  config.observation_contract = ObservationContract::GeneralTrackerCLNFootstate;
+  config.obs_current_dim = kClnFootstateObsCurrentDim;
+  config.obs_history_width = kClnFootstateHistoryWidth;
+  config.obs_history_length = kClnFootstateHistoryLength;
+  config.obs_current_terms = clnFootstateCurrentTerms();
+  config.obs_history_terms = clnFootstateHistoryTerms();
+  return config;
+}
+
 PolicyModelMetadata validMetadata() {
   return {
       {
@@ -141,6 +177,18 @@ PolicyModelMetadata validClnMetadata() {
       {
           {"obs_current", PolicyTensorElementType::Float32, {1, 121}},
           {"obs_history", PolicyTensorElementType::Float32, {1, 25, 35}},
+      },
+      {
+          {"actions", PolicyTensorElementType::Float32, {1, 26}},
+      },
+  };
+}
+
+PolicyModelMetadata validClnFootstateMetadata() {
+  return {
+      {
+          {"obs_current", PolicyTensorElementType::Float32, {1, 127}},
+          {"obs_history", PolicyTensorElementType::Float32, {1, 5, 41}},
       },
       {
           {"actions", PolicyTensorElementType::Float32, {1, 26}},
@@ -181,6 +229,16 @@ TEST_CASE("GA policy IO contract accepts frozen deploy dims and ONNX metadata") 
 TEST_CASE("GA policy IO contract accepts GeneralTrackerCLN deploy dims and ONNX metadata") {
   REQUIRE_NOTHROW(validateGaDeployConfig(validClnConfig()));
   REQUIRE_NOTHROW(validateGaPolicyIoContract(validClnConfig(), validClnMetadata()));
+}
+
+TEST_CASE("GA policy IO contract accepts GeneralTrackerCLNFootstate deploy dims and ONNX metadata") {
+  REQUIRE_NOTHROW(validateGaDeployConfig(validClnFootstateConfig()));
+  REQUIRE_NOTHROW(
+      validateGaPolicyIoContract(validClnFootstateConfig(), validClnFootstateMetadata()));
+}
+
+TEST_CASE("GA policy IO contract rejects old CLN ONNX shapes for Footstate profile") {
+  requireContractRejects(validClnFootstateConfig(), validClnMetadata(), "obs_current shape");
 }
 
 TEST_CASE("GA policy IO contract rejects input name drift") {
@@ -269,6 +327,14 @@ TEST_CASE("GA deploy config contract rejects action vector length drift") {
     requireDeployRejects(config, "action_offset");
     requireContractRejects(config, validMetadata(), "action_offset");
   }
+
+  SECTION("action_clip") {
+    auto config = validConfig();
+    config.action_clip.assign(kJointDim - 1, std::array<double, 2>{-1.0, 1.0});
+
+    requireDeployRejects(config, "action_clip");
+    requireContractRejects(config, validMetadata(), "action_clip");
+  }
 }
 
 TEST_CASE("GA deploy config contract rejects policy gain vector length drift") {
@@ -355,6 +421,15 @@ TEST_CASE("GA deploy config contract rejects non-finite action and gain values")
     requireDeployRejects(config, "policy_kd");
     requireContractRejects(config, validMetadata(), "policy_kd");
   }
+
+  SECTION("action_clip Inf") {
+    auto config = validConfig();
+    config.action_clip.assign(kJointDim, std::array<double, 2>{-1.0, 1.0});
+    config.action_clip[0][1] = std::numeric_limits<double>::infinity();
+
+    requireDeployRejects(config, "action_clip");
+    requireContractRejects(config, validMetadata(), "action_clip");
+  }
 }
 
 TEST_CASE("GA deploy config contract rejects non-positive policy scale and gains") {
@@ -404,6 +479,15 @@ TEST_CASE("GA deploy config contract rejects non-positive policy scale and gains
 
     requireDeployRejects(config, "policy_kd");
     requireContractRejects(config, validMetadata(), "policy_kd");
+  }
+
+  SECTION("inverted action_clip") {
+    auto config = validConfig();
+    config.action_clip.assign(kJointDim, std::array<double, 2>{-1.0, 1.0});
+    config.action_clip[0] = {2.0, 1.0};
+
+    requireDeployRejects(config, "action_clip");
+    requireContractRejects(config, validMetadata(), "action_clip");
   }
 }
 

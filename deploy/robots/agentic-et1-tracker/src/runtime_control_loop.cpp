@@ -19,6 +19,7 @@ namespace agentic_et1_tracker {
 namespace {
 
 constexpr double kMaxTransitionDurationS = 5.0;
+constexpr double kPolicyStartupHoldDurationS = 0.1;
 
 bool isStartupOrWaitingError(ErrorCode error) {
   switch (error) {
@@ -538,10 +539,12 @@ void RuntimeControlLoop::enterInternalState(RuntimeInternalState state) {
   switch (state) {
     case RuntimeInternalState::Passive:
       active_policy_ticks_until_next_ = 0;
+      clearPolicyStartupHold();
       velocity_policy_ticks_until_next_ = 0;
       break;
     case RuntimeInternalState::FixStand:
       active_policy_ticks_until_next_ = 0;
+      clearPolicyStartupHold();
       velocity_policy_ticks_until_next_ = 0;
       if (fixstand_runner_) {
         fixstand_runner_->reset();
@@ -550,20 +553,28 @@ void RuntimeControlLoop::enterInternalState(RuntimeInternalState state) {
     case RuntimeInternalState::Velocity:
     case RuntimeInternalState::GeneralTrackerIdle:
       active_policy_ticks_until_next_ = 0;
+      clearPolicyStartupHold();
       velocity_policy_ticks_until_next_ = 0;
       if (velocity_runner_) {
         velocity_runner_->reset();
       }
       break;
     case RuntimeInternalState::GeneralTrackerActive:
+      clearPolicyStartupHold();
+      active_policy_ticks_until_next_ = 0;
+      active_first_advance_ = true;
+      break;
     case RuntimeInternalState::GeneralTrackerTransition:
+      clearPolicyStartupHold();
       active_policy_ticks_until_next_ = 0;
       active_first_advance_ = true;
       break;
     case RuntimeInternalState::Stopping:
+      clearPolicyStartupHold();
       break;
     case RuntimeInternalState::Fault:
       active_policy_ticks_until_next_ = 0;
+      clearPolicyStartupHold();
       velocity_policy_ticks_until_next_ = 0;
       break;
   }
@@ -613,6 +624,18 @@ void RuntimeControlLoop::enterTrackPreparingState() {
 
 void RuntimeControlLoop::enterTrackActiveState() {
   enterInternalState(RuntimeInternalState::GeneralTrackerActive);
+  resetPolicyStartupHoldForActiveUser();
+}
+
+void RuntimeControlLoop::resetPolicyStartupHoldForActiveUser() {
+  policy_startup_hold_steps_remaining_ =
+      hasPolicyRuntime() && active_kind_ == ActiveKind::User
+          ? policyStartupHoldPolicySteps()
+          : 0;
+}
+
+void RuntimeControlLoop::clearPolicyStartupHold() {
+  policy_startup_hold_steps_remaining_ = 0;
 }
 
 bool RuntimeControlLoop::isMotionAcceptingState() const {
@@ -1190,6 +1213,10 @@ void RuntimeControlLoop::advanceActiveWithPolicy() {
     return;
   }
 
+  if (advanceUserPolicyStartupHold()) {
+    return;
+  }
+
   if (!consumeStepDue(active_policy_ticks_until_next_, activePolicyIntervalTicks())) {
     return;
   }
@@ -1299,6 +1326,82 @@ void RuntimeControlLoop::advanceActiveWithPolicy() {
   }
 
   publishActive();
+}
+
+bool RuntimeControlLoop::advanceUserPolicyStartupHold() {
+  if (!active_ || active_kind_ != ActiveKind::User ||
+      policy_startup_hold_steps_remaining_ == 0) {
+    return false;
+  }
+
+  std::optional<LowStateSample> low_state;
+  std::optional<RobotReadinessStatus> readiness;
+
+  auto readReadyLowState = [&]() -> bool {
+    low_state = readLowStateForStatus();
+    readiness =
+        mapRobotReadiness(low_state,
+                          robot_io_->lowCmdOccupancy(),
+                          expected_mode_machine_);
+    if (readiness->err != ErrorCode::Ok) {
+      failActiveReadiness(*readiness);
+      return false;
+    }
+    applyReadiness(*readiness);
+    return true;
+  };
+
+  if (!consumeStepDue(active_policy_ticks_until_next_, activePolicyIntervalTicks())) {
+    return true;
+  }
+
+  if (!readReadyLowState()) {
+    return true;
+  }
+
+  active_->started_at = active_first_advance_
+                            ? std::chrono::steady_clock::now()
+                            : active_->started_at;
+  active_first_advance_ = false;
+  active_->frame = 0;
+  publishActive();
+  publishReferenceActive();
+
+  PolicyStepResult step;
+  try {
+    step = policy_runner_->step(0, *low_state, *policy_, lowCmdBaseFrame());
+  } catch (const std::exception&) {
+    failActiveWithFault(ErrorCode::ModelInferenceFailed,
+                        RobotState::Fault,
+                        "policy_inference_failed",
+                        readiness ? readiness->low_ms : std::nullopt);
+    return true;
+  }
+
+  try {
+    writeLowCmdFrame(step.low_cmd);
+  } catch (const std::exception&) {
+    failActiveWithFault(ErrorCode::InternalError,
+                        RobotState::Fault,
+                        "lowcmd_write_failed",
+                        readiness ? readiness->low_ms : std::nullopt);
+    return true;
+  }
+
+  --policy_startup_hold_steps_remaining_;
+  if (policy_startup_hold_steps_remaining_ > 0) {
+    return true;
+  }
+
+  try {
+    policy_runner_->recalibrateObservationAnchor(*low_state);
+  } catch (const std::exception&) {
+    failActiveWithFault(ErrorCode::ModelInferenceFailed,
+                        RobotState::Fault,
+                        "policy_inference_failed",
+                        readiness ? readiness->low_ms : std::nullopt);
+  }
+  return true;
 }
 
 void RuntimeControlLoop::advanceHolding() {
@@ -2715,6 +2818,24 @@ std::size_t RuntimeControlLoop::activePolicyIntervalTicks() const {
     return 1;
   }
   return ticksForRate(active_->fps);
+}
+
+std::size_t RuntimeControlLoop::policyStartupHoldPolicySteps() const {
+  const double rate_hz = active_ ? active_->fps : 0.0;
+  if (!std::isfinite(rate_hz) || rate_hz <= 0.0) {
+    return 1;
+  }
+
+  const double max_steps =
+      static_cast<double>(std::numeric_limits<std::size_t>::max());
+  const double steps = std::ceil(kPolicyStartupHoldDurationS * rate_hz);
+  if (!std::isfinite(steps) || steps <= 1.0) {
+    return 1;
+  }
+  if (steps >= max_steps) {
+    return std::numeric_limits<std::size_t>::max();
+  }
+  return static_cast<std::size_t>(steps);
 }
 
 std::size_t RuntimeControlLoop::stopHoldTicks() const {

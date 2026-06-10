@@ -19,10 +19,10 @@ agentic_et1_tracker:
   reference:
     enabled: false
   policy:
-    profile: "GeneralTrackerCLN"
+    profile: "GeneralTrackerCLNFootstate"
     policy_dir: "config/policy/general_tracker_cln"
-    policy_file: "multi_policy_v17c2_70k.onnx"
-    deploy: "config/policy/general_tracker_cln/params/deploy.yaml"
+    policy_file: "multi_policy_footstate3.onnx"
+    deploy: "config/policy/general_tracker_cln/params/deploy_fut_multi_footstate.yaml"
     fps: 50
   control:
     startup_control: "FixStand"

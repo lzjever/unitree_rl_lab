@@ -301,6 +301,40 @@ TEST_CASE("RobotIO maps 26 policy joints into the 35 motor SDK LowCmd frame") {
   REQUIRE(frame.motors[14].tau == 0.0F);
 }
 
+TEST_CASE("RobotIO preserves base frame only in overlay LowCmd mode") {
+  LowCmdFrame base;
+  base.mode_machine = 3;
+  base.mode_pr = 2;
+  base.motors.at(14).mode = 6;
+  base.motors.at(14).q = 42.0F;
+  base.motors.at(14).dq = -2.0F;
+  base.motors.at(14).kp = 12.0F;
+  base.motors.at(14).kd = 1.25F;
+  base.motors.at(14).tau = 0.75F;
+
+  const LowCmdFrame overlay =
+      makeLowCmdFrame(deployConfig(), policyOutput(), 1, &base);
+  REQUIRE(overlay.mode_machine == 1);
+  REQUIRE(overlay.mode_pr == 0);
+  REQUIRE(overlay.motors.at(14).mode == base.motors.at(14).mode);
+  REQUIRE(overlay.motors.at(14).q == base.motors.at(14).q);
+  REQUIRE(overlay.motors.at(14).dq == base.motors.at(14).dq);
+  REQUIRE(overlay.motors.at(14).kp == base.motors.at(14).kp);
+  REQUIRE(overlay.motors.at(14).kd == base.motors.at(14).kd);
+  REQUIRE(overlay.motors.at(14).tau == base.motors.at(14).tau);
+
+  const LowCmdFrame clear =
+      makeLowCmdFrame(deployConfig(), policyOutput(), 1, &base, LowCmdBaseBehavior::Clear);
+  REQUIRE(clear.mode_machine == 1);
+  REQUIRE(clear.mode_pr == 0);
+  REQUIRE(clear.motors.at(14).mode == base.motors.at(14).mode);
+  REQUIRE(clear.motors.at(14).q == base.motors.at(14).q);
+  REQUIRE(clear.motors.at(14).dq == 0.0F);
+  REQUIRE(clear.motors.at(14).kp == 0.0F);
+  REQUIRE(clear.motors.at(14).kd == 0.0F);
+  REQUIRE(clear.motors.at(14).tau == 0.0F);
+}
+
 TEST_CASE("RobotIO builds hold-current LowCmd from current policy joint q") {
   const DeployConfig config = deployConfig();
   const LowStateSample low_state = holdLowState(config);

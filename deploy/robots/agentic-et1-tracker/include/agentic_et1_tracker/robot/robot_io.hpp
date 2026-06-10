@@ -62,6 +62,11 @@ struct LowCmdOccupancy {
   std::size_t sample_age_ms{0};
 };
 
+enum class LowCmdBaseBehavior {
+  OverlayBase,
+  Clear,
+};
+
 enum class OrientationSafety {
   Enforce,
   Skip,
@@ -113,12 +118,16 @@ RobotReadinessStatus mapRobotReadiness(const std::optional<LowStateSample>& low_
 LowCmdFrame makeLowCmdFrame(const DeployConfig& config,
                             const PolicyOutput& output,
                             std::uint8_t expected_mode_machine,
-                            const LowCmdFrame* base_frame = nullptr);
+                            const LowCmdFrame* base_frame = nullptr,
+                            LowCmdBaseBehavior base_behavior =
+                                LowCmdBaseBehavior::OverlayBase);
 
 LowCmdFrame makeLowCmdFrame(const std::vector<int>& sdk_joint_ids_map,
                             const PolicyOutput& output,
                             std::uint8_t expected_mode_machine,
-                            const LowCmdFrame* base_frame = nullptr);
+                            const LowCmdFrame* base_frame = nullptr,
+                            LowCmdBaseBehavior base_behavior =
+                                LowCmdBaseBehavior::OverlayBase);
 
 LowCmdFrame makeHoldLowCmdFrame(const DeployConfig& config,
                                 const LowStateSample& low_state,

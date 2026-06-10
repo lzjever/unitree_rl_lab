@@ -32,6 +32,7 @@ P0_NEXT = {
     "sequence-interrupt",
     "standby",
     "fixstand",
+    "passive",
     "status",
     "urgent-stop",
     "idle-load",
@@ -335,7 +336,92 @@ def validate_trk(path):
         raise CliError("REQUEST_INVALID", "path must end with .trk", next_step="run-trk")
     if not path.exists():
         raise CliError("REQUEST_INVALID", "path does not exist", next_step="run-trk")
+    if not path.is_file():
+        raise CliError("REQUEST_INVALID", "path must be a file", next_step="run-trk")
     return str(path)
+
+
+def user_motion_root():
+    return Path.cwd() / "generated" / "user-motion"
+
+
+def is_relative_to(path, root):
+    try:
+        Path(path).relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def find_user_motion_script():
+    return str(skill_dir() / "scripts" / "find-user-motion")
+
+
+def find_user_motion(root, query):
+    finder = find_user_motion_script()
+    if not Path(finder).exists():
+        raise CliError("REQUEST_INVALID", "find-user-motion helper is not installed", next_step="run-trk")
+    proc = run_subprocess([finder, str(root), query])
+    raw = proc.stdout.strip().splitlines()
+    if not raw:
+        raise CliError("REQUEST_INVALID", "user motion search failed", next_step="run-trk")
+    try:
+        doc = json.loads(raw[-1])
+    except json.JSONDecodeError:
+        raise CliError("REQUEST_INVALID", "user motion search returned invalid json", next_step="run-trk")
+    if not doc.get("ok"):
+        error = doc.get("error") if isinstance(doc.get("error"), dict) else {}
+        code = error.get("code", "REQUEST_INVALID")
+        if code in {"NOT_FOUND", "AMBIGUOUS"}:
+            code = "REQUEST_INVALID"
+        raise CliError(code, error.get("message", "user motion not found"), next_step="run-trk")
+    return doc.get("path")
+
+
+def relative_trk_candidate(root, raw):
+    path = Path(raw)
+    if path.is_absolute():
+        raise CliError("REQUEST_INVALID", "relative path expected", next_step="run-trk")
+    if not raw or any(part == ".." for part in path.parts):
+        raise CliError("REQUEST_INVALID", "relative path must stay under generated/user-motion", next_step="run-trk")
+    if path.suffix and path.suffix != ".trk":
+        raise CliError("REQUEST_INVALID", "path must end with .trk", next_step="run-trk")
+    if not path.suffix:
+        path = path.with_suffix(".trk")
+    return root / path
+
+
+def validate_user_motion_path(path, root):
+    root_real = root.resolve(strict=False)
+    try:
+        path_real = Path(path).resolve(strict=True)
+    except OSError:
+        raise CliError("REQUEST_INVALID", "path does not exist", next_step="run-trk")
+    if not is_relative_to(path_real, root_real):
+        raise CliError("REQUEST_INVALID", "path must stay under generated/user-motion", next_step="run-trk")
+    return validate_trk(path_real)
+
+
+def matched_user_motion_doc(query, path, root):
+    path = Path(path)
+    try:
+        file = path.relative_to(root.resolve(strict=False)).as_posix()
+    except ValueError:
+        file = path.name
+    return {"query": query, "file": file}
+
+
+def resolve_run_trk_path(raw):
+    path = Path(raw)
+    if path.is_absolute():
+        return validate_trk(path), None
+    root = user_motion_root()
+    candidate = relative_trk_candidate(root, raw)
+    if candidate.exists():
+        return validate_user_motion_path(candidate, root), None
+    matched = find_user_motion(root, raw)
+    resolved = validate_user_motion_path(matched, root)
+    return resolved, matched_user_motion_doc(raw, resolved, root)
 
 
 def execute_trk(base, path, mode, wait, timeout, poll, hold=False):
@@ -377,6 +463,10 @@ def tracker_status(base, timeout):
 
 def tracker_fixstand(base, timeout):
     return http_request(base, "POST", "/fixstand", timeout=timeout)
+
+
+def tracker_passive(base, password, timeout):
+    return http_request(base, "POST", "/passive", {"password": password}, timeout=timeout)
 
 
 def tracker_stop(base, timeout):
@@ -547,12 +637,13 @@ def run_text_cmd(args, base, timeout, poll):
 
 def run_trk_cmd(args, base, timeout, poll):
     cancel_active_sequences("run-trk")
-    started = execute_trk(base, args.path, args.mode, args.wait, timeout, poll, hold=args.hold)
+    path, matched = resolve_run_trk_path(args.path)
+    started = execute_trk(base, path, args.mode, args.wait, timeout, poll, hold=args.hold)
     if not started.get("ok"):
         error = started.get("error", {})
         return err_doc("run-trk", error.get("code", "TRACKER_RUN_FAILED"), error.get("message", "tracker run failed"), "run-trk")
     active = {"run_id": started.get("id")} if started.get("id") else None
-    return ok_doc("run-trk", "standby", intent="run_trk", state="running", active=active, segments={"submitted": 1}, hold=args.hold)
+    return ok_doc("run-trk", "standby", intent="run_trk", state="running", active=active, segments={"submitted": 1}, hold=args.hold, matched=matched)
 
 
 def compact_tracker_state(status):
@@ -633,6 +724,17 @@ def fixstand_cmd(base, timeout):
         error = out.get("error", {})
         return err_doc("fixstand", error.get("code", "TRACKER_STATE_CONFLICT"), error.get("message", "fixstand failed"), "fixstand")
     return ok_doc("fixstand", "standby", intent="explicit_stand_configuration", state="fixstand")
+
+
+def passive_cmd(args, base, timeout):
+    if not args.password:
+        return err_doc("passive", "REQUEST_INVALID", "passive requires --password", "fixstand")
+    cancel_active_sequences("passive")
+    out = tracker_passive(base, args.password, timeout)
+    if not out.get("ok"):
+        error = out.get("error", {})
+        return err_doc("passive", error.get("code", "TRACKER_STATE_CONFLICT"), error.get("message", "passive failed"), "fixstand")
+    return ok_doc("passive", "fixstand", intent="explicit_passive", state="passive")
 
 
 def urgent_stop_cmd(args, base, timeout):
@@ -1469,6 +1571,8 @@ def parse(argv):
 
     sub.add_parser("standby")
     sub.add_parser("fixstand")
+    ps = sub.add_parser("passive")
+    ps.add_argument("--password")
     sub.add_parser("status")
 
     us = sub.add_parser("urgent-stop")
@@ -1538,6 +1642,8 @@ def main(argv):
             out = standby_cmd(base, args.timeout, args.poll)
         elif args.cmd == "fixstand":
             out = fixstand_cmd(base, args.timeout)
+        elif args.cmd == "passive":
+            out = passive_cmd(args, base, args.timeout)
         elif args.cmd == "urgent-stop":
             out = urgent_stop_cmd(args, base, args.timeout)
         elif args.cmd == "idle-load":

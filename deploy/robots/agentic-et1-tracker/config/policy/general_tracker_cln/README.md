@@ -1,18 +1,24 @@
-# GeneralTrackerCLN Profile
+# GeneralTrackerCLN Footstate Profile
 
 This directory is the default app-local policy profile path used by
 `agentic-et1-tracker/config.yaml`.
 
-It contains the app-owned GeneralTrackerCLN release assets:
+It contains the app-owned GeneralTrackerCLNFootstate release assets:
 
-- `exported/multi_policy_v17c2_70k.onnx`
-- `params/deploy.yaml`
+- `exported/multi_policy_footstate3.onnx`
+- `params/deploy_fut_multi_footstate.yaml`
 
 The fixed policy contract is:
 
-- `obs_current`: `[1, 121]`
-- `obs_history`: `[1, 25, 35]`
+- `obs_current`: `[1, 127]`
+- `obs_history`: `[1, 5, 41]`
 - `actions`: `[1, 26]`
+
+The old GeneralTrackerCLN compatibility assets remain packaged for explicit
+rollback configs:
+
+- `exported/multi_policy_v17c2_70k.onnx`
+- `params/deploy.yaml`
 
 Runtime configuration must point at this app-local profile and must not point to
 or read the ET1 app policy tree under `deploy/robots/et1/config/policy/...`.

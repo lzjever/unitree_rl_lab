@@ -122,6 +122,8 @@ class RuntimeControlLoop final {
   void enterGeneralTrackerIdleState();
   void enterTrackPreparingState();
   void enterTrackActiveState();
+  void resetPolicyStartupHoldForActiveUser();
+  void clearPolicyStartupHold();
   bool isMotionAcceptingState() const;
   bool isControlPublishingState() const;
   bool isUserOwnedTransition() const;
@@ -139,6 +141,7 @@ class RuntimeControlLoop final {
   void completePreparing();
   void advanceActive();
   void advanceActiveWithPolicy();
+  bool advanceUserPolicyStartupHold();
   void advanceHolding();
   void advanceHoldingWithPolicy();
   bool startTransitionFromHoldingToNextUser();
@@ -186,6 +189,7 @@ class RuntimeControlLoop final {
   bool consumeStepDue(std::size_t& ticks_until_next, std::size_t interval_ticks);
   std::size_t velocityPolicyIntervalTicks() const;
   std::size_t activePolicyIntervalTicks() const;
+  std::size_t policyStartupHoldPolicySteps() const;
   std::size_t stopHoldTicks() const;
   std::optional<double> transitionDurationForUse() const;
   void publishActive();
@@ -250,6 +254,7 @@ class RuntimeControlLoop final {
   bool active_first_advance_{false};
   std::size_t stopping_hold_ticks_remaining_{0};
   std::size_t active_policy_ticks_until_next_{0};
+  std::size_t policy_startup_hold_steps_remaining_{0};
   std::size_t velocity_policy_ticks_until_next_{0};
   bool fail_next_transition_start_for_test_{false};
   std::optional<LowCmdFrame> lowcmd_buffer_;

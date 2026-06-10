@@ -3,6 +3,7 @@
 #include <exception>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -125,14 +126,15 @@ ControlMode startupControl(const ControlConfig& config) {
 
 bool policyProfileMatchesDeployContract(const PolicyConfig& policy,
                                         ObservationContract contract) {
-  bool profile_is_cln = false;
-  if (policy.profile == "GeneralTrackerCLN") {
-    profile_is_cln = true;
-  } else if (policy.profile != "GeneralTracker") {
-    return false;
+  std::optional<ObservationContract> expected_contract;
+  if (policy.profile == "GeneralTrackerCLNFootstate") {
+    expected_contract = ObservationContract::GeneralTrackerCLNFootstate;
+  } else if (policy.profile == "GeneralTrackerCLN") {
+    expected_contract = ObservationContract::GeneralTrackerCLN;
+  } else if (policy.profile == "GeneralTracker") {
+    expected_contract = ObservationContract::GeneralTracker;
   }
-  const bool deploy_is_cln = contract == ObservationContract::GeneralTrackerCLN;
-  return profile_is_cln == deploy_is_cln;
+  return expected_contract && contract == *expected_contract;
 }
 
 }  // namespace

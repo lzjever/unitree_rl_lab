@@ -1,5 +1,7 @@
 #include "agentic_et1_tracker/policy/policy_math.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <sstream>
 #include <string>
 
@@ -68,6 +70,9 @@ const Vec& partByName(const PolicyObservationParts& parts, const std::string& na
   if (name == "future_commands") {
     return parts.future_commands;
   }
+  if (name == "future_command_with_foot_support_state") {
+    return parts.future_commands;
+  }
 
   throw error("unknown observation term '" + name + "'");
 }
@@ -126,6 +131,20 @@ void validateActionConfig(const DeployConfig& config) {
   requireSize("DeployConfig.action_offset", config.action_offset.size(), kJointDim);
   requireSize("DeployConfig.policy_kp", config.policy_kp.size(), kJointDim);
   requireSize("DeployConfig.policy_kd", config.policy_kd.size(), kJointDim);
+  if (!config.action_clip.empty()) {
+    requireSize("DeployConfig.action_clip", config.action_clip.size(), kJointDim);
+    for (std::size_t i = 0; i < config.action_clip.size(); ++i) {
+      const auto& clip = config.action_clip[i];
+      if (!std::isfinite(clip[0]) || !std::isfinite(clip[1])) {
+        throw error("DeployConfig.action_clip[" + std::to_string(i) +
+                    "] must be finite");
+      }
+      if (clip[0] > clip[1]) {
+        throw error("DeployConfig.action_clip[" + std::to_string(i) +
+                    "] min must be <= max");
+      }
+    }
+  }
 }
 
 Vec copyDoublesAsFloats(const std::vector<double>& values) {
@@ -181,7 +200,7 @@ void HistoryBuffer::push(const PolicyObservationParts& parts) {
 
 Vec HistoryBuffer::flatten() const {
   if (!temporal_history_) {
-    throw error("HistoryBuffer does not flatten GeneralTrackerCLN future_commands");
+    throw error("HistoryBuffer does not flatten non-temporal future commands");
   }
   if (rows_.empty()) {
     throw error("HistoryBuffer must be reset before flatten");
@@ -224,8 +243,15 @@ PolicyOutput scaleAction(const DeployConfig& config, const Vec& raw_action) {
   output.raw_action = raw_action;
   output.target_q.reserve(kJointDim);
   for (std::size_t i = 0; i < kJointDim; ++i) {
-    output.target_q.push_back(raw_action[i] * static_cast<float>(config.action_scale[i]) +
-                              static_cast<float>(config.action_offset[i]));
+    float target_q = raw_action[i] * static_cast<float>(config.action_scale[i]) +
+                     static_cast<float>(config.action_offset[i]);
+    if (!config.action_clip.empty()) {
+      const auto& clip = config.action_clip[i];
+      target_q = std::clamp(target_q,
+                            static_cast<float>(clip[0]),
+                            static_cast<float>(clip[1]));
+    }
+    output.target_q.push_back(target_q);
   }
   output.kp = copyDoublesAsFloats(config.policy_kp);
   output.kd = copyDoublesAsFloats(config.policy_kd);

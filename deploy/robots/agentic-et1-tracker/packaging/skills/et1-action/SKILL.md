@@ -23,9 +23,11 @@ Common commands:
 scripts/et1-action run-text "<concise English motion prompt>" --duration 3
 scripts/et1-action run-text "<concise English final-pose prompt>" --duration 4 --hold --no-preset
 scripts/et1-action run-trk /abs/path/motion.trk
+scripts/et1-action run-trk relative/name-under-user-motion
 scripts/et1-action status
 scripts/et1-action standby
 scripts/et1-action fixstand  # explicit "enter stand configuration" only
+scripts/et1-action passive --password "$ET1_PASSIVE_PASSWORD"  # explicit authorized passive mode only
 scripts/et1-action urgent-stop --urgent
 scripts/et1-action idle-load
 scripts/et1-action cache-clear
@@ -33,9 +35,11 @@ scripts/et1-action sequence-start --plan-json '{"segments":[{"text":"<segment pr
 scripts/et1-action sequence-status SEQ_ID
 ```
 
-Normal stop requests map to `standby` or `sequence-cancel`; do not use `urgent-stop` unless the user clearly asks for emergency stop, abort, or kill. Use `fixstand` only when the user explicitly asks to enter the stand configuration. `passive` is not part of the hot path.
+Normal stop requests map to `standby` or `sequence-cancel`; do not use `urgent-stop` unless the user clearly asks for emergency stop, abort, or kill. Use `fixstand` only when the user explicitly asks to enter the stand configuration. Use `passive --password ...` only when the user explicitly authorizes passive mode and provides the password; passive mode does not automatically recover, and the next normal recovery step is `fixstand`.
 `standby` cancels active local sequences and tracker queued motions, but does not clear idle configuration. If idle motions are loaded, the tracker may enter idle background motion; if no idle is loaded, it stays in velocity0 standby. Trust the command JSON `state/ctrl/active/idle` fields instead of assuming pure velocity0.
 Only clear generation cache when the user explicitly asks to clear/reset cache. Run `scripts/et1-action cache-clear`; add `--root PATH` only when clearing a non-default text-to-TRK root. Do not clear cache as a normal retry or motion-control step.
+
+`run-trk` accepts absolute `.trk` file paths and relative user-motion names. Absolute paths must already exist, be files, and end in `.trk`; `.et1trk` is not supported. Relative paths are resolved under `Path.cwd()/generated/user-motion`, may include subdirectories, and may omit the `.trk` suffix. Relative paths must not contain `..`, and symlinks must resolve inside the user-motion root. If the exact relative file is not found, `scripts/find-user-motion` searches that root for a best `.trk` match: first a unique stem-exact match, then a unique basename/stem contains match. No match or multiple same-priority matches returns `REQUEST_INVALID`.
 
 For long or multi-part requests, use `sequence-start` and return to the user immediately. The workflow has a background worker that prepares and submits a small queue-ahead window so motion generation overlaps current playback.
 When a later user message asks for a new action, call `run-text` or a new `sequence-start`; do not append to the old sequence unless the user explicitly says to append/continue after current work.

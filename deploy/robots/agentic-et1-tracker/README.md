@@ -203,7 +203,8 @@ acceptance.
 Release policy/control assets are owned by `agentic-et1-tracker` and live under
 `deploy/robots/agentic-et1-tracker/config`:
 
-- GeneralTrackerCLN policy: `config/policy/general_tracker_cln`
+- Default GeneralTrackerCLNFootstate policy:
+  `config/policy/general_tracker_cln`
 - StandbyVelocity policy: `config/policy/velocity/v0`
 - FixStand posture: `config/posture/fixstand/v0/fixstand.yaml`
 - Passive posture: `config/posture/passive/v0/passive.yaml`
@@ -211,10 +212,13 @@ Release policy/control assets are owned by `agentic-et1-tracker` and live under
 
 Runtime configuration must point at these app-local release assets. Runtime
 does not fall back to the ET1 app tree under `deploy/robots/et1`.
-Release packages carry only the CLN tracker policy directory and omit the unused
-legacy `config/policy/general_tracker` tracker policy directory.
-The public motion input contract remains the existing `.trk` format; CLN does
-not add `.et1trk` as a service input.
+Release packages carry the `general_tracker_cln` policy directory with the
+default `multi_policy_footstate3.onnx` /
+`deploy_fut_multi_footstate.yaml` assets and the old
+`multi_policy_v17c2_70k.onnx` / `deploy.yaml` CLN compatibility assets. They
+omit the unused legacy `config/policy/general_tracker` tracker policy
+directory. The public motion input contract remains the existing `.trk` format;
+CLN/footstate does not add `.et1trk` as a service input.
 
 `standby_ref.trk` is now an app-owned release asset with simulator visual
 acceptance recorded in its manifest. Runtime playback is gated internally by

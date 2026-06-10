@@ -2,6 +2,7 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -59,6 +60,23 @@ constexpr const char* kClnHistoryObs[] = {
     "future_commands",
 };
 
+constexpr const char* kClnFootstateCurrentObs[] = {
+    "command_yaw",
+    "command_root_ori_b",
+    "command_xy_yaw_vel",
+    "command_jnt_pos",
+    "projected_gravity",
+    "base_ang_vel",
+    "joint_pos_rel",
+    "joint_vel_rel",
+    "last_action",
+    "command_foot_support_state",
+};
+
+constexpr const char* kClnFootstateHistoryObs[] = {
+    "future_command_with_foot_support_state",
+};
+
 struct TempDeploy {
   explicit TempDeploy(const std::string& yaml) {
     const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -106,6 +124,19 @@ std::string intRange(int begin, int end_exclusive) {
   return out.str();
 }
 
+std::string clipRows(double lo, double hi, int count) {
+  std::ostringstream out;
+  out << '[';
+  for (int i = 0; i < count; ++i) {
+    if (i > 0) {
+      out << ", ";
+    }
+    out << '[' << lo << ", " << hi << ']';
+  }
+  out << ']';
+  return out.str();
+}
+
 std::string obsBlock(const char* const* names, std::size_t count, int history_length) {
   std::ostringstream out;
   out << "    use_gym_history: true\n";
@@ -113,6 +144,34 @@ std::string obsBlock(const char* const* names, std::size_t count, int history_le
     out << "    " << names[i] << ":\n";
     out << "      history_length: " << history_length << "\n";
   }
+  return out.str();
+}
+
+std::string obsBlockWithMetadata(const char* const* names,
+                                 std::size_t count,
+                                 int history_length,
+                                 bool use_gym_history) {
+  std::ostringstream out;
+  out << "    use_gym_history: " << (use_gym_history ? "true" : "false") << "\n";
+  for (std::size_t i = 0; i < count; ++i) {
+    out << "    " << names[i] << ":\n";
+    out << "      params: {}\n";
+    out << "      clip: null\n";
+    out << "      scale: null\n";
+    out << "      history_length: " << history_length << "\n";
+  }
+  return out.str();
+}
+
+std::string footstateHistoryBlock(int horizon) {
+  std::ostringstream out;
+  out << "    use_gym_history: false\n";
+  out << "    " << kClnFootstateHistoryObs[0] << ":\n";
+  out << "      params:\n";
+  out << "        horizon: " << horizon << "\n";
+  out << "      clip: null\n";
+  out << "      scale: null\n";
+  out << "      history_length: 1\n";
   return out.str();
 }
 
@@ -158,6 +217,30 @@ std::string validClnDeployYaml() {
   return out.str();
 }
 
+std::string validClnFootstateDeployYaml() {
+  std::ostringstream out;
+  out << "joint_ids_map: " << intRange(0, 26) << "\n";
+  out << "sdk_joint_ids_map: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, "
+         "13, 15, 16, 17, 18, 19, 22, 23, 24, 25, 26, 29, 30]\n";
+  out << "step_dt: 0.02\n";
+  out << "default_joint_pos: " << repeatValues("0.25", 26) << "\n";
+  out << "actions:\n";
+  out << "  JointPositionAction:\n";
+  out << "    scale: " << repeatValues("0.1", 26) << "\n";
+  out << "    offset: " << repeatValues("0.0", 26) << "\n";
+  out << "policy_kp: " << repeatValues("1.0", 26) << "\n";
+  out << "policy_kd: " << repeatValues("0.1", 26) << "\n";
+  out << "observations:\n";
+  out << "  obs_current:\n";
+  out << obsBlockWithMetadata(kClnFootstateCurrentObs,
+                              sizeof(kClnFootstateCurrentObs) /
+                                  sizeof(kClnFootstateCurrentObs[0]),
+                              1, true);
+  out << "  obs_history:\n";
+  out << footstateHistoryBlock(5);
+  return out.str();
+}
+
 std::string replaceOnce(std::string yaml,
                         const std::string& needle,
                         const std::string& replacement) {
@@ -197,6 +280,7 @@ TEST_CASE("DeployConfig loads the frozen GeneralTracker deploy contract") {
   REQUIRE(config.default_joint_pos.size() == 26);
   REQUIRE(config.action_scale.size() == 26);
   REQUIRE(config.action_offset.size() == 26);
+  REQUIRE(config.action_clip.empty());
   REQUIRE(config.obs_current.size() == 11);
   REQUIRE(config.obs_history.size() == 10);
   REQUIRE(config.obs_current_terms.size() == 11);
@@ -219,6 +303,32 @@ TEST_CASE("DeployConfig loads the frozen GeneralTracker deploy contract") {
   requireTerm(config.obs_history_terms, "command_foot_support_state", 6, 93);
 }
 
+TEST_CASE("DeployConfig parses optional JointPositionAction clip") {
+  SECTION("valid per-joint clip") {
+    const std::string yaml =
+        replaceOnce(validDeployYaml(), "    offset: " + repeatValues("0.0", 26) + "\n",
+                    "    offset: " + repeatValues("0.0", 26) + "\n"
+                    "    clip: " + clipRows(-0.5, 0.75, 26) + "\n");
+
+    const DeployConfig config = loadYaml(yaml);
+
+    REQUIRE(config.action_clip.size() == 26);
+    REQUIRE(config.action_clip.at(0) == std::array<double, 2>{-0.5, 0.75});
+    REQUIRE(config.action_clip.at(25) == std::array<double, 2>{-0.5, 0.75});
+  }
+
+  SECTION("null clip is disabled") {
+    const std::string yaml =
+        replaceOnce(validDeployYaml(), "    offset: " + repeatValues("0.0", 26) + "\n",
+                    "    offset: " + repeatValues("0.0", 26) + "\n"
+                    "    clip: null\n");
+
+    const DeployConfig config = loadYaml(yaml);
+
+    REQUIRE(config.action_clip.empty());
+  }
+}
+
 TEST_CASE("DeployConfig loads the GeneralTrackerCLN observation contract") {
   const DeployConfig config = loadYaml(validClnDeployYaml());
 
@@ -236,6 +346,28 @@ TEST_CASE("DeployConfig loads the GeneralTrackerCLN observation contract") {
   requireTerm(config.obs_current_terms, "command_root_ori_b", 6, 2);
   requireTerm(config.obs_current_terms, "last_action", 26, 95);
   requireTerm(config.obs_history_terms, "future_commands", 35, 0);
+}
+
+TEST_CASE("DeployConfig loads the GeneralTrackerCLNFootstate observation contract") {
+  const DeployConfig config = loadYaml(validClnFootstateDeployYaml());
+
+  REQUIRE(config.joint_dim == 26);
+  REQUIRE(config.observation_contract == ObservationContract::GeneralTrackerCLNFootstate);
+  REQUIRE(config.obs_current.size() == 10);
+  REQUIRE(config.obs_history.size() == 1);
+  REQUIRE(config.obs_current_terms.size() == 10);
+  REQUIRE(config.obs_history_terms.size() == 1);
+  REQUIRE(config.obs_current_dim == 127);
+  REQUIRE(config.obs_history_width == 41);
+  REQUIRE(config.obs_history_length == 5);
+
+  requireTerm(config.obs_current_terms, "command_yaw", 2, 0);
+  requireTerm(config.obs_current_terms, "last_action", 26, 95);
+  requireTerm(config.obs_current_terms, "command_foot_support_state", 6, 121);
+  requireTerm(config.obs_history_terms,
+              "future_command_with_foot_support_state",
+              41,
+              0);
 }
 
 TEST_CASE("DeployConfig loads ET1 GeneralTracker override joint ids when configured") {
@@ -375,6 +507,126 @@ TEST_CASE("DeployConfig rejects observation order and metadata drift") {
   }
 }
 
+TEST_CASE("DeployConfig rejects GeneralTrackerCLNFootstate deploy drift") {
+  SECTION("missing current foot support term") {
+    const std::string yaml =
+        replaceOnce(validClnFootstateDeployYaml(),
+                    "    command_foot_support_state:\n"
+                    "      params: {}\n"
+                    "      clip: null\n"
+                    "      scale: null\n"
+                    "      history_length: 1\n",
+                    "");
+
+    REQUIRE_THROWS_WITH(loadYaml(yaml), ContainsSubstring("command_foot_support_state"));
+  }
+
+  SECTION("missing future foot support term") {
+    const std::string yaml =
+        replaceOnce(validClnFootstateDeployYaml(),
+                    "    future_command_with_foot_support_state:\n"
+                    "      params:\n"
+                    "        horizon: 5\n"
+                    "      clip: null\n"
+                    "      scale: null\n"
+                    "      history_length: 1\n",
+                    "");
+
+    REQUIRE_THROWS_AS(loadYaml(yaml), DeployConfigError);
+  }
+
+  SECTION("current term order drift") {
+    const std::string yaml =
+        replaceOnce(validClnFootstateDeployYaml(),
+                    "    last_action:\n"
+                    "      params: {}\n"
+                    "      clip: null\n"
+                    "      scale: null\n"
+                    "      history_length: 1\n"
+                    "    command_foot_support_state:\n"
+                    "      params: {}\n"
+                    "      clip: null\n"
+                    "      scale: null\n"
+                    "      history_length: 1\n",
+                    "    command_foot_support_state:\n"
+                    "      params: {}\n"
+                    "      clip: null\n"
+                    "      scale: null\n"
+                    "      history_length: 1\n"
+                    "    last_action:\n"
+                    "      params: {}\n"
+                    "      clip: null\n"
+                    "      scale: null\n"
+                    "      history_length: 1\n");
+
+    REQUIRE_THROWS_WITH(loadYaml(yaml), ContainsSubstring("observations.obs_current"));
+  }
+
+  SECTION("future horizon drift") {
+    const std::string yaml = replaceOnce(validClnFootstateDeployYaml(),
+                                         "        horizon: 5\n",
+                                         "        horizon: 6\n");
+
+    REQUIRE_THROWS_WITH(loadYaml(yaml), ContainsSubstring("horizon"));
+  }
+
+  SECTION("current use_gym_history must be true") {
+    const std::string yaml = replaceOnce(validClnFootstateDeployYaml(),
+                                         "  obs_current:\n"
+                                         "    use_gym_history: true\n",
+                                         "  obs_current:\n"
+                                         "    use_gym_history: false\n");
+
+    REQUIRE_THROWS_WITH(loadYaml(yaml), ContainsSubstring("use_gym_history"));
+  }
+
+  SECTION("future use_gym_history must be false") {
+    const std::string yaml = replaceOnce(validClnFootstateDeployYaml(),
+                                         "  obs_history:\n"
+                                         "    use_gym_history: false\n",
+                                         "  obs_history:\n"
+                                         "    use_gym_history: true\n");
+
+    REQUIRE_THROWS_WITH(loadYaml(yaml), ContainsSubstring("use_gym_history"));
+  }
+
+  SECTION("future scale must be null or absent") {
+    const std::string yaml = replaceOnce(validClnFootstateDeployYaml(),
+                                         "    future_command_with_foot_support_state:\n"
+                                         "      params:\n"
+                                         "        horizon: 5\n"
+                                         "      clip: null\n"
+                                         "      scale: null\n"
+                                         "      history_length: 1\n",
+                                         "    future_command_with_foot_support_state:\n"
+                                         "      params:\n"
+                                         "        horizon: 5\n"
+                                         "      clip: null\n"
+                                         "      scale: 1.0\n"
+                                         "      history_length: 1\n");
+
+    REQUIRE_THROWS_WITH(loadYaml(yaml), ContainsSubstring("scale"));
+  }
+
+  SECTION("future history_length must stay frozen at one") {
+    const std::string yaml = replaceOnce(validClnFootstateDeployYaml(),
+                                         "    future_command_with_foot_support_state:\n"
+                                         "      params:\n"
+                                         "        horizon: 5\n"
+                                         "      clip: null\n"
+                                         "      scale: null\n"
+                                         "      history_length: 1\n",
+                                         "    future_command_with_foot_support_state:\n"
+                                         "      params:\n"
+                                         "        horizon: 5\n"
+                                         "      clip: null\n"
+                                         "      scale: null\n"
+                                         "      history_length: 2\n");
+
+    REQUIRE_THROWS_WITH(loadYaml(yaml), ContainsSubstring("history_length"));
+  }
+}
+
 TEST_CASE("DeployConfig rejects bad fixed-width vectors") {
   SECTION("policy_kd length") {
     const std::string yaml =
@@ -390,6 +642,33 @@ TEST_CASE("DeployConfig rejects bad fixed-width vectors") {
                     "    scale: " + repeatValues("0.1", 25));
 
     REQUIRE_THROWS_WITH(loadYaml(yaml), ContainsSubstring("actions.JointPositionAction.scale"));
+  }
+
+  SECTION("action clip length") {
+    const std::string yaml =
+        replaceOnce(validDeployYaml(), "    offset: " + repeatValues("0.0", 26) + "\n",
+                    "    offset: " + repeatValues("0.0", 26) + "\n"
+                    "    clip: " + clipRows(-1.0, 1.0, 25) + "\n");
+
+    REQUIRE_THROWS_WITH(loadYaml(yaml), ContainsSubstring("actions.JointPositionAction.clip"));
+  }
+
+  SECTION("action clip row width") {
+    const std::string yaml =
+        replaceOnce(validDeployYaml(), "    offset: " + repeatValues("0.0", 26) + "\n",
+                    "    offset: " + repeatValues("0.0", 26) + "\n"
+                    "    clip: [[-1.0, 1.0, 2.0], " + clipRows(-1.0, 1.0, 25).substr(1) + "\n");
+
+    REQUIRE_THROWS_WITH(loadYaml(yaml), ContainsSubstring("actions.JointPositionAction.clip"));
+  }
+
+  SECTION("action clip inverted bounds") {
+    const std::string yaml =
+        replaceOnce(validDeployYaml(), "    offset: " + repeatValues("0.0", 26) + "\n",
+                    "    offset: " + repeatValues("0.0", 26) + "\n"
+                    "    clip: [[1.0, -1.0], " + clipRows(-1.0, 1.0, 25).substr(1) + "\n");
+
+    REQUIRE_THROWS_WITH(loadYaml(yaml), ContainsSubstring("actions.JointPositionAction.clip"));
   }
 }
 

@@ -28,6 +28,7 @@ P0_NEXT = {
     "sequence-interrupt",
     "standby",
     "fixstand",
+    "passive",
     "status",
     "urgent-stop",
     "idle-load",
@@ -44,6 +45,7 @@ DEFAULT_FIELDS = {
     "idle",
     "segments",
     "hold",
+    "matched",
     "next",
     "error",
 }
@@ -116,6 +118,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok": True, "ctrl": "standby_velocity"})
         elif self.path == "/fixstand":
             self.send_json({"ok": True, "ctrl": "fixstand"})
+        elif self.path == "/passive":
+            self.send_json({"ok": True, "ctrl": "passive"})
         elif self.path == "/stop":
             self.send_json({"ok": True, "stopped": True})
         elif self.path == "/idle":
@@ -220,13 +224,14 @@ print(json.dumps({"ok": True}))
         env.update(extra)
         return env
 
-    def cli(self, *args, env_extra=None, check=True):
+    def cli(self, *args, env_extra=None, check=True, cwd=None):
         proc = subprocess.run(
             [sys.executable, str(SCRIPT), *args],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=self.env(**(env_extra or {})),
+            cwd=cwd,
             timeout=10,
         )
         lines = proc.stdout.splitlines()
@@ -495,6 +500,75 @@ print(json.dumps({"ok": True}))
         self.assertTrue(self.tracker.records[-1][2]["hold"])
         self.assertTrue(out["hold"])
 
+    def test_run_trk_relative_path_resolves_under_user_motion_and_adds_suffix(self):
+        work = self.base / "work"
+        motion = work / "generated" / "user-motion" / "sub" / "wave.trk"
+        motion.parent.mkdir(parents=True)
+        motion.write_text("wave\n", encoding="utf-8")
+
+        out, _ = self.cli("run-trk", "sub/wave", cwd=work)
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(self.tracker.records[-1][1], "/execute")
+        self.assertEqual(self.tracker.records[-1][2]["path"], str(motion.resolve()))
+        self.assertNotIn("matched", out)
+
+    def test_run_trk_relative_best_match_uses_find_user_motion(self):
+        work = self.base / "work"
+        motion = work / "generated" / "user-motion" / "nested" / "friendly-wave.trk"
+        motion.parent.mkdir(parents=True)
+        motion.write_text("wave\n", encoding="utf-8")
+
+        out, _ = self.cli("run-trk", "wave", cwd=work)
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(self.tracker.records[-1][2]["path"], str(motion.resolve()))
+        self.assertEqual(out["matched"], {"query": "wave", "file": "nested/friendly-wave.trk"})
+
+    def test_run_trk_relative_best_match_ambiguous_is_request_invalid(self):
+        work = self.base / "work"
+        root = work / "generated" / "user-motion"
+        (root / "a").mkdir(parents=True)
+        (root / "b").mkdir(parents=True)
+        (root / "a" / "friendly-wave.trk").write_text("a\n", encoding="utf-8")
+        (root / "b" / "other-wave.trk").write_text("b\n", encoding="utf-8")
+
+        out, proc = self.cli("run-trk", "wave", cwd=work, check=False)
+
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["error"]["code"], "REQUEST_INVALID")
+        self.assertEqual([r for r in self.tracker.records if r[1] == "/execute"], [])
+
+    def test_run_trk_relative_rejects_parent_escape_and_symlink_escape(self):
+        work = self.base / "work"
+        root = work / "generated" / "user-motion"
+        root.mkdir(parents=True)
+        outside = self.base / "outside.trk"
+        outside.write_text("outside\n", encoding="utf-8")
+        os.symlink(outside, root / "escape.trk")
+
+        parent, parent_proc = self.cli("run-trk", "../outside", cwd=work, check=False)
+        symlink, symlink_proc = self.cli("run-trk", "escape", cwd=work, check=False)
+
+        self.assertNotEqual(parent_proc.returncode, 0)
+        self.assertEqual(parent["error"]["code"], "REQUEST_INVALID")
+        self.assertNotEqual(symlink_proc.returncode, 0)
+        self.assertEqual(symlink["error"]["code"], "REQUEST_INVALID")
+        self.assertEqual([r for r in self.tracker.records if r[1] == "/execute"], [])
+
+    def test_run_trk_rejects_et1trk_extension(self):
+        work = self.base / "work"
+        motion = work / "generated" / "user-motion" / "old.et1trk"
+        motion.parent.mkdir(parents=True)
+        motion.write_text("old\n", encoding="utf-8")
+
+        out, proc = self.cli("run-trk", "old.et1trk", cwd=work, check=False)
+
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(out["error"]["code"], "REQUEST_INVALID")
+        self.assertEqual([r for r in self.tracker.records if r[1] == "/execute"], [])
+
     def test_default_stage_dir_uses_tracker_config_motion_dir(self):
         old_config = os.environ.get("ET1_TRACKER_CONFIG")
         old_disable = os.environ.get("ET1_ACTION_DISABLE_TRACKER_CONFIG_DISCOVERY")
@@ -550,6 +624,28 @@ print(json.dumps({"ok": True}))
         self.assertEqual(out["cmd"], "fixstand")
         self.assertEqual(out["intent"], "explicit_stand_configuration")
         self.assertEqual(self.tracker.records[-1][1], "/fixstand")
+
+    def test_passive_requires_password(self):
+        out, proc = self.cli("passive", check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["cmd"], "passive")
+        self.assertEqual(out["error"]["code"], "REQUEST_INVALID")
+        self.assertEqual(out["next"], "fixstand")
+        self.assertEqual([r for r in self.tracker.records if r[1] == "/passive"], [])
+
+    def test_passive_posts_password_and_cancels_existing_sequence(self):
+        state_path = self.write_active_sequence()
+        out, _ = self.cli("passive", "--password", "secret")
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["cmd"], "passive")
+        self.assertEqual(out["intent"], "explicit_passive")
+        self.assertEqual(out["state"], "passive")
+        self.assertEqual(out["next"], "fixstand")
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["state"], "canceled")
+        self.assertEqual(self.tracker.records[-1][1], "/passive")
+        self.assertEqual(self.tracker.records[-1][2], {"password": "secret"})
 
     def test_status_public_alias_queries_tracker_status(self):
         out, _ = self.cli("status")

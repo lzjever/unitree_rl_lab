@@ -13,8 +13,12 @@ namespace {
 
 constexpr std::size_t kJointDim = TrkSchema::kJointDim;
 constexpr std::size_t kSdkDim = kSdkMotorCount;
+constexpr std::size_t kAnchorBodyIndex = 14;
 constexpr std::size_t kClnFutureCommandWidth = 35;
+constexpr std::size_t kClnFootstateFutureCommandWidth = 41;
 constexpr double kQuatNormEpsilon = 1.0e-12;
+const Vec kIdentityRootOriB{1.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F};
+const Vec kZeroXyYawVel{0.0F, 0.0F, 0.0F};
 
 struct Vec3 {
   double x{0.0};
@@ -119,6 +123,14 @@ Quat yawQuat(double yaw) {
   return {std::cos(yaw * 0.5), 0.0, 0.0, std::sin(yaw * 0.5)};
 }
 
+Quat angleAxisX(double radians) {
+  return {std::cos(radians * 0.5), std::sin(radians * 0.5), 0.0, 0.0};
+}
+
+Quat angleAxisZ(double radians) {
+  return yawQuat(radians);
+}
+
 double yawFromQuat(Quat q) {
   return std::atan2(2.0 * (q.w * q.z + q.x * q.y),
                     1.0 - 2.0 * (q.y * q.y + q.z * q.z));
@@ -136,11 +148,14 @@ Vec3 rotateByYaw(double yaw, Vec3 v) {
   return {c * v.x - s * v.y, s * v.x + c * v.y, v.z};
 }
 
-Quat removeYawBias(Quat q, double yaw_bias, bool no_global_mode) {
+Quat alignReferenceQuat(Quat q,
+                        const ObservationBuilderState& state,
+                        bool no_global_mode) {
   if (!no_global_mode) {
     return q;
   }
-  return normalizeQuat(multiply(yawQuat(-yaw_bias), q), "yaw-biased quaternion");
+  return normalizeQuat(multiply(yawQuat(state.ref_world_align_yaw), q),
+                       "anchor-aligned reference quaternion");
 }
 
 void rotationFirstTwoColumns(Quat q, Vec& out) {
@@ -208,6 +223,20 @@ void validateDeployConfigForBuilder(const DeployConfig& config) {
   }
 }
 
+void validateDeployConfigForState(const DeployConfig& config) {
+  requireExactSize("DeployConfig.joint_dim", config.joint_dim, kJointDim);
+  requireExactSize("DeployConfig.sdk_joint_ids_map", config.sdk_joint_ids_map.size(),
+                   kJointDim);
+
+  for (std::size_t i = 0; i < config.sdk_joint_ids_map.size(); ++i) {
+    const int sdk_index = config.sdk_joint_ids_map[i];
+    if (sdk_index < 0 || sdk_index >= static_cast<int>(kSdkDim)) {
+      throw error("DeployConfig.sdk_joint_ids_map[" + std::to_string(i) +
+                  "] is outside the SDK motor slots");
+    }
+  }
+}
+
 void validateLastAction(const Vec& last_action) {
   requireExactSize("last_action", last_action.size(), kJointDim);
 }
@@ -220,6 +249,47 @@ Vec projectedGravity(Quat robot_q) {
 
 Vec baseAngularVelocity(const LowStateSample& low_state) {
   return {low_state.gyro[0], low_state.gyro[1], low_state.gyro[2]};
+}
+
+Quat bodyQuat(const TrkFrameView& frame, std::size_t body_index, const std::string& field) {
+  requireView(field, frame.body_quat_w, (body_index + 1) * 4);
+  const std::size_t offset = body_index * 4;
+  return normalizeQuat({frame.body_quat_w.ptr[offset + 0],
+                        frame.body_quat_w.ptr[offset + 1],
+                        frame.body_quat_w.ptr[offset + 2],
+                        frame.body_quat_w.ptr[offset + 3]},
+                       field);
+}
+
+std::array<double, kJointDim> zeroPolicyJointPositions() {
+  std::array<double, kJointDim> joint_pos{};
+  return joint_pos;
+}
+
+std::array<double, kJointDim> policyJointPositions(const DeployConfig& config,
+                                                   const LowStateSample& low_state) {
+  validateDeployConfigForState(config);
+  std::array<double, kJointDim> joint_pos{};
+  for (std::size_t policy_index = 0; policy_index < kJointDim; ++policy_index) {
+    const auto sdk_index = static_cast<std::size_t>(config.sdk_joint_ids_map[policy_index]);
+    joint_pos[policy_index] = low_state.motors[sdk_index].q;
+  }
+  return joint_pos;
+}
+
+Quat robotAnchorQuat(Quat robot_root_q,
+                     const std::array<double, kJointDim>& policy_joint_pos) {
+  Quat q = normalizeQuat(robot_root_q, "robot_anchor.root_quat");
+  q = multiply(q, angleAxisX(policy_joint_pos[12]));
+  q = multiply(q, angleAxisZ(policy_joint_pos[13]));
+  return normalizeQuat(q, "robot_anchor quaternion");
+}
+
+double anchorFrameOffsetYaw(Quat ref_anchor_q, Quat robot_anchor_q) {
+  const Quat offset_q =
+      normalizeQuat(multiply(robot_anchor_q, conjugate(ref_anchor_q)),
+                    "anchor frame offset quaternion");
+  return yawFromQuat(offset_q);
 }
 
 std::array<bool, kJointDim> overrideJointMask(const DeployConfig& config) {
@@ -268,8 +338,8 @@ Vec commandVelocity(const TrkFrameView& frame,
   Vec3 ang = rootVector("body_ang_vel_w", frame.body_ang_vel_w);
 
   if (builder_config.no_global_mode) {
-    lin = rotateByYaw(-state.first_ref_root_yaw, lin);
-    ang = rotateByYaw(-state.first_ref_root_yaw, ang);
+    lin = rotateByYaw(state.ref_world_align_yaw, lin);
+    ang = rotateByYaw(state.ref_world_align_yaw, ang);
   }
 
   const double current_ref_yaw = yawFromQuat(ref_q);
@@ -285,10 +355,9 @@ FrameKinematics frameKinematics(const TrkFrameView& frame,
                                 const ObservationBuilderConfig& builder_config) {
   const Quat ref_q_raw = quatFromView(frame.body_quat_w, "body_quat_w");
   const Quat robot_q_raw = quatFromArray(low_state.quat_wxyz, "low_state.quat_wxyz");
-  const Quat ref_q = removeYawBias(ref_q_raw, state.first_ref_root_yaw,
-                                   builder_config.no_global_mode);
-  const Quat robot_q = removeYawBias(robot_q_raw, state.entry_robot_yaw,
-                                     builder_config.no_global_mode);
+  const Quat ref_q =
+      alignReferenceQuat(ref_q_raw, state, builder_config.no_global_mode);
+  const Quat robot_q = robot_q_raw;
   const Quat relative_q =
       normalizeQuat(multiply(conjugate(robot_q), ref_q), "command_root_ori_b quaternion");
   return {ref_q, robot_q, relative_q};
@@ -312,21 +381,28 @@ void appendFutureCommand(const TrkFrameView& future_frame,
                          Quat robot_q,
                          Vec& out,
                          const ObservationBuilderState& state,
-                         const ObservationBuilderConfig& builder_config) {
+                         const ObservationBuilderConfig& builder_config,
+                         bool force_motion_root_velocity) {
   const Quat future_ref_q_raw = quatFromView(future_frame.body_quat_w,
                                              "future_commands.body_quat_w");
-  const Quat future_ref_q = removeYawBias(future_ref_q_raw, state.first_ref_root_yaw,
-                                          builder_config.no_global_mode);
+  const Quat future_ref_q =
+      alignReferenceQuat(future_ref_q_raw, state, builder_config.no_global_mode);
   const Quat future_relative_q =
       normalizeQuat(multiply(conjugate(robot_q), future_ref_q),
                     "future_commands.root_ori_b quaternion");
 
   Vec future_root_ori_b;
-  rotationFirstTwoColumns(future_relative_q, future_root_ori_b);
+  if (force_motion_root_velocity || builder_config.use_motion_root_command) {
+    rotationFirstTwoColumns(future_relative_q, future_root_ori_b);
+  } else {
+    future_root_ori_b = kIdentityRootOriB;
+  }
   out.insert(out.end(), future_root_ori_b.begin(), future_root_ori_b.end());
 
   const Vec future_xy_yaw_vel =
-      commandVelocity(future_frame, future_ref_q, state, builder_config);
+      (force_motion_root_velocity || builder_config.use_motion_velocity_command)
+          ? commandVelocity(future_frame, future_ref_q, state, builder_config)
+          : kZeroXyYawVel;
   out.insert(out.end(), future_xy_yaw_vel.begin(), future_xy_yaw_vel.end());
 
   const Vec future_joint_pos = copyView("future_commands.joint_pos",
@@ -344,8 +420,14 @@ Vec futureCommands(const DeployConfig& config,
     throw error("track must contain at least one frame");
   }
   const std::size_t expected_size = config.obs_history_length * config.obs_history_width;
-  if (config.obs_history_width != kClnFutureCommandWidth) {
-    throw error("GeneralTrackerCLN future command width must be 35");
+  const bool include_foot_support =
+      config.observation_contract == ObservationContract::GeneralTrackerCLNFootstate;
+  const std::size_t expected_width =
+      include_foot_support ? kClnFootstateFutureCommandWidth : kClnFutureCommandWidth;
+  if (config.obs_history_width != expected_width) {
+    std::ostringstream out;
+    out << "CLN future command width must be " << expected_width;
+    throw error(out.str());
   }
 
   Vec out;
@@ -353,18 +435,22 @@ Vec futureCommands(const DeployConfig& config,
   for (std::size_t horizon_idx = 0; horizon_idx < config.obs_history_length; ++horizon_idx) {
     const std::size_t future_frame_index =
         std::min(frame_index + horizon_idx + 1, track.metadata.frames - 1);
-    appendFutureCommand(requireTrackFrame(track, future_frame_index), robot_q, out,
-                        state, builder_config);
+    const TrkFrameView future_frame = requireTrackFrame(track, future_frame_index);
+    appendFutureCommand(future_frame, robot_q, out, state, builder_config,
+                        include_foot_support);
+    if (include_foot_support) {
+      const Vec future_support = supportState(future_frame);
+      out.insert(out.end(), future_support.begin(), future_support.end());
+    }
   }
   requireExactSize("future_commands", out.size(), expected_size);
   return out;
 }
 
-}  // namespace
-
-ObservationBuilderState makeObservationBuilderState(
+ObservationBuilderState makeObservationBuilderStateWithJoints(
     const TrkFrameView& first_frame,
     const LowStateSample& entry_low_state,
+    const std::array<double, kJointDim>& entry_policy_joint_pos,
     const ObservationBuilderConfig& config) {
   ObservationBuilderState state;
   const Quat first_ref_q = quatFromView(first_frame.body_quat_w, "body_quat_w");
@@ -375,7 +461,42 @@ ObservationBuilderState makeObservationBuilderState(
 
   state.first_ref_root_yaw = yawFromQuat(first_ref_q);
   state.entry_robot_yaw = yawFromQuat(entry_robot_q);
+  const Quat ref_anchor_q =
+      bodyQuat(first_frame, kAnchorBodyIndex, "body_quat_w anchor body");
+  const Quat robot_anchor_q = robotAnchorQuat(entry_robot_q, entry_policy_joint_pos);
+  state.ref_world_align_yaw = anchorFrameOffsetYaw(ref_anchor_q, robot_anchor_q);
   return state;
+}
+
+}  // namespace
+
+ObservationBuilderConfig defaultObservationBuilderConfig(const DeployConfig& config) {
+  ObservationBuilderConfig builder_config;
+  if (config.observation_contract == ObservationContract::GeneralTracker) {
+    builder_config.use_motion_root_command = true;
+    builder_config.use_motion_velocity_command = true;
+  }
+  return builder_config;
+}
+
+ObservationBuilderState makeObservationBuilderState(
+    const TrkFrameView& first_frame,
+    const LowStateSample& entry_low_state,
+    const ObservationBuilderConfig& config) {
+  const std::array<double, kJointDim> joint_pos = zeroPolicyJointPositions();
+  return makeObservationBuilderStateWithJoints(first_frame, entry_low_state, joint_pos,
+                                               config);
+}
+
+ObservationBuilderState makeObservationBuilderState(
+    const DeployConfig& deploy_config,
+    const TrkFrameView& first_frame,
+    const LowStateSample& entry_low_state,
+    const ObservationBuilderConfig& config) {
+  const std::array<double, kJointDim> joint_pos =
+      policyJointPositions(deploy_config, entry_low_state);
+  return makeObservationBuilderStateWithJoints(first_frame, entry_low_state, joint_pos,
+                                               config);
 }
 
 PolicyObservationParts buildObservationParts(
@@ -393,16 +514,26 @@ PolicyObservationParts buildObservationParts(
 
   PolicyObservationParts parts;
   parts.command_yaw = commandYaw(kinematics.ref_q, kinematics.robot_q);
-  rotationFirstTwoColumns(kinematics.relative_q, parts.command_root_ori_b);
-  parts.command_xy_yaw_vel = commandVelocity(frame, kinematics.ref_q, state, builder_config);
+  if (builder_config.use_motion_root_command) {
+    rotationFirstTwoColumns(kinematics.relative_q, parts.command_root_ori_b);
+  } else {
+    parts.command_root_ori_b = kIdentityRootOriB;
+  }
+  parts.command_xy_yaw_vel =
+      builder_config.use_motion_velocity_command
+          ? commandVelocity(frame, kinematics.ref_q, state, builder_config)
+          : kZeroXyYawVel;
   parts.command_jnt_pos = copyView("joint_pos", frame.joint_pos, kJointDim);
   parts.projected_gravity = projectedGravity(kinematics.robot_q);
   parts.base_ang_vel = baseAngularVelocity(low_state);
   fillJointObservations(config, low_state, parts.command_jnt_pos, parts.joint_pos_rel,
                         parts.joint_vel_rel);
   parts.last_action = last_action;
-  if (config.observation_contract == ObservationContract::GeneralTracker) {
+  if (config.observation_contract == ObservationContract::GeneralTracker ||
+      config.observation_contract == ObservationContract::GeneralTrackerCLNFootstate) {
     parts.command_foot_support_state = supportState(frame);
+  }
+  if (config.observation_contract == ObservationContract::GeneralTracker) {
     parts.ref_com_rel_navi = copyView("ref_com_rel_navi", frame.ref_com_rel_navi, 3);
     parts.ref_com_vel_navi = copyView("ref_com_vel_navi", frame.ref_com_vel_navi, 3);
   }
@@ -420,7 +551,8 @@ PolicyObservationParts buildObservationParts(
   const TrkFrameView frame = requireTrackFrame(track, frame_index);
   PolicyObservationParts parts =
       buildObservationParts(config, frame, low_state, last_action, state, builder_config);
-  if (config.observation_contract == ObservationContract::GeneralTrackerCLN) {
+  if (config.observation_contract == ObservationContract::GeneralTrackerCLN ||
+      config.observation_contract == ObservationContract::GeneralTrackerCLNFootstate) {
     const FrameKinematics kinematics =
         frameKinematics(frame, low_state, state, builder_config);
     parts.future_commands =

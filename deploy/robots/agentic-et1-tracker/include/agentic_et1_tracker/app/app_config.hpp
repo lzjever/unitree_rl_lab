@@ -12,10 +12,10 @@
 namespace agentic_et1_tracker {
 
 struct PolicyConfig {
-  std::string profile{"GeneralTrackerCLN"};
+  std::string profile{"GeneralTrackerCLNFootstate"};
   std::string policy_dir{"config/policy/general_tracker_cln"};
-  std::string policy_file{"multi_policy_v17c2_70k.onnx"};
-  std::string deploy{"config/policy/general_tracker_cln/params/deploy.yaml"};
+  std::string policy_file{"multi_policy_footstate3.onnx"};
+  std::string deploy{"config/policy/general_tracker_cln/params/deploy_fut_multi_footstate.yaml"};
   double fps{50.0};
 };
 

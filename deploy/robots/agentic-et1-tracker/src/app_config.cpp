@@ -17,7 +17,8 @@ namespace agentic_et1_tracker {
 namespace {
 
 constexpr const char* kRootKey = "agentic_et1_tracker";
-constexpr const char* kPolicyProfile = "GeneralTrackerCLN";
+constexpr const char* kFootstatePolicyProfile = "GeneralTrackerCLNFootstate";
+constexpr const char* kClnPolicyProfile = "GeneralTrackerCLN";
 constexpr const char* kLegacyPolicyProfile = "GeneralTracker";
 constexpr const char* kStartupFixStand = "FixStand";
 constexpr const char* kStartupStandbyVelocity = "StandbyVelocity";
@@ -300,6 +301,19 @@ void validatePolicyFile(const std::string& value) {
   }
 }
 
+std::optional<ObservationContract> expectedContractForProfile(const std::string& profile) {
+  if (profile == kFootstatePolicyProfile) {
+    return ObservationContract::GeneralTrackerCLNFootstate;
+  }
+  if (profile == kClnPolicyProfile) {
+    return ObservationContract::GeneralTrackerCLN;
+  }
+  if (profile == kLegacyPolicyProfile) {
+    return ObservationContract::GeneralTracker;
+  }
+  return std::nullopt;
+}
+
 void validatePolicyProfileDeployContract(const PolicyConfig& policy) {
   std::error_code ec;
   if (!std::filesystem::is_regular_file(policy.deploy, ec)) {
@@ -313,10 +327,8 @@ void validatePolicyProfileDeployContract(const PolicyConfig& policy) {
     throw error(std::string("policy.deploy invalid: ") + err.what());
   }
 
-  const bool profile_is_cln = policy.profile == kPolicyProfile;
-  const bool deploy_is_cln =
-      deploy_config.observation_contract == ObservationContract::GeneralTrackerCLN;
-  if (profile_is_cln != deploy_is_cln) {
+  const auto expected_contract = expectedContractForProfile(policy.profile);
+  if (!expected_contract || deploy_config.observation_contract != *expected_contract) {
     throw error("policy.profile must match deploy observation contract");
   }
 }
@@ -423,9 +435,10 @@ AppConfig loadAppConfig(const std::filesystem::path& path) {
         throw error("policy must be a map");
       }
       config.policy.profile = optionalString(policy, "profile", config.policy.profile);
-      if (config.policy.profile != kPolicyProfile &&
-          config.policy.profile != kLegacyPolicyProfile) {
-        throw error("policy.profile must be GeneralTrackerCLN or GeneralTracker");
+      if (!expectedContractForProfile(config.policy.profile)) {
+        throw error(
+            "policy.profile must be GeneralTrackerCLNFootstate, GeneralTrackerCLN, or "
+            "GeneralTracker");
       }
       config.policy.policy_dir =
           optionalString(policy, "policy_dir", config.policy.policy_dir);

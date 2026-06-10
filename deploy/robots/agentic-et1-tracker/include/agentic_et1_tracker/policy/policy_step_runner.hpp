@@ -36,15 +36,24 @@ class PolicyStepRunner {
   PolicyStepRunner(const DeployConfig& config,
                    TrkTrack track,
                    const LowStateSample& entry_low_state,
+                   std::uint8_t expected_mode_machine);
+  PolicyStepRunner(const DeployConfig& config,
+                   TrkTrack track,
+                   const LowStateSample& entry_low_state,
                    std::uint8_t expected_mode_machine,
-                   ObservationBuilderConfig builder_config = {});
+                   ObservationBuilderConfig builder_config);
+  PolicyStepRunner(const DeployConfig& config,
+                   std::shared_ptr<const TrkTrack> track,
+                   const LowStateSample& entry_low_state,
+                   std::uint8_t expected_mode_machine);
   PolicyStepRunner(const DeployConfig& config,
                    std::shared_ptr<const TrkTrack> track,
                    const LowStateSample& entry_low_state,
                    std::uint8_t expected_mode_machine,
-                   ObservationBuilderConfig builder_config = {});
+                   ObservationBuilderConfig builder_config);
 
   void reset(const LowStateSample& entry_low_state);
+  void recalibrateObservationAnchor(const LowStateSample& low_state);
 
   PolicyStepResult step(std::size_t frame_index,
                         const LowStateSample& low_state,

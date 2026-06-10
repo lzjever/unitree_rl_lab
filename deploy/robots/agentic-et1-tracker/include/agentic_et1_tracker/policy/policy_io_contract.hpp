@@ -17,6 +17,9 @@ inline constexpr std::size_t kGaPolicyObsHistoryWidth = 105;
 inline constexpr std::size_t kClnPolicyObsCurrentDim = 121;
 inline constexpr std::size_t kClnPolicyObsHistoryLength = 25;
 inline constexpr std::size_t kClnPolicyObsHistoryWidth = 35;
+inline constexpr std::size_t kClnFootstatePolicyObsCurrentDim = 127;
+inline constexpr std::size_t kClnFootstatePolicyObsHistoryLength = 5;
+inline constexpr std::size_t kClnFootstatePolicyObsHistoryWidth = 41;
 
 enum class PolicyTensorElementType {
   Float32,

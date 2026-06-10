@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <filesystem>
 #include <stdexcept>
@@ -17,6 +18,7 @@ struct ObservationTerm {
 enum class ObservationContract {
   GeneralTracker,
   GeneralTrackerCLN,
+  GeneralTrackerCLNFootstate,
 };
 
 struct DeployConfig {
@@ -30,6 +32,7 @@ struct DeployConfig {
   std::vector<double> default_joint_pos;
   std::vector<double> action_scale;
   std::vector<double> action_offset;
+  std::vector<std::array<double, 2>> action_clip;
   std::vector<std::string> obs_current;
   std::vector<std::string> obs_history;
   std::vector<ObservationTerm> obs_current_terms;

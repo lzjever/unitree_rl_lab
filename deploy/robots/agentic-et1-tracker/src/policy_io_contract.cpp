@@ -82,6 +82,29 @@ const std::array<ExpectedObservationTerm, 1>& expectedClnHistoryTerms() {
   return values;
 }
 
+const std::array<ExpectedObservationTerm, 10>& expectedClnFootstateCurrentTerms() {
+  static constexpr std::array<ExpectedObservationTerm, 10> values{{
+      {"command_yaw", 2},
+      {"command_root_ori_b", 6},
+      {"command_xy_yaw_vel", 3},
+      {"command_jnt_pos", kGaPolicyJointDim},
+      {"projected_gravity", 3},
+      {"base_ang_vel", 3},
+      {"joint_pos_rel", kGaPolicyJointDim},
+      {"joint_vel_rel", kGaPolicyJointDim},
+      {"last_action", kGaPolicyJointDim},
+      {"command_foot_support_state", 6},
+  }};
+  return values;
+}
+
+const std::array<ExpectedObservationTerm, 1>& expectedClnFootstateHistoryTerms() {
+  static constexpr std::array<ExpectedObservationTerm, 1> values{{
+      {"future_command_with_foot_support_state", kClnFootstatePolicyObsHistoryWidth},
+  }};
+  return values;
+}
+
 PolicyIoContractError error(const std::string& message) {
   return PolicyIoContractError("policy io contract error: " + message);
 }
@@ -155,6 +178,23 @@ void requireFiniteDoubles(const std::string& field,
   }
 }
 
+void requireActionClip(const DeployConfig& config) {
+  if (config.action_clip.empty()) {
+    return;
+  }
+  requireSize("action_clip", config.action_clip.size(), kGaPolicyJointDim);
+  for (std::size_t i = 0; i < config.action_clip.size(); ++i) {
+    const std::string field = "action_clip[" + std::to_string(i) + "]";
+    const auto& clip = config.action_clip[i];
+    if (!std::isfinite(clip[0]) || !std::isfinite(clip[1])) {
+      throw error(field + " must be finite");
+    }
+    if (clip[0] > clip[1]) {
+      throw error(field + " min must be <= max");
+    }
+  }
+}
+
 template <std::size_t N>
 void requireFrozenObservationTerms(
     const std::string& field,
@@ -198,31 +238,47 @@ void validateGaDeployConfig(const DeployConfig& config) {
   requireFiniteDoubles("default_joint_pos", config.default_joint_pos, false);
   requireFiniteDoubles("action_offset", config.action_offset, false);
   requireFiniteDoubles("action_scale", config.action_scale, true);
+  requireActionClip(config);
   requireFiniteDoubles("policy_kp", config.policy_kp, true);
   requireFiniteDoubles("policy_kd", config.policy_kd, true);
   requireFrozenMap("joint_ids_map", config.joint_ids_map, expectedJointIdsMap());
   requireFrozenMap("sdk_joint_ids_map", config.sdk_joint_ids_map,
                    expectedSdkJointIdsMap());
-  if (config.observation_contract == ObservationContract::GeneralTrackerCLN) {
-    requireSize("obs_current_dim", config.obs_current_dim, kClnPolicyObsCurrentDim);
-    requireSize("obs_history_width", config.obs_history_width,
-                kClnPolicyObsHistoryWidth);
-    requireSize("obs_history_length", config.obs_history_length,
-                kClnPolicyObsHistoryLength);
-    requireFrozenObservationTerms("obs_current_terms", config.obs_current_terms,
-                                  expectedClnCurrentTerms());
-    requireFrozenObservationTerms("obs_history_terms", config.obs_history_terms,
-                                  expectedClnHistoryTerms());
-  } else {
-    requireSize("obs_current_dim", config.obs_current_dim, kGaPolicyObsCurrentDim);
-    requireSize("obs_history_width", config.obs_history_width,
-                kGaPolicyObsHistoryWidth);
-    requireSize("obs_history_length", config.obs_history_length,
-                kGaPolicyObsHistoryLength);
-    requireFrozenObservationTerms("obs_current_terms", config.obs_current_terms,
-                                  expectedCurrentTerms());
-    requireFrozenObservationTerms("obs_history_terms", config.obs_history_terms,
-                                  expectedHistoryTerms());
+  switch (config.observation_contract) {
+    case ObservationContract::GeneralTracker:
+      requireSize("obs_current_dim", config.obs_current_dim, kGaPolicyObsCurrentDim);
+      requireSize("obs_history_width", config.obs_history_width,
+                  kGaPolicyObsHistoryWidth);
+      requireSize("obs_history_length", config.obs_history_length,
+                  kGaPolicyObsHistoryLength);
+      requireFrozenObservationTerms("obs_current_terms", config.obs_current_terms,
+                                    expectedCurrentTerms());
+      requireFrozenObservationTerms("obs_history_terms", config.obs_history_terms,
+                                    expectedHistoryTerms());
+      break;
+    case ObservationContract::GeneralTrackerCLN:
+      requireSize("obs_current_dim", config.obs_current_dim, kClnPolicyObsCurrentDim);
+      requireSize("obs_history_width", config.obs_history_width,
+                  kClnPolicyObsHistoryWidth);
+      requireSize("obs_history_length", config.obs_history_length,
+                  kClnPolicyObsHistoryLength);
+      requireFrozenObservationTerms("obs_current_terms", config.obs_current_terms,
+                                    expectedClnCurrentTerms());
+      requireFrozenObservationTerms("obs_history_terms", config.obs_history_terms,
+                                    expectedClnHistoryTerms());
+      break;
+    case ObservationContract::GeneralTrackerCLNFootstate:
+      requireSize("obs_current_dim", config.obs_current_dim,
+                  kClnFootstatePolicyObsCurrentDim);
+      requireSize("obs_history_width", config.obs_history_width,
+                  kClnFootstatePolicyObsHistoryWidth);
+      requireSize("obs_history_length", config.obs_history_length,
+                  kClnFootstatePolicyObsHistoryLength);
+      requireFrozenObservationTerms("obs_current_terms", config.obs_current_terms,
+                                    expectedClnFootstateCurrentTerms());
+      requireFrozenObservationTerms("obs_history_terms", config.obs_history_terms,
+                                    expectedClnFootstateHistoryTerms());
+      break;
   }
 }
 

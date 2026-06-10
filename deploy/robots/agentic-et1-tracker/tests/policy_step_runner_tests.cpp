@@ -24,15 +24,29 @@ constexpr std::size_t kBodyCount = TrkSchema::kBodyCount;
 constexpr std::size_t kHistoryLength = 25;
 constexpr std::size_t kHistoryWidth = 105;
 constexpr std::size_t kClnHistoryWidth = 35;
+constexpr std::size_t kClnFootstateHistoryLength = 5;
+constexpr std::size_t kClnFootstateHistoryWidth = 41;
 constexpr std::size_t kObsCurrentLastActionOffset = 93;
 constexpr std::size_t kClnObsCurrentLastActionOffset = 95;
+constexpr std::size_t kClnFootstateCurrentFootOffset = 121;
+constexpr std::size_t kObsCurrentRootOffset = 0;
+constexpr std::size_t kObsCurrentVelocityOffset = 6;
+constexpr std::size_t kClnObsCurrentRootOffset = 2;
+constexpr std::size_t kClnObsCurrentVelocityOffset = 8;
 constexpr std::size_t kObsCurrentCommandJointOffset = 9;
 constexpr std::size_t kObsHistoryCommandJointOffset = 9;
 constexpr std::size_t kClnFutureCommandJointOffset = 9;
+constexpr std::size_t kClnFootstateFutureFootOffset = 35;
 constexpr float kPi = 3.14159265358979323846F;
 
 std::array<float, 4> yawQuat(float radians) {
   return {std::cos(radians * 0.5F), 0.0F, 0.0F, std::sin(radians * 0.5F)};
+}
+
+Vec rootOriFromYaw(float yaw) {
+  const float c = std::cos(yaw);
+  const float s = std::sin(yaw);
+  return {c, -s, s, c, 0.0F, 0.0F};
 }
 
 Vec seq(float start, std::size_t count) {
@@ -132,6 +146,30 @@ DeployConfig validClnConfig() {
   return config;
 }
 
+DeployConfig validClnFootstateConfig() {
+  DeployConfig config = validConfig();
+  config.observation_contract = ObservationContract::GeneralTrackerCLNFootstate;
+  config.obs_current_terms = terms({
+      {"command_yaw", 2},
+      {"command_root_ori_b", 6},
+      {"command_xy_yaw_vel", 3},
+      {"command_jnt_pos", kJointDim},
+      {"projected_gravity", 3},
+      {"base_ang_vel", 3},
+      {"joint_pos_rel", kJointDim},
+      {"joint_vel_rel", kJointDim},
+      {"last_action", kJointDim},
+      {"command_foot_support_state", 6},
+  });
+  config.obs_history_terms = terms({
+      {"future_command_with_foot_support_state", kClnFootstateHistoryWidth},
+  });
+  config.obs_current_dim = 127;
+  config.obs_history_width = kClnFootstateHistoryWidth;
+  config.obs_history_length = kClnFootstateHistoryLength;
+  return config;
+}
+
 void resizeFloatArray(TrkFloatArray& array,
                       std::size_t frames,
                       std::size_t frame_size) {
@@ -218,6 +256,17 @@ void setRootQuat(TrkTrack& track,
   }
 }
 
+void setBodyQuat(TrkTrack& track,
+                 std::size_t frame_index,
+                 std::size_t body_index,
+                 const std::array<float, 4>& quat_wxyz) {
+  const std::size_t offset =
+      frame_index * track.body_quat_w.frame_size + body_index * 4;
+  for (std::size_t i = 0; i < quat_wxyz.size(); ++i) {
+    track.body_quat_w.values.at(offset + i) = quat_wxyz[i];
+  }
+}
+
 void setRootLinVel(TrkTrack& track, std::size_t frame_index, float x, float y, float z) {
   const std::size_t offset = frame_index * track.body_lin_vel_w.frame_size;
   track.body_lin_vel_w.values.at(offset) = x;
@@ -245,6 +294,8 @@ LowStateSample liveState(const DeployConfig& config) {
     low.motors.at(sdk_slot).q = 10.0F + static_cast<float>(policy_index);
     low.motors.at(sdk_slot).dq = 20.0F + static_cast<float>(policy_index);
   }
+  low.motors.at(static_cast<std::size_t>(config.sdk_joint_ids_map.at(12))).q = 0.0F;
+  low.motors.at(static_cast<std::size_t>(config.sdk_joint_ids_map.at(13))).q = 0.0F;
   return low;
 }
 
@@ -289,6 +340,22 @@ void requireClnFutureJointRow(const Vec& history,
   requireSliceApprox(history,
                      row * kClnHistoryWidth + kClnFutureCommandJointOffset,
                      seq(joint_base, kJointDim));
+}
+
+void requireClnFootstateFutureJointRow(const Vec& history,
+                                       std::size_t row,
+                                       float joint_base) {
+  requireSliceApprox(history,
+                     row * kClnFootstateHistoryWidth + kClnFutureCommandJointOffset,
+                     seq(joint_base, kJointDim));
+}
+
+void requireClnFootstateFutureFootRow(const Vec& history,
+                                      std::size_t row,
+                                      const Vec& expected) {
+  requireSliceApprox(history,
+                     row * kClnFootstateHistoryWidth + kClnFootstateFutureFootOffset,
+                     expected);
 }
 
 template <typename Fn>
@@ -337,7 +404,7 @@ TEST_CASE("PolicyStepRunner first step uses zero last action and emits scaled Lo
   REQUIRE(result.low_cmd.mode_machine == 7);
 }
 
-TEST_CASE("PolicyStepRunner overlays active track LowCmd on a base frame") {
+TEST_CASE("PolicyStepRunner clears base-frame commands for active track LowCmd") {
   const DeployConfig config = validConfig();
   const TrkTrack track = makeTrack(1);
   const LowStateSample low = liveState(config);
@@ -358,10 +425,10 @@ TEST_CASE("PolicyStepRunner overlays active track LowCmd on a base frame") {
   REQUIRE(result.low_cmd.mode_machine == 7);
   REQUIRE(result.low_cmd.motors.at(14).mode == base.motors.at(14).mode);
   REQUIRE(result.low_cmd.motors.at(14).q == base.motors.at(14).q);
-  REQUIRE(result.low_cmd.motors.at(14).dq == base.motors.at(14).dq);
-  REQUIRE(result.low_cmd.motors.at(14).kp == base.motors.at(14).kp);
-  REQUIRE(result.low_cmd.motors.at(14).kd == base.motors.at(14).kd);
-  REQUIRE(result.low_cmd.motors.at(14).tau == base.motors.at(14).tau);
+  REQUIRE(result.low_cmd.motors.at(14).dq == 0.0F);
+  REQUIRE(result.low_cmd.motors.at(14).kp == 0.0F);
+  REQUIRE(result.low_cmd.motors.at(14).kd == 0.0F);
+  REQUIRE(result.low_cmd.motors.at(14).tau == 0.0F);
 
   const auto mapped_slot = static_cast<std::size_t>(config.sdk_joint_ids_map.at(0));
   REQUIRE(result.low_cmd.motors.at(mapped_slot).q != base.motors.at(mapped_slot).q);
@@ -392,9 +459,83 @@ TEST_CASE("PolicyStepRunner second step feeds prior action and oldest-to-newest 
                          frameJointBase(1));
 }
 
+TEST_CASE("PolicyStepRunner defaults GeneralTracker to motion root and velocity commands") {
+  const DeployConfig config = validConfig();
+  TrkTrack track = makeTrack(2);
+  setRootQuat(track, 1, yawQuat(kPi * 0.5F));
+  setRootLinVel(track, 1, 2.0F, -3.0F, 9.0F);
+  setRootAngVel(track, 1, 0.0F, 0.0F, 0.75F);
+  const LowStateSample low = liveState(config);
+  PolicyStepRunner runner(config, track, low, 7);
+  RecordingPolicy policy(Vec(kJointDim, 0.0F));
+
+  const PolicyStepResult result = runner.step(1, low, policy);
+
+  requireSliceApprox(result.inputs.obs_current,
+                     kObsCurrentRootOffset,
+                     {0.0F, -1.0F, 1.0F, 0.0F, 0.0F, 0.0F});
+  requireSliceApprox(result.inputs.obs_current,
+                     kObsCurrentVelocityOffset,
+                     {-3.0F, -2.0F, 0.75F});
+}
+
+TEST_CASE("PolicyStepRunner reset uses ET1 anchor yaw from body14 and mapped robot joint13") {
+  DeployConfig config = validConfig();
+  config.sdk_joint_ids_map = {30, 29, 26, 25, 24, 23, 22, 19, 18, 17, 16, 15, 13,
+                              12, 11, 10, 9,  8,  7,  6,  5,  4,  3,  2,  1,  0};
+  TrkTrack track = makeTrack(1);
+  setRootQuat(track, 0, yawQuat(0.75F));
+  setBodyQuat(track, 0, 14, yawQuat(-0.25F));
+
+  LowStateSample low = liveState(config);
+  low.motors.at(static_cast<std::size_t>(config.sdk_joint_ids_map.at(12))).q = 0.0F;
+  low.motors.at(static_cast<std::size_t>(config.sdk_joint_ids_map.at(13))).q = 0.40F;
+  PolicyStepRunner runner(config, track, low, 7);
+  RecordingPolicy policy(Vec(kJointDim, 0.0F));
+
+  const PolicyStepResult result = runner.step(0, low, policy);
+
+  const float expected_offset = 0.40F - -0.25F;
+  requireSliceApprox(result.inputs.obs_current,
+                     kObsCurrentRootOffset,
+                     rootOriFromYaw(expected_offset + 0.75F));
+}
+
+TEST_CASE("PolicyStepRunner observation reanchor preserves last action and history") {
+  const DeployConfig config = validConfig();
+  TrkTrack track = makeTrack(2);
+  setRootQuat(track, 0, yawQuat(0.0F));
+  setRootQuat(track, 1, yawQuat(0.0F));
+  setBodyQuat(track, 0, 14, yawQuat(0.0F));
+
+  const LowStateSample low = liveState(config);
+  PolicyStepRunner runner(config, track, low, 7);
+  const Vec raw0 = seq(0.25F, kJointDim);
+  RecordingPolicy policy(raw0);
+
+  runner.step(0, low, policy);
+
+  LowStateSample reanchor_low = low;
+  reanchor_low.quat_wxyz = yawQuat(0.5F);
+  runner.recalibrateObservationAnchor(reanchor_low);
+
+  policy.next_raw = seq(1.25F, kJointDim);
+  const PolicyStepResult result = runner.step(1, reanchor_low, policy);
+
+  requireSliceApprox(result.inputs.obs_current, kObsCurrentLastActionOffset, raw0);
+  requireHistoryJointRow(result.inputs.obs_history, 0, frameJointBase(0));
+  requireHistoryJointRow(result.inputs.obs_history, kHistoryLength - 1,
+                         frameJointBase(1));
+  requireSliceApprox(result.inputs.obs_current, kObsCurrentRootOffset,
+                     rootOriFromYaw(0.0F));
+}
+
 TEST_CASE("PolicyStepRunner builds GeneralTrackerCLN future_commands from .trk frames") {
   const DeployConfig config = validClnConfig();
-  const TrkTrack track = makeTrack(3);
+  TrkTrack track = makeTrack(3);
+  setRootQuat(track, 1, yawQuat(kPi * 0.5F));
+  setRootLinVel(track, 1, 2.0F, -3.0F, 9.0F);
+  setRootAngVel(track, 1, 0.0F, 0.0F, 0.75F);
   const LowStateSample low = liveState(config);
   PolicyStepRunner runner(config, track, low, 7);
   RecordingPolicy policy(Vec(kJointDim, 0.0F));
@@ -404,11 +545,65 @@ TEST_CASE("PolicyStepRunner builds GeneralTrackerCLN future_commands from .trk f
   REQUIRE(policy.calls.size() == 1);
   REQUIRE(result.inputs.obs_current.size() == 121);
   REQUIRE(result.inputs.obs_history.size() == kHistoryLength * kClnHistoryWidth);
+  requireSliceApprox(result.inputs.obs_current,
+                     kClnObsCurrentRootOffset,
+                     {1.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F});
+  requireSliceApprox(result.inputs.obs_current,
+                     kClnObsCurrentVelocityOffset,
+                     {0.0F, 0.0F, 0.0F});
   requireZeroSlice(result.inputs.obs_current, kClnObsCurrentLastActionOffset, kJointDim);
   requireClnFutureJointRow(result.inputs.obs_history, 0, frameJointBase(2));
   requireClnFutureJointRow(result.inputs.obs_history, 1, frameJointBase(2));
   requireClnFutureJointRow(result.inputs.obs_history, kHistoryLength - 1,
                            frameJointBase(2));
+}
+
+TEST_CASE("PolicyStepRunner builds GeneralTrackerCLNFootstate future rows from .trk contact states") {
+  const DeployConfig config = validClnFootstateConfig();
+  TrkTrack track = makeTrack(3);
+  track.left_foot_contact_state.values.at(1) = 0;
+  track.right_foot_contact_state.values.at(1) = 1;
+  track.left_foot_contact_state.values.at(2) = 2;
+  track.right_foot_contact_state.values.at(2) = 0;
+  setRootQuat(track, 2, yawQuat(kPi * 0.5F));
+  setRootLinVel(track, 2, 4.0F, -5.0F, 9.0F);
+  setRootAngVel(track, 2, 0.0F, 0.0F, 6.0F);
+  const LowStateSample low = liveState(config);
+  PolicyStepRunner runner(config, track, low, 7);
+  RecordingPolicy policy(Vec(kJointDim, 0.0F));
+
+  const PolicyStepResult result = runner.step(1, low, policy);
+
+  REQUIRE(policy.calls.size() == 1);
+  REQUIRE(result.inputs.obs_current.size() == 127);
+  REQUIRE(result.inputs.obs_history.size() ==
+          kClnFootstateHistoryLength * kClnFootstateHistoryWidth);
+  requireSliceApprox(result.inputs.obs_current,
+                     kClnObsCurrentRootOffset,
+                     {1.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F});
+  requireSliceApprox(result.inputs.obs_current,
+                     kClnObsCurrentVelocityOffset,
+                     {0.0F, 0.0F, 0.0F});
+  requireZeroSlice(result.inputs.obs_current, kClnObsCurrentLastActionOffset, kJointDim);
+  requireSliceApprox(result.inputs.obs_current,
+                     kClnFootstateCurrentFootOffset,
+                     {1.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F});
+  requireSliceApprox(result.inputs.obs_history,
+                     0,
+                     {0.0F, -1.0F, 1.0F, 0.0F, 0.0F, 0.0F, -5.0F, -4.0F, 6.0F});
+  requireClnFootstateFutureJointRow(result.inputs.obs_history, 0, frameJointBase(2));
+  requireClnFootstateFutureFootRow(result.inputs.obs_history,
+                                   0,
+                                   {0.0F, 0.0F, 1.0F, 1.0F, 0.0F, 0.0F});
+  requireClnFootstateFutureJointRow(result.inputs.obs_history,
+                                    kClnFootstateHistoryLength - 1,
+                                    frameJointBase(2));
+  requireSliceApprox(result.inputs.obs_history,
+                     (kClnFootstateHistoryLength - 1) * kClnFootstateHistoryWidth,
+                     {0.0F, -1.0F, 1.0F, 0.0F, 0.0F, 0.0F, -5.0F, -4.0F, 6.0F});
+  requireClnFootstateFutureFootRow(result.inputs.obs_history,
+                                   kClnFootstateHistoryLength - 1,
+                                   {0.0F, 0.0F, 1.0F, 1.0F, 0.0F, 0.0F});
 }
 
 TEST_CASE("PolicyStepRunner keeps CLN future_commands root and velocity golden order") {
@@ -426,7 +621,7 @@ TEST_CASE("PolicyStepRunner keeps CLN future_commands root and velocity golden o
   REQUIRE(result.inputs.obs_history.size() == kHistoryLength * kClnHistoryWidth);
   requireSliceApprox(result.inputs.obs_history,
                      0,
-                     {0.0F, -1.0F, 1.0F, 0.0F, 0.0F, 0.0F, -3.0F, -2.0F, 0.75F},
+                     {1.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F},
                      1.0e-5F);
 }
 

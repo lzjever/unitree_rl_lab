@@ -67,11 +67,12 @@ AppConfig realFactoryConfigWithRepoAssets() {
   config.mode_machine = 0;
   config.release_motion_mode_on_startup = false;
   config.trk.allowlist_dirs = {"/tmp/user-motions"};
-  config.policy.profile = "GeneralTrackerCLN";
+  config.policy.profile = "GeneralTrackerCLNFootstate";
   config.policy.policy_dir = (root / "config/policy/general_tracker_cln").string();
-  config.policy.policy_file = "multi_policy_v17c2_70k.onnx";
+  config.policy.policy_file = "multi_policy_footstate3.onnx";
   config.policy.deploy =
-      (root / "config/policy/general_tracker_cln/params/deploy.yaml").string();
+      (root / "config/policy/general_tracker_cln/params/deploy_fut_multi_footstate.yaml")
+          .string();
   config.control.velocity_policy_dir = (root / "config/policy/velocity/v0").string();
   config.control.velocity_policy_file = "policy.onnx";
   config.control.velocity_deploy =
@@ -294,6 +295,48 @@ TEST_CASE("AppRuntimeFactory real factory fails before SDK when model file is mi
   const AppRuntimeFactoryResult result = createAppRuntimeDeps(config);
 
   requireModelNotReady(result);
+#else
+  SUCCEED("real factory is not compiled in this build");
+#endif
+}
+
+TEST_CASE("AppRuntimeFactory real factory fails before SDK on policy/deploy contract mismatch") {
+#if AGENTIC_ET1_TRACKER_REAL_FACTORY
+  const auto root = appRoot();
+  const auto legacy_deploy = root / "config/policy/general_tracker/params/deploy.yaml";
+  const auto cln_deploy = root / "config/policy/general_tracker_cln/params/deploy.yaml";
+  const auto footstate_deploy =
+      root / "config/policy/general_tracker_cln/params/deploy_fut_multi_footstate.yaml";
+
+  AppConfig config;
+  config.mode_machine = 0;
+  config.release_motion_mode_on_startup = false;
+  config.policy.policy_dir = (root / "config/policy/general_tracker_cln").string();
+  config.policy.policy_file = "missing.onnx";
+
+  SECTION("legacy profile with footstate deploy") {
+    config.policy.profile = "GeneralTracker";
+    config.policy.deploy = footstate_deploy.string();
+    requireModelNotReady(createAppRuntimeDeps(config));
+  }
+
+  SECTION("CLN profile with footstate deploy") {
+    config.policy.profile = "GeneralTrackerCLN";
+    config.policy.deploy = footstate_deploy.string();
+    requireModelNotReady(createAppRuntimeDeps(config));
+  }
+
+  SECTION("footstate profile with legacy deploy") {
+    config.policy.profile = "GeneralTrackerCLNFootstate";
+    config.policy.deploy = legacy_deploy.string();
+    requireModelNotReady(createAppRuntimeDeps(config));
+  }
+
+  SECTION("footstate profile with CLN deploy") {
+    config.policy.profile = "GeneralTrackerCLNFootstate";
+    config.policy.deploy = cln_deploy.string();
+    requireModelNotReady(createAppRuntimeDeps(config));
+  }
 #else
   SUCCEED("real factory is not compiled in this build");
 #endif

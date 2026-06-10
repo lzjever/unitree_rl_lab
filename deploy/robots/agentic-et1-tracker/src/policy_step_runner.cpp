@@ -26,6 +26,16 @@ bool usesTemporalHistory(const DeployConfig& config) {
 PolicyStepRunner::PolicyStepRunner(const DeployConfig& config,
                                    TrkTrack track,
                                    const LowStateSample& entry_low_state,
+                                   std::uint8_t expected_mode_machine)
+    : PolicyStepRunner(config,
+                       std::move(track),
+                       entry_low_state,
+                       expected_mode_machine,
+                       defaultObservationBuilderConfig(config)) {}
+
+PolicyStepRunner::PolicyStepRunner(const DeployConfig& config,
+                                   TrkTrack track,
+                                   const LowStateSample& entry_low_state,
                                    std::uint8_t expected_mode_machine,
                                    ObservationBuilderConfig builder_config)
     : PolicyStepRunner(config,
@@ -33,6 +43,16 @@ PolicyStepRunner::PolicyStepRunner(const DeployConfig& config,
                        entry_low_state,
                        expected_mode_machine,
                        builder_config) {}
+
+PolicyStepRunner::PolicyStepRunner(const DeployConfig& config,
+                                   std::shared_ptr<const TrkTrack> track,
+                                   const LowStateSample& entry_low_state,
+                                   std::uint8_t expected_mode_machine)
+    : PolicyStepRunner(config,
+                       std::move(track),
+                       entry_low_state,
+                       expected_mode_machine,
+                       defaultObservationBuilderConfig(config)) {}
 
 PolicyStepRunner::PolicyStepRunner(const DeployConfig& config,
                                    std::shared_ptr<const TrkTrack> track,
@@ -62,10 +82,26 @@ void PolicyStepRunner::reset(const LowStateSample& entry_low_state) {
     }
 
     builder_state_ =
-        makeObservationBuilderState(*first_frame, entry_low_state, builder_config_);
+        makeObservationBuilderState(config_, *first_frame, entry_low_state, builder_config_);
     history_ = HistoryBuffer(config_);
     history_ready_ = false;
     last_action_ = zeroLastAction();
+  } catch (const PolicyStepError&) {
+    throw;
+  } catch (const std::exception& err) {
+    throw error(err.what());
+  }
+}
+
+void PolicyStepRunner::recalibrateObservationAnchor(const LowStateSample& low_state) {
+  try {
+    const std::optional<TrkFrameView> first_frame = track_->frame(0);
+    if (!first_frame.has_value()) {
+      throw error("missing first frame");
+    }
+
+    builder_state_ =
+        makeObservationBuilderState(config_, *first_frame, low_state, builder_config_);
   } catch (const PolicyStepError&) {
     throw;
   } catch (const std::exception& err) {
@@ -96,8 +132,11 @@ PolicyStepResult PolicyStepRunner::step(std::size_t frame_index,
     result.inputs = buildPolicyInputs(config_, parts, next_history);
     const Vec raw_action = policy.infer(result.inputs);
     result.output = scaleAction(config_, raw_action);
-    result.low_cmd =
-        makeLowCmdFrame(config_, result.output, expected_mode_machine_, base_frame);
+    result.low_cmd = makeLowCmdFrame(config_,
+                                     result.output,
+                                     expected_mode_machine_,
+                                     base_frame,
+                                     LowCmdBaseBehavior::Clear);
 
     history_ = std::move(next_history);
     history_ready_ = usesTemporalHistory(config_) ? true : history_ready_;

@@ -12,9 +12,14 @@ namespace agentic_et1_tracker {
 
 struct ObservationBuilderConfig {
   bool no_global_mode{true};
+  bool use_motion_root_command{false};
+  bool use_motion_velocity_command{false};
 };
 
+ObservationBuilderConfig defaultObservationBuilderConfig(const DeployConfig& config);
+
 struct ObservationBuilderState {
+  double ref_world_align_yaw{0.0};
   double first_ref_root_yaw{0.0};
   double entry_robot_yaw{0.0};
 };
@@ -25,6 +30,12 @@ class ObservationBuilderError final : public std::runtime_error {
 };
 
 ObservationBuilderState makeObservationBuilderState(
+    const TrkFrameView& first_frame,
+    const LowStateSample& entry_low_state,
+    const ObservationBuilderConfig& config = {});
+
+ObservationBuilderState makeObservationBuilderState(
+    const DeployConfig& deploy_config,
     const TrkFrameView& first_frame,
     const LowStateSample& entry_low_state,
     const ObservationBuilderConfig& config = {});

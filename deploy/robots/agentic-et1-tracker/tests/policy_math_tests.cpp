@@ -21,6 +21,9 @@ constexpr std::size_t kCurrentDim = 131;
 constexpr std::size_t kHistoryWidth = 105;
 constexpr std::size_t kClnCurrentDim = 121;
 constexpr std::size_t kClnHistoryWidth = 35;
+constexpr std::size_t kClnFootstateCurrentDim = 127;
+constexpr std::size_t kClnFootstateHistoryLength = 5;
+constexpr std::size_t kClnFootstateHistoryWidth = 41;
 
 Vec seq(float start, std::size_t count) {
   Vec values;
@@ -112,6 +115,30 @@ DeployConfig validClnConfig() {
   return config;
 }
 
+DeployConfig validClnFootstateConfig() {
+  DeployConfig config = validConfig();
+  config.observation_contract = ObservationContract::GeneralTrackerCLNFootstate;
+  config.obs_current_terms = terms({
+      {"command_yaw", 2},
+      {"command_root_ori_b", 6},
+      {"command_xy_yaw_vel", 3},
+      {"command_jnt_pos", kJointDim},
+      {"projected_gravity", 3},
+      {"base_ang_vel", 3},
+      {"joint_pos_rel", kJointDim},
+      {"joint_vel_rel", kJointDim},
+      {"last_action", kJointDim},
+      {"command_foot_support_state", 6},
+  });
+  config.obs_history_terms = terms({
+      {"future_command_with_foot_support_state", kClnFootstateHistoryWidth},
+  });
+  config.obs_current_dim = kClnFootstateCurrentDim;
+  config.obs_history_width = kClnFootstateHistoryWidth;
+  config.obs_history_length = kClnFootstateHistoryLength;
+  return config;
+}
+
 PolicyObservationParts parts(float base) {
   PolicyObservationParts p;
   p.command_yaw = seq(base - 10.0f, 2);
@@ -127,6 +154,13 @@ PolicyObservationParts parts(float base) {
   p.ref_com_rel_navi = seq(base + 400.0f, 3);
   p.ref_com_vel_navi = seq(base + 500.0f, 3);
   p.future_commands = seq(base + 600.0f, kHistoryLength * kClnHistoryWidth);
+  return p;
+}
+
+PolicyObservationParts footstateParts(float base) {
+  PolicyObservationParts p = parts(base);
+  p.future_commands =
+      seq(base + 700.0f, kClnFootstateHistoryLength * kClnFootstateHistoryWidth);
   return p;
 }
 
@@ -181,6 +215,13 @@ Vec expectedClnCurrentRow(const PolicyObservationParts& p) {
   append(p.joint_pos_rel);
   append(p.joint_vel_rel);
   append(p.last_action);
+  return out;
+}
+
+Vec expectedClnFootstateCurrentRow(const PolicyObservationParts& p) {
+  Vec out = expectedClnCurrentRow(p);
+  out.insert(out.end(), p.command_foot_support_state.begin(),
+             p.command_foot_support_state.end());
   return out;
 }
 
@@ -307,6 +348,21 @@ TEST_CASE("buildPolicyInputs uses CLN future_commands as obs_history") {
   REQUIRE(inputs.obs_history.size() == kHistoryLength * kClnHistoryWidth);
 }
 
+TEST_CASE("buildPolicyInputs uses CLNFootstate future payload as non-temporal obs_history") {
+  const DeployConfig config = validClnFootstateConfig();
+  const PolicyObservationParts current = footstateParts(1300.0f);
+  HistoryBuffer history(config);
+
+  const PolicyInputs inputs = buildPolicyInputs(config, current, history);
+
+  REQUIRE(inputs.obs_current == expectedClnFootstateCurrentRow(current));
+  REQUIRE(inputs.obs_history == current.future_commands);
+  REQUIRE(inputs.obs_current.size() == kClnFootstateCurrentDim);
+  REQUIRE(inputs.obs_history.size() ==
+          kClnFootstateHistoryLength * kClnFootstateHistoryWidth);
+  requireSliceEquals(inputs.obs_current, 121, current.command_foot_support_state);
+}
+
 TEST_CASE("scaleAction applies scale and offset and copies policy gains") {
   const DeployConfig config = validConfig();
   const Vec raw = seq(-2.0f, kJointDim);
@@ -325,6 +381,21 @@ TEST_CASE("scaleAction applies scale and offset and copies policy gains") {
     REQUIRE(output.kp[i] == static_cast<float>(config.policy_kp[i]));
     REQUIRE(output.kd[i] == static_cast<float>(config.policy_kd[i]));
   }
+}
+
+TEST_CASE("scaleAction clamps processed target positions when clip is configured") {
+  DeployConfig config = validConfig();
+  config.action_scale.assign(kJointDim, 2.0);
+  config.action_offset.assign(kJointDim, 0.0);
+  config.action_clip.assign(kJointDim, {-1.0, 1.5});
+  const Vec raw = seq(-1.0F, kJointDim);
+
+  const PolicyOutput output = scaleAction(config, raw);
+
+  REQUIRE(output.target_q.at(0) == -1.0F);
+  REQUIRE(output.target_q.at(1) == 0.0F);
+  REQUIRE(output.target_q.at(2) == 1.5F);
+  REQUIRE(output.target_q.at(25) == 1.5F);
 }
 
 TEST_CASE("policy math validates observation and action widths") {
@@ -367,6 +438,17 @@ TEST_CASE("policy math validates observation and action widths") {
   SECTION("CLN future command length") {
     const DeployConfig config = validClnConfig();
     PolicyObservationParts p = parts(0.0f);
+    p.future_commands.pop_back();
+    HistoryBuffer history(config);
+
+    REQUIRE_THROWS_WITH(buildPolicyInputs(config, p, history),
+                        ContainsSubstring("PolicyInputs.obs_history"));
+    REQUIRE_THROWS_AS(buildPolicyInputs(config, p, history), PolicyMathError);
+  }
+
+  SECTION("CLNFootstate future command length") {
+    const DeployConfig config = validClnFootstateConfig();
+    PolicyObservationParts p = footstateParts(0.0f);
     p.future_commands.pop_back();
     HistoryBuffer history(config);
 

@@ -25,6 +25,7 @@
 #include "agentic_et1_tracker/app/app_runtime_factory.hpp"
 #include "agentic_et1_tracker/app/app_runner.hpp"
 #include "agentic_et1_tracker/core/types.hpp"
+#include "agentic_et1_tracker/policy/policy_io_contract.hpp"
 #include "agentic_et1_tracker/trk/schema.hpp"
 
 #ifndef AGENTIC_ET1_TRACKER_REAL_FACTORY
@@ -255,9 +256,70 @@ std::vector<ObservationTerm> observationTerms(
   return out;
 }
 
+template <typename ArrayT>
+void resizeTrackArray(ArrayT& array,
+                      std::size_t frames,
+                      std::vector<std::uint64_t> shape,
+                      std::size_t frame_size) {
+  array.shape = std::move(shape);
+  array.frame_size = frame_size;
+  array.values.assign(frames * frame_size, {});
+}
+
+TrkTrack inMemoryTrack(std::size_t frames) {
+  constexpr std::size_t kBodyPosFrameSize = TrkSchema::kBodyCount * 3;
+  constexpr std::size_t kBodyQuatFrameSize = TrkSchema::kBodyCount * 4;
+
+  TrkTrack track;
+  track.metadata.frames = frames;
+  track.metadata.fps = TrkSchema::kDefaultFps;
+  track.metadata.duration_s =
+      frames == 0 ? 0.0 : static_cast<double>(frames - 1) / TrkSchema::kDefaultFps;
+  track.metadata.version = TrkSchema::kVersion;
+  track.metadata.array_count = TrkSchema::kRequiredArrays.size();
+
+  resizeTrackArray(track.joint_pos, frames, {frames, TrkSchema::kJointDim},
+                   TrkSchema::kJointDim);
+  resizeTrackArray(track.joint_vel, frames, {frames, TrkSchema::kJointDim},
+                   TrkSchema::kJointDim);
+  resizeTrackArray(track.body_pos_w, frames, {frames, TrkSchema::kBodyCount, 3},
+                   kBodyPosFrameSize);
+  resizeTrackArray(track.body_quat_w, frames, {frames, TrkSchema::kBodyCount, 4},
+                   kBodyQuatFrameSize);
+  resizeTrackArray(track.body_lin_vel_w, frames, {frames, TrkSchema::kBodyCount, 3},
+                   kBodyPosFrameSize);
+  resizeTrackArray(track.body_ang_vel_w, frames, {frames, TrkSchema::kBodyCount, 3},
+                   kBodyPosFrameSize);
+  resizeTrackArray(track.left_foot_contact_state, frames, {frames}, 1);
+  resizeTrackArray(track.right_foot_contact_state, frames, {frames}, 1);
+  resizeTrackArray(track.ref_com_rel_navi, frames, {frames, 3}, 3);
+  resizeTrackArray(track.ref_com_vel_navi, frames, {frames, 3}, 3);
+
+  for (std::size_t frame = 0; frame < frames; ++frame) {
+    for (std::size_t joint = 0; joint < TrkSchema::kJointDim; ++joint) {
+      const auto offset = frame * track.joint_pos.frame_size + joint;
+      track.joint_pos.values.at(offset) =
+          0.01F * static_cast<float>(frame) + 0.001F * static_cast<float>(joint);
+    }
+    for (std::size_t body = 0; body < TrkSchema::kBodyCount; ++body) {
+      const auto pos_offset = frame * track.body_pos_w.frame_size + body * 3;
+      track.body_pos_w.values.at(pos_offset) = 0.01F * static_cast<float>(frame);
+      track.body_pos_w.values.at(pos_offset + 1) = 0.001F * static_cast<float>(body);
+      track.body_pos_w.values.at(pos_offset + 2) = 0.5F;
+
+      const auto quat_offset = frame * track.body_quat_w.frame_size + body * 4;
+      track.body_quat_w.values.at(quat_offset) = 1.0F;
+    }
+    track.left_foot_contact_state.values.at(frame) = 1;
+    track.right_foot_contact_state.values.at(frame) = 2;
+  }
+  return track;
+}
+
 DeployConfig deployConfig() {
   DeployConfig config;
   config.joint_dim = kPolicyJointDim;
+  config.observation_contract = ObservationContract::GeneralTrackerCLNFootstate;
   config.sdk_joint_ids_map = frozenSdkMap();
   config.default_joint_pos = doubleSeq(0.25, 0.5, kPolicyJointDim);
   config.policy_kp = doubleSeq(10.0, 1.0, kPolicyJointDim);
@@ -265,6 +327,7 @@ DeployConfig deployConfig() {
   config.action_scale = doubleSeq(0.25, 0.125, kPolicyJointDim);
   config.action_offset = doubleSeq(-1.0, 0.2, kPolicyJointDim);
   config.obs_current_terms = observationTerms({
+      {"command_yaw", 2},
       {"command_root_ori_b", 6},
       {"command_xy_yaw_vel", 3},
       {"command_jnt_pos", kPolicyJointDim},
@@ -274,24 +337,13 @@ DeployConfig deployConfig() {
       {"joint_vel_rel", kPolicyJointDim},
       {"last_action", kPolicyJointDim},
       {"command_foot_support_state", 6},
-      {"ref_com_rel_navi", 3},
-      {"ref_com_vel_navi", 3},
   });
   config.obs_history_terms = observationTerms({
-      {"command_root_ori_b", 6},
-      {"command_xy_yaw_vel", 3},
-      {"command_jnt_pos", kPolicyJointDim},
-      {"projected_gravity", 3},
-      {"base_ang_vel", 3},
-      {"joint_pos_rel", kPolicyJointDim},
-      {"joint_vel_rel", kPolicyJointDim},
-      {"command_foot_support_state", 6},
-      {"ref_com_rel_navi", 3},
-      {"ref_com_vel_navi", 3},
+      {"future_command_with_foot_support_state", kClnFootstatePolicyObsHistoryWidth},
   });
-  config.obs_current_dim = 131;
-  config.obs_history_width = 105;
-  config.obs_history_length = 25;
+  config.obs_current_dim = kClnFootstatePolicyObsCurrentDim;
+  config.obs_history_width = kClnFootstatePolicyObsHistoryWidth;
+  config.obs_history_length = kClnFootstatePolicyObsHistoryLength;
   return config;
 }
 
@@ -359,12 +411,16 @@ class FakePolicy final : public PolicyInference {
     }
   }
 
-  Vec infer(const PolicyInputs&) override {
+  Vec infer(const PolicyInputs& inputs) override {
     ++calls;
+    last_obs_current_size.store(inputs.obs_current.size());
+    last_obs_history_size.store(inputs.obs_history.size());
     return floatSeq(0.25F, kPolicyJointDim);
   }
 
   std::atomic<int> calls{0};
+  std::atomic<std::size_t> last_obs_current_size{0};
+  std::atomic<std::size_t> last_obs_history_size{0};
 
  private:
   std::shared_ptr<std::atomic<int>> destroy_counter_;
@@ -447,6 +503,7 @@ AppRuntimeDeps makeDeps(FakeRobotIO*& robot,
   deps.passive_config = passiveConfig();
   deps.startup_control = ControlMode::FixStand;
   deps.mode = mode;
+  deps.standby_track = std::make_shared<TrkTrack>(inMemoryTrack(2));
   return deps;
 }
 
@@ -779,6 +836,9 @@ TEST_CASE("HTTP execute reaches RuntimeControlLoop policy write") {
   });
   REQUIRE(done.at("err").is_null());
   REQUIRE(policy->calls.load() >= 1);
+  REQUIRE(policy->last_obs_current_size.load() == kClnFootstatePolicyObsCurrentDim);
+  REQUIRE(policy->last_obs_history_size.load() ==
+          kClnFootstatePolicyObsHistoryLength * kClnFootstatePolicyObsHistoryWidth);
   REQUIRE(robot->write_low_cmd_calls.load() >= 1);
   REQUIRE(robot->last_mode_machine.load() == config.mode_machine);
 
@@ -816,6 +876,10 @@ TEST_CASE("AppRunner passes sim mode_machine through to RuntimeControlLoop LowCm
     return json.at("state") == "done";
   });
   REQUIRE(done.at("err").is_null());
+  REQUIRE(policy->calls.load() >= 1);
+  REQUIRE(policy->last_obs_current_size.load() == kClnFootstatePolicyObsCurrentDim);
+  REQUIRE(policy->last_obs_history_size.load() ==
+          kClnFootstatePolicyObsHistoryLength * kClnFootstatePolicyObsHistoryWidth);
   REQUIRE(robot->write_low_cmd_calls.load() >= 1);
   REQUIRE(robot->last_mode_machine.load() == 0);
 

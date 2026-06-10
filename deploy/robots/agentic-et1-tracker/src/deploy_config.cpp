@@ -16,6 +16,8 @@ constexpr double kStepDt = 0.02;
 constexpr double kStepDtEpsilon = 1.0e-9;
 constexpr std::size_t kClnFutureHorizon = 25;
 constexpr std::size_t kClnFutureCommandWidth = 35;
+constexpr std::size_t kClnFootstateFutureHorizon = 5;
+constexpr std::size_t kClnFootstateFutureCommandWidth = 41;
 constexpr std::array<int, kJointDim> kJointIdsMap{{
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
     13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
@@ -68,6 +70,21 @@ constexpr std::array<ObservationSpec, 9> kClnCurrentObs{{
 }};
 constexpr std::array<ObservationSpec, 1> kClnHistoryObs{{
     {"future_commands", kClnFutureCommandWidth},
+}};
+constexpr std::array<ObservationSpec, 10> kClnFootstateCurrentObs{{
+    {"command_yaw", 2},
+    {"command_root_ori_b", 6},
+    {"command_xy_yaw_vel", 3},
+    {"command_jnt_pos", kJointDim},
+    {"projected_gravity", 3},
+    {"base_ang_vel", 3},
+    {"joint_pos_rel", kJointDim},
+    {"joint_vel_rel", kJointDim},
+    {"last_action", kJointDim},
+    {"command_foot_support_state", 6},
+}};
+constexpr std::array<ObservationSpec, 1> kClnFootstateHistoryObs{{
+    {"future_command_with_foot_support_state", kClnFootstateFutureCommandWidth},
 }};
 
 DeployConfigError error(const std::string& message) {
@@ -238,6 +255,50 @@ std::vector<double> readRootDoubleVector(const YAML::Node& root,
                           require_non_negative, require_positive);
 }
 
+std::vector<std::array<double, 2>> readOptionalActionClip(const YAML::Node& action) {
+  const std::string field = "actions.JointPositionAction.clip";
+  const YAML::Node node = action["clip"];
+  if (!node || node.IsNull()) {
+    return {};
+  }
+  if (!node.IsSequence()) {
+    throw error(field + " must be null or a sequence");
+  }
+  if (node.size() != kJointDim) {
+    std::ostringstream out;
+    out << field << " must contain " << kJointDim << " entries";
+    throw error(out.str());
+  }
+
+  std::vector<std::array<double, 2>> values;
+  values.reserve(kJointDim);
+  for (std::size_t i = 0; i < node.size(); ++i) {
+    const std::string row_field = field + "[" + std::to_string(i) + "]";
+    const YAML::Node row = node[i];
+    if (!row.IsSequence()) {
+      throw error(row_field + " must be a sequence");
+    }
+    if (row.size() != 2) {
+      throw error(row_field + " must contain 2 entries");
+    }
+    std::array<double, 2> clip{};
+    for (std::size_t j = 0; j < clip.size(); ++j) {
+      const std::string element_field =
+          row_field + "[" + std::to_string(j) + "]";
+      const double value = scalarAs<double>(row[j], element_field);
+      if (!std::isfinite(value)) {
+        throw error(element_field + " must be finite");
+      }
+      clip[j] = value;
+    }
+    if (clip[0] > clip[1]) {
+      throw error(row_field + " min must be <= max");
+    }
+    values.push_back(clip);
+  }
+  return values;
+}
+
 void validateJointIdsMap(const std::vector<int>& values) {
   for (std::size_t i = 0; i < values.size(); ++i) {
     if (values[i] != kJointIdsMap[i]) {
@@ -283,6 +344,29 @@ std::size_t futureCommandsHorizon(const YAML::Node& obs_history) {
   return kClnFutureHorizon;
 }
 
+std::size_t footstateFutureHorizon(const YAML::Node& obs_history) {
+  const YAML::Node future_command =
+      requiredMap(obs_history,
+                  "future_command_with_foot_support_state",
+                  "observations.obs_history.future_command_with_foot_support_state");
+  const YAML::Node params =
+      requiredMap(future_command,
+                  "params",
+                  "observations.obs_history.future_command_with_foot_support_state.params");
+  const YAML::Node horizon =
+      requiredNode(params,
+                   "horizon",
+                   "observations.obs_history.future_command_with_foot_support_state.params.horizon");
+  const long long value = scalarAs<long long>(
+      horizon,
+      "observations.obs_history.future_command_with_foot_support_state.params.horizon");
+  if (value != static_cast<long long>(kClnFootstateFutureHorizon)) {
+    throw error(
+        "observations.obs_history.future_command_with_foot_support_state.params.horizon must be 5");
+  }
+  return kClnFootstateFutureHorizon;
+}
+
 template <std::size_t N>
 void validateObsKeysInOrder(const YAML::Node& group,
                             const std::array<ObservationSpec, N>& allowed,
@@ -322,12 +406,15 @@ void validateObsKeysInOrder(const YAML::Node& group,
   }
 }
 
-void validateUseGymHistory(const YAML::Node& group, const std::string& field) {
+void validateUseGymHistory(const YAML::Node& group,
+                           const std::string& field,
+                           bool required_value) {
   const YAML::Node node =
       requiredNode(group, "use_gym_history", field + ".use_gym_history");
   const bool value = scalarAs<bool>(node, field + ".use_gym_history");
-  if (!value) {
-    throw error(field + ".use_gym_history must be true");
+  if (value != required_value) {
+    throw error(field + ".use_gym_history must be " +
+                std::string(required_value ? "true" : "false"));
   }
 }
 
@@ -342,8 +429,9 @@ template <std::size_t N>
 std::size_t validateObservationGroup(const YAML::Node& group,
                                      const std::array<ObservationSpec, N>& allowed,
                                      const std::string& field,
-                                     std::size_t required_history_length) {
-  validateUseGymHistory(group, field);
+                                     std::size_t required_history_length,
+                                     bool required_use_gym_history = true) {
+  validateUseGymHistory(group, field, required_use_gym_history);
   validateObsKeysInOrder(group, allowed, field);
 
   for (const ObservationSpec& spec : allowed) {
@@ -447,6 +535,7 @@ DeployConfig loadDeployConfig(const std::filesystem::path& path) {
         readDoubleVector("actions.JointPositionAction.offset",
                          requiredNode(action, "offset", "actions.JointPositionAction.offset"),
                          kJointDim, false, false);
+    config.action_clip = readOptionalActionClip(action);
 
     const YAML::Node observations = requiredMap(root, "observations", "observations");
     validateOnlyObservationGroups(observations);
@@ -454,10 +543,30 @@ DeployConfig loadDeployConfig(const std::filesystem::path& path) {
         requiredMap(observations, "obs_current", "observations.obs_current");
     const YAML::Node obs_history =
         requiredMap(observations, "obs_history", "observations.obs_history");
+    const bool is_cln_footstate =
+        groupHasObservationKey(obs_history, "future_command_with_foot_support_state");
     const bool is_cln =
         groupHasObservationKey(obs_current, "command_yaw") &&
         groupHasObservationKey(obs_history, "future_commands");
-    if (is_cln) {
+    if (is_cln_footstate) {
+      config.observation_contract = ObservationContract::GeneralTrackerCLNFootstate;
+      validateObservationGroup(obs_current,
+                               kClnFootstateCurrentObs,
+                               "observations.obs_current",
+                               1);
+      validateObservationGroup(obs_history,
+                               kClnFootstateHistoryObs,
+                               "observations.obs_history",
+                               1,
+                               false);
+      config.obs_history_length = footstateFutureHorizon(obs_history);
+      config.obs_current = toStrings(kClnFootstateCurrentObs);
+      config.obs_history = toStrings(kClnFootstateHistoryObs);
+      config.obs_current_terms = toTerms(kClnFootstateCurrentObs);
+      config.obs_history_terms = toTerms(kClnFootstateHistoryObs);
+      config.obs_current_dim = sumWidths(kClnFootstateCurrentObs);
+      config.obs_history_width = sumWidths(kClnFootstateHistoryObs);
+    } else if (is_cln) {
       config.observation_contract = ObservationContract::GeneralTrackerCLN;
       validateObservationGroup(obs_current, kClnCurrentObs, "observations.obs_current", 1);
       validateObservationGroup(obs_history, kClnHistoryObs, "observations.obs_history", 1);

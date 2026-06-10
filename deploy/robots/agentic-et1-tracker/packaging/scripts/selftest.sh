@@ -55,12 +55,30 @@ check_sha256() {
   printf 'ok sha256 %s\n' "$path"
 }
 
+check_contains() {
+  local path="$1"
+  local needle="$2"
+  check_file "$path"
+  grep -q "$needle" "$path" || die "missing '$needle' in $path"
+  printf 'ok contains %s %s\n' "$path" "$needle"
+}
+
 check_exec "$ET1_BIN"
 check_exec "$ET1_CLI"
 check_file "$ET1_RELEASE_DIR/config/config.robot.yaml.template"
+check_contains "$ET1_RELEASE_DIR/config/config.robot.yaml.template" \
+  "GeneralTrackerCLNFootstate"
+check_contains "$ET1_RELEASE_DIR/config/config.robot.yaml.template" \
+  "multi_policy_footstate3.onnx"
+check_contains "$ET1_RELEASE_DIR/config/config.robot.yaml.template" \
+  "deploy_fut_multi_footstate.yaml"
 [[ ! -d "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/general_tracker" ]] || \
   die "legacy policy directory must not be present: $ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/general_tracker"
 check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/general_tracker_cln/ASSET_MANIFEST.yaml"
+check_sha256 "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/general_tracker_cln/exported/multi_policy_footstate3.onnx" \
+  "3afdd52f115dc01b042cd3f1be40c90a2affcae5987e5cb5e52442a2115b37d7"
+check_sha256 "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/general_tracker_cln/params/deploy_fut_multi_footstate.yaml" \
+  "89734594308d6e036d348f80e6fa2fa7e224d1e9a4da4ac2b53bb68de91095fc"
 check_sha256 "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/general_tracker_cln/exported/multi_policy_v17c2_70k.onnx" \
   "d4f37c972eb5e98e37a1d425302a70729343009a1564974921965c5faea0d911"
 check_sha256 "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/general_tracker_cln/params/deploy.yaml" \

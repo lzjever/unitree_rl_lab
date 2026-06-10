@@ -31,6 +31,9 @@ namespace {
 
 constexpr std::size_t kPolicyJointDim = TrkSchema::kJointDim;
 constexpr std::uint8_t kExpectedModeMachine = 7;
+constexpr std::size_t kObsCurrentRootOffset = 0;
+constexpr std::size_t kObsCurrentCommandJointOffset = 9;
+constexpr std::size_t kStartupHoldPolicyStepsAt50Fps = 5;
 
 struct TempTree {
   TempTree() {
@@ -182,6 +185,22 @@ float yawFromQuat(std::array<float, 4> quat_wxyz) {
   const float z = quat_wxyz.at(3);
   return std::atan2(2.0F * (w * z + x * y),
                     1.0F - 2.0F * (y * y + z * z));
+}
+
+Vec rootOriFromYaw(float yaw_rad) {
+  const float c = std::cos(yaw_rad);
+  const float s = std::sin(yaw_rad);
+  return {c, -s, s, c, 0.0F, 0.0F};
+}
+
+void requireObsSliceApprox(const Vec& actual,
+                           std::size_t offset,
+                           const Vec& expected,
+                           float margin = 1.0e-5F) {
+  REQUIRE(offset + expected.size() <= actual.size());
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    REQUIRE(actual.at(offset + i) == Catch::Approx(expected.at(i)).margin(margin));
+  }
 }
 
 std::filesystem::path rootPoseTrk(TempTree& tmp,
@@ -762,8 +781,18 @@ void startHoldingRun(RuntimeControlLoop& loop,
               .ok());
   startQueuedRun(loop, store, id, mode);
 
-  loop.tick();
-  const auto snapshot = store.snapshot();
+  StatusSnapshot snapshot;
+  bool saw_holding = false;
+  for (int i = 0; i < 128; ++i) {
+    loop.tick();
+    snapshot = store.snapshot();
+    if (snapshot.exec.has_value() && snapshot.exec->id == id &&
+        snapshot.exec->state == MotionState::Holding) {
+      saw_holding = true;
+      break;
+    }
+  }
+  REQUIRE(saw_holding);
   REQUIRE(snapshot.ctrl == ControllerState::Running);
   REQUIRE(snapshot.active.kind == ActiveKind::User);
   REQUIRE(snapshot.active.id == id);
@@ -1187,21 +1216,24 @@ TEST_CASE("RuntimeControlLoop policy holding keeps executing final frame") {
               .ok());
   startQueuedRun(loop, store, "policy-hold");
 
-  loop.tick();
-  REQUIRE(policy.calls == 1);
+  for (std::size_t tick = 0; tick < kStartupHoldPolicyStepsAt50Fps; ++tick) {
+    loop.tick();
+    REQUIRE(store.snapshot().exec->state == MotionState::Running);
+    REQUIRE(store.snapshot().exec->frame == 0);
+    REQUIRE(policy.calls == static_cast<int>(tick + 1));
+  }
 
   loop.tick();
   REQUIRE(store.snapshot().exec->state == MotionState::Holding);
-  REQUIRE(policy.calls == 2);
-  constexpr std::size_t command_jnt_pos_offset = 9;
+  REQUIRE(policy.calls == static_cast<int>(kStartupHoldPolicyStepsAt50Fps + 1));
   const float final_frame_joint0 = 6.5F;
-  REQUIRE(policy.inputs_seen.at(1).obs_current.at(command_jnt_pos_offset) ==
+  REQUIRE(policy.inputs_seen.back().obs_current.at(kObsCurrentCommandJointOffset) ==
           final_frame_joint0);
 
   loop.tick();
   REQUIRE(store.snapshot().exec->state == MotionState::Holding);
-  REQUIRE(policy.calls == 3);
-  REQUIRE(policy.inputs_seen.at(2).obs_current.at(command_jnt_pos_offset) ==
+  REQUIRE(policy.calls == static_cast<int>(kStartupHoldPolicyStepsAt50Fps + 2));
+  REQUIRE(policy.inputs_seen.back().obs_current.at(kObsCurrentCommandJointOffset) ==
           final_frame_joint0);
 }
 
@@ -1553,8 +1585,16 @@ TEST_CASE("RuntimeControlLoop aligns synthetic transition target root pose in me
                              true))
               .ok());
   startQueuedRun(loop, store, "held-five-meters");
-  loop.tick();
-  REQUIRE(store.snapshot().exec->state == MotionState::Holding);
+  bool saw_holding = false;
+  for (int i = 0; i < 128; ++i) {
+    loop.tick();
+    if (store.snapshot().exec.has_value() &&
+        store.snapshot().exec->state == MotionState::Holding) {
+      saw_holding = true;
+      break;
+    }
+  }
+  REQUIRE(saw_holding);
 
   REQUIRE(bridge.submitQueue(
               executeCommand("target-origin", target_path, MotionMode::Queue, 2))
@@ -2412,6 +2452,227 @@ TEST_CASE("RuntimeControlLoop policy integration starts then steps fake runtime"
   REQUIRE(robot.writes.back().mode_machine == kExpectedModeMachine);
 }
 
+TEST_CASE("RuntimeControlLoop user policy startup holds frame zero then reanchors") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.hz = 50.0;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  LowStateSample low = readyLowState(deploy_config);
+  low.motors.at(static_cast<std::size_t>(deploy_config.sdk_joint_ids_map.at(12))).q =
+      0.0F;
+  low.motors.at(static_cast<std::size_t>(deploy_config.sdk_joint_ids_map.at(13))).q =
+      0.0F;
+  FakeRobotIO robot(low);
+  FakePolicy policy(floatSeq(0.0F, kPolicyJointDim));
+  auto loop = makePolicyLoop(config, bridge, store, tmp.trkConfig(), robot, policy,
+                             deploy_config);
+
+  const auto path = identityQuaternionTrk(tmp, "startup_hold_user.trk", 3);
+  REQUIRE(bridge.submitQueue(executeCommand("startup-hold-user", path)).ok());
+  startQueuedRun(loop, store, "startup-hold-user");
+
+  for (std::size_t tick = 0; tick < kStartupHoldPolicyStepsAt50Fps; ++tick) {
+    if (tick == kStartupHoldPolicyStepsAt50Fps / 2) {
+      low.quat_wxyz = yawQuat(0.5F);
+      robot.low_state = low;
+    }
+    loop.tick();
+    const auto snapshot = store.snapshot();
+    REQUIRE(snapshot.exec.has_value());
+    REQUIRE(snapshot.exec->id == "startup-hold-user");
+    REQUIRE(snapshot.exec->state == MotionState::Running);
+    REQUIRE(snapshot.exec->frame == 0);
+    REQUIRE(policy.calls == static_cast<int>(tick + 1));
+    REQUIRE(policy.inputs_seen.back().obs_current.at(kObsCurrentCommandJointOffset) ==
+            0.0F);
+  }
+
+  loop.tick();
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->frame == 1);
+  REQUIRE(policy.calls == static_cast<int>(kStartupHoldPolicyStepsAt50Fps + 1));
+  REQUIRE(policy.inputs_seen.back().obs_current.at(kObsCurrentCommandJointOffset) ==
+          6.5F);
+  requireObsSliceApprox(policy.inputs_seen.back().obs_current,
+                        kObsCurrentRootOffset,
+                        rootOriFromYaw(0.0F));
+}
+
+TEST_CASE("RuntimeControlLoop user startup hold counts policy writes at high runtime hz") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.hz = 1000.0;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy policy(floatSeq(0.0F, kPolicyJointDim));
+  auto loop = makePolicyLoop(config, bridge, store, tmp.trkConfig(), robot, policy,
+                             deploy_config);
+
+  const auto path = identityQuaternionTrk(tmp, "startup_hold_high_rate.trk", 3);
+  REQUIRE(bridge.submitQueue(executeCommand("startup-hold-high-rate", path)).ok());
+  startQueuedRun(loop, store, "startup-hold-high-rate");
+
+  loop.tick();
+  REQUIRE(policy.calls == 1);
+  REQUIRE(store.snapshot().exec.has_value());
+  REQUIRE(store.snapshot().exec->frame == 0);
+  REQUIRE(policy.inputs_seen.back().obs_current.at(kObsCurrentCommandJointOffset) ==
+          0.0F);
+
+  for (std::size_t write = 1; write < kStartupHoldPolicyStepsAt50Fps; ++write) {
+    for (int non_due_tick = 0; non_due_tick < 19; ++non_due_tick) {
+      loop.tick();
+      REQUIRE(policy.calls == static_cast<int>(write));
+      REQUIRE(store.snapshot().exec.has_value());
+      REQUIRE(store.snapshot().exec->frame == 0);
+    }
+
+    loop.tick();
+    REQUIRE(policy.calls == static_cast<int>(write + 1));
+    REQUIRE(store.snapshot().exec.has_value());
+    REQUIRE(store.snapshot().exec->frame == 0);
+    REQUIRE(policy.inputs_seen.back().obs_current.at(kObsCurrentCommandJointOffset) ==
+            0.0F);
+  }
+
+  REQUIRE(policy.calls == static_cast<int>(kStartupHoldPolicyStepsAt50Fps));
+  REQUIRE(store.snapshot().exec->frame == 0);
+
+  for (int non_due_tick = 0; non_due_tick < 19; ++non_due_tick) {
+    loop.tick();
+    REQUIRE(policy.calls == static_cast<int>(kStartupHoldPolicyStepsAt50Fps));
+    REQUIRE(store.snapshot().exec.has_value());
+    REQUIRE(store.snapshot().exec->frame == 0);
+  }
+
+  loop.tick();
+  REQUIRE(policy.calls == static_cast<int>(kStartupHoldPolicyStepsAt50Fps + 1));
+  REQUIRE(store.snapshot().exec.has_value());
+  REQUIRE(store.snapshot().exec->frame == 1);
+  REQUIRE(policy.inputs_seen.back().obs_current.at(kObsCurrentCommandJointOffset) ==
+          6.5F);
+}
+
+TEST_CASE("RuntimeControlLoop stop during user startup hold still preempts") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.hz = 50.0;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy policy(floatSeq(0.0F, kPolicyJointDim));
+  auto loop = makePolicyLoop(config, bridge, store, tmp.trkConfig(), robot, policy,
+                             deploy_config);
+
+  const auto path = identityQuaternionTrk(tmp, "startup_hold_stop.trk", 3);
+  REQUIRE(bridge.submitQueue(executeCommand("startup-hold-stop", path)).ok());
+  startQueuedRun(loop, store, "startup-hold-stop");
+
+  const std::size_t preempt_ticks = kStartupHoldPolicyStepsAt50Fps - 1;
+  for (std::size_t i = 0; i < preempt_ticks; ++i) {
+    loop.tick();
+    REQUIRE(policy.calls == static_cast<int>(i + 1));
+    REQUIRE(store.snapshot().exec.has_value());
+    REQUIRE(store.snapshot().exec->frame == 0);
+  }
+
+  REQUIRE(bridge.stop().state == ControllerState::Stopping);
+  loop.tick();
+
+  auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Stopping);
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->state == MotionState::Stopping);
+  REQUIRE(policy.calls == static_cast<int>(preempt_ticks));
+
+  loop.tick();
+  snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Idle);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(policy.calls == static_cast<int>(preempt_ticks));
+  const auto stopped = store.findRun("startup-hold-stop");
+  REQUIRE(stopped.ok());
+  REQUIRE(stopped.run->state == MotionState::Stopped);
+  REQUIRE(stopped.run->stop_reason == StopReason::Stop);
+}
+
+TEST_CASE("RuntimeControlLoop synthetic transition is not held but target user startup is") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.hz = 50.0;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeReferenceSink reference;
+  RuntimeControlLoop loop(config,
+                          bridge,
+                          store,
+                          TrkLoader(tmp.trkConfig()),
+                          robot,
+                          policy,
+                          deploy_config,
+                          passiveConfig(),
+                          kExpectedModeMachine,
+                          RuntimeMode::Real,
+                          &reference);
+
+  startHoldingRun(loop, store, bridge, tmp, "startup-held-source", &reference);
+  const auto target_path = identityQuaternionTrk(tmp, "startup_hold_target.trk", 3);
+  REQUIRE(bridge.submitQueue(
+              executeCommand("startup-target-user", target_path, MotionMode::Queue, 3))
+              .ok());
+
+  loop.tick();
+  REQUIRE(store.snapshot().active.kind == ActiveKind::Transition);
+  const int calls_before_transition_step = policy.calls;
+
+  loop.tick();
+  REQUIRE(store.snapshot().active.kind == ActiveKind::Transition);
+  REQUIRE(policy.calls == calls_before_transition_step + 1);
+
+  bool saw_user = false;
+  for (int i = 0; i < 96; ++i) {
+    loop.tick();
+    if (store.snapshot().active.kind == ActiveKind::User) {
+      saw_user = true;
+      break;
+    }
+  }
+  REQUIRE(saw_user);
+  REQUIRE(store.snapshot().exec.has_value());
+  REQUIRE(store.snapshot().exec->id == "startup-target-user");
+  REQUIRE(store.snapshot().exec->frame == 0);
+  const int calls_at_target_start = policy.calls;
+
+  for (std::size_t tick = 0; tick < kStartupHoldPolicyStepsAt50Fps; ++tick) {
+    loop.tick();
+    const auto snapshot = store.snapshot();
+    REQUIRE(snapshot.active.kind == ActiveKind::User);
+    REQUIRE(snapshot.exec.has_value());
+    REQUIRE(snapshot.exec->frame == 0);
+    REQUIRE(policy.calls == calls_at_target_start + static_cast<int>(tick + 1));
+    REQUIRE(policy.inputs_seen.back().obs_current.at(kObsCurrentCommandJointOffset) ==
+            0.0F);
+  }
+
+  loop.tick();
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->frame == 1);
+  REQUIRE(policy.calls ==
+          calls_at_target_start + static_cast<int>(kStartupHoldPolicyStepsAt50Fps) + 1);
+  REQUIRE(policy.inputs_seen.back().obs_current.at(kObsCurrentCommandJointOffset) ==
+          6.5F);
+}
+
 TEST_CASE("RuntimeControlLoop policy integration writes final frame before done") {
   TempTree tmp;
   const RuntimeConfig config = runtimeConfig();
@@ -2440,10 +2701,12 @@ TEST_CASE("RuntimeControlLoop policy integration writes final frame before done"
   loop.tick();
   REQUIRE(store.snapshot().ctrl == ControllerState::Running);
 
-  loop.tick();
+  for (std::size_t tick = 0; tick < kStartupHoldPolicyStepsAt50Fps + 1; ++tick) {
+    loop.tick();
+  }
   requireIdle(store);
-  REQUIRE(robot.write_attempts == 1);
-  REQUIRE(policy.calls == 1);
+  REQUIRE(robot.write_attempts == static_cast<int>(kStartupHoldPolicyStepsAt50Fps + 1));
+  REQUIRE(policy.calls == static_cast<int>(kStartupHoldPolicyStepsAt50Fps + 1));
   REQUIRE(state_at_write == MotionState::Running);
   REQUIRE(frame_at_write == 0);
 
@@ -3496,9 +3759,20 @@ TEST_CASE("RuntimeControlLoop completed track returns to StandbyVelocity") {
                  "done-standby",
                  StartQueuedRunMode::AllowStandbyTransition);
   REQUIRE(loop.internalStateForTest() == RuntimeInternalState::GeneralTrackerActive);
-  loop.tick();
 
-  auto snapshot = store.snapshot();
+  StatusSnapshot snapshot;
+  bool saw_standby_transition = false;
+  for (int i = 0; i < 128; ++i) {
+    loop.tick();
+    snapshot = store.snapshot();
+    if (snapshot.active.kind == ActiveKind::Transition &&
+        snapshot.transition.active &&
+        snapshot.transition.target == "standby") {
+      saw_standby_transition = true;
+      break;
+    }
+  }
+  REQUIRE(saw_standby_transition);
   REQUIRE(loop.internalStateForTest() == RuntimeInternalState::GeneralTrackerTransition);
   REQUIRE(snapshot.ctrl == ControllerState::Running);
   REQUIRE(snapshot.transition.active);
@@ -4936,14 +5210,40 @@ TEST_CASE("RuntimeControlLoop active tracker advances one frame per policy perio
 
   loop.tick();
   REQUIRE(tracker_policy.calls == 2);
-  REQUIRE(frames_at_write == std::vector<std::size_t>{0, 1});
-  REQUIRE(store.snapshot().exec->frame == 1);
+  REQUIRE(frames_at_write == std::vector<std::size_t>{0, 0});
+  REQUIRE(store.snapshot().exec->frame == 0);
 
-  for (int i = 0; i < 20; ++i) {
+  constexpr int kHighRateTicksPerPolicyStep = 20;
+  const int ticks_to_last_startup_hold_write =
+      static_cast<int>(kStartupHoldPolicyStepsAt50Fps - 2) *
+          kHighRateTicksPerPolicyStep +
+      (kHighRateTicksPerPolicyStep - 1);
+  for (int i = 0; i < ticks_to_last_startup_hold_write; ++i) {
     loop.tick();
   }
-  REQUIRE(tracker_policy.calls == 3);
-  REQUIRE(frames_at_write == std::vector<std::size_t>{0, 1, 2});
+  REQUIRE(tracker_policy.calls == static_cast<int>(kStartupHoldPolicyStepsAt50Fps));
+  REQUIRE(frames_at_write ==
+          std::vector<std::size_t>(kStartupHoldPolicyStepsAt50Fps, 0));
+  REQUIRE(store.snapshot().exec->frame == 0);
+
+  loop.tick();
+  REQUIRE(tracker_policy.calls == static_cast<int>(kStartupHoldPolicyStepsAt50Fps + 1));
+  std::vector<std::size_t> expected_frames(kStartupHoldPolicyStepsAt50Fps, 0);
+  expected_frames.push_back(1);
+  REQUIRE(frames_at_write == expected_frames);
+  REQUIRE(store.snapshot().exec->frame == 1);
+
+  for (int i = 0; i < 19; ++i) {
+    loop.tick();
+  }
+  REQUIRE(tracker_policy.calls == static_cast<int>(kStartupHoldPolicyStepsAt50Fps + 1));
+  REQUIRE(frames_at_write == expected_frames);
+  REQUIRE(store.snapshot().exec->frame == 1);
+
+  loop.tick();
+  expected_frames.push_back(2);
+  REQUIRE(tracker_policy.calls == static_cast<int>(kStartupHoldPolicyStepsAt50Fps + 2));
+  REQUIRE(frames_at_write == expected_frames);
   REQUIRE(loop.internalStateForTest() == RuntimeInternalState::GeneralTrackerIdle);
   REQUIRE_FALSE(store.snapshot().exec.has_value());
   REQUIRE(store.findRun("high-rate-track").run->state == MotionState::Done);
