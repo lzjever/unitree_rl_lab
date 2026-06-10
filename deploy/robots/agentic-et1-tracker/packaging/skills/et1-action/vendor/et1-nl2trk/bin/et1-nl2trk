@@ -90,6 +90,7 @@ def parse_args(argv):
     parser.add_argument("--diffusion-steps", type=int)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--serial-id")
+    parser.add_argument("--debug-dir")
     parser.add_argument("--fresh", action="store_true")
     parser.add_argument("--root")
     parser.add_argument("--timeout", type=float)
@@ -116,6 +117,8 @@ def parse_args(argv):
         raise CliError("invalid_args", "args", "--diffusion-steps must be greater than zero")
     if args.serial_id is not None and not SERIAL_ID_RE.fullmatch(args.serial_id):
         raise CliError("invalid_args", "args", "--serial-id must match [A-Za-z0-9_-]{1,64}")
+    if args.debug_dir is not None and str(args.debug_dir).strip() == "":
+        raise CliError("invalid_args", "args", "--debug-dir must not be empty")
 
     return args, prompt
 
@@ -128,6 +131,7 @@ def explicit_options(args):
         "diffusion_steps",
         "seed",
         "serial_id",
+        "debug_dir",
         "root",
         "timeout",
         "poll",
@@ -508,6 +512,33 @@ def copy_output(source, target, allow_existing=False):
     return target
 
 
+def copy_debug_file(source, target):
+    source = Path(source).resolve()
+    target = Path(target).resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if source == target:
+        return target
+    tmp = target.with_name(target.name + ".tmp")
+    shutil.copy2(source, tmp)
+    os.replace(tmp, target)
+    return target
+
+
+def export_debug_artifacts(debug_dir, output_path=None, metadata_path=None, bvh_path=None):
+    if not debug_dir:
+        return {}
+    debug_dir = Path(debug_dir).resolve()
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    exported = {"debug_dir": str(debug_dir)}
+    if bvh_path and Path(bvh_path).exists():
+        exported["debug_bvh"] = str(copy_debug_file(bvh_path, debug_dir / "action.bvh"))
+    if output_path and Path(output_path).exists():
+        exported["debug_output_trk"] = str(copy_debug_file(output_path, debug_dir / "output.trk"))
+    if metadata_path and Path(metadata_path).exists():
+        exported["debug_metadata"] = str(copy_debug_file(metadata_path, debug_dir / "nl2trk-metadata.json"))
+    return exported
+
+
 def ensure_generated_output(dirs, run_id, cached_output):
     generated_path = generated_output_path(dirs, run_id)
     if not generated_path.exists():
@@ -546,7 +577,9 @@ def write_hit_metadata(
         "format": "ET1TRK1",
     }
     metadata["timestamps"]["completed_at"] = utc_now()
-    write_json(hit_dir / "metadata.json", metadata)
+    metadata_path = hit_dir / "metadata.json"
+    write_json(metadata_path, metadata)
+    return metadata_path
 
 
 def update_cache_pointer(dirs, cache_key, run_dir, output_path, generated_path, metadata_path):
@@ -660,6 +693,16 @@ def submit_and_convert(args, prompt, dirs, explicit_target, cache_key, key_paylo
                 "tmp_bvh": str(bvh_path.resolve()),
             }
         )
+        if args.debug_dir:
+            debug_dir = Path(args.debug_dir).resolve()
+            metadata["artifact_paths"].update(
+                {
+                    "debug_dir": str(debug_dir),
+                    "debug_bvh": str((debug_dir / "action.bvh").resolve()),
+                    "debug_output_trk": str((debug_dir / "output.trk").resolve()),
+                    "debug_metadata": str((debug_dir / "nl2trk-metadata.json").resolve()),
+                }
+            )
         metadata["output"] = {
             "bytes": output_path.stat().st_size,
             "sha256": file_sha256(output_path),
@@ -667,6 +710,7 @@ def submit_and_convert(args, prompt, dirs, explicit_target, cache_key, key_paylo
         }
         metadata["timestamps"]["completed_at"] = utc_now()
         write_json(metadata_path, metadata)
+        export_debug_artifacts(args.debug_dir, returned_path, metadata_path, bvh_path)
         update_cache_pointer(dirs, cache_key, run_dir, output_path, generated_path, metadata_path)
         return returned_path
     except CliError as exc:
@@ -698,7 +742,7 @@ def main(argv):
                 run_id = hit.get("run_id") or Path(hit["run_dir"]).name
                 generated_path = ensure_generated_output(dirs, run_id, hit["output_trk"])
                 returned_path = generated_path if explicit_target is None else copy_output(hit["output_trk"], explicit_target)
-                write_hit_metadata(
+                metadata_path = write_hit_metadata(
                     dirs,
                     prompt,
                     args,
@@ -711,6 +755,7 @@ def main(argv):
                     generated_path,
                     returned_path,
                 )
+                export_debug_artifacts(args.debug_dir, returned_path, metadata_path)
                 sys.stdout.write(str(returned_path.resolve()) + "\n")
                 return 0
 

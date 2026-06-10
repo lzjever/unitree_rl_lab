@@ -507,6 +507,65 @@ def run_subprocess(argv):
         return subprocess.CompletedProcess(argv, 127, "", str(e))
 
 
+def utc_timestamp():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def debug_enabled():
+    return os.environ.get("ET1_ACTION_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def safe_path_component(value, default="artifact"):
+    raw = str(value or "").strip()
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in raw).strip("._-")
+    return safe[:96] or default
+
+
+def new_artifact_id(prefix, text):
+    digest = hashlib.sha1((text + str(time.time_ns()) + os.urandom(8).hex()).encode("utf-8")).hexdigest()[:10]
+    return f"{prefix}_{time.strftime('%Y%m%d%H%M%S')}_{digest}"
+
+
+def artifact_root(stage_dir, artifact_id):
+    root = Path(stage_dir) / safe_path_component(artifact_id)
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def segment_artifact_dir(stage_dir, artifact_id, segment_id=None):
+    root = artifact_root(stage_dir, artifact_id)
+    if segment_id:
+        path = root / safe_path_component(segment_id, "segment")
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    return root
+
+
+def write_artifact_files(artifact_dir, text, meta):
+    artifact_dir = Path(artifact_dir)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    (artifact_dir / "prompt.txt").write_text(str(text) + "\n", encoding="utf-8")
+    write_json(artifact_dir / "meta.json", meta)
+
+
+def update_artifact_manifest(stage_dir, artifact_id, entry):
+    root = artifact_root(stage_dir, artifact_id)
+    manifest_path = root / "manifest.json"
+    if manifest_path.exists():
+        try:
+            manifest = read_json(manifest_path)
+        except Exception:
+            manifest = {}
+    else:
+        manifest = {}
+    manifest.setdefault("artifact_id", safe_path_component(artifact_id))
+    manifest.setdefault("created_at", utc_timestamp())
+    manifest["updated_at_iso"] = utc_timestamp()
+    segments = manifest.setdefault("segments", [])
+    segments.append(entry)
+    write_json(manifest_path, manifest)
+
+
 def staged_name(prefix, text, identity=None):
     payload = text if identity is None else json.dumps(identity, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:10]
@@ -545,19 +604,60 @@ def find_preset(text, stage_dir):
     return None
 
 
-def generate_trk(text, duration, stage_dir, serial_id=None, seed=None, diffusion_steps=None):
+def artifact_meta(text, path, source, stage_dir, artifact_id, artifact_dir, serial_id=None, segment_id=None, duration=None, seed=None, diffusion_steps=None):
+    return {
+        "artifact_id": safe_path_component(artifact_id) if artifact_id else None,
+        "artifact_dir": str(Path(artifact_dir).resolve()) if artifact_dir else None,
+        "created_at": utc_timestamp(),
+        "debug": debug_enabled(),
+        "diffusion_steps": diffusion_steps,
+        "duration": duration,
+        "prompt": text,
+        "seed": seed,
+        "segment_id": segment_id,
+        "serial_id": serial_id,
+        "source": source,
+        "stage_dir": str(Path(stage_dir).resolve()),
+        "trk": str(Path(path).resolve()),
+    }
+
+
+def record_artifact(text, path, source, stage_dir, artifact_id=None, artifact_dir=None, serial_id=None, segment_id=None, duration=None, seed=None, diffusion_steps=None):
+    if not artifact_id or not artifact_dir:
+        return
+    meta = artifact_meta(text, path, source, stage_dir, artifact_id, artifact_dir, serial_id, segment_id, duration, seed, diffusion_steps)
+    write_artifact_files(artifact_dir, text, meta)
+    update_artifact_manifest(
+        stage_dir,
+        artifact_id,
+        {
+            "artifact_dir": str(Path(artifact_dir).resolve()),
+            "created_at": meta["created_at"],
+            "prompt": text,
+            "segment_id": segment_id,
+            "source": source,
+            "trk": str(Path(path).resolve()),
+        },
+    )
+
+
+def generate_trk(text, duration, stage_dir, serial_id=None, seed=None, diffusion_steps=None, artifact_id=None, artifact_dir=None, segment_id=None):
     bin_path = nl2trk_bin()
     if not Path(bin_path).exists():
         raise CliError("SEGMENT_GENERATION_FAILED", "internal nl2trk vendor is not installed", next_step="run-text")
+    output_dir = Path(artifact_dir) if artifact_dir else Path(stage_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     identity = {
         "text": text,
         "duration": duration,
         "serial_id": serial_id,
+        "artifact_id": artifact_id,
+        "segment_id": segment_id,
         "seed": seed,
         "diffusion_steps": diffusion_steps,
         "t": time.time_ns() if serial_id else None,
     }
-    out = unique_stage_path(stage_dir, "et1-generated", text, identity)
+    out = unique_stage_path(output_dir, "et1-generated", text, identity)
     argv = [bin_path, "--prompt", text, "--out", str(out)]
     if duration is not None:
         argv += ["--duration", str(duration)]
@@ -567,6 +667,8 @@ def generate_trk(text, duration, stage_dir, serial_id=None, seed=None, diffusion
         argv += ["--seed", str(seed)]
     if diffusion_steps is not None:
         argv += ["--diffusion-steps", str(diffusion_steps)]
+    if debug_enabled():
+        argv += ["--fresh", "--debug-dir", str(Path(artifact_dir or out.parent))]
     proc = run_subprocess(argv)
     if proc.returncode != 0 or not out.exists():
         message = proc.stderr.strip() or proc.stdout.strip() or "nl2trk failed"
@@ -604,19 +706,29 @@ def should_bypass_preset(text, hold=False):
     return bool(hold) or text_requests_hold(text) or text_requests_precise_limb(text)
 
 
-def resolve_text_to_trk(text, duration, stage_dir, serial_id=None, seed=None, diffusion_steps=None, use_preset=True):
+def resolve_text_to_trk(text, duration, stage_dir, serial_id=None, seed=None, diffusion_steps=None, use_preset=True, artifact_id=None, artifact_dir=None, segment_id=None):
     stage_dir = Path(stage_dir)
     stage_dir.mkdir(parents=True, exist_ok=True)
+    artifact_dir = Path(artifact_dir) if artifact_dir else None
+    if artifact_dir:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+    if debug_enabled():
+        use_preset = False
     if use_preset and seed is None and diffusion_steps is None:
-        preset = find_preset(text, stage_dir)
+        preset = find_preset(text, artifact_dir or stage_dir)
         if preset:
+            record_artifact(text, preset, "preset", stage_dir, artifact_id, artifact_dir, serial_id, segment_id, duration, seed, diffusion_steps)
             return preset, "preset"
-    return generate_trk(text, duration, stage_dir, serial_id, seed, diffusion_steps), "nl2trk"
+    path = generate_trk(text, duration, stage_dir, serial_id, seed, diffusion_steps, artifact_id, artifact_dir, segment_id)
+    record_artifact(text, path, "nl2trk", stage_dir, artifact_id, artifact_dir, serial_id, segment_id, duration, seed, diffusion_steps)
+    return path, "nl2trk"
 
 
 def run_text_cmd(args, base, timeout, poll):
     cancel_active_sequences("run-text")
     stage = Path(args.stage_dir) if args.stage_dir else default_stage_dir()
+    artifact_id = new_artifact_id("run", args.text)
+    artifact_dir = segment_artifact_dir(stage, artifact_id)
     hold = bool(args.hold or text_requests_hold(args.text))
     use_preset = not args.no_preset and not should_bypass_preset(args.text, hold)
     path, _source = resolve_text_to_trk(
@@ -626,6 +738,8 @@ def run_text_cmd(args, base, timeout, poll):
         seed=args.seed,
         diffusion_steps=args.diffusion_steps,
         use_preset=use_preset,
+        artifact_id=artifact_id,
+        artifact_dir=artifact_dir,
     )
     started = execute_trk(base, path, args.mode, args.wait, timeout, poll, hold=hold)
     if not started.get("ok"):
@@ -1077,13 +1191,15 @@ def sequence_start_cmd(args):
     cancel_active_sequences("sequence-start")
     segments = parse_plan(args.plan_json)
     seq_id = new_seq_id()
+    serial_id = args.serial_id or seq_id
     def create(state):
         state.update(
             {
                 "state": "starting",
                 "segments": segments,
                 "active": None,
-                "serial_id": args.serial_id or seq_id,
+                "serial_id": serial_id,
+                "artifact_id": safe_path_component(serial_id),
                 "stage_dir": str(Path(args.stage_dir) if args.stage_dir else default_stage_dir()),
                 "op_epoch": 0,
                 "version": 0,
@@ -1249,7 +1365,20 @@ def sequence_interrupt_cmd(args, base, timeout, poll):
     tracker_standby(base, timeout)
     current = load_state(args.seq_id)
     stage = Path(current.get("stage_dir") or default_stage_dir())
-    path, _source = resolve_text_to_trk(args.text, args.duration, stage, current.get("serial_id"), args.seed, args.diffusion_steps)
+    serial_id = current.get("serial_id")
+    artifact_id = current.get("artifact_id") or serial_id
+    artifact_dir = segment_artifact_dir(stage, artifact_id, "interrupt")
+    path, _source = resolve_text_to_trk(
+        args.text,
+        args.duration,
+        stage,
+        serial_id,
+        args.seed,
+        args.diffusion_steps,
+        artifact_id=artifact_id,
+        artifact_dir=artifact_dir,
+        segment_id="interrupt",
+    )
     if not interrupt_still_current():
         return changed_output()
     started = execute_trk(base, path, "interrupt", False, timeout, poll)
@@ -1291,11 +1420,14 @@ def sequence_interrupt_cmd(args, base, timeout, poll):
     return sequence_output(state, intent="interrupt")
 
 
-def prepare_segment(seg, stage_dir, serial_id):
+def prepare_segment(seg, stage_dir, serial_id, artifact_id=None):
     if seg.get("ready_path"):
         seg["status"] = "ready"
         return seg["ready_path"]
     seg["status"] = "generating"
+    segment_id = seg.get("segment_id")
+    artifact_id = artifact_id or serial_id
+    artifact_dir = segment_artifact_dir(stage_dir, artifact_id, segment_id) if artifact_id else None
     path, source = resolve_text_to_trk(
         seg["text"],
         seg.get("duration"),
@@ -1303,6 +1435,9 @@ def prepare_segment(seg, stage_dir, serial_id):
         serial_id,
         seg.get("seed"),
         seg.get("diffusion_steps"),
+        artifact_id=artifact_id,
+        artifact_dir=artifact_dir,
+        segment_id=segment_id,
     )
     seg["ready_path"] = path
     seg["source"] = source
@@ -1395,7 +1530,12 @@ def worker_cmd(args, base, timeout, poll):
                 if selected.get("ready_path"):
                     path = selected["ready_path"]
                 else:
-                    path = prepare_segment(selected, Path(state.get("stage_dir") or default_stage_dir()), state.get("serial_id"))
+                    path = prepare_segment(
+                        selected,
+                        Path(state.get("stage_dir") or default_stage_dir()),
+                        state.get("serial_id"),
+                        state.get("artifact_id"),
+                    )
                     prepared = {"path": path, "source": selected.get("source")}
                     still_current = {"value": False}
                     def mark_ready(state):

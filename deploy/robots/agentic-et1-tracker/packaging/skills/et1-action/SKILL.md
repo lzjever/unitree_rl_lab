@@ -47,6 +47,8 @@ Each generated segment may include `duration`, `seed`, and `diffusion_steps` in 
 Do not block the turn with `sleep && sequence-status`; poll status only when the user explicitly asks for progress or after a short non-blocking check is operationally necessary.
 
 The skill writes generated/staged `.trk` files to `ET1_ACTION_STAGE_DIR` when set; otherwise it prefers the running tracker's first configured `motion_dirs` entry, then common local generated directories. If the tracker returns `TRK_PATH_NOT_ALLOWED`, set `ET1_ACTION_STAGE_DIR` to a tracker-readable `motion_dirs` directory and retry.
+Generated text motions are organized as artifacts under the stage directory. Single `run-text` generations use a local `run_...` artifact id that is not sent to Kimodo. Sequences use the sequence `serial_id` (default: `seq_id`) as the artifact root, with each text segment written under that root. Each generated text segment includes the staged `.trk`, `prompt.txt`, and `meta.json`; sequence roots also maintain `manifest.json`.
+Set `ET1_ACTION_DEBUG=1` (also accepts `true`, `yes`, or `on`) to export debug artifacts. Debug mode bypasses presets and invokes the vendored `et1-nl2trk` with `--fresh --debug-dir <artifact-dir>` so the artifact directory also receives `action.bvh`, `output.trk`, and `nl2trk-metadata.json`. Normal mode does not preserve BVH files and keeps the usual preset/cache behavior.
 
 Read references only as needed:
 

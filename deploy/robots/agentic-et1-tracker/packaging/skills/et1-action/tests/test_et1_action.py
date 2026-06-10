@@ -196,10 +196,17 @@ raise SystemExit(0)
             "#!/usr/bin/env python3\n"
             + self._append_log_script("nl2trk")
             + """
+import shutil
 from pathlib import Path
 out = Path(sys.argv[sys.argv.index("--out") + 1])
 out.parent.mkdir(parents=True, exist_ok=True)
 out.write_text("generated\\n", encoding="utf-8")
+if "--debug-dir" in sys.argv:
+    debug_dir = Path(sys.argv[sys.argv.index("--debug-dir") + 1])
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    (debug_dir / "action.bvh").write_text("bvh\\n", encoding="utf-8")
+    shutil.copy2(out, debug_dir / "output.trk")
+    (debug_dir / "nl2trk-metadata.json").write_text(json.dumps({"ok": True}) + "\\n", encoding="utf-8")
 print(json.dumps({"ok": True}))
 """,
             encoding="utf-8",
@@ -383,7 +390,10 @@ print(json.dumps({"ok": True}))
         execute = self.tracker.records[-1]
         self.assertEqual(execute[1], "/execute")
         self.assertEqual(execute[2]["mode"], "interrupt")
-        self.assertEqual(Path(execute[2]["path"]).parent, self.stage)
+        self.assertTrue(Path(execute[2]["path"]).is_relative_to(self.stage))
+        self.assertTrue((Path(execute[2]["path"]).parent / "prompt.txt").exists())
+        self.assertTrue((Path(execute[2]["path"]).parent / "meta.json").exists())
+        self.assertFalse((Path(execute[2]["path"]).parent / "action.bvh").exists())
 
     def test_run_text_cancels_existing_sequence_before_interrupt_execute(self):
         state_path = self.write_active_sequence()
@@ -434,8 +444,53 @@ print(json.dumps({"ok": True}))
         calls = self.calls()
         self.assertEqual([c[0] for c in calls], ["preset", "nl2trk"])
         self.assertIn("--duration", calls[1][1])
+        self.assertNotIn("--serial-id", calls[1][1])
         self.assertEqual(self.tracker.records[-1][1], "/execute")
         self.assertEqual(self.tracker.records[-1][2]["mode"], "interrupt")
+        trk = Path(self.tracker.records[-1][2]["path"])
+        artifact_dir = trk.parent
+        self.assertEqual(artifact_dir.parent, self.stage)
+        self.assertTrue((artifact_dir / "prompt.txt").exists())
+        self.assertEqual((artifact_dir / "prompt.txt").read_text(encoding="utf-8"), "slow turn\n")
+        meta = json.loads((artifact_dir / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["prompt"], "slow turn")
+        self.assertEqual(meta["source"], "nl2trk")
+        self.assertEqual(meta["trk"], str(trk.resolve()))
+        self.assertTrue((artifact_dir / "manifest.json").exists())
+        self.assertFalse((artifact_dir / "action.bvh").exists())
+
+    def test_run_text_debug_exports_bvh_trk_meta_and_prompt_and_bypasses_preset(self):
+        out, _ = self.cli(
+            "run-text",
+            "wave",
+            "--duration",
+            "3",
+            "--stage-dir",
+            str(self.stage),
+            env_extra={"ET1_ACTION_DEBUG": "true", "FAKE_PRESET_MODE": "hit"},
+        )
+        self.assertTrue(out["ok"])
+        calls = self.calls()
+        self.assertEqual([c[0] for c in calls], ["nl2trk"])
+        self.assertIn("--fresh", calls[0][1])
+        self.assertIn("--debug-dir", calls[0][1])
+        self.assertNotIn("--serial-id", calls[0][1])
+        trk = Path(self.tracker.records[-1][2]["path"])
+        artifact_dir = trk.parent
+        self.assertEqual(Path(calls[0][1][calls[0][1].index("--debug-dir") + 1]), artifact_dir)
+        self.assertTrue((artifact_dir / "action.bvh").exists())
+        self.assertTrue((artifact_dir / "output.trk").exists())
+        self.assertTrue((artifact_dir / "prompt.txt").exists())
+        self.assertTrue((artifact_dir / "meta.json").exists())
+        meta = json.loads((artifact_dir / "meta.json").read_text(encoding="utf-8"))
+        self.assertTrue(meta["debug"])
+
+    def test_run_text_debug_off_does_not_export_bvh(self):
+        out, _ = self.cli("run-text", "slow turn", "--duration", "3", "--stage-dir", str(self.stage))
+        self.assertTrue(out["ok"])
+        artifact_dir = Path(self.tracker.records[-1][2]["path"]).parent
+        self.assertFalse((artifact_dir / "action.bvh").exists())
+        self.assertNotIn("--debug-dir", self.calls()[1][1])
 
     def test_run_text_seed_and_diffusion_steps_bypass_preset(self):
         out, _ = self.cli(
@@ -707,6 +762,39 @@ print(json.dumps({"ok": True}))
         self.assertEqual(state["segments"][1]["status"], "queued")
         self.assertTrue(state["segments"][1]["submitted"])
 
+    def test_sequence_text_segments_share_serial_artifact_root(self):
+        plan = {"segments": [{"text": "first"}, {"text": "second"}]}
+        out, _ = self.cli(
+            "sequence-start",
+            "--plan-json",
+            json.dumps(plan),
+            "--serial-id",
+            "serial_demo",
+            "--stage-dir",
+            str(self.stage),
+            env_extra={"ET1_ACTION_WORKER_MAX_POLLS": "1"},
+        )
+        self.assertTrue(out["ok"])
+        execs = self.wait_for_execs(2)
+        self.assertEqual(len(execs), 2, self.tracker.records)
+        paths = [Path(execute[2]["path"]) for execute in execs]
+        serial_root = self.stage / "serial_demo"
+        self.assertEqual(paths[0].parents[1], serial_root)
+        self.assertEqual(paths[1].parents[1], serial_root)
+        self.assertEqual(paths[0].parent.name, "s1")
+        self.assertEqual(paths[1].parent.name, "s2")
+        for idx, path in enumerate(paths, 1):
+            artifact_dir = path.parent
+            self.assertTrue((artifact_dir / "prompt.txt").exists())
+            self.assertTrue((artifact_dir / "meta.json").exists())
+            meta = json.loads((artifact_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["serial_id"], "serial_demo")
+            self.assertEqual(meta["segment_id"], f"s{idx}")
+            self.assertEqual(meta["trk"], str(path.resolve()))
+        manifest = json.loads((serial_root / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["artifact_id"], "serial_demo")
+        self.assertEqual([segment["segment_id"] for segment in manifest["segments"]], ["s1", "s2"])
+
     def test_append_and_replace_tail_modify_only_unsubmitted_segments(self):
         plan = {"segments": [{"trk": str(self.ready_trk)}, {"text": "old tail"}]}
         out, _ = self.cli(
@@ -827,7 +915,7 @@ print(json.dumps({"ok": True}))
             module.update_state(seq_id, create, create=True)
             module.tracker_standby = lambda base, timeout: {"ok": True}
 
-            def fake_resolve(text, duration, stage, serial_id, seed=None, diffusion_steps=None):
+            def fake_resolve(text, duration, stage, serial_id, seed=None, diffusion_steps=None, **kwargs):
                 module.sequence_cancel_cmd(SimpleNamespace(seq_id=seq_id), "http://unused", 0.1)
                 late_trk.parent.mkdir(parents=True, exist_ok=True)
                 late_trk.write_text("late\n", encoding="utf-8")
@@ -892,7 +980,7 @@ print(json.dumps({"ok": True}))
             module.update_state(seq_id, create, create=True)
             module.tracker_standby = lambda base, timeout: {"ok": True}
 
-            def fake_resolve(text, duration, stage, serial_id, seed=None, diffusion_steps=None):
+            def fake_resolve(text, duration, stage, serial_id, seed=None, diffusion_steps=None, **kwargs):
                 module.sequence_cancel_cmd(SimpleNamespace(seq_id=seq_id), "http://unused", 0.1)
                 generated.parent.mkdir(parents=True, exist_ok=True)
                 generated.write_text("generated\n", encoding="utf-8")
