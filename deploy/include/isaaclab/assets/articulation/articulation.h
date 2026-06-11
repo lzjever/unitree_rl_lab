@@ -60,11 +60,6 @@ struct ArticulationData
         return sdk_joint_ids_map[logical_joint_index];
     }
 
-    // Override joint positions from reference motion (used by joint_pos_rel observation).
-    // If override_joint_mask[i] is true, joint_pos[i] will be replaced by override_joint_pos[i].
-    std::vector<bool> override_joint_mask;
-    Eigen::VectorXf override_joint_pos;
-
     unitree::common::UnitreeJoystick* joystick = nullptr;
     LiveState live_state;
 };
