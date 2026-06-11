@@ -244,7 +244,6 @@ private:
     float reference_fps_ = 50.0f;
     size_t reference_future_horizon_ = ReferenceLoader::kDefaultFutureHorizon;
     size_t live_initial_buffer_frames_ = 1;
-    std::vector<int> override_joint_ids_;  // Joints whose positions are overridden by reference motion
     std::vector<float> policy_kp_;
     std::vector<float> policy_kd_;
     std::vector<float> locomotion_policy_kp_;

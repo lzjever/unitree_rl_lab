@@ -1433,20 +1433,6 @@ State_Track::State_Track(int state_mode, std::string state_string)
     auto cfg = param::config["FSM"][state_string];
     auto policy_dir = param::parser_policy_dir(cfg["policy_dir"].as<std::string>());
 
-    // Read override_joint_ids from config (joints whose positions are replaced by reference motion)
-    if (cfg["override_joint_ids"].IsDefined()) {
-        override_joint_ids_ = cfg["override_joint_ids"].as<std::vector<int>>();
-        spdlog::info("Track: override_joint_ids = [{}]", [&]() {
-            std::string s;
-            for (size_t i = 0; i < override_joint_ids_.size(); ++i) {
-                s += std::to_string(override_joint_ids_[i]) + (i + 1 < override_joint_ids_.size() ? ", " : "");
-            }
-            return s;
-        }());
-    } else {
-        spdlog::info("Track: no override_joint_ids configured");
-    }
-
     no_global_mode_ = cfg["no_global_mode"].as<bool>(false);
     spdlog::info("Track: no_global_mode = {}", no_global_mode_ ? "true" : "false");
     use_motion_root_command_ = cfg["use_motion_root_command"].as<bool>(false);
@@ -1954,24 +1940,6 @@ void State_Track::run_tracking_policy()
                        use_motion_velocity_command_,
                        !one_shot_mode_);
     env->episode_length += 1;
-
-    // Override joint positions with reference motion for specified joints.
-    // Read override_joint_ids from deploy.yaml via the observation params is not possible here,
-    // so we use a fixed set or read from deploy.yaml in constructor.
-    // For now, use the override_joint_ids from deploy.yaml (stored during init).
-    if (!override_joint_ids_.empty()) {
-        const auto& ref_joint_pos = reference_->command_joint_pos();
-        auto& data = env->robot->data;
-        if (data.override_joint_pos.size() != data.joint_pos.size()) {
-            data.override_joint_pos = Eigen::VectorXf::Zero(data.joint_pos.size());
-        }
-        for (int idx : override_joint_ids_) {
-            if (idx >= 0 && idx < static_cast<int>(data.joint_pos.size())) {
-                data.override_joint_pos[idx] = ref_joint_pos[idx];
-                data.joint_pos[idx] = ref_joint_pos[idx];  // directly override
-            }
-        }
-    }
 
     env->robot->update();
     const auto obs = env->observation_manager->compute();
