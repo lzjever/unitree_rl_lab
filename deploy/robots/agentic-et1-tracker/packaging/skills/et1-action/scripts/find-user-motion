@@ -1,95 +1,238 @@
-#!/usr/bin/env bash
-set -u
-
-emit_ok() {
-  python3 - "$1" <<'PY'
+#!/usr/bin/env python3
 import json
+import re
 import sys
-print(json.dumps({"ok": True, "path": sys.argv[1]}, separators=(",", ":")))
-PY
-}
+from difflib import SequenceMatcher
+from pathlib import Path
 
-emit_err() {
-  python3 - "$1" "$2" <<'PY'
-import json
-import sys
-print(json.dumps({"ok": False, "error": {"code": sys.argv[1], "message": sys.argv[2]}}, separators=(",", ":")))
-PY
-}
 
-if [ "$#" -eq 2 ]; then
-  root=$1
-  query=$2
-elif [ "$#" -eq 4 ] && [ "$1" = "--root" ] && [ "$3" = "--query" ]; then
-  root=$2
-  query=$4
-else
-  emit_err REQUEST_INVALID "usage: find-user-motion ROOT QUERY"
-  exit 2
-fi
+THRESHOLD = 0.80
+AMBIGUOUS_MARGIN = 0.03
 
-if [ -z "$query" ]; then
-  emit_err REQUEST_INVALID "query must be non-empty"
-  exit 2
-fi
 
-if [ ! -d "$root" ]; then
-  emit_err REQUEST_INVALID "user-motion root does not exist"
-  exit 2
-fi
+def emit_ok(path, match=None):
+    doc = {"ok": True, "path": str(path)}
+    if match:
+        doc["match"] = match
+    print(json.dumps(doc, ensure_ascii=False, separators=(",", ":")))
 
-root_real=$(realpath -m -- "$root") || {
-  emit_err REQUEST_INVALID "could not resolve user-motion root"
-  exit 2
-}
 
-qbase=${query##*/}
-qstem=$qbase
-if [[ "$qstem" == *.trk ]]; then
-  qstem=${qstem%.trk}
-fi
+def emit_err(code, message, **extra):
+    doc = {"ok": False, "error": {"code": code, "message": message}}
+    doc.update(extra)
+    print(json.dumps(doc, ensure_ascii=False, separators=(",", ":")))
 
-if [ -z "$qstem" ]; then
-  emit_err REQUEST_INVALID "query stem must be non-empty"
-  exit 2
-fi
 
-exact=()
-contains=()
-while IFS= read -r -d '' file; do
-  real=$(realpath -e -- "$file") || continue
-  case "$real" in
-    "$root_real"/*) ;;
-    *) continue ;;
-  esac
-  base=${file##*/}
-  stem=${base%.trk}
-  if [ "$stem" = "$qstem" ]; then
-    exact+=("$real")
-  elif [[ "$base" == *"$query"* || "$base" == *"$qstem"* || "$stem" == *"$qstem"* ]]; then
-    contains+=("$real")
-  fi
-done < <(find "$root_real" -type f -name '*.trk' -print0 | sort -z)
+def parse_args(argv):
+    if len(argv) == 2:
+        return argv[0], argv[1]
+    if len(argv) == 4 and argv[0] == "--root" and argv[2] == "--query":
+        return argv[1], argv[3]
+    emit_err("REQUEST_INVALID", "usage: find-user-motion ROOT QUERY")
+    sys.exit(2)
 
-if [ "${#exact[@]}" -eq 1 ]; then
-  emit_ok "${exact[0]}"
-  exit 0
-fi
 
-if [ "${#exact[@]}" -gt 1 ]; then
-  emit_err AMBIGUOUS "multiple .trk files have the requested stem"
-  exit 1
-fi
+def is_relative_to(path, root):
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
 
-if [ "${#contains[@]}" -eq 1 ]; then
-  emit_ok "${contains[0]}"
-  exit 0
-fi
 
-if [ "${#contains[@]}" -gt 1 ]; then
-  emit_err AMBIGUOUS "multiple .trk files match the query"
-  exit 1
-fi
+def resolve_inside_root(path, root):
+    try:
+        real = path.resolve(strict=True)
+    except OSError:
+        return None
+    if not real.is_file() or real.suffix != ".trk":
+        return None
+    if not is_relative_to(real, root):
+        return None
+    return real
 
-emit_err NOT_FOUND "no matching .trk file found"
-exit 1
+
+def query_stem(query):
+    base = Path(query).name
+    if base.endswith(".trk"):
+        base = base[:-4]
+    return base
+
+
+def iter_trk_files(root):
+    for path in sorted(root.rglob("*.trk"), key=lambda p: p.as_posix()):
+        real = resolve_inside_root(path, root)
+        if real:
+            yield path, real
+
+
+def direct_trk_match(root, query, qstem):
+    exact = []
+    contains = []
+    for display_path, real_path in iter_trk_files(root):
+        base = display_path.name
+        stem = display_path.stem
+        if stem == qstem:
+            exact.append(real_path)
+        elif query in base or qstem in base or qstem in stem:
+            contains.append(real_path)
+
+    if len(exact) == 1:
+        return exact[0], None
+    if len(exact) > 1:
+        emit_err("AMBIGUOUS", "multiple .trk files have the requested stem")
+        sys.exit(1)
+    if len(contains) == 1:
+        return contains[0], None
+    if len(contains) > 1:
+        emit_err("AMBIGUOUS", "multiple .trk files match the query")
+        sys.exit(1)
+    return None, None
+
+
+def normalize(text):
+    text = str(text).lower()
+    text = re.sub(r"\.trk$", "", text)
+    text = re.sub(r"[_\-/]+", " ", text)
+    text = re.sub(r"[^\w\s]+", " ", text, flags=re.UNICODE)
+    return " ".join(text.split())
+
+
+def fuzzy_score(query, name):
+    q = normalize(query)
+    n = normalize(name)
+    if not q or not n:
+        return 0.0
+    q_compact = q.replace(" ", "")
+    n_compact = n.replace(" ", "")
+    score = max(
+        SequenceMatcher(None, q, n).ratio(),
+        SequenceMatcher(None, q_compact, n_compact).ratio(),
+    )
+    if q_compact == n_compact:
+        score = max(score, 1.0)
+    elif len(q_compact) >= 2 and q_compact in n_compact:
+        score = max(score, min(0.95, 0.80 + 0.15 * len(q_compact) / max(len(n_compact), 1)))
+    elif len(n_compact) >= 2 and n_compact in q_compact:
+        score = max(score, min(0.95, 0.80 + 0.15 * len(n_compact) / max(len(q_compact), 1)))
+    return score
+
+
+def json_trk_candidates(metadata_path, doc, root):
+    candidates = [metadata_path.with_suffix(".trk")]
+
+    filename = doc.get("filename")
+    if isinstance(filename, str) and filename:
+        candidates.append(metadata_path.parent / filename)
+
+    motion_path = doc.get("motion_path")
+    if isinstance(motion_path, str) and motion_path:
+        p = Path(motion_path)
+        candidates.append(p if p.is_absolute() else metadata_path.parent / p)
+
+    seen = set()
+    for candidate in candidates:
+        real = resolve_inside_root(candidate, root)
+        if not real or real in seen:
+            continue
+        seen.add(real)
+        yield real
+
+
+def iter_metadata_matches(root, query):
+    for metadata_path in sorted(root.rglob("*.json"), key=lambda p: p.as_posix()):
+        try:
+            metadata_real = metadata_path.resolve(strict=True)
+        except OSError:
+            continue
+        if not is_relative_to(metadata_real, root):
+            continue
+        try:
+            with metadata_real.open("r", encoding="utf-8") as f:
+                doc = json.load(f)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(doc, dict):
+            continue
+        name = doc.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        paths = list(json_trk_candidates(metadata_real, doc, root))
+        if not paths:
+            continue
+        score = fuzzy_score(query, name)
+        if score <= 0:
+            continue
+        yield {
+            "path": paths[0],
+            "name": name,
+            "score": score,
+            "metadata": metadata_real,
+        }
+
+
+def metadata_name_match(root, query):
+    hits = sorted(
+        iter_metadata_matches(root, query),
+        key=lambda h: (-h["score"], h["name"], h["path"].as_posix()),
+    )
+    if not hits or hits[0]["score"] < THRESHOLD:
+        top = [
+            {"name": h["name"], "score": round(h["score"], 3)}
+            for h in hits[:3]
+            if h["score"] >= 0.50
+        ]
+        extra = {"top": top} if top else {}
+        emit_err("NOT_FOUND", "no matching .trk or json name found", **extra)
+        sys.exit(1)
+
+    best = hits[0]
+    if len(hits) > 1 and hits[1]["score"] >= best["score"] - AMBIGUOUS_MARGIN:
+        top = [
+            {"name": h["name"], "score": round(h["score"], 3)}
+            for h in hits[:3]
+        ]
+        emit_err("AMBIGUOUS", "multiple json name matches", top=top)
+        sys.exit(1)
+
+    return best["path"], {
+        "by": "json_name",
+        "name": best["name"],
+        "score": round(best["score"], 3),
+    }
+
+
+def main(argv):
+    root_arg, query = parse_args(argv)
+    if not query:
+        emit_err("REQUEST_INVALID", "query must be non-empty")
+        return 2
+
+    root = Path(root_arg)
+    if not root.is_dir():
+        emit_err("REQUEST_INVALID", "user-motion root does not exist")
+        return 2
+
+    try:
+        root_real = root.resolve(strict=True)
+    except OSError:
+        emit_err("REQUEST_INVALID", "could not resolve user-motion root")
+        return 2
+
+    qstem = query_stem(query)
+    if not qstem:
+        emit_err("REQUEST_INVALID", "query stem must be non-empty")
+        return 2
+
+    direct, match = direct_trk_match(root_real, query, qstem)
+    if direct:
+        emit_ok(direct, match)
+        return 0
+
+    path, match = metadata_name_match(root_real, query)
+    emit_ok(path, match)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

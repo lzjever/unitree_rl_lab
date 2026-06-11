@@ -375,7 +375,7 @@ def find_user_motion(root, query):
         if code in {"NOT_FOUND", "AMBIGUOUS"}:
             code = "REQUEST_INVALID"
         raise CliError(code, error.get("message", "user motion not found"), next_step="run-trk")
-    return doc.get("path")
+    return doc
 
 
 def relative_trk_candidate(root, raw):
@@ -402,13 +402,24 @@ def validate_user_motion_path(path, root):
     return validate_trk(path_real)
 
 
-def matched_user_motion_doc(query, path, root):
+def matched_user_motion_doc(query, path, root, match=None):
     path = Path(path)
     try:
         file = path.relative_to(root.resolve(strict=False)).as_posix()
     except ValueError:
         file = path.name
-    return {"query": query, "file": file}
+    doc = {"query": query, "file": file}
+    if isinstance(match, dict):
+        by = match.get("by")
+        name = match.get("name")
+        score = match.get("score")
+        if by:
+            doc["by"] = by
+        if name:
+            doc["name"] = name
+        if isinstance(score, (int, float)):
+            doc["score"] = score
+    return doc
 
 
 def resolve_run_trk_path(raw):
@@ -420,8 +431,10 @@ def resolve_run_trk_path(raw):
     if candidate.exists():
         return validate_user_motion_path(candidate, root), None
     matched = find_user_motion(root, raw)
-    resolved = validate_user_motion_path(matched, root)
-    return resolved, matched_user_motion_doc(raw, resolved, root)
+    path = matched.get("path") if isinstance(matched, dict) else matched
+    resolved = validate_user_motion_path(path, root)
+    match = matched.get("match") if isinstance(matched, dict) else None
+    return resolved, matched_user_motion_doc(raw, resolved, root, match)
 
 
 def execute_trk(base, path, mode, wait, timeout, poll, hold=False):
