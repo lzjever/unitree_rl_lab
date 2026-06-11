@@ -191,28 +191,6 @@ std::vector<int> readIntVector(const YAML::Node& root,
   return values;
 }
 
-std::vector<int> readOverrideJointIds(const YAML::Node& root) {
-  const YAML::Node node = root["override_joint_ids"];
-  if (!node || node.IsNull()) {
-    return {};
-  }
-  if (!node.IsSequence()) {
-    throw error("override_joint_ids must be a sequence");
-  }
-
-  std::vector<int> values;
-  values.reserve(node.size());
-  for (std::size_t i = 0; i < node.size(); ++i) {
-    values.push_back(scalarAs<int>(node[i],
-                                   "override_joint_ids[" + std::to_string(i) + "]"));
-  }
-
-  if (values.empty() || values == std::vector<int>{24, 25}) {
-    return values;
-  }
-  throw error("override_joint_ids must be absent, empty, or [24, 25]");
-}
-
 std::vector<double> readDoubleVector(const std::string& field,
                                      const YAML::Node& node,
                                      std::size_t expected_size,
@@ -514,7 +492,6 @@ DeployConfig loadDeployConfig(const std::filesystem::path& path) {
 
     config.sdk_joint_ids_map = readIntVector(root, "sdk_joint_ids_map", kJointDim);
     validateSdkJointIdsMap(config.sdk_joint_ids_map);
-    config.override_joint_ids = readOverrideJointIds(root);
 
     config.step_dt = readStepDt(root);
     config.policy_kp = readRootDoubleVector(root, "policy_kp", false, true);

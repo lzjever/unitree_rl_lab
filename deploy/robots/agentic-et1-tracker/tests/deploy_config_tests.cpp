@@ -293,7 +293,6 @@ TEST_CASE("DeployConfig loads the frozen GeneralTracker deploy contract") {
   REQUIRE(config.default_joint_pos[25] == 0.25);
   REQUIRE(config.sdk_joint_ids_map[24] == 29);
   REQUIRE(config.sdk_joint_ids_map[25] == 30);
-  REQUIRE(config.override_joint_ids.empty());
 
   requireTerm(config.obs_current_terms, "command_root_ori_b", 6, 0);
   requireTerm(config.obs_current_terms, "command_xy_yaw_vel", 3, 6);
@@ -370,17 +369,6 @@ TEST_CASE("DeployConfig loads the GeneralTrackerCLNFootstate observation contrac
               0);
 }
 
-TEST_CASE("DeployConfig loads ET1 GeneralTracker override joint ids when configured") {
-  const std::string yaml =
-      replaceOnce(validDeployYaml(), "step_dt: 0.02\n",
-                  "step_dt: 0.02\n"
-                  "override_joint_ids: [24, 25]\n");
-
-  const DeployConfig config = loadYaml(yaml);
-
-  REQUIRE(config.override_joint_ids == std::vector<int>{24, 25});
-}
-
 TEST_CASE("DeployConfig parses and validates default joint positions") {
   SECTION("missing default_joint_pos") {
     const std::string yaml =
@@ -406,26 +394,6 @@ TEST_CASE("DeployConfig parses and validates default joint positions") {
                     "0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25]");
 
     REQUIRE_THROWS_WITH(loadYaml(yaml), ContainsSubstring("default_joint_pos"));
-  }
-}
-
-TEST_CASE("DeployConfig rejects unsupported GeneralTracker override joint ids") {
-  SECTION("unsupported id") {
-    const std::string yaml =
-        replaceOnce(validDeployYaml(), "step_dt: 0.02\n",
-                    "step_dt: 0.02\n"
-                    "override_joint_ids: [23]\n");
-
-    REQUIRE_THROWS_WITH(loadYaml(yaml), ContainsSubstring("override_joint_ids"));
-  }
-
-  SECTION("duplicate id") {
-    const std::string yaml =
-        replaceOnce(validDeployYaml(), "step_dt: 0.02\n",
-                    "step_dt: 0.02\n"
-                    "override_joint_ids: [24, 24]\n");
-
-    REQUIRE_THROWS_WITH(loadYaml(yaml), ContainsSubstring("override_joint_ids"));
   }
 }
 

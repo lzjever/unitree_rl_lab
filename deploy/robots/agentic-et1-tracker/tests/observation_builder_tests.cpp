@@ -596,42 +596,6 @@ TEST_CASE("ObservationBuilder maps SDK motor slots into policy order before defa
   requireVecApprox(parts.joint_vel_rel, expected_dq);
 }
 
-TEST_CASE("ObservationBuilder overrides configured joint_pos_rel from reference joint_pos") {
-  DeployConfig config = validConfig();
-  config.override_joint_ids = {24, 25};
-
-  FrameStorage frame;
-  LowStateSample low = liveState(yawQuat(0.0F));
-  fillPolicyMotors(low, config.sdk_joint_ids_map);
-  for (std::size_t i = 0; i < kJointDim; ++i) {
-    frame.joint_pos[i] = 1000.0F + static_cast<float>(i);
-  }
-
-  const std::size_t head_yaw_sdk =
-      static_cast<std::size_t>(config.sdk_joint_ids_map.at(24));
-  const std::size_t head_pitch_sdk =
-      static_cast<std::size_t>(config.sdk_joint_ids_map.at(25));
-  low.motors.at(head_yaw_sdk).q = -300.0F;
-  low.motors.at(head_pitch_sdk).q = -400.0F;
-
-  const ObservationBuilderState state =
-      makeObservationBuilderState(frame.view(), low, ObservationBuilderConfig{});
-  const PolicyObservationParts parts =
-      buildObservationParts(config, frame.view(), low, seq(0.0F, kJointDim), state);
-
-  Vec expected_q_rel;
-  expected_q_rel.reserve(kJointDim);
-  for (std::size_t i = 0; i < kJointDim; ++i) {
-    const float source_q =
-        i == 24 || i == 25 ? frame.joint_pos[i] : 10.0F + static_cast<float>(i);
-    expected_q_rel.push_back(source_q -
-                             static_cast<float>(config.default_joint_pos.at(i)));
-  }
-  requireVecApprox(parts.joint_pos_rel, expected_q_rel);
-  REQUIRE(parts.joint_vel_rel.at(24) == 20.0F + 24.0F);
-  REQUIRE(parts.joint_vel_rel.at(25) == 20.0F + 25.0F);
-}
-
 TEST_CASE("ObservationBuilder rejects invalid input contracts") {
   DeployConfig config = validConfig();
   FrameStorage frame;
@@ -681,14 +645,6 @@ TEST_CASE("ObservationBuilder rejects invalid input contracts") {
                       ObservationBuilderError);
   }
 
-  SECTION("override joint id outside policy order") {
-    config.override_joint_ids = {26};
-    const ObservationBuilderState state =
-        makeObservationBuilderState(frame.view(), low, ObservationBuilderConfig{});
-    REQUIRE_THROWS_AS(buildObservationParts(config, frame.view(), low, seq(0.0F, kJointDim),
-                                            state),
-                      ObservationBuilderError);
-  }
 }
 
 }  // namespace agentic_et1_tracker

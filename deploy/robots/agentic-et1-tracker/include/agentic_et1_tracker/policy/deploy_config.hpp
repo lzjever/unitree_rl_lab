@@ -26,7 +26,6 @@ struct DeployConfig {
   ObservationContract observation_contract{ObservationContract::GeneralTracker};
   std::vector<int> joint_ids_map;
   std::vector<int> sdk_joint_ids_map;
-  std::vector<int> override_joint_ids;
   std::vector<double> policy_kp;
   std::vector<double> policy_kd;
   std::vector<double> default_joint_pos;

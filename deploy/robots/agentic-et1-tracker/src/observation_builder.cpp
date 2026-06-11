@@ -292,21 +292,6 @@ double anchorFrameOffsetYaw(Quat ref_anchor_q, Quat robot_anchor_q) {
   return yawFromQuat(offset_q);
 }
 
-std::array<bool, kJointDim> overrideJointMask(const DeployConfig& config) {
-  std::array<bool, kJointDim> mask{};
-  for (const int joint_id : config.override_joint_ids) {
-    if (joint_id < 0 || joint_id >= static_cast<int>(kJointDim)) {
-      throw error("DeployConfig.override_joint_ids contains an id outside policy order");
-    }
-    const auto index = static_cast<std::size_t>(joint_id);
-    if (mask[index]) {
-      throw error("DeployConfig.override_joint_ids contains duplicate ids");
-    }
-    mask[index] = true;
-  }
-  return mask;
-}
-
 void fillJointObservations(const DeployConfig& config,
                            const LowStateSample& low_state,
                            const Vec& reference_joint_pos,
@@ -317,14 +302,11 @@ void fillJointObservations(const DeployConfig& config,
   joint_pos_rel.reserve(kJointDim);
   joint_vel_rel.reserve(kJointDim);
   requireExactSize("reference_joint_pos", reference_joint_pos.size(), kJointDim);
-  const auto override_mask = overrideJointMask(config);
 
   for (std::size_t policy_index = 0; policy_index < kJointDim; ++policy_index) {
     const auto sdk_index = static_cast<std::size_t>(config.sdk_joint_ids_map[policy_index]);
     const MotorStateSample& motor = low_state.motors[sdk_index];
-    const float q = override_mask[policy_index] ? reference_joint_pos[policy_index]
-                                                : motor.q;
-    joint_pos_rel.push_back(q -
+    joint_pos_rel.push_back(motor.q -
                             static_cast<float>(config.default_joint_pos[policy_index]));
     joint_vel_rel.push_back(motor.dq);
   }
