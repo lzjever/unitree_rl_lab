@@ -80,6 +80,7 @@ class RuntimeControlLoop final {
   void tick();
   RuntimeInternalState internalStateForTest() const;
   void failNextTransitionStartForTest();
+  void faultNextTransitionStartForTest();
 
  private:
   struct SnapshotRuntimeState {
@@ -96,6 +97,12 @@ class RuntimeControlLoop final {
     Standby,
   };
 
+  enum class StandbyTransitionResult {
+    Started,
+    Fallback,
+    SafetyTerminal,
+  };
+
   struct PendingTransition {
     TransitionTargetKind target_kind{TransitionTargetKind::User};
     std::string target_id;
@@ -103,6 +110,9 @@ class RuntimeControlLoop final {
     std::optional<MotionRequest> target_request;
     std::shared_ptr<const TrkTrack> target_track;
     std::optional<std::size_t> idle_index;
+    MotionState source_completion_state{MotionState::Done};
+    StopReason source_completion_reason{StopReason::None};
+    ErrorCode source_completion_error{ErrorCode::Ok};
   };
 
   bool consumePendingCommands();
@@ -153,6 +163,7 @@ class RuntimeControlLoop final {
   bool startTransitionFromCompletedIdleToIdle();
   bool startTransitionFromCompletedUserToIdle();
   bool startTransitionFromCompletedUserToStandby();
+  StandbyTransitionResult startTransitionFromActiveToStandbyCancellation();
   bool startSyntheticTransitionFromActiveFrame(PendingTransition target);
   bool startInternalTransition(std::shared_ptr<const TrkTrack> track,
                                PendingTransition target,
@@ -211,6 +222,7 @@ class RuntimeControlLoop final {
   void refreshReadinessForPolicyRuntime();
   void applyReadiness(const RobotReadinessStatus& readiness);
   bool readinessRequiresFault(const RobotReadinessStatus& readiness) const;
+  bool isSafetyTerminalState() const;
   void enterFault(ErrorCode error,
                   RobotState robot,
                   std::string block,
@@ -262,6 +274,7 @@ class RuntimeControlLoop final {
   std::vector<float> policy_startup_upper_body_target_q_;
   std::size_t velocity_policy_ticks_until_next_{0};
   bool fail_next_transition_start_for_test_{false};
+  bool fault_next_transition_start_for_test_{false};
   std::optional<LowCmdFrame> lowcmd_buffer_;
   std::optional<LowStateSample> latest_low_state_;
   std::optional<HighStateSample> latest_high_state_;

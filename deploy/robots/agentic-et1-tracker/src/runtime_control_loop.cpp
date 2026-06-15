@@ -163,6 +163,10 @@ void RuntimeControlLoop::failNextTransitionStartForTest() {
   fail_next_transition_start_for_test_ = true;
 }
 
+void RuntimeControlLoop::faultNextTransitionStartForTest() {
+  fault_next_transition_start_for_test_ = true;
+}
+
 void RuntimeControlLoop::tick() {
   if (fsm_state_ == RuntimeInternalState::Stopping) {
     consumeStoppingCommands();
@@ -411,6 +415,14 @@ void RuntimeControlLoop::handleControl(ControlMode mode) {
     cancelWaiting(StopReason::Stop);
   }
   post_stop_control_ = mode;
+  if (mode == ControlMode::StandbyVelocity) {
+    const StandbyTransitionResult transition_result =
+        startTransitionFromActiveToStandbyCancellation();
+    if (transition_result == StandbyTransitionResult::Started ||
+        transition_result == StandbyTransitionResult::SafetyTerminal) {
+      return;
+    }
+  }
   if (active_kind_ == ActiveKind::Idle) {
     stopIdleActive();
   } else if (active_kind_ == ActiveKind::Transition) {
@@ -2008,6 +2020,69 @@ bool RuntimeControlLoop::startTransitionFromCompletedUserToStandby() {
   return startSyntheticTransitionFromActiveFrame(std::move(target));
 }
 
+RuntimeControlLoop::StandbyTransitionResult
+RuntimeControlLoop::startTransitionFromActiveToStandbyCancellation() {
+  if (!active_ || !active_track_ || !standby_track_) {
+    return StandbyTransitionResult::Fallback;
+  }
+
+  if (active_kind_ == ActiveKind::Transition && transition_ &&
+      transition_->target_kind == TransitionTargetKind::Standby) {
+    return StandbyTransitionResult::Started;
+  }
+
+  if (active_kind_ != ActiveKind::User &&
+      active_kind_ != ActiveKind::Transition) {
+    return StandbyTransitionResult::Fallback;
+  }
+  if (active_kind_ == ActiveKind::User &&
+      active_->state == MotionState::Holding) {
+    return StandbyTransitionResult::Fallback;
+  }
+  if (active_kind_ == ActiveKind::Transition && !transition_) {
+    return StandbyTransitionResult::Fallback;
+  }
+
+  const std::optional<TrkFrameView> source_frame = active_track_->frame(active_->frame);
+  if (!source_frame || !standby_track_->frame(0)) {
+    return StandbyTransitionResult::Fallback;
+  }
+
+  if (hasPolicyRuntime()) {
+    const std::optional<LowStateSample> entry_low_state = readLowStateForStatus();
+    const RobotReadinessStatus readiness =
+        mapRobotReadiness(entry_low_state,
+                          robot_io_->lowCmdOccupancy(),
+                          expected_mode_machine_);
+    if (readiness.err != ErrorCode::Ok) {
+      return StandbyTransitionResult::Fallback;
+    }
+    applyReadiness(readiness);
+  }
+
+  if (active_kind_ == ActiveKind::Transition &&
+      transition_->target_kind == TransitionTargetKind::User) {
+    finishTransitionTarget(MotionState::Canceled,
+                           StopReason::Stop,
+                           ErrorCode::Ok);
+  }
+
+  PendingTransition target;
+  target.target_kind = TransitionTargetKind::Standby;
+  target.target_track = standby_track_;
+  if (active_kind_ == ActiveKind::User) {
+    target.source_completion_state = MotionState::Stopped;
+    target.source_completion_reason = StopReason::Stop;
+    target.source_completion_error = ErrorCode::Ok;
+  }
+
+  if (startSyntheticTransitionFromActiveFrame(std::move(target))) {
+    return StandbyTransitionResult::Started;
+  }
+  return isSafetyTerminalState() ? StandbyTransitionResult::SafetyTerminal
+                                 : StandbyTransitionResult::Fallback;
+}
+
 bool RuntimeControlLoop::startSyntheticTransitionFromActiveFrame(
     PendingTransition target) {
   if (!active_ || !active_track_) {
@@ -2074,6 +2149,9 @@ bool RuntimeControlLoop::startSyntheticTransitionFromActiveFrame(
   if (active_kind_ == ActiveKind::User) {
     source_to_complete = active_;
   }
+  const MotionState source_completion_state = target.source_completion_state;
+  const StopReason source_completion_reason = target.source_completion_reason;
+  const ErrorCode source_completion_error = target.source_completion_error;
 
   auto transition_track_ptr =
       std::make_shared<TrkTrack>(std::move(*transition_track));
@@ -2088,19 +2166,28 @@ bool RuntimeControlLoop::startSyntheticTransitionFromActiveFrame(
                                                std::move(target),
                                                std::move(entry_low_state));
   if (started && source_to_complete) {
-    source_to_complete->state = MotionState::Done;
-    source_to_complete->err = ErrorCode::Ok;
-    source_to_complete->stop_reason = StopReason::None;
+    source_to_complete->state = source_completion_state;
+    source_to_complete->err = source_completion_error;
+    source_to_complete->stop_reason = source_completion_reason;
     source_to_complete->ended_at = std::chrono::steady_clock::now();
     status_.publishRunStatus(toStatus(*source_to_complete));
   }
-  return true;
+  return started;
 }
 
 bool RuntimeControlLoop::startInternalTransition(
     std::shared_ptr<const TrkTrack> track,
     PendingTransition target,
     std::optional<LowStateSample> entry_low_state) {
+  if (fault_next_transition_start_for_test_) {
+    fault_next_transition_start_for_test_ = false;
+    failActiveWithFault(ErrorCode::ModelInferenceFailed,
+                        RobotState::Fault,
+                        "policy_inference_failed",
+                        runtime_state_.low_ms);
+    return false;
+  }
+
   if (fail_next_transition_start_for_test_) {
     fail_next_transition_start_for_test_ = false;
     if (target.target_request && !target.target_request->id.empty()) {
@@ -3159,6 +3246,11 @@ void RuntimeControlLoop::applyReadiness(const RobotReadinessStatus& readiness) {
 bool RuntimeControlLoop::readinessRequiresFault(
     const RobotReadinessStatus& readiness) const {
   return readiness.block == "lowcmd_occupied";
+}
+
+bool RuntimeControlLoop::isSafetyTerminalState() const {
+  return fsm_state_ == RuntimeInternalState::Fault ||
+         fsm_state_ == RuntimeInternalState::Passive;
 }
 
 void RuntimeControlLoop::enterFault(ErrorCode error,

@@ -934,7 +934,8 @@ std::filesystem::path startCompletedUserToIdleTransition(
     RuntimeStatusStore& store,
     RuntimeBridge& bridge,
     TempTree& tmp,
-    const std::string& id_prefix) {
+    const std::string& id_prefix,
+    StartQueuedRunMode start_mode = StartQueuedRunMode::RequireDirectStart) {
   const auto idle_path = validTrk(tmp, id_prefix + "_idle.trk", 3);
   REQUIRE(bridge.configureIdle({idleMotion(idle_path, 3)}).ok());
   loop.tick();
@@ -946,7 +947,7 @@ std::filesystem::path startCompletedUserToIdleTransition(
                              MotionMode::Queue,
                              1))
               .ok());
-  startQueuedRun(loop, store, id_prefix + "-source-user");
+  startQueuedRun(loop, store, id_prefix + "-source-user", start_mode);
   loop.tick();
 
   const auto snapshot = store.snapshot();
@@ -983,6 +984,8 @@ void startCompletedUserToStandbyTransition(RuntimeControlLoop& loop,
   REQUIRE_FALSE(snapshot.exec.has_value());
   REQUIRE(snapshot.queue.ids.empty());
   REQUIRE(store.findRun(id_prefix + "-source-user").run->state == MotionState::Done);
+  REQUIRE(store.findRun(id_prefix + "-source-user").run->stop_reason ==
+          StopReason::None);
 }
 
 void advanceBackgroundTransition(RuntimeControlLoop& loop,
@@ -1515,7 +1518,468 @@ TEST_CASE("RuntimeControlLoop completed user gates through standby reference whe
   REQUIRE_FALSE(snapshot.transition.target_state.has_value());
   REQUIRE(snapshot.queue.ids.empty());
   REQUIRE(store.findRun("complete-before-standby").run->state == MotionState::Done);
+  REQUIRE(store.findRun("complete-before-standby").run->stop_reason ==
+          StopReason::None);
   REQUIRE(store.findRun("standby_ref").code == ErrorCode::RunNotFound);
+}
+
+TEST_CASE("RuntimeControlLoop standby velocity cancels running user through standby reference") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.stop_hold_s = 0.0;
+  const auto standby_track =
+      loadTrack(tmp.trkConfig(), validTrk(tmp, "cancel_running_standby_ref.trk", 2));
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  FakeReferenceSink reference;
+  auto loop = makeControlLoop(config,
+                              bridge,
+                              store,
+                              tmp.trkConfig(),
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              deploy_config,
+                              velocity_config,
+                              fixStandConfig(),
+                              ControlMode::StandbyVelocity,
+                              passiveConfig(),
+                              &reference,
+                              standby_track);
+
+  const auto path = validTrk(tmp, "cancel_running_user.trk", 5);
+  REQUIRE(bridge.submitQueue(
+              executeCommand("cancel-running-user", path, MotionMode::Queue, 5))
+              .ok());
+  startQueuedRun(loop,
+                 store,
+                 "cancel-running-user",
+                 StartQueuedRunMode::AllowStandbyTransition);
+  const auto waiting_path = validTrk(tmp, "cancel_running_waiting.trk", 3);
+  REQUIRE(bridge.submitQueue(
+              executeCommand("cancel-running-waiting",
+                             waiting_path,
+                             MotionMode::Queue,
+                             3))
+              .ok());
+
+  REQUIRE(bridge.standbyVelocity().ok());
+  loop.tick();
+
+  auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Running);
+  REQUIRE(snapshot.active.kind == ActiveKind::Transition);
+  REQUIRE(snapshot.active.id.empty());
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.transition.active);
+  REQUIRE(snapshot.transition.target == "standby");
+  REQUIRE(snapshot.transition.target_id.empty());
+  REQUIRE_FALSE(snapshot.transition.target_state.has_value());
+  REQUIRE(snapshot.queue.ids.empty());
+  REQUIRE_FALSE(snapshot.idle.active);
+  REQUIRE(store.findRun("cancel-running-waiting").run->state == MotionState::Canceled);
+  REQUIRE(store.findRun("cancel-running-waiting").run->stop_reason == StopReason::Stop);
+  const auto source = store.findRun("cancel-running-user");
+  REQUIRE(source.ok());
+  REQUIRE(source.run->state == MotionState::Stopped);
+  REQUIRE(source.run->stop_reason == StopReason::Stop);
+  REQUIRE(source.run->err == ErrorCode::Ok);
+
+  advanceToStandbyPlayback(loop, store, standby_track->metadata.frames);
+  for (std::size_t i = 0; i < standby_track->metadata.frames + 4; ++i) {
+    loop.tick();
+    snapshot = store.snapshot();
+    if (snapshot.active.kind == ActiveKind::None) {
+      break;
+    }
+  }
+
+  snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::StandbyVelocity);
+  REQUIRE(snapshot.active.kind == ActiveKind::None);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE(store.findRun("cancel-running-user").run->state == MotionState::Stopped);
+  REQUIRE(store.findRun("cancel-running-user").run->stop_reason == StopReason::Stop);
+}
+
+TEST_CASE("RuntimeControlLoop standby velocity rebuilds active idle transition to standby") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.stop_hold_s = 0.0;
+  const auto standby_track =
+      loadTrack(tmp.trkConfig(), validTrk(tmp, "transition_idle_standby_ref.trk", 2));
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  RuntimeControlLoop loop(config,
+                          bridge,
+                          store,
+                          TrkLoader(tmp.trkConfig()),
+                          &reference,
+                          standby_track);
+
+  startCompletedUserToIdleTransition(loop,
+                                     store,
+                                     bridge,
+                                     tmp,
+                                     "standby-cancel-idle-transition");
+  loop.tick();
+  REQUIRE(store.snapshot().active.kind == ActiveKind::Transition);
+  REQUIRE(store.snapshot().transition.target == "idle");
+  const ReferenceFrameSnapshot source_frame = reference.latest;
+  REQUIRE(source_frame.active);
+
+  REQUIRE(bridge.standbyVelocity().ok());
+  loop.tick();
+
+  auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Running);
+  REQUIRE(snapshot.active.kind == ActiveKind::Transition);
+  REQUIRE(snapshot.transition.active);
+  REQUIRE(snapshot.transition.target == "standby");
+  REQUIRE(snapshot.transition.target_id.empty());
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.idle.enabled);
+  REQUIRE_FALSE(snapshot.idle.active);
+  REQUIRE(snapshot.queue.ids.empty());
+  requireReferenceStartsFrom(reference, source_frame);
+
+  advanceToStandbyPlayback(loop, store, standby_track->metadata.frames);
+  for (std::size_t i = 0; i < standby_track->metadata.frames + 4; ++i) {
+    loop.tick();
+    snapshot = store.snapshot();
+    if (snapshot.active.kind == ActiveKind::None) {
+      break;
+    }
+  }
+
+  snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Idle);
+  REQUIRE(snapshot.active.kind == ActiveKind::None);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE_FALSE(snapshot.transition.active);
+}
+
+TEST_CASE("RuntimeControlLoop standby velocity cancels active user transition to standby") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.stop_hold_s = 0.0;
+  const auto standby_track =
+      loadTrack(tmp.trkConfig(), validTrk(tmp, "transition_user_standby_ref.trk", 2));
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  RuntimeControlLoop loop(config,
+                          bridge,
+                          store,
+                          TrkLoader(tmp.trkConfig()),
+                          &reference,
+                          standby_track);
+
+  startHoldingToUserTransition(loop,
+                               store,
+                               bridge,
+                               tmp,
+                               "standby-cancel-held-source",
+                               "standby-cancel-old-target",
+                               &reference);
+  loop.tick();
+  REQUIRE(store.snapshot().active.kind == ActiveKind::Transition);
+  REQUIRE(store.snapshot().transition.target == "user");
+  REQUIRE(store.snapshot().transition.target_id == "standby-cancel-old-target");
+  const ReferenceFrameSnapshot source_frame = reference.latest;
+  REQUIRE(source_frame.active);
+
+  REQUIRE(bridge.standbyVelocity().ok());
+  loop.tick();
+
+  auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Running);
+  REQUIRE(snapshot.active.kind == ActiveKind::Transition);
+  REQUIRE(snapshot.transition.active);
+  REQUIRE(snapshot.transition.target == "standby");
+  REQUIRE(snapshot.transition.target_id.empty());
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.queue.ids.empty());
+  requireReferenceStartsFrom(reference, source_frame);
+
+  const auto old_target = store.findRun("standby-cancel-old-target");
+  REQUIRE(old_target.ok());
+  REQUIRE(old_target.run->state == MotionState::Canceled);
+  REQUIRE(old_target.run->stop_reason == StopReason::Stop);
+
+  advanceToStandbyPlayback(loop, store, standby_track->metadata.frames);
+  for (std::size_t i = 0; i < standby_track->metadata.frames + 4; ++i) {
+    loop.tick();
+    snapshot = store.snapshot();
+    if (snapshot.active.kind == ActiveKind::None) {
+      break;
+    }
+  }
+
+  snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Idle);
+  REQUIRE(snapshot.active.kind == ActiveKind::None);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE(store.findRun("standby-cancel-old-target").run->state ==
+          MotionState::Canceled);
+  REQUIRE(store.findRun("standby-cancel-old-target").run->stop_reason ==
+          StopReason::Stop);
+}
+
+TEST_CASE("RuntimeControlLoop standby cancellation transition failure falls back to stopping") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.stop_hold_s = 0.0;
+  const auto standby_track =
+      loadTrack(tmp.trkConfig(), validTrk(tmp, "cancel_failure_standby_ref.trk", 2));
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  auto loop = makeControlLoop(config,
+                              bridge,
+                              store,
+                              tmp.trkConfig(),
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              deploy_config,
+                              velocity_config,
+                              fixStandConfig(),
+                              ControlMode::StandbyVelocity,
+                              passiveConfig(),
+                              nullptr,
+                              standby_track);
+
+  const auto path = validTrk(tmp, "cancel_failure_user.trk", 5);
+  REQUIRE(bridge.submitQueue(
+              executeCommand("cancel-failure-user", path, MotionMode::Queue, 5))
+              .ok());
+  startQueuedRun(loop,
+                 store,
+                 "cancel-failure-user",
+                 StartQueuedRunMode::AllowStandbyTransition);
+
+  loop.failNextTransitionStartForTest();
+  REQUIRE(bridge.standbyVelocity().ok());
+  loop.tick();
+
+  auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Stopping);
+  REQUIRE(snapshot.active.kind == ActiveKind::User);
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->id == "cancel-failure-user");
+  REQUIRE(snapshot.exec->state == MotionState::Stopping);
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE(store.findRun("cancel-failure-user").run->state == MotionState::Stopping);
+  REQUIRE(store.findRun("cancel-failure-user").run->stop_reason == StopReason::Stop);
+
+  loop.tick();
+  snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::StandbyVelocity);
+  REQUIRE(snapshot.active.kind == ActiveKind::None);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(store.findRun("cancel-failure-user").run->state == MotionState::Stopped);
+  REQUIRE(store.findRun("cancel-failure-user").run->stop_reason == StopReason::Stop);
+}
+
+TEST_CASE("RuntimeControlLoop standby cancellation transition fault remains fault") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.stop_hold_s = 0.0;
+  const auto standby_track =
+      loadTrack(tmp.trkConfig(), validTrk(tmp, "cancel_fault_standby_ref.trk", 2));
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  auto loop = makeControlLoop(config,
+                              bridge,
+                              store,
+                              tmp.trkConfig(),
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              deploy_config,
+                              velocity_config,
+                              fixStandConfig(),
+                              ControlMode::StandbyVelocity,
+                              passiveConfig(),
+                              nullptr,
+                              standby_track);
+
+  const auto path = validTrk(tmp, "cancel_fault_user.trk", 5);
+  REQUIRE(bridge.submitQueue(
+              executeCommand("cancel-fault-user", path, MotionMode::Queue, 5))
+              .ok());
+  startQueuedRun(loop,
+                 store,
+                 "cancel-fault-user",
+                 StartQueuedRunMode::AllowStandbyTransition);
+
+  loop.faultNextTransitionStartForTest();
+  REQUIRE(bridge.standbyVelocity().ok());
+  loop.tick();
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Fault);
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Fault);
+  REQUIRE(snapshot.err == ErrorCode::ModelInferenceFailed);
+  REQUIRE(snapshot.block == "policy_inference_failed");
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(store.findRun("cancel-fault-user").run->state == MotionState::Failed);
+  REQUIRE(store.findRun("cancel-fault-user").run->err ==
+          ErrorCode::ModelInferenceFailed);
+}
+
+TEST_CASE("RuntimeControlLoop standby velocity while preparing falls back without transition") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.stop_hold_s = 0.0;
+  const auto standby_track =
+      loadTrack(tmp.trkConfig(), validTrk(tmp, "preparing_cancel_standby_ref.trk", 2));
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+  RuntimeControlLoop loop(config,
+                          bridge,
+                          store,
+                          TrkLoader(tmp.trkConfig()),
+                          robot,
+                          tracker_policy,
+                          deploy_config,
+                          passiveConfig(),
+                          kExpectedModeMachine,
+                          RuntimeMode::Real,
+                          nullptr,
+                          standby_track);
+
+  const auto path = validTrk(tmp, "preparing_cancel_user.trk", 5);
+  REQUIRE(bridge.submitQueue(
+              executeCommand("preparing-cancel-user", path, MotionMode::Queue, 5))
+              .ok());
+  loop.tick();
+  REQUIRE(store.snapshot().ctrl == ControllerState::Preparing);
+  REQUIRE(store.snapshot().active.kind == ActiveKind::User);
+  REQUIRE_FALSE(store.snapshot().transition.active);
+
+  REQUIRE(bridge.standbyVelocity().ok());
+  loop.tick();
+
+  auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Stopping);
+  REQUIRE(snapshot.active.kind == ActiveKind::User);
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->id == "preparing-cancel-user");
+  REQUIRE(snapshot.exec->state == MotionState::Stopping);
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE(store.findRun("preparing-cancel-user").run->state == MotionState::Stopping);
+  REQUIRE(store.findRun("preparing-cancel-user").run->stop_reason == StopReason::Stop);
+
+  loop.tick();
+  snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Idle);
+  REQUIRE(snapshot.active.kind == ActiveKind::None);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(store.findRun("preparing-cancel-user").run->state == MotionState::Stopped);
+  REQUIRE(store.findRun("preparing-cancel-user").run->stop_reason == StopReason::Stop);
+}
+
+TEST_CASE("RuntimeControlLoop stop passive and fixstand preempt standby cancellation transition") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.stop_hold_s = 0.0;
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+
+  struct Case {
+    const char* id;
+    ControlMode mode;
+    ControllerState expected_ctrl;
+    ActiveKind expected_active;
+  };
+
+  for (const auto& item : std::vector<Case>{
+           {"cancel-transition-stop", ControlMode::StandbyVelocity,
+            ControllerState::Stopping, ActiveKind::None},
+           {"cancel-transition-passive", ControlMode::Passive,
+            ControllerState::Passive, ActiveKind::None},
+           {"cancel-transition-fixstand", ControlMode::FixStand,
+            ControllerState::FixStand, ActiveKind::None},
+       }) {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeRobotIO robot(readyLowState(deploy_config));
+    FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+    FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+    const auto standby_track =
+        validStandbyTrack(tmp, std::string(item.id) + "_standby_ref.trk");
+    auto loop = makeControlLoop(config,
+                                bridge,
+                                store,
+                                tmp.trkConfig(),
+                                robot,
+                                tracker_policy,
+                                velocity_policy,
+                                deploy_config,
+                                velocity_config,
+                                fixstand_config,
+                                ControlMode::StandbyVelocity,
+                                passiveConfig(),
+                                nullptr,
+                                standby_track);
+
+    const auto path = validTrk(tmp, std::string(item.id) + "_user.trk", 5);
+    REQUIRE(bridge.submitQueue(
+                executeCommand(item.id, path, MotionMode::Queue, 5))
+                .ok());
+    startQueuedRun(loop,
+                   store,
+                   item.id,
+                   StartQueuedRunMode::AllowStandbyTransition);
+
+    REQUIRE(bridge.standbyVelocity().ok());
+    loop.tick();
+    REQUIRE(store.snapshot().active.kind == ActiveKind::Transition);
+    REQUIRE(store.snapshot().transition.target == "standby");
+    REQUIRE(store.findRun(item.id).run->state == MotionState::Stopped);
+    REQUIRE(store.findRun(item.id).run->stop_reason == StopReason::Stop);
+
+    if (std::string(item.id) == "cancel-transition-stop") {
+      REQUIRE(bridge.stop().state == ControllerState::Stopping);
+    } else if (item.mode == ControlMode::Passive) {
+      REQUIRE(bridge.passive().ok());
+    } else {
+      REQUIRE(bridge.fixStand().ok());
+    }
+
+    loop.tick();
+    const auto snapshot = store.snapshot();
+    REQUIRE(snapshot.ctrl == item.expected_ctrl);
+    REQUIRE(snapshot.active.kind == item.expected_active);
+    REQUIRE_FALSE(snapshot.exec.has_value());
+    REQUIRE_FALSE(snapshot.transition.active);
+    REQUIRE(store.findRun(item.id).run->state == MotionState::Stopped);
+    REQUIRE(store.findRun(item.id).run->stop_reason == StopReason::Stop);
+  }
 }
 
 TEST_CASE("RuntimeControlLoop holding to user transition is internal status only") {
@@ -1708,8 +2172,6 @@ TEST_CASE("RuntimeControlLoop transition abort controls terminate target user") 
             ControllerState::Passive, 1},
            {"transition-fixstand-target", ControlMode::FixStand,
             ControllerState::FixStand, 1},
-           {"transition-standby-target", ControlMode::StandbyVelocity,
-            ControllerState::StandbyVelocity, 1},
        }) {
     RuntimeStatusStore store(config);
     RuntimeBridge bridge(config, store);
@@ -5590,7 +6052,7 @@ TEST_CASE("RuntimeControlLoop fixstand and standby commands cancel queued work a
   }
 }
 
-TEST_CASE("RuntimeControlLoop control command while running stops active and clears waiting only") {
+TEST_CASE("RuntimeControlLoop fixstand command while running stops active and clears waiting only") {
   TempTree tmp;
   RuntimeConfig config = runtimeConfig();
   config.stop_hold_s = 0.0;
@@ -5598,22 +6060,14 @@ TEST_CASE("RuntimeControlLoop control command while running stops active and cle
   const VelocityDeployConfig velocity_config = velocityDeployConfig();
   const FixStandConfig fixstand_config = fixStandConfig();
 
-  struct Case {
-    ControlMode mode;
-    ControllerState expected_ctrl;
-  };
-
-  for (const auto& item : std::vector<Case>{
-           {ControlMode::FixStand, ControllerState::FixStand},
-           {ControlMode::StandbyVelocity, ControllerState::StandbyVelocity},
-       }) {
+  SECTION("fixstand") {
     RuntimeStatusStore store(config);
     RuntimeBridge bridge(config, store);
     FakeRobotIO robot(readyLowState(deploy_config));
     FakePolicy tracker_policy;
     FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.5F));
     const auto standby_track =
-        validStandbyTrack(tmp, toString(item.expected_ctrl) + "_control_standby_ref.trk");
+        validStandbyTrack(tmp, "fixstand_control_standby_ref.trk");
     auto loop = makeControlLoop(config,
                                 bridge,
                                 store,
@@ -5628,10 +6082,8 @@ TEST_CASE("RuntimeControlLoop control command while running stops active and cle
                                 passiveConfig(),
                                 nullptr,
                                 standby_track);
-    const auto active_path =
-        validTrk(tmp, toString(item.expected_ctrl) + "_active.trk", 5);
-    const auto waiting_path =
-        validTrk(tmp, toString(item.expected_ctrl) + "_waiting.trk", 3);
+    const auto active_path = validTrk(tmp, "fixstand_active.trk", 5);
+    const auto waiting_path = validTrk(tmp, "fixstand_waiting.trk", 3);
     REQUIRE(bridge.submitQueue(executeCommand("active", active_path)).ok());
     startQueuedRun(loop,
                    store,
@@ -5639,11 +6091,7 @@ TEST_CASE("RuntimeControlLoop control command while running stops active and cle
                    StartQueuedRunMode::AllowStandbyTransition);
     REQUIRE(bridge.submitQueue(executeCommand("waiting", waiting_path)).ok());
 
-    if (item.mode == ControlMode::FixStand) {
-      REQUIRE(bridge.fixStand().ok());
-    } else {
-      REQUIRE(bridge.standbyVelocity().ok());
-    }
+    REQUIRE(bridge.fixStand().ok());
 
     loop.tick();
     auto snapshot = store.snapshot();
@@ -5656,7 +6104,7 @@ TEST_CASE("RuntimeControlLoop control command while running stops active and cle
 
     loop.tick();
     snapshot = store.snapshot();
-    REQUIRE(snapshot.ctrl == item.expected_ctrl);
+    REQUIRE(snapshot.ctrl == ControllerState::FixStand);
     REQUIRE_FALSE(snapshot.exec.has_value());
     REQUIRE(snapshot.queue.ids.empty());
     REQUIRE(store.findRun("active").run->state == MotionState::Stopped);
