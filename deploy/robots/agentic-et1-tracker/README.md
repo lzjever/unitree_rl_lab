@@ -55,12 +55,20 @@ Commands:
   `{"path":"/absolute/file.trk","mode":"queue|interrupt","hold":true,"max_radius_m":0.8}`.
   Same local `.trk` allowlist contract as `/execute`, but routes the motion
   through the loco-upper executor when `loco_upper.enabled: true` and runtime
-  `cap.loco_upper.ready: true`. `max_radius_m` is optional and must be finite,
-  positive, and `<= cap.loco_upper.max_radius_m`. The sim example keeps this
-  disabled by default; turn it on manually in `config.sim.yaml.example` only
-  when testing `/execute_loco_upper`. The loco radius guard applies while the
+  `cap.loco_upper.ready: true`. `max_radius_m` is optional and is the
+  per-request bounded execution radius. If omitted, the service uses
+  `cap.loco_upper.default_radius_m`; if a finite positive request exceeds
+  `cap.loco_upper.max_radius_m`, the effective radius is capped to that
+  deployment maximum. Raw TRK root paths beyond the effective radius are
+  projected/clamped and accepted. The loco radius guard applies while the
   loco-upper executor itself is active in `entry`, `motion`, `holding`, and
-  bounded `exit`; `/stop` still cancels that executor immediately.
+  bounded `exit`; at the boundary it suppresses outward radial velocity and
+  reports `radius_limit_reached` without entering passive/fault. `/stop` still
+  cancels that executor immediately. The sim example keeps this disabled by
+  default; turn it on manually in `config.sim.yaml.example` only when testing
+  `/execute_loco_upper`.
+  The service config key remains `default_max_radius_m`; status/health expose
+  the same client-facing default as `cap.loco_upper.default_radius_m`.
 - `POST /idle`: `{"paths":["/absolute/idle-a.trk","/absolute/idle-b.trk"]}`.
 - `POST /idle`: `{"paths":[]}` clears the idle pool.
 - `POST /stop`: empty body; stops active work and cancels queued work.
@@ -140,7 +148,7 @@ Common error handling:
 | `QUEUE_FULL` | `status` | Poll `/status`; retry after queue drains. |
 | `RUN_NOT_FOUND` | `status` | Use a valid id or full `/status`. |
 | `CONTROL_STATE_CONFLICT` | varies | Follow `error.message`; it names the current `ctrl` and the next route. |
-| `SAFETY_LIMIT_TRIGGERED` | `manual` | Operator resolves; then `/fixstand`. |
+| `SAFETY_LIMIT_TRIGGERED` | `manual` | True low-level safety fault or fall/orientation risk only; radius clamp/limit is not this error. |
 | `INTERNAL_ERROR` | `manual` | Inspect service logs. |
 
 Status schemas:
@@ -207,7 +215,13 @@ curl -sS 'http://127.0.0.1:8083/status?id=<run_id>'
   `cap.loco_upper.strict_pose`.
 - `GET /status?id=<run_id>` for a loco-upper run also returns
   `executor:"loco_upper"` and
-  `loco.{max_radius_m,distance_m,radius_source,phase,radius_clamped,radius_limit_reached,envelope_clamped,raw_action_clamped,lower_q_limited,lower_action_clamped,reason}`.
+  `loco.{max_radius_m,distance_m,radius_source,phase,radius_clamped,radius_limit_reached,envelope_clamped,upper_clamped,upper_rate_limited,raw_action_clamped,lower_q_limited,lower_action_clamped,reason}`.
+- For loco-upper, `loco.max_radius_m` is the effective request/default radius
+  after service max capping. `radius_clamped` means the raw TRK root path was
+  projected into that radius. `radius_limit_reached` means runtime suppressed
+  outward radial velocity at the boundary; it is not a failed/passive state and
+  does not imply `loco.reason:"radius_limit"`. `upper_clamped` and
+  `upper_rate_limited` report bounded upper-body intervention.
 - Difference from old `/execute`: `/execute` stays on the existing
   GeneralTracker path and does not accept `max_radius_m` or return the loco
   run payload.

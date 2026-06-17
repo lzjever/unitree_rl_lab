@@ -57,6 +57,13 @@ Scope：simulation-first，仅要求本机 MuJoCo 验收，不包含真机 GA
 
 这些问题必须在 compile/prepare 阶段被投影、clamp、rate-limit 或 smooth，并在状态中报告。
 
+`max_radius_m` 是每次 `/execute_loco_upper` 请求发起的 bounded execution
+radius。客户端未提供时使用服务端 finite default；服务端 configured max 只表示
+部署能力上限，并作为请求/default radius 的 effective cap。raw TRK root path
+超过 effective radius 时必须 accepted，并把 root trajectory
+projection/clamp 到限制内执行；不能因为动作本身超过半径而 rejected、failed 或
+进入 passive。
+
 时间对齐硬约束：
 
 - bounded execution 不改变 `fps`、`frame_count` 或 raw TRK `duration_s`；当前 `duration_s` 口径为 `(frame_count - 1) / fps`。
@@ -66,10 +73,15 @@ Scope：simulation-first，仅要求本机 MuJoCo 验收，不包含真机 GA
 
 执行中的安全故障保持现有路径：
 
+- 显式授权的 `/passive`。
 - bad orientation。
+- 摔倒风险或姿态越界。
 - `LowCmd` 写失败。
 - policy 输出非有限值。
 - 其他已有 safety/fault/passive 条件。
+
+radius limit 本身不属于 safety/fault/passive 条件。运行时到达 effective radius
+边界时，应 suppress outward radial velocity，记录 `radius_limit_reached`，并保持受控执行、受控完成、hold、bounded exit 或回 standby。
 
 ## 4. 目标和非目标
 
@@ -106,15 +118,20 @@ Scope：simulation-first，仅要求本机 MuJoCo 验收，不包含真机 GA
 - 保留 `/execute_loco_upper` 原请求字段。
 - 不新增必填字段。
 - 不改变已有路径、TRK、执行模式相关字段语义。
+- `max_radius_m` 是客户端请求级行动范围约束；缺省时用服务端 default，effective radius 由请求/default 值再按服务端 max capability cap 得到。
+- 有限正数请求值高于服务端 max capability 时，不因请求本身失败；effective radius 使用服务端 max。
 
 响应和 status：
 
 - 合法 TRK 即使触发 bounded execution，也返回 accepted/queued。
 - 对外 status 使用 compact flags：
   - `radius_clamped`：root path 被 `max_radius_m` 投影。
+  - `radius_limit_reached`：runtime 到达 effective radius 边界并 suppress outward radial velocity；这不是 failure/passive 标志。
   - `envelope_clamped`：root velocity/yaw/accel 或 locomotion command 被能力包络限制。
   - `upper_clamped`：至少一个 upper joint position 被 clamp。
   - `upper_rate_limited`：至少一个 upper joint velocity 或 acceleration 被 rate-limit/smoothing 影响。
+- `radius_limit_reached` 是正常 bounded execution 状态，不应配套
+  `loco.reason:"radius_limit"` 或其他 radius-specific reason。
 - 内部可区分 `upper_accel_limited`，用于测试、日志或 compiler 诊断；外部 status 保持紧凑，不新增独立公开 flag，除非后续产品明确需要。
 - root bounded 状态必须复用现有公开字段 `radius_clamped` 和 `envelope_clamped`；不要新增 `root_projected` 或其他 root projection 公开字段。
 - status flags 不能只存在于 compiler 内部，必须写入 `LocoRunStatus`，经 `RuntimeBridge`/`RuntimeStatusStore` 保存，通过 JSON codec 输出，并由 API/status tests 覆盖。
@@ -130,6 +147,7 @@ Scope：simulation-first，仅要求本机 MuJoCo 验收，不包含真机 GA
 ```json
 {
   "radius_clamped": true,
+  "radius_limit_reached": false,
   "envelope_clamped": false,
   "upper_clamped": true,
   "upper_rate_limited": true
@@ -140,7 +158,7 @@ Scope：simulation-first，仅要求本机 MuJoCo 验收，不包含真机 GA
 
 - `strict_pose` 不再用于 API precheck/probe 拒绝 root path 超 `max_radius_m`。
 - 无论 `strict_pose` 是否开启，root path 超 radius 都应 accepted，并在 compiler 中投影，设置 `radius_clamped`。
-- `strict_pose` 只保留 runtime highstate freshness、jump、radius safety gate；这些 gate 失败时仍走现有 runtime 拒绝或 safety/fault 路径，不属于 compiler failure。
+- `strict_pose` 只约束 runtime highstate freshness/jump 是否足以声明物理 radius containment；pose source 不可信时可按 readiness/pose gate 处理，但不能把 raw root 超 radius 或运行时到达半径边界解释为 passive/fault。
 
 ## 7. 模块设计和边界
 
@@ -204,7 +222,8 @@ Scope：simulation-first，仅要求本机 MuJoCo 验收，不包含真机 GA
 - upper body 使用 compiled plan 中的 full 26 logical joint frame。
 - 不再从 raw TRK 每帧取 upper target。
 - entry、exit、hold、current fallback 都不能回读 raw TRK；只能从 compiled plan 或 bounded standby target 读取。
-- status 中持续携带 `radius_clamped`、`envelope_clamped`、`upper_clamped`、`upper_rate_limited`。
+- status 中持续携带 `radius_clamped`、`radius_limit_reached`、`envelope_clamped`、`upper_clamped`、`upper_rate_limited`。
+- runtime 到达 effective radius 边界时，必须 suppress outward radial velocity，设置 sticky `radius_limit_reached`，继续受控执行或受控完成/回 standby；不得因为 radius limit 本身进入 passive/fault。
 - 执行期间不得改变 raw TRK `fps`、`frame_count`、`duration_s` 或 root/upper frame index 对齐。
 
 ### 时间对齐研发合同
@@ -218,7 +237,7 @@ Scope：simulation-first，仅要求本机 MuJoCo 验收，不包含真机 GA
 
 ### Status propagation
 
-- `LocoRunStatus` 增加或复用 `radius_clamped`、`envelope_clamped`、`upper_clamped`、`upper_rate_limited` 字段。
+- `LocoRunStatus` 增加或复用 `radius_clamped`、`radius_limit_reached`、`envelope_clamped`、`upper_clamped`、`upper_rate_limited` 字段。
 - `RuntimeBridge` 和 `RuntimeStatusStore` 必须保存 compile flags，并在 queued、active、recent 三类 run status 中保留这些字段。
 - JSON codec 必须序列化这些字段，API status tests 必须覆盖 queued/active/recent 三种状态。
 - 任何状态层丢失 `upper_clamped` 或 `upper_rate_limited` 都视为未完成。
@@ -355,7 +374,7 @@ struct LocoUpperCompileResult {
 5. 写 failing tests：root velocity/yaw/accel 或 locomotion command 超 envelope 时，compiler 成功并设置 `envelope_clamped`。
 6. 写 failing tests：bounded execution 后 `fps`、`frame_count`、raw TRK `duration_s`、root/upper frame index 对齐不变。
 7. 写 failing tests：compiled joint frame 是 full 26 logical joints（`kPolicyJointCount`），不是 14 维 upper-only。
-8. 写 failing tests：queued/active/recent status 都能输出 `upper_clamped` 和 `upper_rate_limited`。
+8. 写 failing tests：queued/active/recent status 都能输出 `radius_clamped`、`radius_limit_reached`、`envelope_clamped`、`upper_clamped` 和 `upper_rate_limited`。
 9. 写 failing tests：`strict_pose` 不因 root path 超 radius 触发 API precheck 拒绝。
 10. 实现 `LocoUpperCompileOptions`/factory，API precheck/probe 和 runtime prepare 共用 mapping、limits、lower deploy envelope、`max_radius_m`、runtime config。
 11. 实现 `LocoUpperPlanCompiler` 的 legality validation skeleton，先复用现有 parser/mapping/limit helper。
@@ -367,7 +386,7 @@ struct LocoUpperCompileResult {
 17. 改 runtime prepare 调用同一 compiler/factory，并保存 compiled plan。
 18. 改 runtime execution 从 compiled plan 的 full 26 维 frame 读取 targets；entry/exit/hold/current fallback 只读 compiled plan 或 bounded standby target。
 19. 调整 composer guard：只检测非有限值和异常越界，正常路径不做业务修正。
-20. 扩展 `LocoRunStatus`、`RuntimeBridge`/`RuntimeStatusStore`、JSON codec 和 API/status tests，贯通 `radius_clamped`、`envelope_clamped`、`upper_clamped`、`upper_rate_limited`。
+20. 扩展 `LocoRunStatus`、`RuntimeBridge`/`RuntimeStatusStore`、JSON codec 和 API/status tests，贯通 `radius_clamped`、`radius_limit_reached`、`envelope_clamped`、`upper_clamped`、`upper_rate_limited`。
 21. 跑单元测试和 API-level tests。
 22. 本机 MuJoCo 仿真执行 walk+wave 和 `walk5_fwd.trk`，确认不因 upper 能力边界拒绝。
 
@@ -384,6 +403,7 @@ struct LocoUpperCompileResult {
 - 合法 TRK，root 超 `max_radius_m`：accepted，root plan 被投影，`radius_clamped == true`。
 - 合法 TRK，root velocity/yaw/accel 或 locomotion command 超 envelope：accepted，root plan 被限制，`envelope_clamped == true`。
 - `strict_pose == true` 且 root path 超 radius：accepted，`radius_clamped == true`，不在 precheck 拒绝。
+- `request.max_radius_m` 为有限正数但高于服务端 max capability：accepted，effective radius 使用服务端 max。
 - 非法路径：rejected。
 - 文件损坏：rejected。
 - schema/shape/fps/frame 非法：rejected。
@@ -420,7 +440,7 @@ struct LocoUpperCompileResult {
 - status 在执行中保持 compile flags。
 - API compile 和 runtime compile 对同一 TRK 结果一致。
 - rate-limit/smoothing 只改变每帧目标值，不改变执行时钟、帧数或 raw TRK `duration_s`。
-- `strict_pose` highstate freshness/jump/radius safety gate 仍按现有 runtime 路径生效。
+- `strict_pose` highstate freshness/jump pose-source gate 仍按现有 runtime 路径生效，但 radius boundary 本身不触发 passive/fault。
 
 ### Composer guard
 
@@ -521,12 +541,13 @@ struct LocoUpperCompileResult {
 - [ ] JSON codec 输出 bounded flags。
 - [ ] queued/active/recent status tests 覆盖 `upper_clamped` 和 `upper_rate_limited`。
 - [ ] `radius_clamped` status flag 接入。
+- [ ] `radius_limit_reached` status flag 接入；到达边界时 suppress outward radial velocity，但不 passive/fault。
 - [ ] `envelope_clamped` status flag 接入。
 - [ ] `upper_clamped` status flag 接入。
 - [ ] `upper_rate_limited` status flag 接入。
 - [ ] 内部 `upper_accel_limited` 可测试但不扩张公开 API。
 - [ ] bounded execution 不改变 `fps`、`frame_count`、raw TRK `duration_s` 或 root/upper frame index 对齐。
-- [ ] `strict_pose` 不再让 API precheck/probe 拒绝 root radius 超限；runtime highstate freshness/jump/radius safety gate 保持现有语义。
+- [ ] `strict_pose` 不再让 API precheck/probe 拒绝 root radius 超限；runtime highstate freshness/jump pose-source gate 保持现有语义，radius boundary 本身不触发 passive/fault。
 - [ ] 历史 position rejection 用例 accepted。
 - [ ] 历史 velocity rejection 用例 accepted。
 - [ ] 非法 TRK 仍由 compiler rejected；readiness 仍由 API/runtime gate rejected，且不出现在 compiler result/diagnostics。

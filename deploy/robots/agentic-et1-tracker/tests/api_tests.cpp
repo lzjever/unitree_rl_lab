@@ -615,6 +615,24 @@ TEST_CASE("POST execute_loco_upper interrupt accepts explicit finite bounded rad
   REQUIRE(h.prechecker.received_options.at(0).hold);
 }
 
+TEST_CASE("POST execute_loco_upper clamps explicit radius to configured cap") {
+  Harness h(locoEnabledConfig());
+  observeLocoUpperReady(h);
+
+  const auto response = h.service.handle(
+      {"POST",
+       "/execute_loco_upper",
+       R"({"path":"/tracks/capped.trk","max_radius_m":2.5})"});
+
+  REQUIRE(response.status == 200);
+  REQUIRE(response.body.at("max_radius_m") == 2.0);
+  REQUIRE(h.validator.calls == 1);
+  REQUIRE(h.prechecker.calls == 1);
+  REQUIRE(h.prechecker.received_options.at(0).max_radius_m == 2.0);
+  REQUIRE(h.sink.queue_calls == 1);
+  REQUIRE(h.sink.queue_commands.at(0).loco_options.max_radius_m == 2.0);
+}
+
 TEST_CASE("POST execute_loco_upper rejects invalid schema and radius before ports") {
   const std::vector<std::string> bodies{
       "",
@@ -630,7 +648,6 @@ TEST_CASE("POST execute_loco_upper rejects invalid schema and radius before port
       R"({"path":"/tracks/a.trk","max_radius_m":"0.8"})",
       R"({"path":"/tracks/a.trk","max_radius_m":0})",
       R"({"path":"/tracks/a.trk","max_radius_m":-0.1})",
-      R"({"path":"/tracks/a.trk","max_radius_m":2.01})",
       R"({"path":"/tracks/a.trk","extra":true})",
   };
 

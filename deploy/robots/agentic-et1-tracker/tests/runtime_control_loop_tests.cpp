@@ -4753,13 +4753,20 @@ TEST_CASE("RuntimeControlLoop loco_upper starts active run with zero distance") 
   REQUIRE(snapshot.exec->loco.radius_source.empty());
 }
 
-TEST_CASE("RuntimeControlLoop loco_upper fails when highstate radius exceeds limit plus tolerance") {
+TEST_CASE("RuntimeControlLoop loco_upper records highstate radius limit without Passive") {
   TempTree tmp;
   RuntimeConfig config = runtimeConfig();
   config.radius_tolerance_m = 0.05;
+  config.loco_upper_max_lin_accel_mps2 = 10000.0;
+  config.loco_upper_max_yaw_accel_radps2 = 10000.0;
+  config.loco_upper_smoothing_window_frames = 1;
   RuntimeStatusStore store(config);
   RuntimeBridge bridge(config, store);
   const DeployConfig deploy_config = deployConfig();
+  LocoLowerDeployConfig loco_lower_config = locoLowerDeployConfig();
+  loco_lower_config.command_ranges.lin_vel_x = {-100.0, 100.0};
+  loco_lower_config.command_ranges.lin_vel_y = {-100.0, 100.0};
+  loco_lower_config.command_ranges.ang_vel_z = {-100.0, 100.0};
   FakeRobotIO robot(readyLowState(deploy_config));
   HighStateSample high;
   high.fresh = true;
@@ -4775,18 +4782,28 @@ TEST_CASE("RuntimeControlLoop loco_upper fails when highstate radius exceeds lim
                                   robot,
                                   tracker_policy,
                                   velocity_policy,
-                                  loco_lower_policy);
+                                  loco_lower_policy,
+                                  deploy_config,
+                                  velocityDeployConfig(),
+                                  fixStandConfig(),
+                                  ControlMode::StandbyVelocity,
+                                  passiveConfig(),
+                                  loco_lower_config);
 
   const auto path = rootPositionsTrk(tmp,
                                      "loco_highstate_radius.trk",
                                      {{{0.0F, 0.0F, 0.0F},
                                        {1.0F, 0.0F, 0.0F},
                                        {2.0F, 0.0F, 0.0F},
-                                       {3.0F, 0.0F, 0.0F}}});
+                                       {3.0F, 0.0F, 0.0F},
+                                       {4.0F, 0.0F, 0.0F},
+                                       {5.0F, 0.0F, 0.0F},
+                                       {6.0F, 0.0F, 0.0F},
+                                       {7.0F, 0.0F, 0.0F}}});
   REQUIRE(bridge.submitQueue(locoUpperCommand("loco-highstate-radius",
                                               path,
                                               MotionMode::Queue,
-                                              4,
+                                              8,
                                               false,
                                               5.0))
               .ok());
@@ -4805,38 +4822,41 @@ TEST_CASE("RuntimeControlLoop loco_upper fails when highstate radius exceeds lim
 
   const int writes_before_breach = robot.write_attempts;
   robot.high_state->position = {13.1F, 24.0F, 0.0F};
-  bool saw_failed = false;
+  bool saw_bounded_write = false;
   for (int i = 0; i < 128; ++i) {
     loop.tick();
     snapshot = store.snapshot();
-    if (!snapshot.exec.has_value()) {
-      const auto failed = store.findRun("loco-highstate-radius");
-      if (failed.ok() && failed.run && failed.run->state == MotionState::Failed) {
-        saw_failed = true;
-        break;
-      }
+    if (snapshot.exec.has_value() && robot.write_attempts > writes_before_breach) {
+      saw_bounded_write = true;
+      break;
     }
   }
 
-  REQUIRE(saw_failed);
-  REQUIRE_FALSE(snapshot.exec.has_value());
-  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Passive);
-  REQUIRE(snapshot.ctrl == ControllerState::Passive);
-  REQUIRE(snapshot.err == ErrorCode::SafetyLimitTriggered);
-  REQUIRE(snapshot.block == "radius_limit");
-  REQUIRE(robot.write_attempts == writes_before_breach);
-  const auto failed = store.findRun("loco-highstate-radius");
-  REQUIRE(failed.ok());
-  REQUIRE(failed.run->state == MotionState::Failed);
-  REQUIRE(failed.run->err == ErrorCode::SafetyLimitTriggered);
-  REQUIRE(failed.run->loco.phase == LocoPhase::Failed);
-  REQUIRE(failed.run->loco.reason == LocoReason::RadiusLimit);
-  REQUIRE(failed.run->loco.radius_source == "highstate");
-  REQUIRE(failed.run->loco.distance_m ==
+  REQUIRE(saw_bounded_write);
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::LocoUpperActive);
+  REQUIRE(snapshot.ctrl == ControllerState::Running);
+  REQUIRE(snapshot.err == ErrorCode::Ok);
+  REQUIRE(snapshot.block.empty());
+  REQUIRE(snapshot.exec->state == MotionState::Running);
+  REQUIRE(snapshot.exec->loco.phase != LocoPhase::Failed);
+  REQUIRE(snapshot.exec->loco.radius_limit_reached);
+  REQUIRE(snapshot.exec->loco.reason == LocoReason::None);
+  REQUIRE(snapshot.exec->loco.radius_source == "highstate");
+  REQUIRE(snapshot.exec->loco.distance_m ==
           Catch::Approx(std::hypot(3.1, 4.0)).margin(1.0e-5));
+  REQUIRE(robot.write_attempts > writes_before_breach);
+  REQUIRE_FALSE(loco_lower_policy.inputs_seen.empty());
+  const Vec& obs = loco_lower_policy.inputs_seen.back().obs;
+  REQUIRE(obs.size() == kLocoLowerPolicyObsDim);
+  const double radius = std::hypot(3.1, 4.0);
+  const double outward_velocity =
+      static_cast<double>(obs.at(6)) * (3.1 / radius) +
+      static_cast<double>(obs.at(7)) * (4.0 / radius);
+  REQUIRE(outward_velocity <= 1.0e-5);
 }
 
-TEST_CASE("RuntimeControlLoop loco_upper fails in entry when measured radius already exceeds limit") {
+TEST_CASE("RuntimeControlLoop loco_upper writes entry command when radius already exceeds limit") {
   TempTree tmp;
   RuntimeConfig config = runtimeConfig();
   config.radius_tolerance_m = 0.05;
@@ -4872,24 +4892,22 @@ TEST_CASE("RuntimeControlLoop loco_upper fails in entry when measured radius alr
   loop.tick();
   REQUIRE(store.snapshot().exec.has_value());
   robot.high_state->position = {10.6F, 20.0F, 0.0F};
+  const int writes_before_breach = robot.write_attempts;
 
   loop.tick();
 
   const StatusSnapshot snapshot = store.snapshot();
-  REQUIRE_FALSE(snapshot.exec.has_value());
-  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Passive);
-  REQUIRE(snapshot.ctrl == ControllerState::Passive);
-  REQUIRE(snapshot.err == ErrorCode::SafetyLimitTriggered);
-  REQUIRE(snapshot.block == "radius_limit");
-  REQUIRE(robot.write_attempts == 0);
-  REQUIRE(loco_lower_policy.calls == 0);
-  const auto failed = store.findRun("loco-entry-radius-guard");
-  REQUIRE(failed.ok());
-  REQUIRE(failed.run->state == MotionState::Failed);
-  REQUIRE(failed.run->err == ErrorCode::SafetyLimitTriggered);
-  REQUIRE(failed.run->loco.phase == LocoPhase::Failed);
-  REQUIRE(failed.run->loco.reason == LocoReason::RadiusLimit);
-  REQUIRE(failed.run->loco.distance_m == Catch::Approx(0.6).margin(1.0e-5));
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::LocoUpperActive);
+  REQUIRE(snapshot.ctrl == ControllerState::Running);
+  REQUIRE(snapshot.err == ErrorCode::Ok);
+  REQUIRE(snapshot.block.empty());
+  REQUIRE(snapshot.exec->loco.phase != LocoPhase::Failed);
+  REQUIRE(snapshot.exec->loco.radius_limit_reached);
+  REQUIRE(snapshot.exec->loco.reason == LocoReason::None);
+  REQUIRE(snapshot.exec->loco.distance_m == Catch::Approx(0.6).margin(1.0e-5));
+  REQUIRE(robot.write_attempts > writes_before_breach);
+  REQUIRE(loco_lower_policy.calls > 0);
 }
 
 TEST_CASE("RuntimeControlLoop loco_upper integrates command when highstate position is unavailable") {
@@ -6117,7 +6135,7 @@ TEST_CASE("RuntimeControlLoop loco_upper hold holds final upper target with zero
   REQUIRE(loco_lower_policy.inputs_seen.back().obs.at(8) == 0.0F);
 }
 
-TEST_CASE("RuntimeControlLoop loco_upper fails in holding when measured radius exceeds limit") {
+TEST_CASE("RuntimeControlLoop loco_upper records holding radius limit without Passive") {
   TempTree tmp;
   RuntimeConfig config = runtimeConfig();
   config.transition_duration_s = 0.001;
@@ -6167,19 +6185,17 @@ TEST_CASE("RuntimeControlLoop loco_upper fails in holding when measured radius e
   loop.tick();
 
   const StatusSnapshot snapshot = store.snapshot();
-  REQUIRE_FALSE(snapshot.exec.has_value());
-  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Passive);
-  REQUIRE(snapshot.ctrl == ControllerState::Passive);
-  REQUIRE(snapshot.err == ErrorCode::SafetyLimitTriggered);
-  REQUIRE(snapshot.block == "radius_limit");
-  REQUIRE(robot.write_attempts == writes_before_breach);
-  const auto failed = store.findRun("loco-hold-radius-guard");
-  REQUIRE(failed.ok());
-  REQUIRE(failed.run->state == MotionState::Failed);
-  REQUIRE(failed.run->err == ErrorCode::SafetyLimitTriggered);
-  REQUIRE(failed.run->loco.phase == LocoPhase::Failed);
-  REQUIRE(failed.run->loco.reason == LocoReason::RadiusLimit);
-  REQUIRE(failed.run->loco.distance_m == Catch::Approx(0.6).margin(1.0e-5));
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::LocoUpperActive);
+  REQUIRE(snapshot.ctrl == ControllerState::Running);
+  REQUIRE(snapshot.err == ErrorCode::Ok);
+  REQUIRE(snapshot.block.empty());
+  REQUIRE(snapshot.exec->state == MotionState::Holding);
+  REQUIRE(snapshot.exec->loco.phase == LocoPhase::Holding);
+  REQUIRE(snapshot.exec->loco.radius_limit_reached);
+  REQUIRE(snapshot.exec->loco.reason == LocoReason::None);
+  REQUIRE(snapshot.exec->loco.distance_m == Catch::Approx(0.6).margin(1.0e-5));
+  REQUIRE(robot.write_attempts > writes_before_breach);
 }
 
 TEST_CASE("RuntimeControlLoop loco_upper lower policy NaN maps compact terminal reason") {

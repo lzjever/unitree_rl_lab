@@ -25,7 +25,9 @@ executor:
 - The TRK root motion is converted into safe velocity commands.
 - The locomotion command is projected into the locomotion model capability
   envelope.
-- A per-request maximum command radius can bound the planned locomotion area.
+- A per-request bounded execution radius constrains the planned and commanded
+  locomotion area; raw TRK root motion outside that radius is projected/clamped
+  and still accepted.
 
 ## Product Goal
 
@@ -108,8 +110,11 @@ Allowed keys:
 - `path` required string; same local `.trk` allowlist rules as `/execute`.
 - `mode` optional string, `queue` or `interrupt`; default `queue`.
 - `hold` optional boolean; default `false`.
-- `max_radius_m` optional positive number; if omitted, use a finite service
-  config default. Omitted must not mean unlimited. This is a command/planner
+- `max_radius_m` optional positive number. It is the client-requested bounded
+  execution radius for this action. If omitted, use the finite service config
+  default. Omitted must not mean unlimited. If the request exceeds the service
+  configured maximum capability, the effective radius is capped to that maximum
+  and the response/status report the effective value. This is a command/planner
   radius unless fresh pose is available and configured as required.
 
 Rejected body examples:
@@ -118,8 +123,10 @@ Rejected body examples:
 - non-`.trk` files;
 - upload payloads;
 - non-finite or non-positive `max_radius_m`;
-- `max_radius_m` above configured service maximum;
 - `mode` values other than `queue` or `interrupt`.
+
+Finite positive `max_radius_m` values above the configured service maximum are
+not a validation failure; they are capped to the service maximum.
 
 Response:
 
@@ -205,6 +212,8 @@ For active or queried user runs:
     "radius_clamped": true,
     "radius_limit_reached": false,
     "envelope_clamped": false,
+    "upper_clamped": false,
+    "upper_rate_limited": false,
     "raw_action_clamped": false,
     "lower_q_limited": false,
     "lower_action_clamped": false,
@@ -230,6 +239,10 @@ Fields:
   limiting has actively suppressed outward locomotion.
 - `loco.envelope_clamped`: sticky per-run flag; true once velocity or
   acceleration commands have been limited by the locomotion envelope.
+- `loco.upper_clamped`: sticky per-run flag; true once any upper joint target
+  has been clamped to configured upper limits.
+- `loco.upper_rate_limited`: sticky per-run flag; true once any upper joint
+  velocity or acceleration has been rate-limited or smoothed.
 - `loco.raw_action_clamped`: sticky per-run flag; true once lower policy raw
   output has been clipped to the lower policy action range.
 - `loco.lower_q_limited`: sticky per-run flag; true once composed lower joint
@@ -242,9 +255,13 @@ Fields:
 P0 allowed `loco.reason` values:
 
 ```text
-root_invalid upper_limit upper_dynamic radius_limit pose_missing pose_jump
+root_invalid upper_limit upper_dynamic pose_missing pose_jump
 policy_nan policy_infer lower_limit mapping_invalid hold_timeout path_error deadline_miss
 ```
+
+`radius_limit_reached` is a normal bounded execution status flag, not a
+`loco.reason`; do not publish `loco.reason:"radius_limit"` or any other
+radius-specific reason for radius limiting alone.
 
 Queued runs should return `loco.phase:"queued"`, `distance_m:0`,
 `radius_source:null`, and all sticky flags false. Terminal runs should keep the
@@ -300,9 +317,10 @@ When a loco-upper run reaches its last TRK frame with `hold:true`:
 - `/standby_velocity`, `/fixstand`, `/stop`, `/passive`, a new user run, or
   configured `max_hold_s` can release it using existing control semantics.
 
-`hold:true` is a P0 contract for this endpoint. Unsafe TRK poses must be
-rejected by validation before execution; the endpoint must not partially
-support hold based on implementation convenience.
+`hold:true` is a P0 contract for this endpoint. Invalid or truly dangerous TRK
+inputs must be rejected before execution, but upper/root physical capability
+overruns that can be bounded must be clamped or rate-limited instead of making
+hold a partial feature.
 
 P0 must use a finite configurable `max_hold_s` for loco-upper. If the timeout
 fires, the run exits through the same bounded upper-body exit path and reports
@@ -363,10 +381,11 @@ Required internal data additions:
   `MODEL_NOT_READY` before any run exists.
 
 Dispatch-time validation is required. A run that was valid when queued may
-become unsafe by the time it starts because the robot upper body or controller
-state changed. Before a queued loco-upper run becomes active, revalidate entry
-transition feasibility and publish a terminal `failed` status with compact
-reason when it no longer fits the configured limits.
+become unsafe by the time it starts because robot readiness, orientation, pose
+freshness, or controller state changed. Before a queued loco-upper run becomes
+active, revalidate readiness and entry transition feasibility. Do not turn raw
+root radius overflow into a dispatch failure; the same bounded compiler must
+project it into the effective radius.
 
 ### Assets
 
@@ -426,15 +445,16 @@ It includes waist joints. This improves "upper body follows TRK" fidelity but
 can affect balance; simulation acceptance must validate it before the feature
 is considered P0-ready.
 
-Upper-body direct control is only allowed after validation:
+Upper-body direct control is only allowed after bounded compilation:
 
-- absolute joint targets must be within configured upper-body joint limits;
-- frame-to-frame joint velocity and acceleration must be within configured
-  limits;
-- waist joints must use conservative configured limits; if waist or upper-body
-  motion exceeds loco-compatible dynamics, lower velocity must scale toward zero
-  or the run must be rejected/failed;
-- entry, hold, motion, and exit targets must all pass the same limits;
+- raw absolute joint targets outside configured upper-body joint limits are
+  clamped into the configured limits and reported with `upper_clamped:true`;
+- raw frame-to-frame joint velocity or acceleration beyond configured dynamics
+  is rate-limited/smoothed and reported with `upper_rate_limited:true`;
+- waist joints must use conservative configured limits; when waist or
+  upper-body motion approaches loco-compatible dynamics, lower velocity should
+  scale toward zero before any stability margin is consumed;
+- entry, hold, motion, and exit targets must all use the same bounded targets;
 - basic dangerous-pose/self-collision rejects must exist for known unsafe
   waist/arm/head combinations, even if implemented as conservative rule checks
   in P0;
@@ -457,8 +477,8 @@ Each control tick:
 5. clamp or fail lower-body motor commands against configured lower joint
    position/velocity/torque limits;
 6. write lower-body motor commands from the locomotion policy;
-7. overlay upper-body motor commands from TRK `joint_pos[12..25]` using
-   configured upper-body gains;
+7. overlay upper-body motor commands from the compiled bounded upper joint
+   targets using configured upper-body gains;
 8. explicitly populate all unowned motor slots with safe configured commands;
 9. write the composed LowCmd.
 
@@ -533,7 +553,9 @@ Inputs:
 Runtime pose must define frame and freshness. P0 uses the local odometry frame
 reported by ET1 highstate when available. A highstate pose older than
 `pose_fresh_timeout_ms`, a non-finite pose, or a discontinuous pose jump must
-be ignored or fail the run according to `strict_radius_requires_pose`.
+not be used to claim physical radius containment. With strict pose enabled,
+that is a pose-source/readiness problem, not evidence that the requested action
+itself breached the radius.
 
 Timing rule: TRK frame/progress advances from monotonic simulation/control time
 and TRK fps. It must not be tied to lower policy decimation. The lower policy
@@ -568,11 +590,12 @@ Steps:
 
 8. Project the command into configured locomotion limits.
 9. Near the command radius boundary, remove outward radial velocity. If the
-   projected plan reaches the boundary, the run may still complete normally
-   with `radius_clamped:true`. If measured/estimated runtime distance exceeds
-   `max_radius_m + radius_tolerance_m`, terminate as `state:"failed"`,
-   `loco.phase:"failed"`, top-level `SAFETY_LIMIT_TRIGGERED`, and
-   `loco.reason:"radius_limit"`.
+   projected plan or runtime estimate reaches the boundary, set
+   `radius_limit_reached:true`, suppress further outward radial command, and
+   keep the run under control. The run should complete the bounded plan, enter
+   bounded exit, or return to standby through ordinary control semantics. Radius
+   limiting by itself must not terminate as `failed`, must not report
+   `SAFETY_LIMIT_TRIGGERED`, and must not enter passive.
 
 The first implementation should not add splines, MPC, obstacle avoidance, or
 multi-profile planners. Those belong in P1+ only after P0 simulator evidence.
@@ -621,14 +644,17 @@ simplest conservative rule:
   waist magnitude;
 - scale lower `vx/vy/yaw_rate` toward zero when upper motion approaches those
   limits;
-- reject or fail the run when upper motion exceeds hard limits.
+- clamp or rate-limit raw upper motion before execution when it exceeds
+  configured physical limits; only genuinely dangerous poses or runtime safety
+  faults should reject or fail.
 
 ## Command Radius Safety
 
-`max_radius_m` limits the commanded locomotion area around the action start.
-It is a planner/command radius by default. It is a physical radius only when a
-fresh trusted position source is available and the service is configured to
-require it.
+`max_radius_m` is the client-requested bounded execution radius around the
+action start. It limits the area the executor may plan and command for this
+specific action. It is a planner/command radius by default. It is a physical
+radius only when a fresh trusted position source is available and the service is
+configured to require it.
 
 For P0 simulation, call this a command radius, not a geofence. The acceptance
 gate may compare simulated pose against the radius, but the API must not claim
@@ -636,13 +662,25 @@ physical containment unless strict pose is enabled and fresh pose is available.
 
 Rules:
 
-- effective radius is `request.max_radius_m` or finite config default;
+- effective radius is the finite client `request.max_radius_m`, capped by the
+  service configured `loco_upper.max_radius_m`; if the client omits the field,
+  use the finite service default;
+- the service configured default is only a default for omitted requests;
+- the service configured maximum is a deployment capability cap, not a safety
+  fault threshold for raw TRK content;
 - raw TRK path exceeding the radius is projected into the radius instead of
-  blindly followed;
+  blindly followed, rejected, or treated as a passive/fault condition;
 - status exposes `radius_clamped:true` when projection occurs;
-- runtime must stop advancing locomotion if measured or estimated displacement
-  reaches the radius boundary while the loco-upper executor is still active;
-- outward radial velocity must be suppressed before the boundary is crossed;
+- runtime must suppress outward radial velocity if measured or estimated
+  displacement reaches the effective radius boundary while the loco-upper
+  executor is still active;
+- status exposes sticky `radius_limit_reached:true` when runtime boundary
+  limiting actively suppresses outward radial command;
+- after the boundary is reached, the run remains controlled: it may continue
+  non-outward components, complete the bounded plan, enter bounded exit, hold,
+  or return to standby through ordinary control semantics;
+- reaching the radius boundary or clamping a raw path is not a reason to enter
+  passive, publish `SAFETY_LIMIT_TRIGGERED`, or fail with a radius reason;
 - actual radius enforcement should use fresh highstate position when available;
 - if only command integration is available, status must report
   `radius_source:"integrated"` and docs must state this is not a physical
@@ -653,16 +691,19 @@ Rules:
   cancellation.
 
 If product later requires strict physical radius guarantees, a reliable
-localization source must become a hard dependency and missing pose must reject
-or abort loco-upper runs.
+localization source must become a hard dependency. That future strictness is
+about pose-source validity, not about treating raw TRK radius overflow as a
+safety fault.
 
 ## Validation And Rejection
 
 Existing `TrackValidatorPort` remains the general TRK validator. Loco-upper
-needs an additional loco-specific validator/planner precheck that runs after
-standard TRK validation and before id allocation. It validates root data,
-upper-body limits, planner feasibility, and radius/options. Dispatch-time
-revalidation runs again immediately before the queued item becomes active.
+needs an additional loco-specific compiler/precheck that runs after standard
+TRK validation and before id allocation. It validates root data, config,
+mapping, numeric legality, dangerous-pose rules, and radius option shape.
+Physical capability boundaries are handled by bounded compilation.
+Dispatch-time revalidation runs again immediately before the queued item becomes
+active.
 
 Reject before queue/id allocation when:
 
@@ -670,12 +711,17 @@ Reject before queue/id allocation when:
 - path is not an allowed local `.trk`;
 - TRK fails existing validation;
 - upper-body joint values are non-finite;
-- upper-body joint frame-to-frame jumps exceed configured safety limits;
-- effective `max_radius_m` is invalid;
+- raw upper-body motion violates a true dangerous-pose/self-collision rule that
+  cannot be made safe by clamp/rate-limit;
+- `request.max_radius_m` is non-finite or non-positive;
 - locomotion assets/model/deploy are not ready;
 - controller/readiness gates reject as they would for `/execute`.
 
-Reject or fail at runtime when:
+Finite positive request radius above the service maximum is accepted with the
+effective radius capped to the service maximum. Raw root path outside the
+effective radius is accepted and projected.
+
+Reject or fail at runtime only for true runtime safety/readiness failures:
 
 - lowstate becomes stale;
 - highstate pose is required but stale/missing/jumping;
@@ -683,11 +729,12 @@ Reject or fail at runtime when:
 - policy inference fails;
 - policy output is non-finite;
 - LowCmd write fails;
-- measured/integrated radius exceeds `max_radius_m + radius_tolerance_m`;
 - path tracking error exceeds configured safety threshold.
 
 Orientation safety must continue to route to the existing passive/fault safety
-path. Do not keep playing upper-body TRK after safety failure.
+path. Explicit authorized `/passive`, bad orientation/fall risk, and genuine
+low-level safety faults are the conditions that may enter passive/fault. Radius
+clamping or boundary limiting is not one of those conditions.
 
 ## Configuration
 
@@ -727,7 +774,13 @@ agentic_et1_tracker:
       status_poll_miss_ratio_delta_max: 0.001
 ```
 
-Only `max_radius_m` is per-request. Other tuning is service config.
+Only request `max_radius_m` is per-request. Other tuning is service config.
+`default_max_radius_m` supplies the action radius when the client omits
+`max_radius_m`. The config key keeps its historical name; public capability
+status exposes the same default as `default_radius_m` because clients see only
+the default request radius. Config `max_radius_m` is the deployment capability
+cap applied to the requested/default radius; it must not be interpreted as a
+fault threshold for raw TRK root motion.
 
 When `loco_upper.enabled:true`, the config loader must validate every
 loco-upper field and asset path. A missing policy, deploy, upper-body limits
@@ -740,9 +793,10 @@ and capability discovery reports `enabled:false, ready:false`; all existing
 endpoints must behave as before.
 
 `strict_radius_requires_pose` is P0 behavior. When true, missing/stale/jumping
-runtime pose rejects or aborts loco-upper runs before claiming radius safety.
-When false, command-integrated radius is allowed but must be reported as
-`radius_source:"integrated"`.
+runtime pose rejects or aborts loco-upper runs before claiming physical radius
+containment. It does not make raw TRK root radius overflow a rejection or
+safety fault. When false, command-integrated radius is allowed but must be
+reported as `radius_source:"integrated"`.
 
 The upper-body limits file should provide one entry for each controlled logical
 joint `12..25`:
@@ -821,27 +875,28 @@ Use TDD. Keep tests small and precise.
 - velocity and acceleration limits are always respected.
 - raw path outside radius is projected; `radius_clamped` is true.
 - runtime radius guard runs every loco tick while the loco-upper executor is
-  active across entry, motion, holding, and bounded exit; it sets
-  `radius_limit_reached` and terminal-fails the run with
-  `loco.reason:"radius_limit"` once measured or integrated distance exceeds
-  `max_radius_m + radius_tolerance_m`.
+  active across entry, motion, holding, and bounded exit; it suppresses outward
+  radial velocity at the effective radius boundary, sets
+  `radius_limit_reached`, and keeps the run controlled without passive/fault or
+  radius-specific failure.
 - `/stop` immediately cancels the loco-upper executor, clears active runtime
   state, and returns through stopping/standby without additional loco
   radius-guard ticks.
 - invalid root data is rejected.
 - missing pose with `strict_radius_requires_pose:true` rejects or aborts the
-  run before claiming radius safety.
+  run before claiming physical radius containment.
 - stale, jumping, or NaN highstate pose is handled according to strict-pose
-  config and never silently reports physical radius safety.
+  config and never silently reports physical radius containment.
 
 ### LowCmd Composition Tests
 
 - lower joints `0..11` come only from lower locomotion policy output.
 - upper joints `12..25` come from TRK after entry interpolation.
 - all other motor slots receive explicit configured safe commands every tick.
-- upper joint targets outside limits, above max velocity, or above max
-  acceleration are rejected before LowCmd write.
-- entry, hold, motion, and exit upper targets all use the same limit checks.
+- raw upper joint targets outside limits, above max velocity, or above max
+  acceleration are clamped/rate-limited in the compiled plan before LowCmd
+  write.
+- entry, hold, motion, and exit upper targets all use the same bounded targets.
 - lower policy output outside configured lower limits is clamped or fails
   according to configured hard limits and sets `lower_action_clamped`.
 - wrong SDK/logical joint mapping is caught by tests.
@@ -860,9 +915,10 @@ Use TDD. Keep tests small and precise.
   same user id until terminal `done`.
 - `/standby_velocity` during loco-upper reports `loco.phase:"stopping"` and
   terminates the same user id as `stopped`.
-- radius breach terminates the run as `state:"failed"`,
-  `loco.phase:"failed"`, top-level `SAFETY_LIMIT_TRIGGERED`, and
-  `loco.reason:"radius_limit"`.
+- reaching the effective radius boundary suppresses outward radial velocity,
+  sets `radius_limit_reached`, and remains a controlled execution/completion or
+  standby path rather than `failed`, `SAFETY_LIMIT_TRIGGERED`, passive, or a
+  radius-specific reason.
 - bad orientation enters existing safety path.
 - interrupt from loco-upper to GeneralTracker and GeneralTracker to loco-upper
   preserves run history and queue semantics.
@@ -909,8 +965,8 @@ Required MuJoCo scenarios:
 | static/root-still upper motion | `static_upper.trk`, 3-5 s, `max_radius_m:0.5` | no base jump, lower command stays near zero, upper follows TRK qualitatively |
 | forward 0.4 m with small arms | `forward_small_upper.trk`, 3-6 s, `max_radius_m:0.5` | robot remains upright, moves in expected direction, no fall or spin |
 | yaw turn plus short walk | `yaw_walk.trk`, 3-6 s, `max_radius_m:0.5` | yaw direction matches planned command, no wrap flip |
-| large upper/waist motion | `large_upper_reject.trk`, 2-5 s, `max_radius_m:0.5` | lower velocity scales down or run rejects/fails with compact reason |
-| radius clamp | `radius_clamp.trk`, raw path beyond radius, `max_radius_m:0.35` | MuJoCo ground-truth displacement stays within `max_radius_m + radius_tolerance_m`, `radius_clamped` or `radius_limit_reached` is visible |
+| large upper/waist motion | `large_upper_bounded.trk`, 2-5 s, `max_radius_m:0.5` | upper motion is clamped/rate-limited, lower velocity scales down, and the run rejects/fails only for true dangerous-pose or runtime safety conditions |
+| radius clamp | `radius_clamp.trk`, raw path beyond radius, `max_radius_m:0.35` | raw path is accepted and projected; MuJoCo ground-truth displacement stays within the effective radius tolerance, and `radius_clamped` or `radius_limit_reached` is visible without passive/fault |
 | queue then interrupt | two short fixtures, interrupt after 1 s | old active/queued work stops, new run starts smoothly, terminal statuses are retained |
 | hold then standby | `hold_upper.trk`, `hold:true`, standby after 2 s | upper holds final target, lower zeroes, standby cancellation exits smoothly |
 
@@ -966,11 +1022,11 @@ Performance gates during simulation:
 - Velocity command injection into lower locomotion policy without changing
   zero-command StandbyVelocity.
 - TRK upper-body direct target overlay for joints `12..25`.
-- Upper-body joint limit, velocity, acceleration, and dangerous-pose validation.
+- Upper-body joint clamp/rate-limit and dangerous-pose validation.
 - Root-to-velocity planner with yaw alignment, radius projection, smoothing,
   velocity limits, and acceleration limits.
 - Per-request `max_radius_m`.
-- Compact status for executor and locomotion safety state.
+- Compact status for executor and bounded locomotion state.
 - Stop/passive/fixstand/standby behavior unchanged.
 - TDD coverage for API, planner, LowCmd composition, and runtime priority.
 - MuJoCo-only acceptance with status logs and screenshot review.

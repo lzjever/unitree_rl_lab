@@ -529,8 +529,9 @@ ApiResponse AgentApiService::executeLocoUpper(const std::string& body) {
   }
 
   const double max_radius_m =
-      explicit_radius ? requested_radius_m : capability.default_radius_m;
-  if (!finitePositive(max_radius_m) || max_radius_m > capability.max_radius_m) {
+      explicit_radius ? std::min(requested_radius_m, capability.max_radius_m)
+                      : capability.default_radius_m;
+  if (!finitePositive(max_radius_m)) {
     return error(ErrorCode::RequestInvalid);
   }
 

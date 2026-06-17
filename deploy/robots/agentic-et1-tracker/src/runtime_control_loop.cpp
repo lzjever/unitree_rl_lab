@@ -2084,21 +2084,18 @@ bool RuntimeControlLoop::enforceLocoUpperRadiusLimit(
 
   const double distance = std::hypot(estimate_xy[0], estimate_xy[1]);
   active_->loco.distance_m = distance;
+  if (loco_upper_ && loco_upper_->radius_limit_reached) {
+    active_->loco.radius_limit_reached = true;
+  }
   if (distance <= active_->loco_options.max_radius_m + config_.radius_tolerance_m) {
     return true;
   }
 
   active_->loco.radius_limit_reached = true;
-  active_->loco.reason = LocoReason::RadiusLimit;
-  finishActive(MotionState::Failed,
-               StopReason::None,
-               ErrorCode::SafetyLimitTriggered);
-  RobotReadinessStatus readiness;
-  readiness.robot = RobotState::NotReady;
-  readiness.err = ErrorCode::SafetyLimitTriggered;
-  readiness.block = "radius_limit";
-  enterPassiveState(readiness);
-  return false;
+  if (loco_upper_) {
+    loco_upper_->radius_limit_reached = true;
+  }
+  return true;
 }
 
 void RuntimeControlLoop::failLocoUpperPolicy(
