@@ -511,6 +511,51 @@ TEST_CASE("POST execute_loco_upper rejects enabled config when runtime is not re
   REQUIRE(h.ids.calls == 0);
 }
 
+TEST_CASE("POST execute_loco_upper preserves execute readiness semantics before capability gate") {
+  struct Case {
+    StatusSnapshot snapshot;
+    std::string code;
+    std::string next;
+  };
+
+  auto lowcmd_occupied = readySnapshot();
+  lowcmd_occupied.ready = false;
+  lowcmd_occupied.robot = RobotState::NotReady;
+  lowcmd_occupied.err = ErrorCode::RobotNotReady;
+  lowcmd_occupied.block = "lowcmd_occupied";
+
+  auto disconnected = readySnapshot();
+  disconnected.ready = false;
+  disconnected.robot = RobotState::Disconnected;
+  disconnected.err = ErrorCode::RobotDisconnected;
+
+  for (const auto& item : std::vector<Case>{
+           {lowcmd_occupied, "ROBOT_NOT_READY", "manual"},
+           {disconnected, "ROBOT_DISCONNECTED", "wait_robot"},
+       }) {
+    Harness h(locoEnabledNotReadyConfig());
+    h.status.snapshot_value = item.snapshot;
+
+    const auto execute =
+        h.service.handle({"POST", "/execute", R"({"path":"/tracks/walk-wave.trk"})"});
+    const auto loco = h.service.handle(
+        {"POST", "/execute_loco_upper", R"({"path":"/tracks/walk-wave.trk"})"});
+
+    CAPTURE(item.code);
+    REQUIRE(loco.status == execute.status);
+    requireFailure(execute, item.code);
+    requireFailure(loco, item.code);
+    REQUIRE(nextAction(execute) == item.next);
+    REQUIRE(nextAction(loco) == item.next);
+    REQUIRE(errorCode(loco) != "MODEL_NOT_READY");
+    REQUIRE(h.validator.calls == 0);
+    REQUIRE(h.prechecker.calls == 0);
+    REQUIRE(h.sink.queue_calls == 0);
+    REQUIRE(h.sink.interrupt_calls == 0);
+    REQUIRE(h.ids.calls == 0);
+  }
+}
+
 TEST_CASE("POST execute_loco_upper prechecks validator canonical path before id and queue") {
   Harness h(locoEnabledConfig());
   observeLocoUpperReady(h);

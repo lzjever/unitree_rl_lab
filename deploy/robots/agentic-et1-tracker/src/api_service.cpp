@@ -517,6 +517,13 @@ ApiResponse AgentApiService::executeLocoUpper(const std::string& body) {
   const auto snapshot = status_.snapshot();
   const LocoUpperCapability capability =
       effectiveLocoUpperCapability(configured, snapshot.loco_upper);
+  const ErrorCode readiness = readinessError(snapshot);
+  if (readiness != ErrorCode::Ok) {
+    if (snapshot.block == "lowcmd_occupied") {
+      return error(manualReadinessInfo(readiness));
+    }
+    return error(readiness);
+  }
   if (!capability.ready) {
     return error(ErrorCode::ModelNotReady);
   }
@@ -527,13 +534,6 @@ ApiResponse AgentApiService::executeLocoUpper(const std::string& body) {
     return error(ErrorCode::RequestInvalid);
   }
 
-  const ErrorCode readiness = readinessError(snapshot);
-  if (readiness != ErrorCode::Ok) {
-    if (snapshot.block == "lowcmd_occupied") {
-      return error(manualReadinessInfo(readiness));
-    }
-    return error(readiness);
-  }
   if (executeBlockedByController(snapshot.ctrl)) {
     return controlStateConflict(snapshot.ctrl);
   }
