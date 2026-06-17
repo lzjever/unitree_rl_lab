@@ -17,6 +17,6 @@ required_files:
     sha256: "c76686a5b952a10eded30b87673cf098d23d469f596ad6289bbc05b81bdb5203"
     size_bytes: 760475
   - path: params/deploy_lowobs10k.yaml
-    sha256: "29cab8fe979f6f8c1647c555916b250a3061664427ff62b0aac7cf09aef87aef"
-    size_bytes: 3196
+    sha256: "b88727d5a2c7c87b2ee8f053c1a5ecf367bfaa2f1b0a54bb8362f6a0107aa48a"
+    size_bytes: 3382
 source_notes: "copied from ET1 loco lower reference assets into app-owned tracker assets"

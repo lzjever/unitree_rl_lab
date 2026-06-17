@@ -105,7 +105,7 @@ check_not_lfs_pointer "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/
 check_sha256 "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/loco_lower/et1_low/exported/policy.onnx" \
   "c76686a5b952a10eded30b87673cf098d23d469f596ad6289bbc05b81bdb5203"
 check_sha256 "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/loco_lower/et1_low/params/deploy_lowobs10k.yaml" \
-  "29cab8fe979f6f8c1647c555916b250a3061664427ff62b0aac7cf09aef87aef"
+  "b88727d5a2c7c87b2ee8f053c1a5ecf367bfaa2f1b0a54bb8362f6a0107aa48a"
 check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/posture/fixstand/v0/fixstand.yaml"
 check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/posture/passive/v0/passive.yaml"
 check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/limits/et1_upper_body/v0/README.md"
