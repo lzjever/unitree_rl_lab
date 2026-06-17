@@ -88,14 +88,15 @@ Vec projectedGravity(const LowStateSample& low_state) {
 Vec termValues(const VelocityDeployConfig& config,
                const VelocityObservationTerm& term,
                const LowStateSample& low_state,
-               const Vec& last_action) {
+               const Vec& last_action,
+               VelocityCommand command) {
   Vec values;
   if (term.name == "base_ang_vel") {
     values = {low_state.gyro[0], low_state.gyro[1], low_state.gyro[2]};
   } else if (term.name == "projected_gravity") {
     values = projectedGravity(low_state);
   } else if (term.name == "keyboard_velocity_commands") {
-    values = {0.0F, 0.0F, 0.0F};
+    values = {command.vx, command.vy, command.yaw_rate};
   } else if (term.name == "joint_pos_rel") {
     values.reserve(kVelocityPolicyJointDim);
     for (std::size_t i = 0; i < kVelocityPolicyJointDim; ++i) {
@@ -140,7 +141,8 @@ Vec flattenTermMajorHistory(const std::vector<std::deque<Vec>>& term_history) {
 
 std::vector<Vec> currentTermValues(const VelocityDeployConfig& config,
                                    const LowStateSample& low_state,
-                                   const Vec& last_action) {
+                                   const Vec& last_action,
+                                   VelocityCommand command) {
   std::vector<Vec> values;
   values.reserve(config.observation_terms.size());
   std::size_t offset = 0;
@@ -148,7 +150,7 @@ std::vector<Vec> currentTermValues(const VelocityDeployConfig& config,
     if (term.offset != offset) {
       throw error("observation term offsets must be contiguous");
     }
-    values.push_back(termValues(config, term, low_state, last_action));
+    values.push_back(termValues(config, term, low_state, last_action, command));
     offset += values.back().size();
   }
   requireSize("velocity obs row", offset, kVelocityPolicyObsRowWidth);
@@ -170,10 +172,18 @@ Vec processedAction(const VelocityDeployConfig& config, const Vec& raw_action) {
 VelocityPolicyInputs makeVelocityPolicyInputs(const VelocityDeployConfig& config,
                                               const LowStateSample& low_state,
                                               const Vec& last_action) {
+  return makeVelocityPolicyInputs(config, low_state, last_action, VelocityCommand{});
+}
+
+VelocityPolicyInputs makeVelocityPolicyInputs(const VelocityDeployConfig& config,
+                                              const LowStateSample& low_state,
+                                              const Vec& last_action,
+                                              VelocityCommand command) {
   validateConfig(config);
   requireSize("last_action", last_action.size(), kVelocityPolicyJointDim);
 
-  const std::vector<Vec> values = currentTermValues(config, low_state, last_action);
+  const std::vector<Vec> values =
+      currentTermValues(config, low_state, last_action, command);
   std::vector<std::deque<Vec>> term_history;
   term_history.reserve(values.size());
   for (const Vec& term : values) {
@@ -224,10 +234,18 @@ void VelocityStepRunner::reset() {
 VelocityStepResult VelocityStepRunner::step(const LowStateSample& low_state,
                                             VelocityPolicyInference& policy,
                                             const LowCmdFrame* base_frame) {
+  return step(low_state, policy, VelocityCommand{}, base_frame);
+}
+
+VelocityStepResult VelocityStepRunner::step(const LowStateSample& low_state,
+                                            VelocityPolicyInference& policy,
+                                            VelocityCommand command,
+                                            const LowCmdFrame* base_frame) {
   VelocityStepResult result;
   validateConfig(config_);
   requireSize("last_action", last_action_.size(), kVelocityPolicyJointDim);
-  const std::vector<Vec> values = currentTermValues(config_, low_state, last_action_);
+  const std::vector<Vec> values =
+      currentTermValues(config_, low_state, last_action_, command);
   if (term_history_.empty()) {
     term_history_.reserve(values.size());
     for (const Vec& term : values) {

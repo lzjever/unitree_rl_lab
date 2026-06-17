@@ -183,6 +183,77 @@ double optionalNonNegativeDouble(const YAML::Node& section, const char* key, dou
   return value;
 }
 
+YAML::Node optionalAliasNode(const YAML::Node& section,
+                             const char* key,
+                             const char* alias) {
+  const YAML::Node node = section[key];
+  if (node) {
+    return node;
+  }
+  return section[alias];
+}
+
+std::string optionalStringAlias(const YAML::Node& section,
+                                const char* key,
+                                const char* alias,
+                                const char* name,
+                                std::string current,
+                                bool reject_empty = true) {
+  const YAML::Node node = optionalAliasNode(section, key, alias);
+  if (!node) {
+    return current;
+  }
+  std::string value = scalarAs<std::string>(node, name);
+  if (reject_empty && value.empty()) {
+    throw error(std::string(name) + " must not be empty");
+  }
+  return value;
+}
+
+double optionalPositiveDoubleAlias(const YAML::Node& section,
+                                   const char* key,
+                                   const char* alias,
+                                   const char* name,
+                                   double current) {
+  const YAML::Node node = optionalAliasNode(section, key, alias);
+  if (!node) {
+    return current;
+  }
+  const double value = scalarAs<double>(node, name);
+  if (!std::isfinite(value) || value <= 0.0) {
+    throw error(std::string(name) + " must be positive");
+  }
+  return value;
+}
+
+double optionalNonNegativeDoubleAlias(const YAML::Node& section,
+                                      const char* key,
+                                      const char* alias,
+                                      const char* name,
+                                      double current) {
+  const YAML::Node node = optionalAliasNode(section, key, alias);
+  if (!node) {
+    return current;
+  }
+  const double value = scalarAs<double>(node, name);
+  if (!std::isfinite(value) || value < 0.0) {
+    throw error(std::string(name) + " must be non-negative");
+  }
+  return value;
+}
+
+bool optionalBoolAlias(const YAML::Node& section,
+                       const char* key,
+                       const char* alias,
+                       const char* name,
+                       bool current) {
+  const YAML::Node node = optionalAliasNode(section, key, alias);
+  if (!node) {
+    return current;
+  }
+  return scalarAs<bool>(node, name);
+}
+
 std::vector<std::filesystem::path> requiredMotionDirs(const YAML::Node& section) {
   const YAML::Node node = section["motion_dirs"];
   if (!node || !node.IsSequence() || node.size() == 0) {
@@ -273,11 +344,17 @@ std::string defaultInternalStandbyReference(const std::filesystem::path& policy_
   return (config_dir / ControlConfig{}.standby_reference).lexically_normal().string();
 }
 
-void validateDeployPath(const std::string& policy_dir, const std::string& deploy) {
+void validateDeployPathForKey(const char* key,
+                              const std::string& policy_dir,
+                              const std::string& deploy) {
   const std::filesystem::path params_dir = std::filesystem::path(policy_dir) / "params";
   if (!pathIsWithin(deploy, params_dir)) {
-    throw error("deploy must be under policy_dir/params");
+    throw error(std::string(key) + " must be under policy_dir/params");
   }
+}
+
+void validateDeployPath(const std::string& policy_dir, const std::string& deploy) {
+  validateDeployPathForKey("deploy", policy_dir, deploy);
 }
 
 void validatePolicyModelPath(const std::string& key,
@@ -293,12 +370,16 @@ void validateLockPath(const std::string& value) {
   }
 }
 
-void validatePolicyFile(const std::string& value) {
+void validatePolicyFile(const char* key, const std::string& value) {
   const std::filesystem::path path(value);
   if (path.is_absolute() || path.has_parent_path() || value.find('/') != std::string::npos ||
       value.find('\\') != std::string::npos || value == "." || value == "..") {
-    throw error("policy_file must be a file name only");
+    throw error(std::string(key) + " must be a file name only");
   }
+}
+
+void validatePolicyFile(const std::string& value) {
+  validatePolicyFile("policy_file", value);
 }
 
 std::optional<ObservationContract> expectedContractForProfile(const std::string& profile) {
@@ -340,6 +421,130 @@ void validateReferenceKeys(const YAML::Node& reference) {
       throw error("reference." + key + " is unsupported");
     }
   }
+}
+
+void loadLocoUpperConfig(const YAML::Node& section, LocoUpperConfig& config) {
+  const YAML::Node loco_upper = section["loco_upper"];
+  if (!loco_upper) {
+    return;
+  }
+  if (!loco_upper.IsMap()) {
+    throw error("loco_upper must be a map");
+  }
+
+  config.enabled = optionalBool(loco_upper, "enabled", config.enabled);
+  if (!config.enabled) {
+    return;
+  }
+
+  config.policy_dir =
+      optionalString(loco_upper, "policy_dir", config.policy_dir);
+  config.policy_file =
+      optionalString(loco_upper, "policy_file", config.policy_file);
+  config.deploy = optionalString(loco_upper, "deploy", config.deploy);
+  config.default_radius_m = optionalPositiveDoubleAlias(loco_upper,
+                                                        "default_radius_m",
+                                                        "default_max_radius_m",
+                                                        "loco_upper.default_radius_m",
+                                                        config.default_radius_m);
+  config.max_radius_m = optionalPositiveDoubleAlias(loco_upper,
+                                                    "max_radius_m",
+                                                    "max_radius_m",
+                                                    "loco_upper.max_radius_m",
+                                                    config.max_radius_m);
+  config.radius_tolerance_m = optionalNonNegativeDoubleAlias(
+      loco_upper,
+      "radius_tolerance",
+      "radius_tolerance_m",
+      "loco_upper.radius_tolerance_m",
+      config.radius_tolerance_m);
+  config.max_hold_s = optionalPositiveDoubleAlias(loco_upper,
+                                                  "max_hold_s",
+                                                  "max_hold_s",
+                                                  "loco_upper.max_hold_s",
+                                                  config.max_hold_s);
+  config.strict_pose = optionalBoolAlias(loco_upper,
+                                         "strict_pose",
+                                         "strict_radius_requires_pose",
+                                         "loco_upper.strict_pose",
+                                         config.strict_pose);
+  config.pose_fresh_timeout_ms =
+      optionalPositiveSize(loco_upper,
+                           "pose_fresh_timeout_ms",
+                           config.pose_fresh_timeout_ms);
+  config.pose_jump_reject_m =
+      optionalPositiveDouble(loco_upper,
+                             "pose_jump_reject_m",
+                             config.pose_jump_reject_m);
+  config.max_lin_accel_mps2 =
+      optionalPositiveDouble(loco_upper,
+                             "max_lin_accel_mps2",
+                             config.max_lin_accel_mps2);
+  config.max_yaw_accel_radps2 =
+      optionalPositiveDouble(loco_upper,
+                             "max_yaw_accel_radps2",
+                             config.max_yaw_accel_radps2);
+  config.smoothing_window_frames =
+      optionalPositiveSize(loco_upper,
+                           "smoothing_window_frames",
+                           config.smoothing_window_frames);
+  config.limits = optionalStringAlias(loco_upper,
+                                      "limits",
+                                      "upper_body_limits",
+                                      "loco_upper.limits",
+                                      config.limits);
+  config.joint_map =
+      optionalString(loco_upper, "joint_map", config.joint_map);
+}
+
+void validateLocoUpperConfig(LocoUpperConfig& config,
+                             const std::filesystem::path& config_dir) {
+  if (!config.enabled) {
+    return;
+  }
+
+  if (!std::isfinite(config.default_radius_m) || config.default_radius_m <= 0.0) {
+    throw error("loco_upper.default_radius_m must be positive");
+  }
+  if (!std::isfinite(config.max_radius_m) || config.max_radius_m <= 0.0) {
+    throw error("loco_upper.max_radius_m must be positive");
+  }
+  if (config.default_radius_m > config.max_radius_m) {
+    throw error("loco_upper.default_radius_m must be <= loco_upper.max_radius_m");
+  }
+  if (!std::isfinite(config.radius_tolerance_m) || config.radius_tolerance_m < 0.0) {
+    throw error("loco_upper.radius_tolerance_m must be non-negative");
+  }
+  if (!std::isfinite(config.max_hold_s) || config.max_hold_s <= 0.0) {
+    throw error("loco_upper.max_hold_s must be positive");
+  }
+  if (config.pose_fresh_timeout_ms == 0) {
+    throw error("loco_upper.pose_fresh_timeout_ms must be positive");
+  }
+  if (!std::isfinite(config.pose_jump_reject_m) || config.pose_jump_reject_m <= 0.0) {
+    throw error("loco_upper.pose_jump_reject_m must be positive");
+  }
+  if (!std::isfinite(config.max_lin_accel_mps2) || config.max_lin_accel_mps2 <= 0.0) {
+    throw error("loco_upper.max_lin_accel_mps2 must be positive");
+  }
+  if (!std::isfinite(config.max_yaw_accel_radps2) || config.max_yaw_accel_radps2 <= 0.0) {
+    throw error("loco_upper.max_yaw_accel_radps2 must be positive");
+  }
+  if (config.smoothing_window_frames == 0) {
+    throw error("loco_upper.smoothing_window_frames must be positive");
+  }
+
+  validatePolicyFile("loco_upper.policy_file", config.policy_file);
+  config.policy_dir =
+      resolveConfigPath("loco_upper.policy_dir", config.policy_dir, config_dir);
+  config.deploy = resolveConfigPath("loco_upper.deploy", config.deploy, config_dir);
+  config.limits = resolveConfigPath("loco_upper.limits", config.limits, config_dir);
+  config.joint_map =
+      resolveConfigPath("loco_upper.joint_map", config.joint_map, config_dir);
+  validateDeployPathForKey("loco_upper.deploy", config.policy_dir, config.deploy);
+  validatePolicyModelPath("loco_upper policy model",
+                          config.policy_dir,
+                          config.policy_file);
 }
 
 }  // namespace
@@ -398,6 +603,8 @@ AppConfig loadAppConfig(const std::filesystem::path& path) {
     if (config.reference.enabled && config.mode_machine != 0) {
       throw error("reference.enabled requires mode_machine 0");
     }
+
+    loadLocoUpperConfig(section, config.loco_upper);
 
     config.stop_hold_s = optionalNonNegativeDouble(section, "stop_hold_s", config.stop_hold_s);
     if (config.stop_hold_s != 0.0) {
@@ -508,6 +715,21 @@ AppConfig loadAppConfig(const std::filesystem::path& path) {
     validateDeployPath(config.control.velocity_policy_dir, config.control.velocity_deploy);
     validatePolicyModelPath("control velocity model", config.control.velocity_policy_dir,
                             config.control.velocity_policy_file);
+
+    validateLocoUpperConfig(config.loco_upper, config_dir);
+    config.runtime.loco_upper_max_hold_s = config.loco_upper.max_hold_s;
+    config.runtime.radius_tolerance_m = config.loco_upper.radius_tolerance_m;
+    config.runtime.loco_upper_strict_pose = config.loco_upper.strict_pose;
+    config.runtime.loco_upper_pose_fresh_timeout_ms =
+        config.loco_upper.pose_fresh_timeout_ms;
+    config.runtime.loco_upper_pose_jump_reject_m =
+        config.loco_upper.pose_jump_reject_m;
+    config.runtime.loco_upper_max_lin_accel_mps2 =
+        config.loco_upper.max_lin_accel_mps2;
+    config.runtime.loco_upper_max_yaw_accel_radps2 =
+        config.loco_upper.max_yaw_accel_radps2;
+    config.runtime.loco_upper_smoothing_window_frames =
+        config.loco_upper.smoothing_window_frames;
 
     config.trk.fps = config.policy.fps;
     return config;

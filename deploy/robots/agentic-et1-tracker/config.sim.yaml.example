@@ -16,6 +16,21 @@ agentic_et1_tracker:
   idle_mode: "hold_current"
   reference:
     enabled: true
+  # Simulation-only example for /execute_loco_upper.
+  # This stays disabled by default; set enabled: true manually only when
+  # testing /execute_loco_upper in simulation.
+  loco_upper:
+    enabled: false
+    policy_dir: "config/policy/loco_lower/et1_low"
+    policy_file: "policy.onnx"
+    deploy: "config/policy/loco_lower/et1_low/params/deploy_lowobs10k.yaml"
+    default_radius_m: 0.8
+    max_radius_m: 2.0
+    radius_tolerance_m: 0.05
+    max_hold_s: 10.0
+    strict_pose: false
+    limits: "config/limits/et1_upper_body/v0/limits.yaml"
+    joint_map: "config/limits/et1_upper_body/v0/joint_map.yaml"
   policy:
     profile: "GeneralTrackerCLNFootstate"
     policy_dir: "config/policy/general_tracker_cln"

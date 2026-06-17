@@ -21,6 +21,8 @@
 #include "agentic_et1_tracker/runtime/runtime_status_store.hpp"
 #include "agentic_et1_tracker/control/fixstand.hpp"
 #include "agentic_et1_tracker/control/passive.hpp"
+#include "agentic_et1_tracker/loco_upper/loco_lower_policy.hpp"
+#include "agentic_et1_tracker/loco_upper/lowcmd_composer.hpp"
 #include "agentic_et1_tracker/policy/policy_math.hpp"
 #include "agentic_et1_tracker/policy/velocity_deploy_config.hpp"
 #include "agentic_et1_tracker/policy/velocity_policy_runner.hpp"
@@ -69,7 +71,9 @@ struct ArrayFixture {
   TrkDtype dtype{TrkDtype::Float32};
   std::vector<std::uint64_t> shape;
   std::optional<std::array<float, 3>> root_body_position;
+  std::vector<std::array<float, 3>> root_body_positions;
   std::optional<std::array<float, 4>> root_body_quat;
+  std::vector<std::array<float, 4>> root_body_quats;
   bool identity_quaternions{false};
   bool invalid_contact{false};
   std::size_t invalid_contact_index{0};
@@ -118,11 +122,37 @@ void writePayload(std::ofstream& out, const ArrayFixture& array) {
     if (array.identity_quaternions && array.name == "body_quat_w") {
       value = i % 4 == 0 ? 1.0F : 0.0F;
     }
-    if (array.root_body_position && array.name == "body_pos_w" && i < 3) {
-      value = array.root_body_position->at(i);
+    if (array.name == "body_pos_w") {
+      if (!array.root_body_positions.empty() && array.shape.size() >= 2) {
+        std::uint64_t frame_size = 1;
+        for (std::size_t dim = 1; dim < array.shape.size(); ++dim) {
+          frame_size *= array.shape.at(dim);
+        }
+        const std::uint64_t frame = frame_size == 0 ? 0 : i / frame_size;
+        const std::uint64_t frame_offset = frame_size == 0 ? i : i % frame_size;
+        if (frame < array.root_body_positions.size() && frame_offset < 3) {
+          value = array.root_body_positions.at(static_cast<std::size_t>(frame))
+                      .at(static_cast<std::size_t>(frame_offset));
+        }
+      } else if (array.root_body_position && i < 3) {
+        value = array.root_body_position->at(i);
+      }
     }
-    if (array.root_body_quat && array.name == "body_quat_w" && i < 4) {
-      value = array.root_body_quat->at(i);
+    if (array.name == "body_quat_w") {
+      if (!array.root_body_quats.empty() && array.shape.size() >= 2) {
+        std::uint64_t frame_size = 1;
+        for (std::size_t dim = 1; dim < array.shape.size(); ++dim) {
+          frame_size *= array.shape.at(dim);
+        }
+        const std::uint64_t frame = frame_size == 0 ? 0 : i / frame_size;
+        const std::uint64_t frame_offset = frame_size == 0 ? i : i % frame_size;
+        if (frame < array.root_body_quats.size() && frame_offset < 4) {
+          value = array.root_body_quats.at(static_cast<std::size_t>(frame))
+                      .at(static_cast<std::size_t>(frame_offset));
+        }
+      } else if (array.root_body_quat && i < 4) {
+        value = array.root_body_quat->at(i);
+      }
     }
     writeScalar(out, value);
   }
@@ -258,6 +288,34 @@ std::filesystem::path identityQuaternionTrk(TempTree& tmp,
                                            std::uint64_t frames) {
   auto arrays = requiredArrays(frames);
   arrayNamed(arrays, "body_quat_w").identity_quaternions = true;
+  const auto path = tmp.allowed / name;
+  writeTrk(path, arrays);
+  return path;
+}
+
+std::filesystem::path rootPositionsTrk(
+    TempTree& tmp,
+    const std::string& name,
+    const std::vector<std::array<float, 3>>& root_positions) {
+  auto arrays = requiredArrays(root_positions.size());
+  arrayNamed(arrays, "body_pos_w").root_body_positions = root_positions;
+  arrayNamed(arrays, "body_quat_w").identity_quaternions = true;
+  const auto path = tmp.allowed / name;
+  writeTrk(path, arrays);
+  return path;
+}
+
+std::filesystem::path yawOnlyTrk(TempTree& tmp,
+                                 const std::string& name,
+                                 const std::vector<float>& yaws_rad) {
+  auto arrays = requiredArrays(yaws_rad.size());
+  arrayNamed(arrays, "body_pos_w").root_body_positions =
+      std::vector<std::array<float, 3>>(yaws_rad.size(), {0.0F, 0.0F, 0.0F});
+  auto& quat = arrayNamed(arrays, "body_quat_w");
+  quat.root_body_quats.reserve(yaws_rad.size());
+  for (const float yaw_rad : yaws_rad) {
+    quat.root_body_quats.push_back(yawQuat(yaw_rad));
+  }
   const auto path = tmp.allowed / name;
   writeTrk(path, arrays);
   return path;
@@ -443,13 +501,14 @@ class FakeVelocityPolicy final : public VelocityPolicyInference {
     ++calls;
     inputs_seen.push_back(inputs);
     if (throw_on_infer) {
-      throw std::runtime_error("fake velocity policy failed");
+      throw std::runtime_error(throw_message);
     }
     return next_raw;
   }
 
   Vec next_raw;
   bool throw_on_infer{false};
+  std::string throw_message{"fake velocity policy failed"};
   int calls{0};
   std::vector<VelocityPolicyInputs> inputs_seen;
 };
@@ -508,6 +567,69 @@ VelocityDeployConfig velocityDeployConfig() {
   return config;
 }
 
+LocoLowerDeployConfig locoLowerDeployConfig() {
+  LocoLowerDeployConfig config;
+  config.joint_dim = kLocoLowerPolicyJointDim;
+  config.joint_ids_map = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+  config.sdk_joint_ids_map = config.joint_ids_map;
+  config.stiffness = doubleSeq(40.0, 1.0, kLocoLowerPolicyJointDim);
+  config.damping = doubleSeq(2.0, 0.1, kLocoLowerPolicyJointDim);
+  config.default_joint_pos = doubleSeq(0.0, 0.05, kLocoLowerPolicyJointDim);
+  config.joint_min_q = std::vector<double>(kLocoLowerPolicyJointDim, -1000.0);
+  config.joint_max_q = std::vector<double>(kLocoLowerPolicyJointDim, 1000.0);
+  config.action_scale = std::vector<double>(kLocoLowerPolicyJointDim, 0.1);
+  config.action_offset = doubleSeq(-0.3, 0.03, kLocoLowerPolicyJointDim);
+  config.observation_terms = {
+      {"base_ang_vel", 3, 0, {1.0, 1.0, 1.0}},
+      {"projected_gravity", 3, 3, {1.0, 1.0, 1.0}},
+      {"keyboard_velocity_commands", 3, 6, {1.0, 1.0, 1.0}},
+      {"joint_pos_rel", kLocoLowerPolicyJointDim, 9,
+       std::vector<double>(kLocoLowerPolicyJointDim, 1.0)},
+      {"joint_vel_rel", kLocoLowerPolicyJointDim, 21,
+       std::vector<double>(kLocoLowerPolicyJointDim, 0.05)},
+      {"last_action", kLocoLowerPolicyJointDim, 33,
+       std::vector<double>(kLocoLowerPolicyJointDim, 1.0)},
+  };
+  config.command_ranges.lin_vel_x = {-2.0, 2.0};
+  config.command_ranges.lin_vel_y = {-1.0, 1.0};
+  config.command_ranges.ang_vel_z = {-3.0, 3.0};
+  config.obs_row_width = kLocoLowerPolicyObsRowWidth;
+  config.obs_history_length = kLocoLowerPolicyHistoryLength;
+  config.obs_dim = kLocoLowerPolicyObsDim;
+  config.policy_decimation = 1;
+  config.step_dt = 0.02;
+  return config;
+}
+
+LocoUpperLowCmdComposerConfig locoUpperComposerConfig() {
+  LocoUpperLowCmdComposerConfig config;
+  config.logical_to_sdk = frozenSdkMap();
+  config.upper_kp.assign(kPolicyJointDim, 0.0F);
+  config.upper_kd.assign(kPolicyJointDim, 0.0F);
+  config.lower_min_q.assign(kLocoLowerPolicyJointDim, -1000.0F);
+  config.lower_max_q.assign(kLocoLowerPolicyJointDim, 1000.0F);
+  config.upper_min_q.assign(kPolicyJointDim, -10.0F);
+  config.upper_max_q.assign(kPolicyJointDim, 10.0F);
+  config.upper_max_vel_radps.assign(kPolicyJointDim, 0.0F);
+  config.upper_max_accel_radps2.assign(kPolicyJointDim, 0.0F);
+  for (std::size_t logical = config.upper_start_joint;
+       logical < config.upper_end_joint_exclusive;
+       ++logical) {
+    config.upper_kp.at(logical) = 55.0F;
+    config.upper_kd.at(logical) = 5.0F;
+    config.upper_min_q.at(logical) = -1000.0F;
+    config.upper_max_q.at(logical) = 1000.0F;
+    config.upper_max_vel_radps.at(logical) = 1000.0F;
+    config.upper_max_accel_radps2.at(logical) = 10000.0F;
+  }
+  config.unowned_safe.mode = 0;
+  config.unowned_safe.q = 0.0F;
+  config.unowned_safe.kp = 0.0F;
+  config.unowned_safe.kd = 0.0F;
+  config.expected_mode_machine = kExpectedModeMachine;
+  return config;
+}
+
 FixStandConfig fixStandConfig() {
   FixStandConfig config;
   config.kp = doubleSeq(20.0, 1.0, kFixStandMotorCount);
@@ -548,6 +670,19 @@ ExecuteCommand executeCommand(std::string id,
   command.track.duration_s = static_cast<double>(frames) / 50.0;
   command.track.fps = 50.0;
   command.track.canonical_path = path.string();
+  return command;
+}
+
+ExecuteCommand locoUpperCommand(std::string id,
+                                const std::filesystem::path& path,
+                                MotionMode mode = MotionMode::Queue,
+                                std::size_t frames = 3,
+                                bool hold = false,
+                                double max_radius_m = 0.0) {
+  ExecuteCommand command = executeCommand(std::move(id), path, mode, frames, hold);
+  command.executor = MotionExecutor::LocoUpper;
+  command.loco_options.max_radius_m = max_radius_m;
+  command.loco_options.hold = hold;
   return command;
 }
 
@@ -621,6 +756,46 @@ RuntimeControlLoop makeControlLoop(RuntimeConfig config,
                             std::move(standby_track));
 }
 
+RuntimeControlLoop makeLocoControlLoop(
+    RuntimeConfig config,
+    RuntimeBridge& bridge,
+    RuntimeStatusStore& store,
+    const TrkValidationConfig& trk_config,
+    FakeRobotIO& robot,
+    FakePolicy& tracker_policy,
+    FakeVelocityPolicy& velocity_policy,
+    FakeVelocityPolicy& loco_lower_policy,
+    DeployConfig deploy_config = deployConfig(),
+    VelocityDeployConfig velocity_deploy_config = velocityDeployConfig(),
+    FixStandConfig fixstand_config = fixStandConfig(),
+    ControlMode startup_control = ControlMode::StandbyVelocity,
+    PassiveConfig passive_config = passiveConfig(),
+    LocoLowerDeployConfig loco_lower_deploy_config = locoLowerDeployConfig(),
+    LocoUpperLowCmdComposerConfig loco_upper_composer_config =
+        locoUpperComposerConfig(),
+    ReferenceFrameSink* reference_sink = nullptr,
+    std::shared_ptr<const TrkTrack> standby_track = nullptr) {
+  return RuntimeControlLoop(config,
+                            bridge,
+                            store,
+                            TrkLoader(trk_config),
+                            robot,
+                            tracker_policy,
+                            std::move(deploy_config),
+                            velocity_policy,
+                            std::move(velocity_deploy_config),
+                            std::move(fixstand_config),
+                            std::move(passive_config),
+                            startup_control,
+                            kExpectedModeMachine,
+                            loco_lower_policy,
+                            std::move(loco_lower_deploy_config),
+                            std::move(loco_upper_composer_config),
+                            RuntimeMode::Real,
+                            reference_sink,
+                            std::move(standby_track));
+}
+
 void requireIdle(const RuntimeStatusStore& store) {
   const auto snapshot = store.snapshot();
   REQUIRE(snapshot.ctrl == ControllerState::Idle);
@@ -678,6 +853,103 @@ void requireVelocityFrame(const LowCmdFrame& frame,
     REQUIRE(frame.motors.at(sdk_slot).kp == static_cast<float>(config.stiffness.at(i)));
     REQUIRE(frame.motors.at(sdk_slot).kd == static_cast<float>(config.damping.at(i)));
     REQUIRE(frame.motors.at(sdk_slot).tau == 0.0F);
+  }
+}
+
+void requireLocoLowerFrame(const LowCmdFrame& frame,
+                           const LocoLowerDeployConfig& config,
+                           const Vec& raw_actions) {
+  REQUIRE(frame.mode_machine == kExpectedModeMachine);
+  REQUIRE(frame.mode_pr == 0);
+  for (std::size_t i = 0; i < kLocoLowerPolicyJointDim; ++i) {
+    const auto sdk_slot = static_cast<std::size_t>(config.sdk_joint_ids_map.at(i));
+    REQUIRE(frame.motors.at(sdk_slot).mode == 1);
+    REQUIRE(frame.motors.at(sdk_slot).q ==
+            raw_actions.at(i) * static_cast<float>(config.action_scale.at(i)) +
+                static_cast<float>(config.action_offset.at(i)));
+    REQUIRE(frame.motors.at(sdk_slot).dq == 0.0F);
+    REQUIRE(frame.motors.at(sdk_slot).kp == static_cast<float>(config.stiffness.at(i)));
+    REQUIRE(frame.motors.at(sdk_slot).kd == static_cast<float>(config.damping.at(i)));
+    REQUIRE(frame.motors.at(sdk_slot).tau == 0.0F);
+  }
+}
+
+void requireLocoLowerEntryHandoffFrame(const LowCmdFrame& frame,
+                                       const LocoLowerDeployConfig& config,
+                                       const LowStateSample& entry_low_state,
+                                       const Vec& raw_actions,
+                                       float alpha) {
+  REQUIRE(frame.mode_machine == kExpectedModeMachine);
+  REQUIRE(frame.mode_pr == 0);
+  for (std::size_t i = 0; i < kLocoLowerPolicyJointDim; ++i) {
+    const auto sdk_slot = static_cast<std::size_t>(config.sdk_joint_ids_map.at(i));
+    const float start_q = entry_low_state.motors.at(sdk_slot).q;
+    const float policy_q =
+        raw_actions.at(i) * static_cast<float>(config.action_scale.at(i)) +
+        static_cast<float>(config.action_offset.at(i));
+    const float expected_q = start_q + alpha * (policy_q - start_q);
+    REQUIRE(frame.motors.at(sdk_slot).mode == 1);
+    REQUIRE(frame.motors.at(sdk_slot).q == Catch::Approx(expected_q).margin(1.0e-5F));
+    REQUIRE(frame.motors.at(sdk_slot).dq == 0.0F);
+    REQUIRE(frame.motors.at(sdk_slot).kp == static_cast<float>(config.stiffness.at(i)));
+    REQUIRE(frame.motors.at(sdk_slot).kd == static_cast<float>(config.damping.at(i)));
+    REQUIRE(frame.motors.at(sdk_slot).tau == 0.0F);
+  }
+}
+
+void requireLocoUpperFrame(const LowCmdFrame& frame,
+                           const LocoUpperLowCmdComposerConfig& config,
+                           const TrkTrack& track,
+                           std::size_t trk_frame) {
+  const auto source = track.frame(trk_frame);
+  REQUIRE(source.has_value());
+  REQUIRE(source->joint_pos.ptr != nullptr);
+  for (std::size_t logical = config.upper_start_joint;
+       logical < config.upper_end_joint_exclusive;
+       ++logical) {
+    const auto sdk_slot = static_cast<std::size_t>(config.logical_to_sdk.at(logical));
+    REQUIRE(frame.motors.at(sdk_slot).mode == 1);
+    REQUIRE(frame.motors.at(sdk_slot).q ==
+            Catch::Approx(source->joint_pos.ptr[logical]).margin(1.0e-5F));
+    REQUIRE(frame.motors.at(sdk_slot).dq == 0.0F);
+    REQUIRE(frame.motors.at(sdk_slot).kp ==
+            Catch::Approx(config.upper_kp.at(logical)).margin(1.0e-5F));
+    REQUIRE(frame.motors.at(sdk_slot).kd ==
+            Catch::Approx(config.upper_kd.at(logical)).margin(1.0e-5F));
+    REQUIRE(frame.motors.at(sdk_slot).tau == 0.0F);
+  }
+}
+
+void requireFixStandUpperFrame(const LowCmdFrame& frame,
+                               const LocoUpperLowCmdComposerConfig& composer_config,
+                               const FixStandConfig& fixstand_config) {
+  for (std::size_t logical = composer_config.upper_start_joint;
+       logical < composer_config.upper_end_joint_exclusive;
+       ++logical) {
+    const auto sdk_slot =
+        static_cast<std::size_t>(composer_config.logical_to_sdk.at(logical));
+    REQUIRE(frame.motors.at(sdk_slot).mode == 1);
+    REQUIRE(frame.motors.at(sdk_slot).q ==
+            Catch::Approx(static_cast<float>(fixstand_config.target_q.at(sdk_slot)))
+                .margin(1.0e-5F));
+    REQUIRE(frame.motors.at(sdk_slot).dq == 0.0F);
+    REQUIRE(frame.motors.at(sdk_slot).kp ==
+            Catch::Approx(composer_config.upper_kp.at(logical)).margin(1.0e-5F));
+    REQUIRE(frame.motors.at(sdk_slot).kd ==
+            Catch::Approx(composer_config.upper_kd.at(logical)).margin(1.0e-5F));
+    REQUIRE(frame.motors.at(sdk_slot).tau == 0.0F);
+  }
+}
+
+void applyLowCmdPositionToLowState(const LowCmdFrame& frame,
+                                   LowStateSample& low_state) {
+  low_state.mode_machine = frame.mode_machine;
+  low_state.mode_pr = frame.mode_pr;
+  low_state.fresh = true;
+  low_state.age_ms = 0;
+  for (std::size_t i = 0; i < frame.motors.size(); ++i) {
+    low_state.motors.at(i).q = frame.motors.at(i).q;
+    low_state.motors.at(i).dq = 0.0F;
   }
 }
 
@@ -818,6 +1090,25 @@ void startQueuedRun(RuntimeControlLoop& loop,
   REQUIRE(snapshot.ctrl == ControllerState::Running);
   REQUIRE(snapshot.exec.has_value());
   REQUIRE(snapshot.exec->id == id);
+}
+
+StatusSnapshot advanceThroughFirstLocoMotionWrite(RuntimeControlLoop& loop,
+                                                  RuntimeStatusStore& store) {
+  StatusSnapshot snapshot;
+  bool saw_motion_phase = false;
+  for (int i = 0; i < 128; ++i) {
+    loop.tick();
+    snapshot = store.snapshot();
+    if (snapshot.exec && snapshot.exec->executor == MotionExecutor::LocoUpper &&
+        snapshot.exec->loco.phase == LocoPhase::Motion) {
+      if (saw_motion_phase) {
+        return snapshot;
+      }
+      saw_motion_phase = true;
+    }
+  }
+  FAIL("expected loco_upper motion write");
+  return snapshot;
 }
 
 void startHoldingRun(RuntimeControlLoop& loop,
@@ -1095,6 +1386,52 @@ TEST_CASE("PassiveConfig loads app-owned ET1 passive damping asset") {
 }
 
 }  // namespace
+
+TEST_CASE("RuntimeControlLoop publishes observed loco-upper readiness from runtime deps") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  const DeployConfig deploy_config = deployConfig();
+
+  {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeRobotIO robot(readyLowState(deploy_config));
+    FakePolicy tracker_policy;
+    FakeVelocityPolicy velocity_policy;
+    FakeVelocityPolicy loco_lower_policy;
+    auto loop = makeLocoControlLoop(config,
+                                    bridge,
+                                    store,
+                                    tmp.trkConfig(),
+                                    robot,
+                                    tracker_policy,
+                                    velocity_policy,
+                                    loco_lower_policy,
+                                    deploy_config);
+
+    REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Velocity);
+    REQUIRE(store.snapshot().loco_upper.ready);
+  }
+
+  {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeRobotIO robot(readyLowState(deploy_config));
+    FakePolicy tracker_policy;
+    FakeVelocityPolicy velocity_policy;
+    auto loop = makeControlLoop(config,
+                                bridge,
+                                store,
+                                tmp.trkConfig(),
+                                robot,
+                                tracker_policy,
+                                velocity_policy,
+                                deploy_config);
+
+    REQUIRE(loop.internalStateForTest() == RuntimeInternalState::FixStand);
+    REQUIRE_FALSE(store.snapshot().loco_upper.ready);
+  }
+}
 
 TEST_CASE("RuntimeControlLoop loads queued trk and publishes deterministic progress to done") {
   TempTree tmp;
@@ -4342,6 +4679,2068 @@ TEST_CASE("RuntimeControlLoop completed track returns to StandbyVelocity") {
   requireFixStandHoldMotor(robot.writes.back(), fixstand_config, 12);
 }
 
+TEST_CASE("RuntimeControlLoop loco_upper starts active run with zero distance") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.1F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy);
+
+  const auto path = rootPositionsTrk(tmp,
+                                     "loco_start_distance.trk",
+                                     {{{0.0F, 0.0F, 0.0F},
+                                       {3.0F, 4.0F, 0.0F},
+                                       {6.0F, 8.0F, 0.0F}}});
+  REQUIRE(bridge.submitQueue(locoUpperCommand("loco-start-distance",
+                                              path,
+                                              MotionMode::Queue,
+                                              3))
+              .ok());
+
+  loop.tick();
+
+  const StatusSnapshot snapshot = store.snapshot();
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->executor == MotionExecutor::LocoUpper);
+  REQUIRE(snapshot.exec->loco.phase == LocoPhase::Entry);
+  REQUIRE(snapshot.exec->loco.distance_m == Catch::Approx(0.0));
+  REQUIRE(snapshot.exec->loco.distance_m != Catch::Approx(10.0));
+  REQUIRE(snapshot.exec->loco.radius_source.empty());
+}
+
+TEST_CASE("RuntimeControlLoop loco_upper fails when highstate radius exceeds limit plus tolerance") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.radius_tolerance_m = 0.05;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  HighStateSample high;
+  high.fresh = true;
+  high.position = {10.0F, 20.0F, 0.0F};
+  robot.high_state = high;
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.1F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy);
+
+  const auto path = rootPositionsTrk(tmp,
+                                     "loco_highstate_radius.trk",
+                                     {{{0.0F, 0.0F, 0.0F},
+                                       {1.0F, 0.0F, 0.0F},
+                                       {2.0F, 0.0F, 0.0F},
+                                       {3.0F, 0.0F, 0.0F}}});
+  REQUIRE(bridge.submitQueue(locoUpperCommand("loco-highstate-radius",
+                                              path,
+                                              MotionMode::Queue,
+                                              4,
+                                              false,
+                                              5.0))
+              .ok());
+
+  loop.tick();
+  StatusSnapshot snapshot = store.snapshot();
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->loco.distance_m == Catch::Approx(0.0));
+  REQUIRE(snapshot.exec->loco.radius_source.empty());
+
+  robot.high_state->position = {13.0F, 24.0F, 0.0F};
+  snapshot = advanceThroughFirstLocoMotionWrite(loop, store);
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->loco.radius_source == "highstate");
+  REQUIRE(snapshot.exec->loco.distance_m == Catch::Approx(5.0).margin(1.0e-5));
+
+  const int writes_before_breach = robot.write_attempts;
+  robot.high_state->position = {13.1F, 24.0F, 0.0F};
+  bool saw_failed = false;
+  for (int i = 0; i < 128; ++i) {
+    loop.tick();
+    snapshot = store.snapshot();
+    if (!snapshot.exec.has_value()) {
+      const auto failed = store.findRun("loco-highstate-radius");
+      if (failed.ok() && failed.run && failed.run->state == MotionState::Failed) {
+        saw_failed = true;
+        break;
+      }
+    }
+  }
+
+  REQUIRE(saw_failed);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Passive);
+  REQUIRE(snapshot.ctrl == ControllerState::Passive);
+  REQUIRE(snapshot.err == ErrorCode::SafetyLimitTriggered);
+  REQUIRE(snapshot.block == "radius_limit");
+  REQUIRE(robot.write_attempts == writes_before_breach);
+  const auto failed = store.findRun("loco-highstate-radius");
+  REQUIRE(failed.ok());
+  REQUIRE(failed.run->state == MotionState::Failed);
+  REQUIRE(failed.run->err == ErrorCode::SafetyLimitTriggered);
+  REQUIRE(failed.run->loco.phase == LocoPhase::Failed);
+  REQUIRE(failed.run->loco.reason == LocoReason::RadiusLimit);
+  REQUIRE(failed.run->loco.radius_source == "highstate");
+  REQUIRE(failed.run->loco.distance_m ==
+          Catch::Approx(std::hypot(3.1, 4.0)).margin(1.0e-5));
+}
+
+TEST_CASE("RuntimeControlLoop loco_upper fails in entry when measured radius already exceeds limit") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.radius_tolerance_m = 0.05;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  HighStateSample high;
+  high.fresh = true;
+  high.position = {10.0F, 20.0F, 0.0F};
+  robot.high_state = high;
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.1F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy);
+
+  const auto path = identityQuaternionTrk(tmp, "loco_entry_radius_guard.trk", 3);
+  REQUIRE(bridge.submitQueue(locoUpperCommand("loco-entry-radius-guard",
+                                              path,
+                                              MotionMode::Queue,
+                                              3,
+                                              false,
+                                              0.5))
+              .ok());
+
+  loop.tick();
+  REQUIRE(store.snapshot().exec.has_value());
+  robot.high_state->position = {10.6F, 20.0F, 0.0F};
+
+  loop.tick();
+
+  const StatusSnapshot snapshot = store.snapshot();
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Passive);
+  REQUIRE(snapshot.ctrl == ControllerState::Passive);
+  REQUIRE(snapshot.err == ErrorCode::SafetyLimitTriggered);
+  REQUIRE(snapshot.block == "radius_limit");
+  REQUIRE(robot.write_attempts == 0);
+  REQUIRE(loco_lower_policy.calls == 0);
+  const auto failed = store.findRun("loco-entry-radius-guard");
+  REQUIRE(failed.ok());
+  REQUIRE(failed.run->state == MotionState::Failed);
+  REQUIRE(failed.run->err == ErrorCode::SafetyLimitTriggered);
+  REQUIRE(failed.run->loco.phase == LocoPhase::Failed);
+  REQUIRE(failed.run->loco.reason == LocoReason::RadiusLimit);
+  REQUIRE(failed.run->loco.distance_m == Catch::Approx(0.6).margin(1.0e-5));
+}
+
+TEST_CASE("RuntimeControlLoop loco_upper integrates command when highstate position is unavailable") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  HighStateSample invalid_high;
+  invalid_high.fresh = true;
+  invalid_high.position = {
+      std::numeric_limits<float>::quiet_NaN(), 0.0F, 0.0F};
+  robot.high_state = invalid_high;
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.1F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy);
+
+  const auto path = rootPositionsTrk(tmp,
+                                     "loco_integrated_distance.trk",
+                                     {{{0.0F, 0.0F, 0.0F},
+                                       {0.02F, 0.0F, 0.0F},
+                                       {0.04F, 0.0F, 0.0F},
+                                       {0.06F, 0.0F, 0.0F}}});
+  REQUIRE(bridge.submitQueue(locoUpperCommand("loco-integrated-distance",
+                                              path,
+                                              MotionMode::Queue,
+                                              4))
+              .ok());
+
+  loop.tick();
+  const StatusSnapshot snapshot = advanceThroughFirstLocoMotionWrite(loop, store);
+
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->loco.radius_source == "integrated");
+  REQUIRE(snapshot.exec->loco.distance_m == Catch::Approx(0.02).margin(1.0e-5));
+}
+
+TEST_CASE("RuntimeControlLoop loco_upper radius source reflects per-frame estimator") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  HighStateSample high;
+  high.fresh = true;
+  high.position = {10.0F, 20.0F, 0.0F};
+  robot.high_state = high;
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.1F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy);
+
+  const auto path = rootPositionsTrk(tmp,
+                                     "loco_radius_source_switch.trk",
+                                     {{{0.0F, 0.0F, 0.0F},
+                                       {0.02F, 0.0F, 0.0F},
+                                       {0.04F, 0.0F, 0.0F},
+                                       {0.06F, 0.0F, 0.0F}}});
+  REQUIRE(bridge.submitQueue(locoUpperCommand("loco-radius-source-switch",
+                                              path,
+                                              MotionMode::Queue,
+                                              4))
+              .ok());
+
+  loop.tick();
+  robot.high_state->position = {10.02F, 20.0F, 0.0F};
+  StatusSnapshot snapshot = advanceThroughFirstLocoMotionWrite(loop, store);
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->loco.radius_source == "highstate");
+
+  robot.high_state->position = {
+      std::numeric_limits<float>::quiet_NaN(), 20.0F, 0.0F};
+  loop.tick();
+  snapshot = store.snapshot();
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->loco.phase == LocoPhase::Motion);
+  REQUIRE(snapshot.exec->loco.radius_source == "integrated");
+}
+
+TEST_CASE("RuntimeControlLoop strict_pose rejects loco_upper start without fresh highstate") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.loco_upper_strict_pose = true;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.1F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy);
+
+  const auto path = identityQuaternionTrk(tmp, "loco_strict_missing_start.trk", 3);
+  REQUIRE(bridge.submitQueue(
+              locoUpperCommand("loco-strict-missing-start", path, MotionMode::Queue, 3))
+              .ok());
+
+  loop.tick();
+
+  const StatusSnapshot snapshot = store.snapshot();
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(robot.write_attempts == 0);
+  REQUIRE(loco_lower_policy.calls == 0);
+  const auto failed = store.findRun("loco-strict-missing-start");
+  REQUIRE(failed.ok());
+  REQUIRE(failed.run->state == MotionState::Failed);
+  REQUIRE(failed.run->err == ErrorCode::SafetyLimitTriggered);
+  REQUIRE(failed.run->loco.phase == LocoPhase::Failed);
+  REQUIRE(failed.run->loco.reason == LocoReason::PoseMissing);
+}
+
+TEST_CASE("RuntimeControlLoop strict_pose aborts loco_upper when highstate becomes stale") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.loco_upper_strict_pose = true;
+  config.loco_upper_pose_fresh_timeout_ms = 10;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  HighStateSample high;
+  high.fresh = true;
+  high.age_ms = 0;
+  high.position = {10.0F, 20.0F, 0.0F};
+  robot.high_state = high;
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.1F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy);
+
+  const auto path = identityQuaternionTrk(tmp, "loco_strict_stale_runtime.trk", 3);
+  REQUIRE(bridge.submitQueue(
+              locoUpperCommand("loco-strict-stale-runtime", path, MotionMode::Queue, 3))
+              .ok());
+
+  loop.tick();
+  REQUIRE(store.snapshot().exec.has_value());
+  robot.high_state->age_ms = 11;
+
+  loop.tick();
+
+  const StatusSnapshot snapshot = store.snapshot();
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.ctrl == ControllerState::Passive);
+  REQUIRE(snapshot.err == ErrorCode::SafetyLimitTriggered);
+  REQUIRE(snapshot.block == "pose_missing");
+  REQUIRE(robot.write_attempts == 0);
+  REQUIRE(loco_lower_policy.calls == 0);
+  const auto failed = store.findRun("loco-strict-stale-runtime");
+  REQUIRE(failed.ok());
+  REQUIRE(failed.run->state == MotionState::Failed);
+  REQUIRE(failed.run->err == ErrorCode::SafetyLimitTriggered);
+  REQUIRE(failed.run->loco.phase == LocoPhase::Failed);
+  REQUIRE(failed.run->loco.reason == LocoReason::PoseMissing);
+}
+
+TEST_CASE("RuntimeControlLoop strict_pose aborts loco_upper on highstate jump") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.loco_upper_strict_pose = true;
+  config.loco_upper_pose_jump_reject_m = 0.05;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  HighStateSample high;
+  high.fresh = true;
+  high.age_ms = 0;
+  high.position = {10.0F, 20.0F, 0.0F};
+  robot.high_state = high;
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.1F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy);
+
+  const auto path = identityQuaternionTrk(tmp, "loco_strict_jump_runtime.trk", 3);
+  REQUIRE(bridge.submitQueue(
+              locoUpperCommand("loco-strict-jump-runtime", path, MotionMode::Queue, 3))
+              .ok());
+
+  loop.tick();
+  REQUIRE(store.snapshot().exec.has_value());
+  robot.high_state->position = {10.2F, 20.0F, 0.0F};
+
+  loop.tick();
+
+  const StatusSnapshot snapshot = store.snapshot();
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.ctrl == ControllerState::Passive);
+  REQUIRE(snapshot.err == ErrorCode::SafetyLimitTriggered);
+  REQUIRE(snapshot.block == "pose_jump");
+  REQUIRE(robot.write_attempts == 0);
+  REQUIRE(loco_lower_policy.calls == 0);
+  const auto failed = store.findRun("loco-strict-jump-runtime");
+  REQUIRE(failed.ok());
+  REQUIRE(failed.run->state == MotionState::Failed);
+  REQUIRE(failed.run->err == ErrorCode::SafetyLimitTriggered);
+  REQUIRE(failed.run->loco.phase == LocoPhase::Failed);
+  REQUIRE(failed.run->loco.reason == LocoReason::PoseJump);
+}
+
+TEST_CASE("RuntimeControlLoop loco_upper command clamp marks envelope sticky") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  LocoLowerDeployConfig loco_lower_config = locoLowerDeployConfig();
+  loco_lower_config.command_ranges.lin_vel_x = {-0.05, 0.05};
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.1F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy,
+                                  deploy_config,
+                                  velocityDeployConfig(),
+                                  fixStandConfig(),
+                                  ControlMode::StandbyVelocity,
+                                  passiveConfig(),
+                                  loco_lower_config);
+
+  const auto path = rootPositionsTrk(tmp,
+                                     "loco_command_clamp.trk",
+                                     {{{0.0F, 0.0F, 0.0F},
+                                       {0.02F, 0.0F, 0.0F},
+                                       {0.04F, 0.0F, 0.0F},
+                                       {0.06F, 0.0F, 0.0F}}});
+  REQUIRE(bridge.submitQueue(locoUpperCommand("loco-command-clamp",
+                                              path,
+                                              MotionMode::Queue,
+                                              4))
+              .ok());
+
+  loop.tick();
+  StatusSnapshot snapshot = store.snapshot();
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE_FALSE(snapshot.exec->loco.envelope_clamped);
+
+  snapshot = advanceThroughFirstLocoMotionWrite(loop, store);
+
+  REQUIRE(loco_lower_policy.inputs_seen.back().obs.at(6) ==
+          Catch::Approx(0.05F));
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->loco.envelope_clamped);
+
+  loop.tick();
+  snapshot = store.snapshot();
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->loco.envelope_clamped);
+}
+
+TEST_CASE("RuntimeControlLoop loco_upper clamps processed lower q to joint limits and reports telemetry") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.001;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  LocoLowerDeployConfig loco_lower_config = locoLowerDeployConfig();
+  loco_lower_config.joint_min_q = std::vector<double>(kLocoLowerPolicyJointDim, -0.2);
+  loco_lower_config.joint_max_q = std::vector<double>(kLocoLowerPolicyJointDim, 0.2);
+  loco_lower_config.action_scale = std::vector<double>(kLocoLowerPolicyJointDim, 0.5);
+  loco_lower_config.action_offset = std::vector<double>(kLocoLowerPolicyJointDim, 0.0);
+  LocoUpperLowCmdComposerConfig composer_config = locoUpperComposerConfig();
+  composer_config.lower_min_q.assign(kLocoLowerPolicyJointDim, -0.2F);
+  composer_config.lower_max_q.assign(kLocoLowerPolicyJointDim, 0.2F);
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 1.0F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy,
+                                  deploy_config,
+                                  velocityDeployConfig(),
+                                  fixStandConfig(),
+                                  ControlMode::StandbyVelocity,
+                                  passiveConfig(),
+                                  loco_lower_config,
+                                  composer_config);
+
+  const auto path = identityQuaternionTrk(tmp, "loco_lower_action_clamp.trk", 4);
+  REQUIRE(bridge.submitQueue(
+              locoUpperCommand("loco-lower-action-clamp", path, MotionMode::Queue, 4))
+              .ok());
+
+  loop.tick();
+  const StatusSnapshot snapshot = advanceThroughFirstLocoMotionWrite(loop, store);
+
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE_FALSE(snapshot.exec->loco.raw_action_clamped);
+  REQUIRE(snapshot.exec->loco.lower_q_limited);
+  REQUIRE(snapshot.exec->loco.lower_action_clamped);
+  REQUIRE(loco_lower_policy.calls > 0);
+  for (std::size_t i = 0; i < kLocoLowerPolicyJointDim; ++i) {
+    const auto slot = static_cast<std::size_t>(loco_lower_config.sdk_joint_ids_map.at(i));
+    REQUIRE(robot.writes.back().motors.at(slot).q == Catch::Approx(0.2F));
+  }
+}
+
+TEST_CASE("RuntimeControlLoop loco_upper planner limits are applied before lower policy input") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.hz = 50.0;
+  config.transition_duration_s = 0.001;
+  config.loco_upper_smoothing_window_frames = 2;
+  config.loco_upper_max_lin_accel_mps2 = 10000.0;
+  config.loco_upper_max_yaw_accel_radps2 = 10000.0;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  LocoLowerDeployConfig loco_lower_config = locoLowerDeployConfig();
+  loco_lower_config.command_ranges.lin_vel_x = {-100.0, 100.0};
+  loco_lower_config.command_ranges.lin_vel_y = {-100.0, 100.0};
+  loco_lower_config.command_ranges.ang_vel_z = {-100.0, 100.0};
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.1F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy,
+                                  deploy_config,
+                                  velocityDeployConfig(),
+                                  fixStandConfig(),
+                                  ControlMode::StandbyVelocity,
+                                  passiveConfig(),
+                                  loco_lower_config);
+
+  const auto path = rootPositionsTrk(tmp,
+                                     "loco_runtime_planner_limits.trk",
+                                     {{{0.0F, 0.0F, 0.0F},
+                                       {0.0F, 0.0F, 0.0F},
+                                       {1.0F, 0.0F, 0.0F},
+                                       {2.0F, 0.0F, 0.0F}}});
+  REQUIRE(bridge.submitQueue(
+              locoUpperCommand("loco-runtime-planner-limits", path, MotionMode::Queue, 4))
+              .ok());
+
+  bool saw_smoothed_command = false;
+  for (int i = 0; i < 32; ++i) {
+    loop.tick();
+    if (loco_lower_policy.inputs_seen.empty()) {
+      continue;
+    }
+    const Vec& obs = loco_lower_policy.inputs_seen.back().obs;
+    if (obs.at(6) == Catch::Approx(25.0F).margin(1.0e-5F)) {
+      saw_smoothed_command = true;
+      break;
+    }
+  }
+
+  REQUIRE(saw_smoothed_command);
+}
+
+TEST_CASE("RuntimeControlLoop loco_upper planner linear acceleration clamp sets telemetry") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.hz = 50.0;
+  config.transition_duration_s = 0.001;
+  config.loco_upper_smoothing_window_frames = 1;
+  config.loco_upper_max_lin_accel_mps2 = 1.0;
+  config.loco_upper_max_yaw_accel_radps2 = 1000.0;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  LocoLowerDeployConfig loco_lower_config = locoLowerDeployConfig();
+  loco_lower_config.command_ranges.lin_vel_x = {-100.0, 100.0};
+  loco_lower_config.command_ranges.lin_vel_y = {-100.0, 100.0};
+  loco_lower_config.command_ranges.ang_vel_z = {-100.0, 100.0};
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.1F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy,
+                                  deploy_config,
+                                  velocityDeployConfig(),
+                                  fixStandConfig(),
+                                  ControlMode::StandbyVelocity,
+                                  passiveConfig(),
+                                  loco_lower_config);
+
+  const auto path = rootPositionsTrk(tmp,
+                                     "loco_runtime_planner_lin_accel_telemetry.trk",
+                                     {{{0.0F, 0.0F, 0.0F},
+                                       {0.0F, 0.0F, 0.0F},
+                                       {1.0F, 0.0F, 0.0F},
+                                       {2.0F, 0.0F, 0.0F}}});
+  REQUIRE(bridge.submitQueue(
+              locoUpperCommand("loco-runtime-planner-lin-accel", path, MotionMode::Queue, 4))
+              .ok());
+
+  bool saw_clamped_command = false;
+  StatusSnapshot snapshot;
+  for (int i = 0; i < 64; ++i) {
+    loop.tick();
+    snapshot = store.snapshot();
+    if (!snapshot.exec.has_value() || loco_lower_policy.inputs_seen.empty()) {
+      continue;
+    }
+    if (snapshot.exec->loco.envelope_clamped &&
+        loco_lower_policy.inputs_seen.back().obs.at(6) ==
+            Catch::Approx(0.02F).margin(1.0e-5F)) {
+      saw_clamped_command = true;
+      break;
+    }
+  }
+
+  REQUIRE(saw_clamped_command);
+}
+
+TEST_CASE("RuntimeControlLoop loco_upper planner yaw acceleration clamp sets telemetry") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.hz = 50.0;
+  config.transition_duration_s = 0.001;
+  config.loco_upper_smoothing_window_frames = 1;
+  config.loco_upper_max_lin_accel_mps2 = 1000.0;
+  config.loco_upper_max_yaw_accel_radps2 = 1.0;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  LocoLowerDeployConfig loco_lower_config = locoLowerDeployConfig();
+  loco_lower_config.command_ranges.lin_vel_x = {-100.0, 100.0};
+  loco_lower_config.command_ranges.lin_vel_y = {-100.0, 100.0};
+  loco_lower_config.command_ranges.ang_vel_z = {-100.0, 100.0};
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.1F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy,
+                                  deploy_config,
+                                  velocityDeployConfig(),
+                                  fixStandConfig(),
+                                  ControlMode::StandbyVelocity,
+                                  passiveConfig(),
+                                  loco_lower_config);
+
+  const auto path = yawOnlyTrk(tmp,
+                               "loco_runtime_planner_yaw_accel_telemetry.trk",
+                               {0.0F, 0.0F, 1.0F, 2.0F});
+  REQUIRE(bridge.submitQueue(
+              locoUpperCommand("loco-runtime-planner-yaw-accel", path, MotionMode::Queue, 4))
+              .ok());
+
+  bool saw_clamped_command = false;
+  StatusSnapshot snapshot;
+  for (int i = 0; i < 64; ++i) {
+    loop.tick();
+    snapshot = store.snapshot();
+    if (!snapshot.exec.has_value() || loco_lower_policy.inputs_seen.empty()) {
+      continue;
+    }
+    if (snapshot.exec->loco.envelope_clamped &&
+        loco_lower_policy.inputs_seen.back().obs.at(8) ==
+            Catch::Approx(0.02F).margin(1.0e-5F)) {
+      saw_clamped_command = true;
+      break;
+    }
+  }
+
+  REQUIRE(saw_clamped_command);
+}
+
+TEST_CASE("RuntimeControlLoop loco_upper starts from StandbyVelocity without GeneralTracker transition and composes LowCmd") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.04;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const LocoLowerDeployConfig loco_lower_config = locoLowerDeployConfig();
+  const LocoUpperLowCmdComposerConfig composer_config = locoUpperComposerConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.5F));
+  const auto standby_track = validStandbyTrack(tmp, "loco_standby_start_ref.trk");
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy,
+                                  deploy_config,
+                                  velocity_config,
+                                  fixStandConfig(),
+                                  ControlMode::StandbyVelocity,
+                                  passiveConfig(),
+                                  loco_lower_config,
+                                  composer_config,
+                                  nullptr,
+                                  standby_track);
+
+  const auto path = identityQuaternionTrk(tmp, "loco_standby_motion.trk", 4);
+  const auto loaded = loadTrack(tmp.trkConfig(), path);
+  REQUIRE(bridge.submitQueue(locoUpperCommand("loco-standby", path, MotionMode::Queue, 4))
+              .ok());
+
+  loop.tick();
+  auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Running);
+  REQUIRE(snapshot.active.kind == ActiveKind::User);
+  REQUIRE(snapshot.active.id == "loco-standby");
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->executor == MotionExecutor::LocoUpper);
+  REQUIRE(snapshot.exec->loco.phase == LocoPhase::Entry);
+
+  bool saw_motion = false;
+  for (int i = 0; i < 128; ++i) {
+    loop.tick();
+    snapshot = store.snapshot();
+    if (snapshot.exec && snapshot.exec->loco.phase == LocoPhase::Motion &&
+        !loco_lower_policy.inputs_seen.empty()) {
+      const Vec& motion_obs = loco_lower_policy.inputs_seen.back().obs;
+      if (motion_obs.at(6) == 0.0F && motion_obs.at(7) == 0.0F &&
+          motion_obs.at(8) == 0.0F) {
+        continue;
+      }
+      saw_motion = true;
+      break;
+    }
+  }
+  REQUIRE(saw_motion);
+  REQUIRE(tracker_policy.calls == 0);
+  REQUIRE(velocity_policy.calls == 0);
+  REQUIRE(loco_lower_policy.calls > 0);
+  REQUIRE_FALSE(robot.writes.empty());
+  requireLocoLowerFrame(robot.writes.back(), loco_lower_config, loco_lower_policy.next_raw);
+  requireLocoUpperFrame(robot.writes.back(), composer_config, *loaded, snapshot.exec->frame);
+  REQUIRE(loco_lower_policy.inputs_seen.back().obs.size() == kLocoLowerPolicyObsDim);
+  const Vec& obs = loco_lower_policy.inputs_seen.back().obs;
+  REQUIRE((obs.at(6) != 0.0F || obs.at(7) != 0.0F || obs.at(8) != 0.0F));
+}
+
+TEST_CASE("RuntimeControlLoop loco_upper entry handoff starts lower target from current q") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.06;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  LocoLowerDeployConfig loco_lower_config = locoLowerDeployConfig();
+  loco_lower_config.policy_decimation = 2;
+  const LowStateSample entry_low_state = readyLowState(deploy_config);
+  FakeRobotIO robot(entry_low_state);
+  FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.5F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy,
+                                  deploy_config,
+                                  velocityDeployConfig(),
+                                  fixStandConfig(),
+                                  ControlMode::StandbyVelocity,
+                                  passiveConfig(),
+                                  loco_lower_config);
+
+  const auto path = identityQuaternionTrk(tmp, "loco_entry_lower_handoff.trk", 4);
+  REQUIRE(bridge.submitQueue(
+              locoUpperCommand("loco-entry-lower-handoff", path, MotionMode::Queue, 4))
+              .ok());
+
+  loop.tick();
+  REQUIRE(store.snapshot().exec.has_value());
+  REQUIRE(store.snapshot().exec->loco.phase == LocoPhase::Entry);
+  REQUIRE(robot.writes.empty());
+
+  loop.tick();
+  REQUIRE(loco_lower_policy.calls == 0);
+  REQUIRE(robot.writes.size() == 1);
+  requireLocoLowerEntryHandoffFrame(robot.writes.back(),
+                                    loco_lower_config,
+                                    entry_low_state,
+                                    Vec(kLocoLowerPolicyJointDim, 0.0F),
+                                    0.0F);
+
+  loop.tick();
+  REQUIRE(loco_lower_policy.calls == 1);
+  REQUIRE(robot.writes.size() == 2);
+  requireLocoLowerEntryHandoffFrame(robot.writes.back(),
+                                    loco_lower_config,
+                                    entry_low_state,
+                                    loco_lower_policy.next_raw,
+                                    0.5F);
+  const Vec& first_obs = loco_lower_policy.inputs_seen.back().obs;
+  REQUIRE(first_obs.at(6) == 0.0F);
+  REQUIRE(first_obs.at(7) == 0.0F);
+  REQUIRE(first_obs.at(8) == 0.0F);
+  for (std::size_t i = 0; i < kLocoLowerPolicyJointDim; ++i) {
+    REQUIRE(first_obs.at(kLocoLowerPolicyObsRowWidth - kLocoLowerPolicyJointDim + i) ==
+            0.0F);
+  }
+}
+
+TEST_CASE("RuntimeControlLoop loco_upper lower controller runs at runtime tick through decimation") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.hz = 1000.0;
+  config.transition_duration_s = 0.04;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  LocoLowerDeployConfig loco_lower_config = locoLowerDeployConfig();
+  loco_lower_config.policy_decimation = 10;
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.5F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy,
+                                  deploy_config,
+                                  velocityDeployConfig(),
+                                  fixStandConfig(),
+                                  ControlMode::StandbyVelocity,
+                                  passiveConfig(),
+                                  loco_lower_config);
+
+  const auto path = identityQuaternionTrk(tmp, "loco_runtime_tick_lower.trk", 4);
+  REQUIRE(bridge.submitQueue(
+              locoUpperCommand("loco-runtime-tick-lower", path, MotionMode::Queue, 4))
+              .ok());
+
+  loop.tick();
+  REQUIRE(store.snapshot().exec.has_value());
+  REQUIRE(store.snapshot().exec->loco.phase == LocoPhase::Entry);
+  REQUIRE(robot.write_attempts == 0);
+
+  for (int i = 0; i < 20; ++i) {
+    loop.tick();
+  }
+
+  REQUIRE(store.snapshot().exec.has_value());
+  REQUIRE(store.snapshot().exec->loco.phase == LocoPhase::Entry);
+  REQUIRE(robot.write_attempts == 20);
+  REQUIRE(loco_lower_policy.calls == 2);
+}
+
+TEST_CASE("RuntimeControlLoop loco_upper motion writes every runtime tick while frame advances at track fps") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.hz = 1000.0;
+  config.transition_duration_s = 0.001;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  LocoLowerDeployConfig loco_lower_config = locoLowerDeployConfig();
+  loco_lower_config.policy_decimation = 10;
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.5F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy,
+                                  deploy_config,
+                                  velocityDeployConfig(),
+                                  fixStandConfig(),
+                                  ControlMode::StandbyVelocity,
+                                  passiveConfig(),
+                                  loco_lower_config);
+
+  const auto path = identityQuaternionTrk(tmp, "loco_runtime_tick_motion.trk", 4);
+  REQUIRE(bridge.submitQueue(
+              locoUpperCommand("loco-runtime-tick-motion", path, MotionMode::Queue, 4))
+              .ok());
+
+  loop.tick();
+  loop.tick();
+  REQUIRE(store.snapshot().exec.has_value());
+  REQUIRE(store.snapshot().exec->loco.phase == LocoPhase::Motion);
+  REQUIRE(robot.write_attempts == 1);
+
+  loop.tick();
+  REQUIRE(store.snapshot().exec->frame == 0);
+  REQUIRE(robot.write_attempts == 2);
+
+  for (int i = 0; i < 19; ++i) {
+    loop.tick();
+  }
+
+  REQUIRE(store.snapshot().exec->frame == 0);
+  REQUIRE(robot.write_attempts == 21);
+  REQUIRE(loco_lower_policy.calls == 2);
+
+  loop.tick();
+  REQUIRE(store.snapshot().exec->frame == 1);
+  REQUIRE(robot.write_attempts == 22);
+}
+
+TEST_CASE("RuntimeControlLoop loco_upper naturally exits and publishes done") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.04;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.1F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy);
+
+  const auto path = identityQuaternionTrk(tmp, "loco_done.trk", 2);
+  REQUIRE(bridge.submitQueue(locoUpperCommand("loco-done", path, MotionMode::Queue, 2))
+              .ok());
+
+  bool saw_exit = false;
+  bool saw_done = false;
+  for (int i = 0; i < 256; ++i) {
+    loop.tick();
+    const auto snapshot = store.snapshot();
+    if (snapshot.exec && snapshot.exec->loco.phase == LocoPhase::Exit) {
+      saw_exit = true;
+    }
+    const auto found = store.findRun("loco-done");
+    if (found.ok() && found.run && found.run->state == MotionState::Done) {
+      saw_done = true;
+      break;
+    }
+  }
+
+  REQUIRE(saw_exit);
+  REQUIRE(saw_done);
+  REQUIRE(store.snapshot().active.kind == ActiveKind::None);
+  const auto done = store.findRun("loco-done");
+  REQUIRE(done.run->executor == MotionExecutor::LocoUpper);
+  REQUIRE(done.run->loco.phase == LocoPhase::Done);
+  REQUIRE(done.run->frame == 1);
+  REQUIRE(done.run->progress == 1.0);
+}
+
+TEST_CASE("RuntimeControlLoop loco_upper hold times out through bounded exit") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.04;
+  config.loco_upper_max_hold_s = 0.04;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  const LocoUpperLowCmdComposerConfig composer_config = locoUpperComposerConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.0F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy,
+                                  deploy_config,
+                                  velocityDeployConfig(),
+                                  fixStandConfig(),
+                                  ControlMode::StandbyVelocity,
+                                  passiveConfig(),
+                                  locoLowerDeployConfig(),
+                                  composer_config);
+
+  const auto path = identityQuaternionTrk(tmp, "loco_hold_timeout.trk", 3);
+  REQUIRE(bridge.submitQueue(
+              locoUpperCommand("loco-hold-timeout", path, MotionMode::Queue, 3, true))
+              .ok());
+
+  bool saw_exit = false;
+  bool saw_done = false;
+  for (int i = 0; i < 256; ++i) {
+    loop.tick();
+    const auto snapshot = store.snapshot();
+    if (snapshot.exec && snapshot.exec->loco.phase == LocoPhase::Exit) {
+      saw_exit = true;
+    }
+    const auto found = store.findRun("loco-hold-timeout");
+    if (found.ok() && found.run && found.run->state == MotionState::Done) {
+      saw_done = true;
+      break;
+    }
+  }
+
+  REQUIRE(saw_exit);
+  REQUIRE(saw_done);
+  const auto done = store.findRun("loco-hold-timeout");
+  REQUIRE(done.run->err == ErrorCode::Ok);
+  REQUIRE(done.run->state == MotionState::Done);
+  REQUIRE(done.run->loco.phase == LocoPhase::Done);
+  REQUIRE(done.run->loco.reason == LocoReason::HoldTimeout);
+  REQUIRE(done.run->stop_reason == StopReason::None);
+}
+
+TEST_CASE("RuntimeControlLoop loco_upper hold holds final upper target with zero lower command") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.04;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  const LocoLowerDeployConfig loco_lower_config = locoLowerDeployConfig();
+  const LocoUpperLowCmdComposerConfig composer_config = locoUpperComposerConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.0F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy,
+                                  deploy_config,
+                                  velocityDeployConfig(),
+                                  fixStandConfig(),
+                                  ControlMode::StandbyVelocity,
+                                  passiveConfig(),
+                                  loco_lower_config,
+                                  composer_config);
+
+  const auto path = identityQuaternionTrk(tmp, "loco_hold.trk", 3);
+  const auto loaded = loadTrack(tmp.trkConfig(), path);
+  REQUIRE(bridge.submitQueue(locoUpperCommand("loco-hold", path, MotionMode::Queue, 3, true))
+              .ok());
+
+  bool saw_holding = false;
+  for (int i = 0; i < 256; ++i) {
+    loop.tick();
+    const auto snapshot = store.snapshot();
+    if (snapshot.exec && snapshot.exec->state == MotionState::Holding &&
+        snapshot.exec->loco.phase == LocoPhase::Holding && robot.write_attempts > 0) {
+      saw_holding = true;
+      break;
+    }
+  }
+  REQUIRE(saw_holding);
+  loop.tick();
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.active.kind == ActiveKind::User);
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->state == MotionState::Holding);
+  REQUIRE(snapshot.exec->loco.phase == LocoPhase::Holding);
+  REQUIRE(snapshot.exec->frame == 2);
+  requireLocoUpperFrame(robot.writes.back(), composer_config, *loaded, 2);
+  REQUIRE(loco_lower_policy.inputs_seen.back().obs.at(6) == 0.0F);
+  REQUIRE(loco_lower_policy.inputs_seen.back().obs.at(7) == 0.0F);
+  REQUIRE(loco_lower_policy.inputs_seen.back().obs.at(8) == 0.0F);
+}
+
+TEST_CASE("RuntimeControlLoop loco_upper fails in holding when measured radius exceeds limit") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.001;
+  config.radius_tolerance_m = 0.05;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  HighStateSample high;
+  high.fresh = true;
+  high.position = {2.0F, 3.0F, 0.0F};
+  robot.high_state = high;
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.0F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy);
+
+  const auto path = identityQuaternionTrk(tmp, "loco_hold_radius_guard.trk", 3);
+  REQUIRE(bridge.submitQueue(locoUpperCommand("loco-hold-radius-guard",
+                                              path,
+                                              MotionMode::Queue,
+                                              3,
+                                              true,
+                                              0.5))
+              .ok());
+
+  bool reached_holding = false;
+  for (int i = 0; i < 256; ++i) {
+    loop.tick();
+    const auto snapshot = store.snapshot();
+    if (snapshot.exec && snapshot.exec->loco.phase == LocoPhase::Holding) {
+      reached_holding = true;
+      break;
+    }
+  }
+  REQUIRE(reached_holding);
+
+  robot.high_state->position = {2.6F, 3.0F, 0.0F};
+  const int writes_before_breach = robot.write_attempts;
+  loop.tick();
+
+  const StatusSnapshot snapshot = store.snapshot();
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Passive);
+  REQUIRE(snapshot.ctrl == ControllerState::Passive);
+  REQUIRE(snapshot.err == ErrorCode::SafetyLimitTriggered);
+  REQUIRE(snapshot.block == "radius_limit");
+  REQUIRE(robot.write_attempts == writes_before_breach);
+  const auto failed = store.findRun("loco-hold-radius-guard");
+  REQUIRE(failed.ok());
+  REQUIRE(failed.run->state == MotionState::Failed);
+  REQUIRE(failed.run->err == ErrorCode::SafetyLimitTriggered);
+  REQUIRE(failed.run->loco.phase == LocoPhase::Failed);
+  REQUIRE(failed.run->loco.reason == LocoReason::RadiusLimit);
+  REQUIRE(failed.run->loco.distance_m == Catch::Approx(0.6).margin(1.0e-5));
+}
+
+TEST_CASE("RuntimeControlLoop loco_upper lower policy NaN maps compact terminal reason") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.001;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  FakeVelocityPolicy loco_lower_policy(
+      Vec(kLocoLowerPolicyJointDim, std::numeric_limits<float>::quiet_NaN()));
+  LocoLowerDeployConfig loco_lower_config = locoLowerDeployConfig();
+  loco_lower_config.policy_decimation = 1;
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy,
+                                  deploy_config,
+                                  velocityDeployConfig(),
+                                  fixStandConfig(),
+                                  ControlMode::StandbyVelocity,
+                                  passiveConfig(),
+                                  loco_lower_config);
+
+  const auto path = identityQuaternionTrk(tmp, "loco_policy_nan.trk", 3);
+  REQUIRE(bridge.submitQueue(
+              locoUpperCommand("loco-policy-nan", path, MotionMode::Queue, 3))
+              .ok());
+
+  loop.tick();
+  loop.tick();
+
+  const StatusSnapshot snapshot = store.snapshot();
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.ctrl == ControllerState::Fault);
+  REQUIRE(snapshot.err == ErrorCode::ModelInferenceFailed);
+  REQUIRE(snapshot.block == "policy_inference_failed");
+  const auto failed = store.findRun("loco-policy-nan");
+  REQUIRE(failed.ok());
+  REQUIRE(failed.run->state == MotionState::Failed);
+  REQUIRE(failed.run->err == ErrorCode::ModelInferenceFailed);
+  REQUIRE(failed.run->loco.phase == LocoPhase::Failed);
+  REQUIRE(failed.run->loco.reason == LocoReason::PolicyNan);
+}
+
+TEST_CASE("RuntimeControlLoop loco_upper lower policy throw maps compact terminal reason") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.001;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.1F));
+  loco_lower_policy.throw_on_infer = true;
+  LocoLowerDeployConfig loco_lower_config = locoLowerDeployConfig();
+  loco_lower_config.policy_decimation = 1;
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy,
+                                  deploy_config,
+                                  velocityDeployConfig(),
+                                  fixStandConfig(),
+                                  ControlMode::StandbyVelocity,
+                                  passiveConfig(),
+                                  loco_lower_config);
+
+  const auto path = identityQuaternionTrk(tmp, "loco_policy_infer.trk", 3);
+  REQUIRE(bridge.submitQueue(
+              locoUpperCommand("loco-policy-infer", path, MotionMode::Queue, 3))
+              .ok());
+
+  loop.tick();
+  loop.tick();
+
+  const StatusSnapshot snapshot = store.snapshot();
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.ctrl == ControllerState::Fault);
+  REQUIRE(snapshot.err == ErrorCode::ModelInferenceFailed);
+  REQUIRE(snapshot.block == "policy_inference_failed");
+  const auto failed = store.findRun("loco-policy-infer");
+  REQUIRE(failed.ok());
+  REQUIRE(failed.run->state == MotionState::Failed);
+  REQUIRE(failed.run->err == ErrorCode::ModelInferenceFailed);
+  REQUIRE(failed.run->loco.phase == LocoPhase::Failed);
+  REQUIRE(failed.run->loco.reason == LocoReason::PolicyInfer);
+}
+
+TEST_CASE("RuntimeControlLoop loco_upper lower policy non-finite exception maps compact terminal reason") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.001;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.1F));
+  loco_lower_policy.throw_on_infer = true;
+  loco_lower_policy.throw_message =
+      "policy runtime error: actions output contains non-finite values";
+  LocoLowerDeployConfig loco_lower_config = locoLowerDeployConfig();
+  loco_lower_config.policy_decimation = 1;
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy,
+                                  deploy_config,
+                                  velocityDeployConfig(),
+                                  fixStandConfig(),
+                                  ControlMode::StandbyVelocity,
+                                  passiveConfig(),
+                                  loco_lower_config);
+
+  const auto path =
+      identityQuaternionTrk(tmp, "loco_policy_non_finite_throw.trk", 3);
+  REQUIRE(bridge.submitQueue(locoUpperCommand("loco-policy-non-finite-throw",
+                                              path,
+                                              MotionMode::Queue,
+                                              3))
+              .ok());
+
+  loop.tick();
+  loop.tick();
+
+  const StatusSnapshot snapshot = store.snapshot();
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.ctrl == ControllerState::Fault);
+  REQUIRE(snapshot.err == ErrorCode::ModelInferenceFailed);
+  REQUIRE(snapshot.block == "policy_inference_failed");
+  const auto failed = store.findRun("loco-policy-non-finite-throw");
+  REQUIRE(failed.ok());
+  REQUIRE(failed.run->state == MotionState::Failed);
+  REQUIRE(failed.run->err == ErrorCode::ModelInferenceFailed);
+  REQUIRE(failed.run->loco.phase == LocoPhase::Failed);
+  REQUIRE(failed.run->loco.reason == LocoReason::PolicyNan);
+}
+
+TEST_CASE("RuntimeControlLoop loco_upper exit interpolates upper toward standby before standby velocity") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.06;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  LocoUpperLowCmdComposerConfig composer_config = locoUpperComposerConfig();
+  const std::size_t logical_joint = composer_config.upper_start_joint;
+  const std::size_t sdk_slot =
+      static_cast<std::size_t>(composer_config.logical_to_sdk.at(logical_joint));
+  composer_config.unowned_safe.q = 2.25F;
+  FixStandConfig fixstand_config = fixStandConfig();
+  fixstand_config.target_q.at(sdk_slot) = -1.5;
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.0F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy,
+                                  deploy_config,
+                                  velocityDeployConfig(),
+                                  fixstand_config,
+                                  ControlMode::StandbyVelocity,
+                                  passiveConfig(),
+                                  locoLowerDeployConfig(),
+                                  composer_config);
+
+  const auto path = identityQuaternionTrk(tmp, "loco_exit_to_standby.trk", 2);
+  const auto loaded = loadTrack(tmp.trkConfig(), path);
+  const auto final_frame = loaded->frame(1);
+  REQUIRE(final_frame.has_value());
+  const float final_q = final_frame->joint_pos.ptr[logical_joint];
+  const float target_q = static_cast<float>(fixstand_config.target_q.at(sdk_slot));
+  REQUIRE(final_q != target_q);
+  REQUIRE(target_q != composer_config.unowned_safe.q);
+  REQUIRE(bridge.submitQueue(
+              locoUpperCommand("loco-exit-standby", path, MotionMode::Queue, 2))
+              .ok());
+
+  bool saw_mid_exit = false;
+  bool saw_done = false;
+  float mid_exit_q = final_q;
+  for (int i = 0; i < 256; ++i) {
+    loop.tick();
+    const auto snapshot = store.snapshot();
+    if (snapshot.exec && snapshot.exec->loco.phase == LocoPhase::Exit &&
+        !robot.writes.empty()) {
+      const float q = robot.writes.back().motors.at(sdk_slot).q;
+      if (q != Catch::Approx(final_q).margin(1.0e-5F) &&
+          q != Catch::Approx(target_q).margin(1.0e-5F)) {
+        saw_mid_exit = true;
+        mid_exit_q = q;
+      }
+    }
+    const auto found = store.findRun("loco-exit-standby");
+    if (found.ok() && found.run && found.run->state == MotionState::Done) {
+      saw_done = true;
+      break;
+    }
+  }
+  REQUIRE(saw_mid_exit);
+  REQUIRE(std::fabs(mid_exit_q - target_q) < std::fabs(final_q - target_q));
+  REQUIRE(saw_done);
+  REQUIRE(robot.writes.back().motors.at(sdk_slot).q ==
+          Catch::Approx(target_q).margin(1.0e-5F));
+
+  const int writes_before_standby = robot.write_attempts;
+  loop.tick();
+  REQUIRE(robot.write_attempts > writes_before_standby);
+  REQUIRE(robot.writes.back().motors.at(sdk_slot).q ==
+          Catch::Approx(target_q).margin(1.0e-5F));
+}
+
+TEST_CASE("RuntimeControlLoop loco_upper standby velocity stops active run") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.04;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.1F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy);
+
+  const auto path = identityQuaternionTrk(tmp, "loco_standby_stop.trk", 20);
+  REQUIRE(bridge.submitQueue(
+              locoUpperCommand("loco-standby-stop", path, MotionMode::Queue, 20))
+              .ok());
+  bool saw_motion = false;
+  for (int i = 0; i < 128; ++i) {
+    loop.tick();
+    const auto snapshot = store.snapshot();
+    if (snapshot.exec && snapshot.exec->loco.phase == LocoPhase::Motion) {
+      saw_motion = true;
+      break;
+    }
+  }
+  REQUIRE(saw_motion);
+
+  REQUIRE(bridge.standbyVelocity().ok());
+  loop.tick();
+  auto snapshot = store.snapshot();
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::LocoUpperActive);
+  REQUIRE(snapshot.ctrl == ControllerState::Running);
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->state == MotionState::Stopping);
+  REQUIRE(snapshot.exec->loco.phase == LocoPhase::Stopping);
+
+  bool saw_stopped = false;
+  for (int i = 0; i < 128; ++i) {
+    loop.tick();
+    const auto found = store.findRun("loco-standby-stop");
+    if (found.ok() && found.run && found.run->state == MotionState::Stopped) {
+      saw_stopped = true;
+      break;
+    }
+  }
+  REQUIRE(saw_stopped);
+  REQUIRE(store.findRun("loco-standby-stop").run->loco.phase == LocoPhase::Stopped);
+  REQUIRE(store.findRun("loco-standby-stop").run->stop_reason == StopReason::Stop);
+  REQUIRE(store.snapshot().active.kind == ActiveKind::None);
+}
+
+TEST_CASE("RuntimeControlLoop stop immediately cancels loco_upper active run") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.04;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.1F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy);
+
+  const auto path = identityQuaternionTrk(tmp, "loco_stop.trk", 20);
+  REQUIRE(bridge.submitQueue(locoUpperCommand("loco-stop", path, MotionMode::Queue, 20))
+              .ok());
+  bool saw_motion = false;
+  for (int i = 0; i < 128; ++i) {
+    loop.tick();
+    const auto snapshot = store.snapshot();
+    if (snapshot.exec && snapshot.exec->loco.phase == LocoPhase::Motion) {
+      saw_motion = true;
+      break;
+    }
+  }
+  REQUIRE(saw_motion);
+
+  const int lower_calls_before_stop = loco_lower_policy.calls;
+  REQUIRE(bridge.stop().state == ControllerState::Stopping);
+  loop.tick();
+  auto snapshot = store.snapshot();
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Stopping);
+  REQUIRE(snapshot.ctrl == ControllerState::Stopping);
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->state == MotionState::Stopping);
+  REQUIRE(snapshot.exec->loco.phase == LocoPhase::Stopping);
+  REQUIRE(loco_lower_policy.calls == lower_calls_before_stop);
+
+  bool saw_stopped = false;
+  for (int i = 0; i < 128; ++i) {
+    loop.tick();
+    const auto found = store.findRun("loco-stop");
+    if (found.ok() && found.run && found.run->state == MotionState::Stopped) {
+      saw_stopped = true;
+      break;
+    }
+  }
+  REQUIRE(saw_stopped);
+  REQUIRE(store.findRun("loco-stop").run->loco.phase == LocoPhase::Stopped);
+  REQUIRE(store.findRun("loco-stop").run->stop_reason == StopReason::Stop);
+  REQUIRE(store.snapshot().active.kind == ActiveKind::None);
+}
+
+TEST_CASE("RuntimeControlLoop loco_upper bad orientation fails through safety path") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.04;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(badOrientationLowState(deploy_config, 45));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.1F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy);
+
+  const auto path = identityQuaternionTrk(tmp, "loco_bad_orientation.trk", 3);
+  REQUIRE(bridge.submitQueue(
+              locoUpperCommand("loco-bad-orientation", path, MotionMode::Queue, 3))
+              .ok());
+
+  loop.tick();
+  const auto snapshot = store.snapshot();
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Passive);
+  REQUIRE(snapshot.ctrl == ControllerState::Passive);
+  REQUIRE(snapshot.err == ErrorCode::RobotBadOrientation);
+  REQUIRE(snapshot.block == "bad_orientation");
+  REQUIRE(snapshot.queue.ids.empty());
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  const auto failed = store.findRun("loco-bad-orientation");
+  REQUIRE(failed.ok());
+  REQUIRE(failed.run->state == MotionState::Failed);
+  REQUIRE(failed.run->executor == MotionExecutor::LocoUpper);
+  REQUIRE(failed.run->loco.phase == LocoPhase::Failed);
+  REQUIRE(loco_lower_policy.calls == 0);
+  REQUIRE(robot.write_attempts == 0);
+}
+
+TEST_CASE("RuntimeControlLoop GeneralTracker active run does not use loco lower policy") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy(floatSeq(0.25F, kPolicyJointDim));
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.5F));
+  const auto standby_track = validStandbyTrack(tmp, "general_tracker_loco_runtime_ref.trk");
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy,
+                                  deploy_config,
+                                  velocityDeployConfig(),
+                                  fixStandConfig(),
+                                  ControlMode::StandbyVelocity,
+                                  passiveConfig(),
+                                  locoLowerDeployConfig(),
+                                  locoUpperComposerConfig(),
+                                  nullptr,
+                                  standby_track);
+
+  const auto path = validTrk(tmp, "general_tracker_not_loco.trk", 3);
+  REQUIRE(bridge.submitQueue(executeCommand("general-tracker", path)).ok());
+  startQueuedRun(loop, store, "general-tracker", StartQueuedRunMode::AllowStandbyTransition);
+
+  for (int i = 0; i < 8; ++i) {
+    loop.tick();
+    if (tracker_policy.calls > 0) {
+      break;
+    }
+  }
+  REQUIRE(tracker_policy.calls > 0);
+  REQUIRE(loco_lower_policy.calls == 0);
+  REQUIRE(store.snapshot().exec.has_value());
+  REQUIRE(store.snapshot().exec->executor == MotionExecutor::GeneralTracker);
+  REQUIRE(robot.write_attempts > 0);
+}
+
+TEST_CASE("RuntimeControlLoop active idle starts LocoUpper without GeneralTracker transition") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.04;
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+
+  for (const MotionMode mode : {MotionMode::Queue, MotionMode::Interrupt}) {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeRobotIO robot(readyLowState(deploy_config));
+    FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+    FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+    FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.5F));
+    auto loop = makeLocoControlLoop(config,
+                                    bridge,
+                                    store,
+                                    tmp.trkConfig(),
+                                    robot,
+                                    tracker_policy,
+                                    velocity_policy,
+                                    loco_lower_policy,
+                                    deploy_config,
+                                    velocity_config,
+                                    fixstand_config,
+                                    ControlMode::StandbyVelocity);
+
+    const auto idle_path =
+        validTrk(tmp, std::string("loco_idle_source_") + toString(mode) + ".trk", 3);
+    const auto loco_path =
+        identityQuaternionTrk(tmp,
+                              std::string("loco_from_idle_") + toString(mode) + ".trk",
+                              4);
+    REQUIRE(bridge.configureIdle({idleMotion(idle_path, 3)}).ok());
+    loop.tick();
+    loop.tick();
+    loop.tick();
+    REQUIRE(store.snapshot().active.kind == ActiveKind::Idle);
+    const int tracker_calls_before_loco = tracker_policy.calls;
+
+    if (mode == MotionMode::Interrupt) {
+      REQUIRE(bridge.submitInterrupt(
+                  locoUpperCommand("loco-from-idle", loco_path, mode, 4))
+                  .ok());
+    } else {
+      REQUIRE(bridge.submitQueue(locoUpperCommand("loco-from-idle", loco_path, mode, 4))
+                  .ok());
+    }
+    loop.tick();
+
+    auto snapshot = store.snapshot();
+    REQUIRE_FALSE(snapshot.transition.active);
+    REQUIRE(snapshot.active.kind == ActiveKind::User);
+    REQUIRE(snapshot.exec.has_value());
+    REQUIRE(snapshot.exec->id == "loco-from-idle");
+    REQUIRE(snapshot.exec->executor == MotionExecutor::LocoUpper);
+
+    bool saw_loco_lower = false;
+    for (int i = 0; i < 128; ++i) {
+      loop.tick();
+      snapshot = store.snapshot();
+      if (snapshot.exec && snapshot.exec->executor == MotionExecutor::LocoUpper &&
+          loco_lower_policy.calls > 0) {
+        saw_loco_lower = true;
+        break;
+      }
+    }
+    REQUIRE(saw_loco_lower);
+    REQUIRE(tracker_policy.calls == tracker_calls_before_loco);
+  }
+}
+
+TEST_CASE("RuntimeControlLoop GeneralTracker holding queues LocoUpper without PolicyStepRunner transition") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.04;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  const LocoLowerDeployConfig loco_lower_config = locoLowerDeployConfig();
+  const LocoUpperLowCmdComposerConfig composer_config = locoUpperComposerConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.5F));
+  const auto standby_track = validStandbyTrack(tmp, "loco_after_gt_hold_standby.trk");
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy,
+                                  deploy_config,
+                                  velocityDeployConfig(),
+                                  fixStandConfig(),
+                                  ControlMode::StandbyVelocity,
+                                  passiveConfig(),
+                                  loco_lower_config,
+                                  composer_config,
+                                  nullptr,
+                                  standby_track);
+
+  startHoldingRun(loop,
+                  store,
+                  bridge,
+                  tmp,
+                  "gt-held",
+                  nullptr,
+                  StartQueuedRunMode::AllowStandbyTransition);
+  const int tracker_calls_before_loco = tracker_policy.calls;
+  const auto loco_path = identityQuaternionTrk(tmp, "loco_after_gt_hold.trk", 4);
+  REQUIRE(bridge.submitQueue(
+              locoUpperCommand("loco-after-gt-hold", loco_path, MotionMode::Queue, 4))
+              .ok());
+
+  loop.tick();
+  auto snapshot = store.snapshot();
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE(store.findRun("gt-held").run->state == MotionState::Done);
+  REQUIRE(store.findRun("gt-held").run->stop_reason == StopReason::None);
+
+  bool saw_loco = false;
+  for (int i = 0; i < 128; ++i) {
+    loop.tick();
+    snapshot = store.snapshot();
+    if (snapshot.exec && snapshot.exec->id == "loco-after-gt-hold" &&
+        snapshot.exec->executor == MotionExecutor::LocoUpper &&
+        loco_lower_policy.calls > 0) {
+      saw_loco = true;
+      break;
+    }
+  }
+  REQUIRE(saw_loco);
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE(tracker_policy.calls == tracker_calls_before_loco);
+}
+
+TEST_CASE("RuntimeControlLoop LocoUpper holding queues GeneralTracker after loco terminal") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.04;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.1F));
+  const auto standby_track = validStandbyTrack(tmp, "gt_after_loco_hold_standby.trk");
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy,
+                                  deploy_config,
+                                  velocityDeployConfig(),
+                                  fixStandConfig(),
+                                  ControlMode::StandbyVelocity,
+                                  passiveConfig(),
+                                  locoLowerDeployConfig(),
+                                  locoUpperComposerConfig(),
+                                  nullptr,
+                                  standby_track);
+
+  const auto loco_path = identityQuaternionTrk(tmp, "loco_hold_before_gt.trk", 3);
+  REQUIRE(bridge.submitQueue(
+              locoUpperCommand("loco-held-before-gt", loco_path, MotionMode::Queue, 3, true))
+              .ok());
+  bool saw_loco_holding = false;
+  for (int i = 0; i < 256; ++i) {
+    loop.tick();
+    const auto snapshot = store.snapshot();
+    if (snapshot.exec && snapshot.exec->id == "loco-held-before-gt" &&
+        snapshot.exec->state == MotionState::Holding &&
+        snapshot.exec->loco.phase == LocoPhase::Holding) {
+      saw_loco_holding = true;
+      break;
+    }
+  }
+  REQUIRE(saw_loco_holding);
+
+  const auto gt_path = validTrk(tmp, "gt_after_loco_hold.trk", 2);
+  REQUIRE(bridge.submitQueue(executeCommand("gt-after-loco-hold", gt_path, MotionMode::Queue, 2))
+              .ok());
+  loop.tick();
+  auto snapshot = store.snapshot();
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->id == "loco-held-before-gt");
+  REQUIRE(snapshot.exec->state == MotionState::Holding);
+  REQUIRE(snapshot.exec->loco.phase == LocoPhase::Exit);
+  REQUIRE(snapshot.queue.ids == std::vector<std::string>{"gt-after-loco-hold"});
+  REQUIRE(store.findRun("loco-held-before-gt").run->state == MotionState::Holding);
+
+  bool saw_gt = false;
+  bool held_done = false;
+  for (int i = 0; i < 256; ++i) {
+    loop.tick();
+    snapshot = store.snapshot();
+    const auto held = store.findRun("loco-held-before-gt");
+    held_done = held_done ||
+                (held.ok() && held.run && held.run->state == MotionState::Done);
+    if (snapshot.exec && snapshot.exec->id == "gt-after-loco-hold" &&
+        snapshot.exec->executor == MotionExecutor::GeneralTracker) {
+      REQUIRE(held_done);
+      saw_gt = true;
+      break;
+    }
+  }
+  REQUIRE(saw_gt);
+  const auto loco_done = store.findRun("loco-held-before-gt");
+  REQUIRE(loco_done.ok());
+  REQUIRE(loco_done.run->state == MotionState::Done);
+  REQUIRE(loco_done.run->loco.phase == LocoPhase::Done);
+}
+
+TEST_CASE("RuntimeControlLoop LocoUpper holding queues LocoUpper after bounded exit") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.04;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.1F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy);
+
+  const auto held_path = identityQuaternionTrk(tmp, "loco_hold_before_loco.trk", 3);
+  REQUIRE(bridge.submitQueue(
+              locoUpperCommand("loco-held-before-loco",
+                               held_path,
+                               MotionMode::Queue,
+                               3,
+                               true))
+              .ok());
+  bool saw_loco_holding = false;
+  for (int i = 0; i < 256; ++i) {
+    loop.tick();
+    const auto snapshot = store.snapshot();
+    if (snapshot.exec && snapshot.exec->id == "loco-held-before-loco" &&
+        snapshot.exec->state == MotionState::Holding &&
+        snapshot.exec->loco.phase == LocoPhase::Holding) {
+      saw_loco_holding = true;
+      break;
+    }
+  }
+  REQUIRE(saw_loco_holding);
+
+  const auto next_path = identityQuaternionTrk(tmp, "loco_after_loco_hold.trk", 3);
+  REQUIRE(bridge.submitQueue(
+              locoUpperCommand("loco-after-loco-hold",
+                               next_path,
+                               MotionMode::Queue,
+                               3))
+              .ok());
+  loop.tick();
+  auto snapshot = store.snapshot();
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->id == "loco-held-before-loco");
+  REQUIRE(snapshot.exec->state == MotionState::Holding);
+  REQUIRE(snapshot.exec->loco.phase == LocoPhase::Exit);
+  REQUIRE(snapshot.queue.ids == std::vector<std::string>{"loco-after-loco-hold"});
+  REQUIRE(store.findRun("loco-held-before-loco").run->state ==
+          MotionState::Holding);
+
+  bool saw_next_loco = false;
+  bool held_done = false;
+  for (int i = 0; i < 256; ++i) {
+    loop.tick();
+    snapshot = store.snapshot();
+    const auto held = store.findRun("loco-held-before-loco");
+    held_done = held_done ||
+                (held.ok() && held.run && held.run->state == MotionState::Done);
+    if (snapshot.exec && snapshot.exec->id == "loco-after-loco-hold" &&
+        snapshot.exec->executor == MotionExecutor::LocoUpper) {
+      REQUIRE(held_done);
+      saw_next_loco = true;
+      break;
+    }
+  }
+  REQUIRE(saw_next_loco);
+  const auto done = store.findRun("loco-held-before-loco");
+  REQUIRE(done.ok());
+  REQUIRE(done.run->state == MotionState::Done);
+  REQUIRE(done.run->loco.phase == LocoPhase::Done);
+}
+
+TEST_CASE("RuntimeControlLoop LocoUpper interrupt and FixStand use loco stopping") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.04;
+  const DeployConfig deploy_config = deployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+
+  SECTION("interrupt stops loco before urgent starts") {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeRobotIO robot(readyLowState(deploy_config));
+    FakePolicy tracker_policy;
+    FakeVelocityPolicy velocity_policy;
+    FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.2F));
+    auto loop = makeLocoControlLoop(config,
+                                    bridge,
+                                    store,
+                                    tmp.trkConfig(),
+                                    robot,
+                                    tracker_policy,
+                                    velocity_policy,
+                                    loco_lower_policy);
+
+    const auto active_path = identityQuaternionTrk(tmp, "loco_interrupt_active.trk", 20);
+    REQUIRE(bridge.submitQueue(
+                locoUpperCommand("loco-interrupt-active", active_path, MotionMode::Queue, 20))
+                .ok());
+    bool saw_motion = false;
+    for (int i = 0; i < 128; ++i) {
+      loop.tick();
+      const auto snapshot = store.snapshot();
+      if (snapshot.exec && snapshot.exec->loco.phase == LocoPhase::Motion) {
+        saw_motion = true;
+        break;
+      }
+    }
+    REQUIRE(saw_motion);
+
+    const auto urgent_path = identityQuaternionTrk(tmp, "loco_interrupt_urgent.trk", 4);
+    REQUIRE(bridge.submitInterrupt(
+                locoUpperCommand("loco-interrupt-urgent",
+                                 urgent_path,
+                                 MotionMode::Interrupt,
+                                 4))
+                .ok());
+    loop.tick();
+    auto snapshot = store.snapshot();
+    REQUIRE(loop.internalStateForTest() == RuntimeInternalState::LocoUpperActive);
+    REQUIRE(snapshot.exec.has_value());
+    REQUIRE(snapshot.exec->id == "loco-interrupt-active");
+    REQUIRE(snapshot.exec->state == MotionState::Stopping);
+    REQUIRE(snapshot.exec->loco.phase == LocoPhase::Stopping);
+
+    bool saw_urgent = false;
+    for (int i = 0; i < 256; ++i) {
+      loop.tick();
+      snapshot = store.snapshot();
+      if (snapshot.exec && snapshot.exec->id == "loco-interrupt-urgent" &&
+          snapshot.exec->executor == MotionExecutor::LocoUpper) {
+        saw_urgent = true;
+        break;
+      }
+    }
+    REQUIRE(saw_urgent);
+    const auto stopped = store.findRun("loco-interrupt-active");
+    REQUIRE(stopped.ok());
+    REQUIRE(stopped.run->state == MotionState::Stopped);
+    REQUIRE(stopped.run->stop_reason == StopReason::Interrupt);
+    REQUIRE(stopped.run->loco.phase == LocoPhase::Stopped);
+  }
+
+  SECTION("fixstand immediately stops loco and enters FixStand") {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeRobotIO robot(readyLowState(deploy_config));
+    FakePolicy tracker_policy;
+    FakeVelocityPolicy velocity_policy;
+    FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.2F));
+    auto loop = makeLocoControlLoop(config,
+                                    bridge,
+                                    store,
+                                    tmp.trkConfig(),
+                                    robot,
+                                    tracker_policy,
+                                    velocity_policy,
+                                    loco_lower_policy,
+                                    deploy_config,
+                                    velocityDeployConfig(),
+                                    fixstand_config);
+
+    const auto active_path = identityQuaternionTrk(tmp, "loco_fixstand_active.trk", 20);
+    REQUIRE(bridge.submitQueue(
+                locoUpperCommand("loco-fixstand-active", active_path, MotionMode::Queue, 20))
+                .ok());
+    bool saw_motion = false;
+    for (int i = 0; i < 128; ++i) {
+      loop.tick();
+      const auto snapshot = store.snapshot();
+      if (snapshot.exec && snapshot.exec->loco.phase == LocoPhase::Motion) {
+        saw_motion = true;
+        break;
+      }
+    }
+    REQUIRE(saw_motion);
+
+    REQUIRE(bridge.fixStand().ok());
+    const int writes_before_fixstand = robot.write_attempts;
+    loop.tick();
+    auto snapshot = store.snapshot();
+    REQUIRE(loop.internalStateForTest() == RuntimeInternalState::FixStand);
+    REQUIRE(snapshot.ctrl == ControllerState::FixStand);
+    REQUIRE(snapshot.active.kind == ActiveKind::None);
+    REQUIRE_FALSE(snapshot.exec.has_value());
+    REQUIRE(robot.write_attempts > writes_before_fixstand);
+    REQUIRE_FALSE(robot.writes.empty());
+    REQUIRE(robot.writes.back().mode_machine == kExpectedModeMachine);
+    REQUIRE(robot.writes.back().motors.at(12).mode == 1);
+    REQUIRE(robot.writes.back().motors.at(12).kp ==
+            static_cast<float>(fixstand_config.kp.at(12)));
+    REQUIRE(robot.writes.back().motors.at(12).kd ==
+            static_cast<float>(fixstand_config.kd.at(12)));
+    const auto stopped = store.findRun("loco-fixstand-active");
+    REQUIRE(stopped.ok());
+    REQUIRE(stopped.run->state == MotionState::Stopped);
+    REQUIRE(stopped.run->stop_reason == StopReason::Stop);
+    REQUIRE(stopped.run->loco.phase == LocoPhase::Stopped);
+  }
+}
+
 TEST_CASE("RuntimeControlLoop standby no-active user gates through standby reference") {
   TempTree tmp;
   const RuntimeConfig config = runtimeConfig();
@@ -5619,6 +8018,207 @@ TEST_CASE("RuntimeControlLoop active idle bad orientation enters Passive without
   REQUIRE(snapshot.block == "bad_orientation");
   REQUIRE_FALSE(snapshot.exec.has_value());
   REQUIRE(store.findRun(idle_path.string()).code == ErrorCode::RunNotFound);
+}
+
+TEST_CASE("RuntimeControlLoop standby velocity default-off uses legacy velocity runner") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.5F));
+  auto loop = makeControlLoop(config,
+                              bridge,
+                              store,
+                              tmp.trkConfig(),
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              deploy_config,
+                              velocity_config,
+                              fixStandConfig(),
+                              ControlMode::StandbyVelocity);
+
+  loop.tick();
+
+  REQUIRE(store.snapshot().ctrl == ControllerState::StandbyVelocity);
+  REQUIRE(velocity_policy.calls == 1);
+  REQUIRE(tracker_policy.calls == 0);
+  REQUIRE(robot.write_attempts == 1);
+  requireVelocityFrame(robot.writes.back(), velocity_config, velocity_policy.next_raw);
+}
+
+TEST_CASE("RuntimeControlLoop standby velocity with loco runtime still uses legacy velocity runner") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.04;
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const LocoLowerDeployConfig loco_lower_config = locoLowerDeployConfig();
+  const LocoUpperLowCmdComposerConfig composer_config = locoUpperComposerConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.5F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy,
+                                  deploy_config,
+                                  velocity_config,
+                                  fixstand_config,
+                                  ControlMode::StandbyVelocity,
+                                  passiveConfig(),
+                                  loco_lower_config,
+                                  composer_config);
+
+  loop.tick();
+
+  REQUIRE(store.snapshot().ctrl == ControllerState::StandbyVelocity);
+  REQUIRE(velocity_policy.calls == 1);
+  REQUIRE(loco_lower_policy.calls == 0);
+  REQUIRE(robot.write_attempts == 1);
+  requireVelocityFrame(robot.writes.back(), velocity_config, velocity_policy.next_raw);
+
+  const LowCmdFrame standby_frame = robot.writes.back();
+  applyLowCmdPositionToLowState(standby_frame, *robot.low_state);
+  const LowStateSample standby_low_state = *robot.low_state;
+  const auto path = identityQuaternionTrk(tmp, "loco_after_standby_lower.trk", 3);
+  REQUIRE(bridge.submitQueue(
+              locoUpperCommand("loco-after-standby-lower", path, MotionMode::Queue, 3))
+              .ok());
+
+  loop.tick();
+  REQUIRE(store.snapshot().exec.has_value());
+  REQUIRE(store.snapshot().exec->loco.phase == LocoPhase::Entry);
+  REQUIRE(robot.write_attempts == 1);
+
+  loop.tick();
+
+  REQUIRE(velocity_policy.calls == 1);
+  REQUIRE(loco_lower_policy.calls == 1);
+  REQUIRE(robot.write_attempts == 2);
+  requireLocoLowerEntryHandoffFrame(robot.writes.back(),
+                                    loco_lower_config,
+                                    standby_low_state,
+                                    loco_lower_policy.next_raw,
+                                    0.0F);
+}
+
+TEST_CASE("RuntimeControlLoop standby to loco_upper resets lower last_action before decimated first eval") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.06;
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  LocoLowerDeployConfig loco_lower_config = locoLowerDeployConfig();
+  loco_lower_config.policy_decimation = 10;
+  const LocoUpperLowCmdComposerConfig composer_config = locoUpperComposerConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.5F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy,
+                                  deploy_config,
+                                  velocity_config,
+                                  fixstand_config,
+                                  ControlMode::StandbyVelocity,
+                                  passiveConfig(),
+                                  loco_lower_config,
+                                  composer_config);
+
+  loop.tick();
+  REQUIRE(velocity_policy.calls == 1);
+  REQUIRE(loco_lower_policy.calls == 0);
+  const LowCmdFrame standby_frame = robot.writes.back();
+  applyLowCmdPositionToLowState(standby_frame, *robot.low_state);
+  const LowStateSample standby_low_state = *robot.low_state;
+
+  const auto path = identityQuaternionTrk(tmp, "loco_after_standby_decimated_lower.trk", 4);
+  REQUIRE(bridge.submitQueue(
+              locoUpperCommand("loco-after-standby-decimated-lower", path, MotionMode::Queue, 4))
+              .ok());
+
+  loop.tick();
+  REQUIRE(store.snapshot().exec.has_value());
+  REQUIRE(store.snapshot().exec->loco.phase == LocoPhase::Entry);
+  REQUIRE(robot.write_attempts == 1);
+
+  loop.tick();
+  REQUIRE(loco_lower_policy.calls == 0);
+  REQUIRE(robot.write_attempts == 2);
+  requireLocoLowerEntryHandoffFrame(robot.writes.back(),
+                                    loco_lower_config,
+                                    standby_low_state,
+                                    Vec(kLocoLowerPolicyJointDim, 0.0F),
+                                    0.0F);
+
+  loop.tick();
+  REQUIRE(loco_lower_policy.calls == 0);
+  REQUIRE(robot.write_attempts == 3);
+}
+
+TEST_CASE("RuntimeControlLoop standby velocity does not run loco lower at runtime tick rate") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.hz = 1000.0;
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  LocoLowerDeployConfig loco_lower_config = locoLowerDeployConfig();
+  loco_lower_config.policy_decimation = 10;
+  const LocoUpperLowCmdComposerConfig composer_config = locoUpperComposerConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.5F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy,
+                                  deploy_config,
+                                  velocity_config,
+                                  fixstand_config,
+                                  ControlMode::StandbyVelocity,
+                                  passiveConfig(),
+                                  loco_lower_config,
+                                  composer_config);
+
+  for (int i = 0; i < 20; ++i) {
+    loop.tick();
+  }
+
+  REQUIRE(store.snapshot().ctrl == ControllerState::StandbyVelocity);
+  REQUIRE(velocity_policy.calls >= 1);
+  REQUIRE(loco_lower_policy.calls == 0);
+  REQUIRE(robot.write_attempts == 20);
+  requireVelocityFrame(robot.writes.back(), velocity_config, velocity_policy.next_raw);
 }
 
 TEST_CASE("RuntimeControlLoop standby velocity overlays latest FixStand LowCmd frame") {

@@ -2,10 +2,13 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
 
 #include "agentic_et1_tracker/app/app_config.hpp"
 #include "agentic_et1_tracker/control/fixstand.hpp"
 #include "agentic_et1_tracker/control/passive.hpp"
+#include "agentic_et1_tracker/loco_upper/loco_lower_policy.hpp"
+#include "agentic_et1_tracker/loco_upper/lowcmd_composer.hpp"
 #include "agentic_et1_tracker/policy/deploy_config.hpp"
 #include "agentic_et1_tracker/policy/policy_step_runner.hpp"
 #include "agentic_et1_tracker/policy/velocity_deploy_config.hpp"
@@ -19,8 +22,11 @@ struct AppRuntimeDeps {
   std::unique_ptr<RobotIO> robot_io;
   std::unique_ptr<PolicyInference> policy;
   std::unique_ptr<VelocityPolicyInference> velocity_policy;
+  std::unique_ptr<VelocityPolicyInference> loco_lower_policy;
   DeployConfig deploy_config;
   VelocityDeployConfig velocity_deploy_config;
+  std::optional<LocoLowerDeployConfig> loco_lower_deploy_config;
+  std::optional<LocoUpperLowCmdComposerConfig> loco_upper_composer_config;
   FixStandConfig fixstand_config;
   PassiveConfig passive_config;
   ControlMode startup_control{ControlMode::FixStand};

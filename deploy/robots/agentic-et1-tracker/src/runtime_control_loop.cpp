@@ -4,13 +4,16 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <exception>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <utility>
 
 #include "agentic_et1_tracker/policy/observation_builder.hpp"
+#include "agentic_et1_tracker/loco_upper/validator.hpp"
 #include "agentic_et1_tracker/trk/reference_alignment.hpp"
 #include "agentic_et1_tracker/trk/synthetic_transition.hpp"
 #include "agentic_et1_tracker/trk/validator.hpp"
@@ -22,6 +25,7 @@ constexpr double kMaxTransitionDurationS = 5.0;
 constexpr double kPolicyStartupHoldDurationS = 0.5;
 constexpr std::size_t kStartupUpperBodyFirstPolicyJoint = 14;
 constexpr std::size_t kStartupUpperBodyLastPolicyJointExclusive = 26;
+constexpr double kLocoUpperRadiusSuppressMarginM = 0.02;
 
 bool isStartupOrWaitingError(ErrorCode error) {
   switch (error) {
@@ -34,6 +38,113 @@ bool isStartupOrWaitingError(ErrorCode error) {
     default:
       return false;
   }
+}
+
+bool isGeneralTrackerRequest(const MotionRequest& request) {
+  return request.executor == MotionExecutor::GeneralTracker;
+}
+
+bool isNonFinitePolicyMessage(const char* message) {
+  if (message == nullptr) {
+    return false;
+  }
+  return std::strstr(message, "non-finite") != nullptr ||
+         std::strstr(message, "not finite") != nullptr ||
+         std::strstr(message, "must be finite") != nullptr;
+}
+
+bool isFinitePlanarPosition(const std::array<float, 3>& position) {
+  return std::isfinite(position[0]) && std::isfinite(position[1]);
+}
+
+std::optional<std::array<double, 2>> highstatePlanarPosition(
+    const std::optional<HighStateSample>& high_state) {
+  if (!high_state || !high_state->fresh || !isFinitePlanarPosition(high_state->position)) {
+    return std::nullopt;
+  }
+  return std::array<double, 2>{
+      static_cast<double>(high_state->position[0]),
+      static_cast<double>(high_state->position[1]),
+  };
+}
+
+std::optional<std::array<double, 2>> freshHighstatePlanarPosition(
+    const std::optional<HighStateSample>& high_state,
+    std::size_t max_age_ms) {
+  if (!high_state || !high_state->fresh || high_state->age_ms > max_age_ms ||
+      !isFinitePlanarPosition(high_state->position)) {
+    return std::nullopt;
+  }
+  return std::array<double, 2>{
+      static_cast<double>(high_state->position[0]),
+      static_cast<double>(high_state->position[1]),
+  };
+}
+
+double maxAbsRangeValue(const LocoLowerRange& range) {
+  return std::max(std::abs(range.min), std::abs(range.max));
+}
+
+LocoUpperCommandLimits locoUpperCommandLimitsFromConfig(
+    const RuntimeConfig& runtime_config,
+    const LocoLowerDeployConfig& lower_config) {
+  LocoUpperCommandLimits limits;
+  const double max_vx = maxAbsRangeValue(lower_config.command_ranges.lin_vel_x);
+  const double max_vy = maxAbsRangeValue(lower_config.command_ranges.lin_vel_y);
+  limits.max_linear_velocity = std::hypot(max_vx, max_vy);
+  limits.max_yaw_rate = maxAbsRangeValue(lower_config.command_ranges.ang_vel_z);
+  limits.max_linear_acceleration = runtime_config.loco_upper_max_lin_accel_mps2;
+  limits.max_yaw_acceleration = runtime_config.loco_upper_max_yaw_accel_radps2;
+  limits.smoothing_window_frames = runtime_config.loco_upper_smoothing_window_frames;
+  return limits;
+}
+
+double locoCommandDtS(double root_plan_dt_s, double active_fps, double runtime_hz) {
+  if (std::isfinite(root_plan_dt_s) && root_plan_dt_s > 0.0) {
+    return root_plan_dt_s;
+  }
+  if (std::isfinite(active_fps) && active_fps > 0.0) {
+    return 1.0 / active_fps;
+  }
+  return 1.0 / std::max(1.0, runtime_hz);
+}
+
+LocoUpperPlanarSample planarSampleFromXY(const std::array<double, 2>& xy) {
+  LocoUpperPlanarSample sample;
+  sample.x = xy[0];
+  sample.y = xy[1];
+  return sample;
+}
+
+VelocityCommand clampBodyCommand(const LocoLowerCommandRanges& ranges,
+                                 VelocityCommand command,
+                                 bool& clamped) {
+  const auto clamp_axis = [&clamped](float value, const LocoLowerRange& range) {
+    const float bounded =
+        std::clamp(value, static_cast<float>(range.min), static_cast<float>(range.max));
+    if (bounded != value) {
+      clamped = true;
+    }
+    return bounded;
+  };
+  command.vx = clamp_axis(command.vx, ranges.lin_vel_x);
+  command.vy = clamp_axis(command.vy, ranges.lin_vel_y);
+  command.yaw_rate = clamp_axis(command.yaw_rate, ranges.ang_vel_z);
+  return command;
+}
+
+LocoUpperVelocityCommand bodyVelocityToWorldCommand(
+    const VelocityCommand& command_body,
+    double robot_yaw) {
+  const double cos_yaw = std::cos(robot_yaw);
+  const double sin_yaw = std::sin(robot_yaw);
+  LocoUpperVelocityCommand command_world;
+  command_world.vx = cos_yaw * static_cast<double>(command_body.vx) -
+                     sin_yaw * static_cast<double>(command_body.vy);
+  command_world.vy = sin_yaw * static_cast<double>(command_body.vx) +
+                     cos_yaw * static_cast<double>(command_body.vy);
+  command_world.yaw_rate = static_cast<double>(command_body.yaw_rate);
+  return command_world;
 }
 
 ServiceHealth healthStateForSnapshot(const StatusSnapshot& snapshot) {
@@ -55,7 +166,130 @@ HealthSnapshot healthFromSnapshot(const StatusSnapshot& snapshot) {
   health.mode = snapshot.mode;
   health.err = snapshot.err;
   health.block = snapshot.block;
+  health.loco_upper = snapshot.loco_upper;
   return health;
+}
+
+LocoUpperJointValidationOptions jointValidationOptionsFromComposerConfig(
+    const LocoUpperLowCmdComposerConfig& config) {
+  LocoUpperJointValidationOptions options;
+  for (std::size_t logical = config.upper_start_joint;
+       logical < config.upper_end_joint_exclusive;
+       ++logical) {
+    options.min_positions.push_back(static_cast<double>(config.upper_min_q.at(logical)));
+    options.max_positions.push_back(static_cast<double>(config.upper_max_q.at(logical)));
+    options.max_velocities.push_back(
+        static_cast<double>(config.upper_max_vel_radps.at(logical)));
+    options.max_accelerations.push_back(
+        static_cast<double>(config.upper_max_accel_radps2.at(logical)));
+  }
+  return options;
+}
+
+LocoReason locoReasonFromValidationFailure(
+    LocoUpperJointValidationFailureKind failure_kind) {
+  switch (failure_kind) {
+    case LocoUpperJointValidationFailureKind::Position:
+      return LocoReason::UpperLimit;
+    case LocoUpperJointValidationFailureKind::Velocity:
+    case LocoUpperJointValidationFailureKind::Acceleration:
+      return LocoReason::UpperDynamic;
+    case LocoUpperJointValidationFailureKind::None:
+    case LocoUpperJointValidationFailureKind::InvalidConfig:
+    case LocoUpperJointValidationFailureKind::InvalidTrack:
+      break;
+  }
+  return LocoReason::UpperLimit;
+}
+
+double yawFromLowState(const LowStateSample& low_state) {
+  const float w = low_state.quat_wxyz[0];
+  const float x = low_state.quat_wxyz[1];
+  const float y = low_state.quat_wxyz[2];
+  const float z = low_state.quat_wxyz[3];
+  return std::atan2(2.0 * (static_cast<double>(w) * z +
+                           static_cast<double>(x) * y),
+                    1.0 - 2.0 * (static_cast<double>(y) * y +
+                                  static_cast<double>(z) * z));
+}
+
+std::vector<float> upperTargetsFromFrame(const TrkFrameView& frame) {
+  if (frame.joint_pos.ptr == nullptr || frame.joint_pos.size < kPolicyJointCount) {
+    return {};
+  }
+  return std::vector<float>(frame.joint_pos.ptr,
+                            frame.joint_pos.ptr + frame.joint_pos.size);
+}
+
+std::vector<float> upperTargetsFromLowState(
+    const LocoUpperLowCmdComposerConfig& config,
+    const LowStateSample& low_state,
+    const std::vector<float>& fallback) {
+  std::vector<float> targets = fallback;
+  if (targets.size() < kPolicyJointCount) {
+    targets.assign(kPolicyJointCount, 0.0F);
+  }
+  for (std::size_t logical = config.upper_start_joint;
+       logical < config.upper_end_joint_exclusive &&
+       logical < config.logical_to_sdk.size();
+       ++logical) {
+    const int sdk_slot_raw = config.logical_to_sdk.at(logical);
+    if (sdk_slot_raw >= 0 && sdk_slot_raw < static_cast<int>(kSdkMotorCount)) {
+      targets.at(logical) =
+          low_state.motors.at(static_cast<std::size_t>(sdk_slot_raw)).q;
+    }
+  }
+  return targets;
+}
+
+std::size_t locoLowerSdkSlot(const LocoLowerDeployConfig& config,
+                             std::size_t policy_index) {
+  const int logical = config.joint_ids_map.at(policy_index);
+  return static_cast<std::size_t>(
+      config.sdk_joint_ids_map.at(static_cast<std::size_t>(logical)));
+}
+
+std::vector<float> lowerEntryTargetsFromLowState(
+    const LocoLowerDeployConfig& config,
+    const LowStateSample& low_state) {
+  std::vector<float> targets;
+  targets.reserve(kLocoLowerPolicyJointDim);
+  for (std::size_t i = 0; i < kLocoLowerPolicyJointDim; ++i) {
+    targets.push_back(low_state.motors.at(locoLowerSdkSlot(config, i)).q);
+  }
+  return targets;
+}
+
+void applyLocoUpperLowerEntryInterpolation(const LocoLowerDeployConfig& config,
+                                           const std::vector<float>& start_q,
+                                           const Vec& policy_target_q,
+                                           float alpha,
+                                           LowCmdFrame& lower_frame) {
+  if (start_q.size() != kLocoLowerPolicyJointDim ||
+      policy_target_q.size() != kLocoLowerPolicyJointDim) {
+    throw std::runtime_error("loco upper lower entry handoff size mismatch");
+  }
+
+  const float bounded_alpha = std::clamp(alpha, 0.0F, 1.0F);
+  for (std::size_t i = 0; i < kLocoLowerPolicyJointDim; ++i) {
+    const std::size_t sdk_slot = locoLowerSdkSlot(config, i);
+    MotorCommand& motor = lower_frame.motors.at(sdk_slot);
+    motor.q = start_q.at(i) +
+              bounded_alpha * (policy_target_q.at(i) - start_q.at(i));
+  }
+}
+
+std::vector<float> interpolateUpperTargets(const std::vector<float>& start,
+                                           const std::vector<float>& target,
+                                           float alpha) {
+  std::vector<float> out = target;
+  if (out.size() < kPolicyJointCount) {
+    out.resize(kPolicyJointCount, 0.0F);
+  }
+  for (std::size_t i = 0; i < std::min(start.size(), out.size()); ++i) {
+    out.at(i) = start.at(i) + alpha * (target.at(i) - start.at(i));
+  }
+  return out;
 }
 
 }  // namespace
@@ -72,6 +306,60 @@ RuntimeControlLoop::RuntimeControlLoop(RuntimeConfig config,
       loader_(std::move(loader)),
       standby_track_(std::move(standby_track)),
       reference_sink_(reference_sink) {
+  clearReference();
+  publishSnapshot();
+}
+
+RuntimeControlLoop::RuntimeControlLoop(
+    RuntimeConfig config,
+    RuntimeBridge& bridge,
+    RuntimeStatusStore& status,
+    TrkLoader loader,
+    RobotIO& robot_io,
+    PolicyInference& policy,
+    DeployConfig deploy_config,
+    VelocityPolicyInference& velocity_policy,
+    VelocityDeployConfig velocity_deploy_config,
+    FixStandConfig fixstand_config,
+    PassiveConfig passive_config,
+    ControlMode startup_control,
+    std::uint8_t expected_mode_machine,
+    VelocityPolicyInference& loco_lower_policy,
+    LocoLowerDeployConfig loco_lower_deploy_config,
+    LocoUpperLowCmdComposerConfig loco_upper_composer_config,
+    RuntimeMode mode,
+    ReferenceFrameSink* reference_sink,
+    std::shared_ptr<const TrkTrack> standby_track)
+    : config_(config),
+      bridge_(bridge),
+      status_(status),
+      loader_(std::move(loader)),
+      standby_track_(std::move(standby_track)),
+      reference_sink_(reference_sink),
+      robot_io_(&robot_io),
+      policy_(&policy),
+      deploy_config_(std::move(deploy_config)),
+      velocity_policy_(&velocity_policy),
+      velocity_deploy_config_(std::move(velocity_deploy_config)),
+      loco_lower_policy_(&loco_lower_policy),
+      loco_lower_deploy_config_(std::move(loco_lower_deploy_config)),
+      loco_upper_composer_config_(std::move(loco_upper_composer_config)),
+      fixstand_config_(std::move(fixstand_config)),
+      passive_config_(std::move(passive_config)),
+      expected_mode_machine_(expected_mode_machine),
+      mode_(mode),
+      post_stop_control_(startup_control) {
+  runtime_state_.ready = false;
+  runtime_state_.robot = RobotState::Disconnected;
+  runtime_state_.err = ErrorCode::ServiceNotReady;
+  runtime_state_.block = "runtime_not_started";
+  fixstand_runner_.emplace(*fixstand_config_, expected_mode_machine_, config_.hz);
+  velocity_runner_.emplace(*velocity_deploy_config_, expected_mode_machine_);
+  if (startup_control == ControlMode::FixStand) {
+    enterFixStandState();
+  } else {
+    enterVelocityState();
+  }
   clearReference();
   publishSnapshot();
 }
@@ -198,6 +486,12 @@ void RuntimeControlLoop::tick() {
     return;
   }
 
+  if (fsm_state_ == RuntimeInternalState::LocoUpperActive) {
+    advanceLocoUpperActive();
+    publishSnapshot();
+    return;
+  }
+
   if (fsm_state_ == RuntimeInternalState::GeneralTrackerActive ||
       fsm_state_ == RuntimeInternalState::GeneralTrackerTransition) {
     if (ctrl_ == ControllerState::Preparing) {
@@ -242,13 +536,17 @@ bool RuntimeControlLoop::consumePendingCommands() {
         return true;
       case CommandKind::FixStand:
         handleControl(ControlMode::FixStand);
-        if (fsm_state_ == RuntimeInternalState::Stopping) {
+        if (fsm_state_ == RuntimeInternalState::Stopping ||
+            (active_ && active_->executor == MotionExecutor::LocoUpper &&
+             active_->state == MotionState::Stopping)) {
           return true;
         }
         break;
       case CommandKind::StandbyVelocity:
         handleControl(ControlMode::StandbyVelocity);
-        if (fsm_state_ == RuntimeInternalState::Stopping) {
+        if (fsm_state_ == RuntimeInternalState::Stopping ||
+            (active_ && active_->executor == MotionExecutor::LocoUpper &&
+             active_->state == MotionState::Stopping)) {
           return true;
         }
         break;
@@ -257,11 +555,14 @@ bool RuntimeControlLoop::consumePendingCommands() {
         return true;
       case CommandKind::Interrupt:
         handleInterrupt(std::move(command->request));
-        return fsm_state_ == RuntimeInternalState::Stopping;
+        return fsm_state_ == RuntimeInternalState::Stopping ||
+               (active_ && active_->executor == MotionExecutor::LocoUpper &&
+                active_->state == MotionState::Stopping);
       case CommandKind::Queue:
         if (active_kind_ == ActiveKind::Idle) {
           MotionRequest request = std::move(command->request);
-          if (startTransitionFromIdleToUser(request)) {
+          if (isGeneralTrackerRequest(request) &&
+              startTransitionFromIdleToUser(request)) {
             return true;
           }
           stopIdleActive();
@@ -269,8 +570,19 @@ bool RuntimeControlLoop::consumePendingCommands() {
           break;
         }
         if (isBackgroundOwnedTransitionOrPlayback()) {
-          startTransitionFromCurrentReferenceToUser(std::move(command->request),
-                                                    StopReason::None);
+          if (isGeneralTrackerRequest(command->request)) {
+            startTransitionFromCurrentReferenceToUser(std::move(command->request),
+                                                      StopReason::None);
+          } else {
+            const bool preempted_idle_background =
+                transition_ && transition_->target_kind == TransitionTargetKind::Idle;
+            abortTransition(MotionState::Canceled, StopReason::None, ErrorCode::Ok);
+            if (preempted_idle_background) {
+              clearIdleConfig();
+            }
+            enterGeneralTrackerIdleState();
+            waiting_.push_back(std::move(command->request));
+          }
           return true;
         }
         waiting_.push_back(std::move(command->request));
@@ -344,6 +656,14 @@ void RuntimeControlLoop::handleStop(std::uint64_t sequence, bool requires_stoppi
     stopping_hold_ticks_remaining_ = 0;
     return;
   }
+  if (active_ && active_kind_ == ActiveKind::User &&
+      active_->executor == MotionExecutor::LocoUpper) {
+    post_stop_control_ = ControlMode::StandbyVelocity;
+    markActiveStopping(StopReason::Stop);
+    stop_reason_ = StopReason::Stop;
+    enterStopping(StopReason::Stop);
+    return;
+  }
   post_stop_control_ = ControlMode::StandbyVelocity;
   if (active_) {
     markActiveStopping(StopReason::Stop);
@@ -381,6 +701,7 @@ void RuntimeControlLoop::handleControl(ControlMode mode) {
     }
     active_.reset();
     active_track_.reset();
+    loco_upper_.reset();
     policy_runner_.reset();
     clearReference();
     post_stop_control_ = ControlMode::Passive;
@@ -388,6 +709,22 @@ void RuntimeControlLoop::handleControl(ControlMode mode) {
     stop_to_idle_pending_ = false;
     stopping_hold_ticks_remaining_ = 0;
     handleInternalEvent(RuntimeInternalEvent::SafetyPassive);
+    return;
+  }
+  if (mode == ControlMode::StandbyVelocity && active_kind_ == ActiveKind::User &&
+      active_ && active_->executor == MotionExecutor::LocoUpper) {
+    cancelWaiting(StopReason::Stop);
+    post_stop_control_ = ControlMode::StandbyVelocity;
+    beginLocoUpperStopping(StopReason::Stop);
+    return;
+  }
+  if (mode == ControlMode::FixStand && active_kind_ == ActiveKind::User &&
+      active_ && active_->executor == MotionExecutor::LocoUpper) {
+    cancelWaiting(StopReason::Stop);
+    active_->loco.phase = LocoPhase::Stopped;
+    finishActive(MotionState::Stopped, StopReason::Stop, ErrorCode::Ok);
+    post_stop_control_ = ControlMode::FixStand;
+    enterFixStandState();
     return;
   }
   if (mode == ControlMode::StandbyVelocity && active_kind_ == ActiveKind::User &&
@@ -431,6 +768,7 @@ void RuntimeControlLoop::handleControl(ControlMode mode) {
   if (fsm_state_ == RuntimeInternalState::Fault) {
     active_.reset();
     active_track_.reset();
+    loco_upper_.reset();
     policy_runner_.reset();
     clearReference();
     handleInternalEvent(RuntimeInternalEvent::FixStand);
@@ -474,7 +812,7 @@ void RuntimeControlLoop::handleIdleConfig(std::vector<IdleMotion> motions) {
 void RuntimeControlLoop::handleInterrupt(MotionRequest request) {
   cancelWaiting(StopReason::Interrupt);
   if (active_kind_ == ActiveKind::Idle) {
-    if (startTransitionFromIdleToUser(request)) {
+    if (isGeneralTrackerRequest(request) && startTransitionFromIdleToUser(request)) {
       return;
     }
     stopIdleActive();
@@ -482,10 +820,27 @@ void RuntimeControlLoop::handleInterrupt(MotionRequest request) {
   if (active_kind_ == ActiveKind::Transition) {
     const StopReason replaced_reason =
         isUserOwnedTransition() ? StopReason::Interrupt : StopReason::None;
-    startTransitionFromCurrentReferenceToUser(std::move(request), replaced_reason);
+    if (isGeneralTrackerRequest(request)) {
+      startTransitionFromCurrentReferenceToUser(std::move(request), replaced_reason);
+    } else {
+      const bool preempted_idle_background =
+          transition_ && transition_->target_kind == TransitionTargetKind::Idle;
+      abortTransition(MotionState::Canceled, replaced_reason, ErrorCode::Ok);
+      if (preempted_idle_background) {
+        clearIdleConfig();
+      }
+      enterGeneralTrackerIdleState();
+      waiting_.push_back(std::move(request));
+    }
     return;
   }
   waiting_.push_back(std::move(request));
+  if (active_kind_ == ActiveKind::User && active_ &&
+      active_->executor == MotionExecutor::LocoUpper) {
+    post_stop_control_ = ControlMode::StandbyVelocity;
+    beginLocoUpperStopping(StopReason::Interrupt);
+    return;
+  }
   if (active_kind_ == ActiveKind::User && active_ &&
       active_->state == MotionState::Holding) {
     return;
@@ -538,6 +893,7 @@ ControllerState RuntimeControlLoop::controllerStateForInternal(
       return hasControlRuntime() ? ControllerState::StandbyVelocity : ControllerState::Idle;
     case RuntimeInternalState::GeneralTrackerActive:
     case RuntimeInternalState::GeneralTrackerTransition:
+    case RuntimeInternalState::LocoUpperActive:
       return ControllerState::Running;
     case RuntimeInternalState::Stopping:
       return ControllerState::Stopping;
@@ -579,6 +935,11 @@ void RuntimeControlLoop::enterInternalState(RuntimeInternalState state) {
       active_first_advance_ = true;
       break;
     case RuntimeInternalState::GeneralTrackerTransition:
+      clearPolicyStartupHold();
+      active_policy_ticks_until_next_ = 0;
+      active_first_advance_ = true;
+      break;
+    case RuntimeInternalState::LocoUpperActive:
       clearPolicyStartupHold();
       active_policy_ticks_until_next_ = 0;
       active_first_advance_ = true;
@@ -793,6 +1154,13 @@ bool RuntimeControlLoop::writePassiveDamping() {
 }
 
 void RuntimeControlLoop::startNext() {
+  if (!waiting_.empty() && waiting_.front().executor == MotionExecutor::LocoUpper) {
+    MotionRequest request = std::move(waiting_.front());
+    waiting_.pop_front();
+    startLocoUpper(std::move(request));
+    return;
+  }
+
   std::optional<LowStateSample> entry_low_state;
   std::optional<RobotReadinessStatus> readiness;
   if (hasPolicyRuntime()) {
@@ -831,6 +1199,170 @@ void RuntimeControlLoop::startNext() {
   idle_current_index_.reset();
   handleInternalEvent(RuntimeInternalEvent::MotionRequest);
   publishActive();
+}
+
+void RuntimeControlLoop::startLocoUpper(MotionRequest request) {
+  auto failRequest = [this](MotionRequest failed,
+                            ErrorCode error,
+                            std::optional<RobotReadinessStatus> readiness = std::nullopt) {
+    active_track_.reset();
+    loco_upper_.reset();
+    failed.state = MotionState::Failed;
+    failed.frame = 0;
+    failed.err = error;
+    failed.stop_reason = StopReason::None;
+    failed.loco.phase = LocoPhase::Failed;
+    failed.ended_at = std::chrono::steady_clock::now();
+    status_.publishRunStatus(toStatus(failed));
+    if (readiness) {
+      if (readinessRequiresFault(*readiness)) {
+        enterFault(readiness->err,
+                   readiness->robot,
+                   readiness->block,
+                   readiness->low_ms);
+      } else {
+        enterPassiveState(*readiness);
+      }
+    }
+  };
+
+  request.state = MotionState::Queued;
+  request.frame = 0;
+  request.err = ErrorCode::Ok;
+  request.stop_reason = StopReason::None;
+  request.loco.max_radius_m = request.loco_options.max_radius_m;
+  request.loco.phase = LocoPhase::Queued;
+
+  if (!hasLocoUpperRuntime()) {
+    failRequest(std::move(request), ErrorCode::ModelNotReady);
+    return;
+  }
+
+  const std::optional<LowStateSample> entry_low_state = readLowStateForStatus();
+  const RobotReadinessStatus readiness =
+      mapRobotReadiness(entry_low_state,
+                        robot_io_->lowCmdOccupancy(),
+                        expected_mode_machine_);
+  applyReadiness(readiness);
+  if (readiness.err != ErrorCode::Ok) {
+    failRequest(std::move(request), readiness.err, readiness);
+    return;
+  }
+
+  if (!prepareLocoUpperTrack(request)) {
+    failRequest(std::move(request), request.err);
+    return;
+  }
+
+  if (!loco_upper_ || !active_track_) {
+    request.err = ErrorCode::InternalError;
+    failRequest(std::move(request), request.err);
+    return;
+  }
+
+  const std::optional<HighStateSample> start_high_state = readHighStateForStatus();
+  const auto start_xy =
+      config_.loco_upper_strict_pose
+          ? freshHighstatePlanarPosition(start_high_state,
+                                         config_.loco_upper_pose_fresh_timeout_ms)
+          : highstatePlanarPosition(start_high_state);
+  if (config_.loco_upper_strict_pose && !start_xy) {
+    request.loco.reason = LocoReason::PoseMissing;
+    failRequest(std::move(request), ErrorCode::SafetyLimitTriggered);
+    return;
+  }
+  if (start_xy) {
+    loco_upper_->highstate_start_xy = *start_xy;
+    loco_upper_->last_highstate_xy = *start_xy;
+    loco_upper_->has_highstate_start = true;
+    loco_upper_->has_last_highstate_xy = true;
+  }
+
+  loco_upper_->entry_start_upper =
+      upperTargetsFromLowState(*loco_upper_composer_config_,
+                               *entry_low_state,
+                               loco_upper_->first_upper);
+  loco_upper_->lower_entry_start_q =
+      lowerEntryTargetsFromLowState(*loco_lower_deploy_config_, *entry_low_state);
+  loco_upper_->phase_total_ticks = ticksForPeriod(
+      transitionDurationForUse().value_or(1.0 / std::max(1.0, config_.hz)));
+  loco_upper_->phase_ticks_remaining = loco_upper_->phase_total_ticks;
+  request.state = MotionState::Running;
+  request.started_at = std::chrono::steady_clock::now();
+  request.loco.phase = LocoPhase::Entry;
+  active_ = std::move(request);
+  active_kind_ = ActiveKind::User;
+  idle_current_index_.reset();
+  enterInternalState(RuntimeInternalState::LocoUpperActive);
+  publishReferenceActive();
+  publishActive();
+}
+
+bool RuntimeControlLoop::prepareLocoUpperTrack(MotionRequest& request) {
+  TrkLoadResult loaded = loader_.load(request.path);
+  if (!loaded.ok()) {
+    request.err = toCoreErrorCode(loaded.code);
+    return false;
+  }
+
+  request.frames = loaded.track->metadata.frames;
+  request.fps = loaded.track->metadata.fps;
+  request.duration_s = loaded.track->metadata.duration_s;
+  active_track_ = std::make_shared<TrkTrack>(std::move(*loaded.track));
+
+  LocoUpperRootPlanResult root = extractRootPlanarPath(*active_track_);
+  if (!root.ok()) {
+    request.err = ErrorCode::TrkValidationFailed;
+    request.loco.reason = LocoReason::RootInvalid;
+    return false;
+  }
+
+  const LocoUpperJointValidationResult upper =
+      extractAndValidateUpperJointTargets(
+          *active_track_,
+          jointValidationOptionsFromComposerConfig(*loco_upper_composer_config_));
+  if (!upper.ok()) {
+    request.err = ErrorCode::TrkValidationFailed;
+    request.loco.reason = locoReasonFromValidationFailure(upper.failure_kind);
+    return false;
+  }
+
+  LocoUpperRuntimeState runtime;
+  runtime.root_plan = alignRootPlanToStart(root.plan);
+  if (request.loco_options.max_radius_m > 0.0) {
+    LocoUpperProjectionResult projected =
+        projectRootPlanToRadius(runtime.root_plan, request.loco_options.max_radius_m);
+    runtime.root_plan = std::move(projected.plan);
+    runtime.radius_clamped = projected.radius_clamped;
+  }
+  const LocoUpperVelocityCommandPlan command_plan =
+      rootPlanToVelocityCommandPlan(
+          runtime.root_plan,
+          locoUpperCommandLimitsFromConfig(config_, *loco_lower_deploy_config_));
+  runtime.commands_world = command_plan.commands;
+  runtime.envelope_clamped = command_plan.limits_clamped;
+  runtime.lower_runner.emplace(*loco_lower_deploy_config_, expected_mode_machine_);
+  const auto first_frame = active_track_->frame(0);
+  const auto final_frame =
+      active_track_->frame(active_track_->metadata.frames == 0
+                               ? 0
+                               : active_track_->metadata.frames - 1);
+  if (!first_frame || !final_frame) {
+    request.err = ErrorCode::InternalError;
+    return false;
+  }
+  runtime.first_upper = upperTargetsFromFrame(*first_frame);
+  runtime.final_upper = upperTargetsFromFrame(*final_frame);
+  if (runtime.first_upper.size() < kPolicyJointCount ||
+      runtime.final_upper.size() < kPolicyJointCount) {
+    request.err = ErrorCode::InternalError;
+    return false;
+  }
+  request.loco.radius_clamped = runtime.radius_clamped;
+  request.loco.envelope_clamped = runtime.envelope_clamped;
+  request.loco.distance_m = 0.0;
+  loco_upper_ = std::move(runtime);
+  return true;
 }
 
 bool RuntimeControlLoop::canStartIdle() const {
@@ -880,6 +1412,9 @@ void RuntimeControlLoop::startIdle() {
 }
 
 bool RuntimeControlLoop::startTransitionFromIdleToUser(MotionRequest target_request) {
+  if (!isGeneralTrackerRequest(target_request)) {
+    return false;
+  }
   if (active_kind_ != ActiveKind::Idle || !active_ || !active_track_) {
     return false;
   }
@@ -984,6 +1519,11 @@ bool RuntimeControlLoop::shouldStartTransitionFromStandbyToUser() const {
 void RuntimeControlLoop::startTransitionFromStandbyToUser(
     MotionRequest target_request,
     std::optional<LowStateSample> entry_low_state) {
+  if (!isGeneralTrackerRequest(target_request)) {
+    waiting_.push_front(std::move(target_request));
+    return;
+  }
+
   auto failTarget = [this](MotionRequest request, ErrorCode error) {
     request.state = MotionState::Failed;
     request.frame = 0;
@@ -1116,6 +1656,7 @@ void RuntimeControlLoop::completePreparing() {
       request.stop_reason = StopReason::None;
       active_.reset();
       active_track_.reset();
+      loco_upper_.reset();
       policy_runner_.reset();
       clearReference();
       waiting_.push_front(std::move(request));
@@ -1141,6 +1682,7 @@ void RuntimeControlLoop::completePreparing() {
     status_.publishRunStatus(toStatus(*active_));
     active_.reset();
     active_track_.reset();
+    loco_upper_.reset();
     clearReference();
     post_stop_control_ = ControlMode::StandbyVelocity;
     enterGeneralTrackerIdleState();
@@ -1277,6 +1819,643 @@ void RuntimeControlLoop::advanceActive() {
 
   publishActive();
   publishReferenceActive();
+}
+
+void RuntimeControlLoop::advanceLocoUpperActive() {
+  if (!active_ || active_kind_ != ActiveKind::User ||
+      active_->executor != MotionExecutor::LocoUpper || !loco_upper_) {
+    finishActive(MotionState::Failed, StopReason::None, ErrorCode::InternalError);
+    enterGeneralTrackerIdleState();
+    return;
+  }
+
+  switch (active_->loco.phase) {
+    case LocoPhase::Entry:
+      advanceLocoUpperEntry();
+      break;
+    case LocoPhase::Motion:
+      advanceLocoUpperMotion();
+      break;
+    case LocoPhase::Exit:
+      advanceLocoUpperExit();
+      break;
+    case LocoPhase::Holding:
+      advanceLocoUpperHolding();
+      break;
+    case LocoPhase::Stopping:
+      advanceLocoUpperStopping();
+      break;
+    default:
+      finishActive(MotionState::Failed, StopReason::None, ErrorCode::InternalError);
+      enterGeneralTrackerIdleState();
+      break;
+  }
+}
+
+void RuntimeControlLoop::advanceLocoUpperEntry() {
+  if (!active_ || !loco_upper_) {
+    return;
+  }
+
+  const std::size_t total = std::max<std::size_t>(1, loco_upper_->phase_total_ticks);
+  const std::size_t remaining = loco_upper_->phase_ticks_remaining;
+  const std::size_t completed = total > remaining ? total - remaining : 0;
+  const float alpha =
+      total <= 1 ? 1.0F
+                 : std::clamp(static_cast<float>(completed) /
+                                  static_cast<float>(total - 1),
+                              0.0F,
+                              1.0F);
+  if (!writeLocoUpperStep({0.0F, 0.0F, 0.0F},
+                          interpolateUpperTargets(loco_upper_->entry_start_upper,
+                                                   loco_upper_->first_upper,
+                                                   alpha),
+                          alpha)) {
+    return;
+  }
+  publishActive();
+  publishReferenceActive();
+  if (loco_upper_->phase_ticks_remaining > 0) {
+    --loco_upper_->phase_ticks_remaining;
+  }
+  if (loco_upper_->phase_ticks_remaining == 0) {
+    active_->frame = 0;
+    setLocoPhase(LocoPhase::Motion);
+  }
+}
+
+void RuntimeControlLoop::advanceLocoUpperMotion() {
+  if (!active_ || !loco_upper_) {
+    return;
+  }
+  const bool frame_due =
+      consumeStepDue(active_policy_ticks_until_next_, activePolicyIntervalTicks());
+  if (frame_due) {
+    if (active_first_advance_) {
+      active_->started_at = std::chrono::steady_clock::now();
+      active_->frame = 0;
+      active_first_advance_ = false;
+    } else if (active_->frames > 0 && active_->frame + 1 < active_->frames) {
+      ++active_->frame;
+    }
+
+    if (!prepareLocoUpperFrameStep(active_->frame, false)) {
+      return;
+    }
+  } else if (loco_upper_->current_upper.size() < kPolicyJointCount &&
+             !prepareLocoUpperFrameStep(active_->frame, false)) {
+    return;
+  }
+
+  if (!writeLocoUpperStep(loco_upper_->current_command,
+                          loco_upper_->current_upper)) {
+    return;
+  }
+  publishReferenceActive();
+  publishActive();
+
+  if (frame_due &&
+      (active_->frames == 0 || active_->frame + 1 >= active_->frames)) {
+    active_->frame = active_->frames == 0 ? 0 : active_->frames - 1;
+    publishReferenceActive();
+    if (active_->hold) {
+      active_->state = MotionState::Holding;
+      loco_upper_->hold_ticks_remaining = ticksForPeriod(config_.loco_upper_max_hold_s);
+      setLocoPhase(LocoPhase::Holding);
+      publishActive();
+      return;
+    }
+    beginLocoUpperExit(LocoReason::None);
+    publishActive();
+  }
+}
+
+void RuntimeControlLoop::advanceLocoUpperExit() {
+  if (!active_ || !loco_upper_) {
+    return;
+  }
+  if (!writeLocoUpperUpperTransitionStep()) {
+    return;
+  }
+  publishReferenceActive();
+  publishActive();
+  if (loco_upper_->phase_ticks_remaining > 0) {
+    --loco_upper_->phase_ticks_remaining;
+  }
+  if (loco_upper_->phase_ticks_remaining == 0) {
+    finishLocoUpperDone();
+  }
+}
+
+void RuntimeControlLoop::advanceLocoUpperHolding() {
+  if (!active_ || !loco_upper_) {
+    return;
+  }
+  if (!waiting_.empty()) {
+    beginLocoUpperExit(LocoReason::None);
+    publishActive();
+    return;
+  }
+  if (loco_upper_->hold_ticks_remaining == 0) {
+    beginLocoUpperExit(LocoReason::HoldTimeout);
+    publishActive();
+    return;
+  }
+  if (!writeLocoUpperFinalHold(true)) {
+    return;
+  }
+  if (loco_upper_->hold_ticks_remaining > 0) {
+    --loco_upper_->hold_ticks_remaining;
+  }
+  active_->frame = active_->frames == 0 ? 0 : active_->frames - 1;
+  publishReferenceActive();
+  publishActive();
+}
+
+void RuntimeControlLoop::advanceLocoUpperStopping() {
+  if (!active_ || !loco_upper_) {
+    return;
+  }
+  if (!writeLocoUpperUpperTransitionStep()) {
+    return;
+  }
+  publishReferenceActive();
+  publishActive();
+  if (loco_upper_->phase_ticks_remaining > 0) {
+    --loco_upper_->phase_ticks_remaining;
+  }
+  if (loco_upper_->phase_ticks_remaining == 0) {
+    completeLocoUpperStopped();
+  }
+}
+
+void RuntimeControlLoop::beginLocoUpperExit(LocoReason reason) {
+  if (!active_ || !loco_upper_) {
+    return;
+  }
+  loco_upper_->phase_total_ticks = ticksForPeriod(
+      transitionDurationForUse().value_or(1.0 / std::max(1.0, config_.hz)));
+  loco_upper_->phase_ticks_remaining = loco_upper_->phase_total_ticks;
+  loco_upper_->transition_start_upper = currentLocoUpperTargets();
+  loco_upper_->transition_target_upper = locoUpperStandbyTargets();
+  active_->loco.reason = reason;
+  setLocoPhase(LocoPhase::Exit);
+}
+
+bool RuntimeControlLoop::requireStrictPoseForLocoUpper(
+    std::array<double, 2>& estimate_xy) {
+  if (!active_ || !loco_upper_) {
+    return false;
+  }
+  const auto high_xy =
+      freshHighstatePlanarPosition(readHighStateForStatus(),
+                                   config_.loco_upper_pose_fresh_timeout_ms);
+  if (!high_xy) {
+    failLocoUpperSafety(LocoReason::PoseMissing, "pose_missing");
+    return false;
+  }
+  if (loco_upper_->has_last_highstate_xy) {
+    const double dx = (*high_xy)[0] - loco_upper_->last_highstate_xy[0];
+    const double dy = (*high_xy)[1] - loco_upper_->last_highstate_xy[1];
+    const double jump = std::hypot(dx, dy);
+    if (!std::isfinite(jump) ||
+        jump > config_.loco_upper_pose_jump_reject_m) {
+      failLocoUpperSafety(LocoReason::PoseJump, "pose_jump");
+      return false;
+    }
+  }
+
+  if (!loco_upper_->has_highstate_start) {
+    loco_upper_->highstate_start_xy = *high_xy;
+    loco_upper_->has_highstate_start = true;
+  }
+  loco_upper_->last_highstate_xy = *high_xy;
+  loco_upper_->has_last_highstate_xy = true;
+  estimate_xy[0] = (*high_xy)[0] - loco_upper_->highstate_start_xy[0];
+  estimate_xy[1] = (*high_xy)[1] - loco_upper_->highstate_start_xy[1];
+  loco_upper_->integrated_xy = estimate_xy;
+  active_->loco.radius_source = "highstate";
+  active_->loco.distance_m = std::hypot(estimate_xy[0], estimate_xy[1]);
+  return true;
+}
+
+void RuntimeControlLoop::failLocoUpperSafety(LocoReason reason, const char* block) {
+  if (!active_) {
+    return;
+  }
+  active_->loco.reason = reason;
+  active_->loco.phase = LocoPhase::Failed;
+  finishActive(MotionState::Failed,
+               StopReason::None,
+               ErrorCode::SafetyLimitTriggered);
+  RobotReadinessStatus readiness;
+  readiness.robot = RobotState::NotReady;
+  readiness.err = ErrorCode::SafetyLimitTriggered;
+  readiness.block = block;
+  enterPassiveState(readiness);
+}
+
+bool RuntimeControlLoop::updateLocoUpperRadiusState(
+    std::array<double, 2>& estimate_xy) {
+  if (!active_ || !loco_upper_) {
+    return false;
+  }
+  if (loco_upper_->has_highstate_start) {
+    if (const auto high_xy = highstatePlanarPosition(readHighStateForStatus())) {
+      estimate_xy[0] = (*high_xy)[0] - loco_upper_->highstate_start_xy[0];
+      estimate_xy[1] = (*high_xy)[1] - loco_upper_->highstate_start_xy[1];
+      loco_upper_->integrated_xy = estimate_xy;
+      loco_upper_->last_highstate_xy = *high_xy;
+      loco_upper_->has_last_highstate_xy = true;
+      active_->loco.radius_source = "highstate";
+      active_->loco.distance_m = std::hypot(estimate_xy[0], estimate_xy[1]);
+      return true;
+    }
+  }
+
+  active_->loco.radius_source = "integrated";
+  active_->loco.distance_m = std::hypot(estimate_xy[0], estimate_xy[1]);
+  return true;
+}
+
+bool RuntimeControlLoop::enforceLocoUpperRadiusLimit(
+    const std::array<double, 2>& estimate_xy) {
+  if (!active_ || active_->loco_options.max_radius_m <= 0.0) {
+    return true;
+  }
+
+  const double distance = std::hypot(estimate_xy[0], estimate_xy[1]);
+  active_->loco.distance_m = distance;
+  if (distance <= active_->loco_options.max_radius_m + config_.radius_tolerance_m) {
+    return true;
+  }
+
+  active_->loco.radius_limit_reached = true;
+  active_->loco.reason = LocoReason::RadiusLimit;
+  finishActive(MotionState::Failed,
+               StopReason::None,
+               ErrorCode::SafetyLimitTriggered);
+  RobotReadinessStatus readiness;
+  readiness.robot = RobotState::NotReady;
+  readiness.err = ErrorCode::SafetyLimitTriggered;
+  readiness.block = "radius_limit";
+  enterPassiveState(readiness);
+  return false;
+}
+
+void RuntimeControlLoop::failLocoUpperPolicy(
+    LocoReason reason,
+    const RobotReadinessStatus& readiness) {
+  if (active_) {
+    active_->loco.reason = reason;
+  }
+  failActiveWithFault(ErrorCode::ModelInferenceFailed,
+                      RobotState::Fault,
+                      "policy_inference_failed",
+                      readiness.low_ms);
+}
+
+bool RuntimeControlLoop::writeLocoUpperStep(
+    VelocityCommand command,
+    const std::vector<float>& upper_targets,
+    std::optional<float> lower_entry_alpha) {
+  if (!active_ || !loco_upper_ || !loco_upper_->lower_runner ||
+      !hasLocoUpperRuntime()) {
+    failActiveWithFault(ErrorCode::ModelInferenceFailed,
+                        RobotState::Fault,
+                        "policy_inference_failed");
+    return false;
+  }
+
+  if (config_.loco_upper_strict_pose) {
+    std::array<double, 2> estimate_xy = loco_upper_->integrated_xy;
+    if (!requireStrictPoseForLocoUpper(estimate_xy)) {
+      return false;
+    }
+    if (!enforceLocoUpperRadiusLimit(estimate_xy)) {
+      return false;
+    }
+  } else {
+    std::array<double, 2> estimate_xy = loco_upper_->integrated_xy;
+    if (!updateLocoUpperRadiusState(estimate_xy) ||
+        !enforceLocoUpperRadiusLimit(estimate_xy)) {
+      return false;
+    }
+  }
+
+  const std::optional<LowStateSample> low_state = readLowStateForStatus();
+  const RobotReadinessStatus readiness =
+      mapRobotReadiness(low_state,
+                        robot_io_->lowCmdOccupancy(),
+                        expected_mode_machine_);
+  if (readiness.err != ErrorCode::Ok) {
+    failActiveReadiness(readiness);
+    return false;
+  }
+  applyReadiness(readiness);
+
+  LocoLowerStepResult lower;
+  LocoUpperLowCmdComposeResult composed;
+  try {
+    lower = loco_upper_->lower_runner->step(*low_state,
+                                            command,
+                                            *loco_lower_policy_,
+                                            lowCmdBaseFrame());
+    LowCmdFrame lower_frame = lower.low_cmd;
+    if (lower_entry_alpha.has_value()) {
+      applyLocoUpperLowerEntryInterpolation(*loco_lower_deploy_config_,
+                                            loco_upper_->lower_entry_start_q,
+                                            lower.processed_action,
+                                            *lower_entry_alpha,
+                                            lower_frame);
+    }
+    composed = composeLocoUpperLowCmd(*loco_upper_composer_config_,
+                                      lower_frame,
+                                      upper_targets);
+  } catch (const LocoLowerPolicyError& err) {
+    const LocoReason reason = isNonFinitePolicyMessage(err.what())
+                                  ? LocoReason::PolicyNan
+                                  : LocoReason::PolicyInfer;
+    failLocoUpperPolicy(reason, readiness);
+    return false;
+  } catch (const std::exception& err) {
+    failLocoUpperPolicy(isNonFinitePolicyMessage(err.what())
+                            ? LocoReason::PolicyNan
+                            : LocoReason::PolicyInfer,
+                        readiness);
+    return false;
+  }
+
+  try {
+    writeLowCmdFrame(composed.frame);
+  } catch (const std::exception&) {
+    failActiveWithFault(ErrorCode::InternalError,
+                        RobotState::Fault,
+                        "lowcmd_write_failed",
+                        readiness.low_ms);
+    return false;
+  }
+  loco_upper_->last_upper = upper_targets;
+  loco_upper_->envelope_clamped =
+      loco_upper_->envelope_clamped || lower.command_clamped;
+  active_->loco.envelope_clamped = loco_upper_->envelope_clamped;
+  loco_upper_->raw_action_clamped =
+      loco_upper_->raw_action_clamped || lower.raw_action_clamped;
+  active_->loco.raw_action_clamped = loco_upper_->raw_action_clamped;
+  loco_upper_->lower_q_limited =
+      loco_upper_->lower_q_limited || composed.lower_q_limited;
+  active_->loco.lower_q_limited = loco_upper_->lower_q_limited;
+  loco_upper_->lower_action_clamped =
+      loco_upper_->lower_action_clamped || lower.raw_action_clamped ||
+      composed.lower_q_limited;
+  active_->loco.lower_action_clamped = loco_upper_->lower_action_clamped;
+  return true;
+}
+
+bool RuntimeControlLoop::prepareLocoUpperFrameStep(std::size_t frame,
+                                                   bool zero_lower_command) {
+  if (!active_ || !active_track_ || !loco_upper_) {
+    return false;
+  }
+
+  VelocityCommand command{};
+  double robot_yaw = 0.0;
+  if (const std::optional<LowStateSample> low_state =
+          latest_low_state_ ? latest_low_state_ : readLowStateForStatus()) {
+    robot_yaw = yawFromLowState(*low_state);
+  }
+
+  if (!zero_lower_command && !loco_upper_->commands_world.empty()) {
+    const std::size_t command_index =
+        std::min(frame, loco_upper_->commands_world.size() - 1);
+    LocoUpperVelocityCommand command_world =
+        loco_upper_->commands_world.at(command_index);
+
+    std::array<double, 2> estimate_xy = loco_upper_->integrated_xy;
+    std::string radius_source;
+    if (config_.loco_upper_strict_pose) {
+      if (!requireStrictPoseForLocoUpper(estimate_xy)) {
+        return false;
+      }
+      radius_source = "highstate";
+    } else if (loco_upper_->has_highstate_start) {
+      if (const auto high_xy = highstatePlanarPosition(readHighStateForStatus())) {
+        estimate_xy[0] = (*high_xy)[0] - loco_upper_->highstate_start_xy[0];
+        estimate_xy[1] = (*high_xy)[1] - loco_upper_->highstate_start_xy[1];
+        radius_source = "highstate";
+        loco_upper_->integrated_xy = estimate_xy;
+      }
+    }
+    if (radius_source.empty()) {
+      radius_source = "integrated";
+    }
+
+    if (active_->loco_options.max_radius_m > 0.0) {
+      command_world = suppressOutwardRadialVelocityNearRadius(
+          planarSampleFromXY(estimate_xy),
+          command_world,
+          active_->loco_options.max_radius_m,
+          kLocoUpperRadiusSuppressMarginM);
+      loco_upper_->radius_limit_reached =
+          loco_upper_->radius_limit_reached || command_world.radius_limit_reached;
+    }
+
+    const LocoUpperVelocityCommand body =
+        worldVelocityToBodyCommand(command_world, robot_yaw);
+    command.vx = static_cast<float>(body.vx);
+    command.vy = static_cast<float>(body.vy);
+    command.yaw_rate = static_cast<float>(body.yaw_rate);
+    bool command_clamped = false;
+    command = clampBodyCommand(loco_lower_deploy_config_->command_ranges,
+                               command,
+                               command_clamped);
+    loco_upper_->envelope_clamped =
+        loco_upper_->envelope_clamped || command_clamped;
+    active_->loco.radius_source = radius_source;
+    if (radius_source == "integrated") {
+      const LocoUpperVelocityCommand integrated_world =
+          bodyVelocityToWorldCommand(command, robot_yaw);
+      const double dt_s = locoCommandDtS(loco_upper_->root_plan.dt_s,
+                                         active_->fps,
+                                         config_.hz);
+      loco_upper_->integrated_xy[0] += integrated_world.vx * dt_s;
+      loco_upper_->integrated_xy[1] += integrated_world.vy * dt_s;
+      estimate_xy = loco_upper_->integrated_xy;
+    }
+    active_->loco.distance_m = std::hypot(estimate_xy[0], estimate_xy[1]);
+    if (!enforceLocoUpperRadiusLimit(estimate_xy)) {
+      return false;
+    }
+  }
+
+  const std::optional<TrkFrameView> upper_frame = active_track_->frame(frame);
+  if (!upper_frame) {
+    failActiveWithFault(ErrorCode::InternalError,
+                        RobotState::Fault,
+                        "policy_inference_failed");
+    return false;
+  }
+  active_->loco.radius_limit_reached = loco_upper_->radius_limit_reached;
+  active_->loco.envelope_clamped = loco_upper_->envelope_clamped;
+  loco_upper_->current_command = command;
+  loco_upper_->current_upper = upperTargetsFromFrame(*upper_frame);
+  return true;
+}
+
+bool RuntimeControlLoop::writeLocoUpperFrame(std::size_t frame,
+                                             bool zero_lower_command) {
+  if (!prepareLocoUpperFrameStep(frame, zero_lower_command)) {
+    return false;
+  }
+  return writeLocoUpperStep(loco_upper_->current_command,
+                            loco_upper_->current_upper);
+}
+
+bool RuntimeControlLoop::writeLocoUpperFinalHold(bool zero_lower_command) {
+  if (!active_ || !loco_upper_) {
+    return false;
+  }
+  if (active_->frames > 0) {
+    active_->frame = active_->frames - 1;
+  }
+  if (!zero_lower_command) {
+    return writeLocoUpperFrame(active_->frame, false);
+  }
+  return writeLocoUpperStep({0.0F, 0.0F, 0.0F}, loco_upper_->final_upper);
+}
+
+bool RuntimeControlLoop::writeLocoUpperUpperTransitionStep() {
+  if (!active_ || !loco_upper_) {
+    return false;
+  }
+  if (active_->frames > 0) {
+    active_->frame = active_->frames - 1;
+  }
+  const std::size_t total = std::max<std::size_t>(1, loco_upper_->phase_total_ticks);
+  const std::size_t remaining = loco_upper_->phase_ticks_remaining;
+  const std::size_t completed = total > remaining ? total - remaining : 0;
+  const float alpha =
+      total <= 1 ? 1.0F
+                 : std::clamp(static_cast<float>(completed) /
+                                  static_cast<float>(total - 1),
+                              0.0F,
+                              1.0F);
+  return writeLocoUpperStep(
+      {0.0F, 0.0F, 0.0F},
+      interpolateUpperTargets(loco_upper_->transition_start_upper,
+                              loco_upper_->transition_target_upper,
+                              alpha));
+}
+
+std::vector<float> RuntimeControlLoop::fixstandUpperTargets() const {
+  std::vector<float> targets(kPolicyJointCount, 0.0F);
+  if (!loco_upper_composer_config_ || !fixstand_config_) {
+    return targets;
+  }
+  for (std::size_t logical = loco_upper_composer_config_->upper_start_joint;
+       logical < loco_upper_composer_config_->upper_end_joint_exclusive &&
+       logical < targets.size() &&
+       logical < loco_upper_composer_config_->logical_to_sdk.size();
+       ++logical) {
+    const int sdk_slot_raw = loco_upper_composer_config_->logical_to_sdk.at(logical);
+    if (sdk_slot_raw < 0) {
+      continue;
+    }
+    const auto sdk_slot = static_cast<std::size_t>(sdk_slot_raw);
+    if (sdk_slot >= fixstand_config_->target_q.size()) {
+      continue;
+    }
+    targets.at(logical) =
+        static_cast<float>(fixstand_config_->target_q.at(sdk_slot));
+  }
+  return targets;
+}
+
+std::vector<float> RuntimeControlLoop::locoUpperStandbyTargets() const {
+  return fixstandUpperTargets();
+}
+
+std::vector<float> RuntimeControlLoop::currentLocoUpperTargets() const {
+  if (!active_ || !loco_upper_) {
+    return {};
+  }
+  if (loco_upper_->last_upper.size() >= kPolicyJointCount) {
+    return loco_upper_->last_upper;
+  }
+  const std::optional<TrkFrameView> current_frame =
+      active_track_ ? active_track_->frame(active_->frame) : std::nullopt;
+  std::vector<float> current =
+      current_frame ? upperTargetsFromFrame(*current_frame) : std::vector<float>{};
+  if (current.size() < kPolicyJointCount) {
+    current = loco_upper_->final_upper;
+  }
+  return current;
+}
+
+void RuntimeControlLoop::beginLocoUpperStopping(StopReason reason) {
+  if (!active_ || active_->executor != MotionExecutor::LocoUpper) {
+    return;
+  }
+  if (!loco_upper_) {
+    return;
+  }
+  active_->state = MotionState::Stopping;
+  active_->stop_reason = reason;
+  active_->err = ErrorCode::Ok;
+  loco_upper_->phase_total_ticks = ticksForPeriod(
+      transitionDurationForUse().value_or(1.0 / std::max(1.0, config_.hz)));
+  loco_upper_->phase_ticks_remaining = loco_upper_->phase_total_ticks;
+  loco_upper_->transition_start_upper = currentLocoUpperTargets();
+  loco_upper_->transition_target_upper = locoUpperStandbyTargets();
+  setLocoPhase(LocoPhase::Stopping);
+  publishActive();
+  enterInternalState(RuntimeInternalState::LocoUpperActive);
+}
+
+void RuntimeControlLoop::completeLocoUpperStopped() {
+  if (!active_) {
+    return;
+  }
+  const ControlMode post_stop_control = post_stop_control_;
+  active_->loco.phase = LocoPhase::Stopped;
+  finishActive(MotionState::Stopped, active_->stop_reason, ErrorCode::Ok);
+  if (post_stop_control == ControlMode::FixStand) {
+    enterFixStandState();
+  } else {
+    post_stop_control_ = ControlMode::StandbyVelocity;
+    enterVelocityState();
+  }
+}
+
+void RuntimeControlLoop::finishLocoUpperDone() {
+  if (!active_) {
+    return;
+  }
+  active_->loco.phase = LocoPhase::Done;
+  finishActive(MotionState::Done, StopReason::None, ErrorCode::Ok);
+  post_stop_control_ = ControlMode::StandbyVelocity;
+  enterVelocityState();
+}
+
+void RuntimeControlLoop::setLocoPhase(LocoPhase phase) {
+  if (!active_) {
+    return;
+  }
+  active_->loco.phase = phase;
+  active_->loco.radius_clamped =
+      loco_upper_ ? loco_upper_->radius_clamped : active_->loco.radius_clamped;
+  active_->loco.radius_limit_reached =
+      loco_upper_ ? loco_upper_->radius_limit_reached
+                  : active_->loco.radius_limit_reached;
+  active_->loco.envelope_clamped =
+      loco_upper_ ? loco_upper_->envelope_clamped : active_->loco.envelope_clamped;
+  active_->loco.raw_action_clamped =
+      loco_upper_ ? loco_upper_->raw_action_clamped : active_->loco.raw_action_clamped;
+  active_->loco.lower_q_limited =
+      loco_upper_ ? loco_upper_->lower_q_limited : active_->loco.lower_q_limited;
+  active_->loco.lower_action_clamped =
+      loco_upper_ ? loco_upper_->lower_action_clamped
+                  : active_->loco.lower_action_clamped;
 }
 
 void RuntimeControlLoop::advanceActiveWithPolicy() {
@@ -1502,8 +2681,17 @@ void RuntimeControlLoop::advanceHolding() {
     return;
   }
 
-  if (!waiting_.empty() && startTransitionFromHoldingToNextUser()) {
-    return;
+  if (!waiting_.empty()) {
+    if (isGeneralTrackerRequest(waiting_.front())) {
+      if (startTransitionFromHoldingToNextUser()) {
+        return;
+      }
+    } else {
+      finishActive(MotionState::Done, StopReason::None, ErrorCode::Ok);
+      post_stop_control_ = ControlMode::StandbyVelocity;
+      enterGeneralTrackerIdleState();
+      return;
+    }
   }
 
   if (!consumeStepDue(active_policy_ticks_until_next_, activePolicyIntervalTicks())) {
@@ -1521,8 +2709,17 @@ void RuntimeControlLoop::advanceHoldingWithPolicy() {
     return;
   }
 
-  if (!waiting_.empty() && startTransitionFromHoldingToNextUser()) {
-    return;
+  if (!waiting_.empty()) {
+    if (isGeneralTrackerRequest(waiting_.front())) {
+      if (startTransitionFromHoldingToNextUser()) {
+        return;
+      }
+    } else {
+      finishActive(MotionState::Done, StopReason::None, ErrorCode::Ok);
+      post_stop_control_ = ControlMode::StandbyVelocity;
+      enterGeneralTrackerIdleState();
+      return;
+    }
   }
 
   if (!policy_runner_) {
@@ -1579,6 +2776,9 @@ bool RuntimeControlLoop::startTransitionFromHoldingToNextUser() {
   if (!active_ || active_kind_ != ActiveKind::User ||
       active_->state != MotionState::Holding || !active_track_ ||
       waiting_.empty()) {
+    return false;
+  }
+  if (!isGeneralTrackerRequest(waiting_.front())) {
     return false;
   }
 
@@ -1671,6 +2871,9 @@ bool RuntimeControlLoop::startTransitionFromHoldingToStandby() {
 bool RuntimeControlLoop::startTransitionFromCurrentReferenceToUser(
     MotionRequest target_request,
     StopReason replaced_reason) {
+  if (!isGeneralTrackerRequest(target_request)) {
+    return false;
+  }
   if (active_kind_ != ActiveKind::Transition || !active_ || !active_track_) {
     return false;
   }
@@ -2846,10 +4049,14 @@ void RuntimeControlLoop::markActiveStopping(StopReason reason) {
   active_->state = MotionState::Stopping;
   active_->stop_reason = reason;
   active_->err = ErrorCode::Ok;
+  if (active_->executor == MotionExecutor::LocoUpper) {
+    active_->loco.phase = LocoPhase::Stopping;
+  }
   if (active_kind_ == ActiveKind::User) {
     status_.publishRunStatus(toStatus(*active_));
   }
   active_track_.reset();
+  loco_upper_.reset();
   policy_runner_.reset();
   clearReference();
 }
@@ -2861,6 +4068,13 @@ void RuntimeControlLoop::completeStoppingActive(MotionState state, ErrorCode err
 
   active_->state = state;
   active_->err = error;
+  if (active_->executor == MotionExecutor::LocoUpper) {
+    if (state == MotionState::Stopped) {
+      active_->loco.phase = LocoPhase::Stopped;
+    } else if (state == MotionState::Failed) {
+      active_->loco.phase = LocoPhase::Failed;
+    }
+  }
   active_->ended_at = std::chrono::steady_clock::now();
   if (active_kind_ == ActiveKind::User) {
     status_.publishRunStatus(toStatus(*active_));
@@ -2869,6 +4083,7 @@ void RuntimeControlLoop::completeStoppingActive(MotionState state, ErrorCode err
   active_kind_ = ActiveKind::None;
   idle_current_index_.reset();
   active_track_.reset();
+  loco_upper_.reset();
   transition_.reset();
   clearReference();
 }
@@ -2883,6 +4098,33 @@ std::optional<MotionRequest> RuntimeControlLoop::finishActive(MotionState state,
   active_->state = state;
   active_->stop_reason = reason;
   active_->err = error;
+  if (active_->executor == MotionExecutor::LocoUpper) {
+    switch (state) {
+      case MotionState::Done:
+        active_->loco.phase = LocoPhase::Done;
+        break;
+      case MotionState::Stopped:
+        active_->loco.phase = LocoPhase::Stopped;
+        break;
+      case MotionState::Canceled:
+        active_->loco.phase = LocoPhase::Canceled;
+        break;
+      case MotionState::Failed:
+        active_->loco.phase = LocoPhase::Failed;
+        break;
+      case MotionState::Holding:
+        active_->loco.phase = LocoPhase::Holding;
+        break;
+      case MotionState::Stopping:
+        active_->loco.phase = LocoPhase::Stopping;
+        break;
+      case MotionState::Queued:
+        active_->loco.phase = LocoPhase::Queued;
+        break;
+      case MotionState::Running:
+        break;
+    }
+  }
   active_->ended_at = std::chrono::steady_clock::now();
   MotionRequest completed = *active_;
   if (active_kind_ == ActiveKind::User) {
@@ -2892,6 +4134,7 @@ std::optional<MotionRequest> RuntimeControlLoop::finishActive(MotionState state,
   active_kind_ = ActiveKind::None;
   idle_current_index_.reset();
   active_track_.reset();
+  loco_upper_.reset();
   policy_runner_.reset();
   transition_.reset();
   clearReference();
@@ -2906,6 +4149,7 @@ void RuntimeControlLoop::stopIdleActive() {
   active_kind_ = ActiveKind::None;
   idle_current_index_.reset();
   active_track_.reset();
+  loco_upper_.reset();
   policy_runner_.reset();
   transition_.reset();
   clearReference();
@@ -3090,6 +4334,7 @@ void RuntimeControlLoop::publishSnapshot() {
   snapshot.queue.ids = waitingIds();
   snapshot.queue.n = snapshot.queue.ids.size();
   snapshot.idle = idleStatus();
+  snapshot.loco_upper.ready = hasLocoUpperRuntime();
   if (hasPolicyRuntime()) {
     snapshot.low_ms = runtime_state_.low_ms;
     snapshot.block = runtime_state_.block;
@@ -3214,6 +4459,13 @@ bool RuntimeControlLoop::hasControlRuntime() const {
          velocity_deploy_config_.has_value() && fixstand_config_.has_value() &&
          passive_config_.has_value() &&
          fixstand_runner_.has_value() && velocity_runner_.has_value();
+}
+
+bool RuntimeControlLoop::hasLocoUpperRuntime() const {
+  return hasPolicyRuntime() && loco_lower_policy_ != nullptr &&
+         loco_lower_deploy_config_.has_value() &&
+         loco_upper_composer_config_.has_value() &&
+         fixstand_config_.has_value();
 }
 
 void RuntimeControlLoop::refreshReadinessForPolicyRuntime() {

@@ -6,17 +6,31 @@
 namespace agentic_et1_tracker {
 namespace {
 
+LocoRunStatus queuedLocoStatus(const LocoRunOptions& options) {
+  LocoRunStatus status;
+  status.max_radius_m = options.max_radius_m;
+  status.distance_m = 0.0;
+  status.radius_source.clear();
+  status.phase = LocoPhase::Queued;
+  return status;
+}
+
 MotionRequest motionRequest(const ExecuteCommand& command, std::uint64_t sequence) {
   MotionRequest request;
   request.sequence = sequence;
   request.id = command.id;
   request.path = command.path;
+  request.executor = command.executor;
   request.state = MotionState::Queued;
   request.frame = 0;
   request.frames = command.track.frames;
   request.fps = command.track.fps;
   request.duration_s = command.track.duration_s;
   request.hold = command.hold;
+  request.loco_options = command.loco_options;
+  if (request.executor == MotionExecutor::LocoUpper) {
+    request.loco = queuedLocoStatus(command.loco_options);
+  }
   request.err = ErrorCode::Ok;
   request.stop_reason = StopReason::None;
   return request;

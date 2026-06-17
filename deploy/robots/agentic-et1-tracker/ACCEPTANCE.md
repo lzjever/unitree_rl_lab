@@ -1,8 +1,33 @@
 # Agentic ET1 Tracker Acceptance Evidence
 
 Date: 2026-05-29
-Latest targeted update: 2026-06-10
+Latest targeted update: 2026-06-17
 Environment: local workspace `/home/galbot/works/et1`
+
+## Loco-upper simulation handoff status
+
+Status as of 2026-06-17:
+
+- Scope remains simulation-only P0 handoff for `/execute_loco_upper`.
+- Runtime/documentation gates are recorded in this working tree; this is not a
+  true-robot GA claim.
+- Unit/fake-runtime gates appear covered by the current test tree:
+  `tests/api_tests.cpp`, `tests/app_config_tests.cpp`,
+  `tests/app_runner_tests.cpp`, `tests/runtime_control_loop_tests.cpp`,
+  `tests/loco_lower_policy_tests.cpp`, `tests/loco_upper_lowcmd_composer_tests.cpp`,
+  and `tests/loco_upper_planner_tests.cpp`.
+- Offline package gate is `packaging/scripts/selftest.sh`, which now checks the
+  app-owned `config/policy/loco_lower/et1_low` assets and
+  `config/limits/et1_upper_body/v0` limits/joint-map assets without starting a
+  service or simulator.
+- Local MuJoCo visual acceptance for the current loco-upper handoff has been
+  recorded in simulation only. This is still not a true-robot GA claim.
+- 2026-06-17 local MuJoCo acceptance summary:
+  old standby remained stable; `zero` and `fixstand` loco-upper hold remained
+  stable; `standby_ref` non-hold returned to standby stably.
+- Evidence files:
+  `/tmp/agentic-loco-acceptance/loco_upper_standby.png` and
+  `/tmp/agentic-loco-acceptance/final_status.json`.
 
 ## Build/test evidence
 
@@ -270,15 +295,21 @@ Contract-level GA evidence must cover:
 
 ## Manual MuJoCo acceptance
 
-No broad fresh MuJoCo visual acceptance has been recorded for the current
-revision beyond the targeted `standby_ref.trk` simulator review above. Earlier
-MuJoCo evidence predated the current FixStand/StandbyVelocity/FSM semantics and
-is historical only. No idle/status/control MuJoCo acceptance has been recorded
-in this docs/skill pass.
+2026-06-17 local simulator-only acceptance was run for the current
+FixStand/StandbyVelocity/FSM semantics. It covered:
 
-This section records an acceptance operation-order correction only. It does
-not change code semantics, add an API, or claim that MuJoCo visual acceptance
-has completed.
+- old standby stable before loco work;
+- `zero` loco-upper hold stable;
+- `fixstand` loco-upper hold stable;
+- `standby_ref` non-hold returns to standby stable.
+
+Artifacts recorded for this pass:
+
+- screenshot: `/tmp/agentic-loco-acceptance/loco_upper_standby.png`
+- final status JSON: `/tmp/agentic-loco-acceptance/final_status.json`
+
+This evidence is MuJoCo simulation only. It does not claim real-robot
+acceptance or GA completion.
 
 Use `config.sim.yaml.example` as the starting point for local MuJoCo
 acceptance. The acceptance config should keep sim-safe settings such as
@@ -286,7 +317,9 @@ acceptance. The acceptance config should keep sim-safe settings such as
 `200` ms LowCmd owner preflight, and disabled MotionSwitcher release. Set
 `motion_dirs` to the test `.trk` directory for the run; the recommended local
 test directory remains `/home/galbot/works/et1/generated`, but the current local
-config may need adjustment to match the chosen test directory.
+config may need adjustment to match the chosen test directory. Enable
+`agentic_et1_tracker.loco_upper.enabled: true` manually only for the
+`/execute_loco_upper` scenario.
 
 Smoke and normal acceptance runs must not begin by sending `/passive` when
 `/status` already reports `ready:true` and `ctrl:"standby_velocity"`. Passive is
@@ -341,7 +374,7 @@ Pending MuJoCo evidence must record:
 | Hermetic stub tests | recorded above | Keep explicit stub/test configure and tests passing. |
 | Docs/skill CLI contract | recorded above | Keep packaged and installed skill tests/diffs passing. |
 | `standby_ref.trk` release asset and runtime gate | unit/runtime/release covered; real robot pending | App-local asset, manifest, internal runtime playback, abort behavior, user allowlist rejection, and internal asset failure behavior are recorded; hardware/operator validation remains pending before GA. |
-| MuJoCo visual acceptance | partial; pending | Targeted standby_ref simulator review and automated runtime gate coverage are recorded; broader scenarios listed above still need `config.sim.yaml.example` evidence. |
+| MuJoCo visual acceptance | recorded for current loco-upper handoff; simulation-only | Local 2026-06-17 MuJoCo evidence covers old standby stability, `zero`/`fixstand` loco-upper hold stability, and `standby_ref` non-hold return to standby; broader real-robot validation remains pending. |
 | Real robot acceptance | pending | ET1 hardware/operator validation. |
 
 Do not mark GA until the pending broader MuJoCo/control and real-robot gates

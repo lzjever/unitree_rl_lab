@@ -131,6 +131,58 @@ void requireFiniteActions(const Vec& actions) {
   }
 }
 
+struct SingleInputOrtRuntimeState {
+  explicit SingleInputOrtRuntimeState(const std::filesystem::path& model_path,
+                                      const char* log_id)
+      : env(ORT_LOGGING_LEVEL_WARNING, log_id) {
+    session_options.SetIntraOpNumThreads(1);
+    session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+    session = std::make_unique<Ort::Session>(
+        env, model_path.c_str(), session_options);
+  }
+
+  PolicyModelMetadata metadata() const { return readMetadata(*session, allocator); }
+
+  Ort::Env env;
+  Ort::SessionOptions session_options;
+  mutable Ort::AllocatorWithDefaultOptions allocator;
+  std::unique_ptr<Ort::Session> session;
+};
+
+Vec runSingleInputModel(Ort::Session& session,
+                        const Vec& obs,
+                        std::size_t obs_dim,
+                        std::size_t expected_actions) {
+  Vec obs_copy = obs;
+  const std::array<std::int64_t, 2> obs_shape{
+      1, static_cast<std::int64_t>(obs_dim)};
+
+  Ort::MemoryInfo memory_info =
+      Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+  std::array<Ort::Value, 1> input_tensors{
+      Ort::Value::CreateTensor<float>(
+          memory_info, obs_copy.data(), obs_copy.size(),
+          obs_shape.data(), obs_shape.size()),
+  };
+
+  const std::array<const char*, 1> input_names{"obs"};
+  const std::array<const char*, 1> output_names{"actions"};
+
+  std::vector<Ort::Value> outputs = session.Run(
+      Ort::RunOptions{nullptr}, input_names.data(), input_tensors.data(),
+      input_tensors.size(), output_names.data(), output_names.size());
+
+  if (outputs.size() != 1) {
+    throw error("ORT returned wrong output count");
+  }
+  requireOutputTensor(outputs[0], expected_actions);
+
+  const float* data = outputs[0].GetTensorData<float>();
+  Vec actions(data, data + expected_actions);
+  requireFiniteActions(actions);
+  return actions;
+}
+
 }  // namespace
 
 struct OnnxPolicyRuntime::Impl {
@@ -228,20 +280,13 @@ Vec OnnxPolicyRuntime::infer(const PolicyInputs& inputs) {
 struct OnnxVelocityPolicyRuntime::Impl {
   Impl(const std::filesystem::path& model_path,
        const VelocityDeployConfig& deploy_config)
-      : env(ORT_LOGGING_LEVEL_WARNING, "agentic_et1_velocity_policy_runtime") {
-    session_options.SetIntraOpNumThreads(1);
-    session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-    session = std::make_unique<Ort::Session>(
-        env, model_path.c_str(), session_options);
-
-    const PolicyModelMetadata metadata = readMetadata(*session, allocator);
-    validateVelocityPolicyIoContract(deploy_config, metadata);
+      : deploy_config(deploy_config),
+        ort(model_path, "agentic_et1_velocity_policy_runtime") {
+    validateVelocityPolicyIoContract(deploy_config, ort.metadata());
   }
 
-  Ort::Env env;
-  Ort::SessionOptions session_options;
-  Ort::AllocatorWithDefaultOptions allocator;
-  std::unique_ptr<Ort::Session> session;
+  VelocityDeployConfig deploy_config;
+  SingleInputOrtRuntimeState ort;
 };
 
 OnnxVelocityPolicyRuntime::OnnxVelocityPolicyRuntime(
@@ -270,34 +315,61 @@ OnnxVelocityPolicyRuntime& OnnxVelocityPolicyRuntime::operator=(
 Vec OnnxVelocityPolicyRuntime::infer(const VelocityPolicyInputs& inputs) {
   try {
     validateVelocityPolicyInputs(inputs.obs);
+    return runSingleInputModel(
+        *impl_->ort.session, inputs.obs, impl_->deploy_config.obs_dim,
+        impl_->deploy_config.joint_dim);
+  } catch (const PolicyRuntimeError&) {
+    throw;
+  } catch (const PolicyIoContractError& err) {
+    throw error(err.what());
+  } catch (const Ort::Exception& err) {
+    throw error(std::string("ORT run failed: ") + err.what());
+  } catch (const std::exception& err) {
+    throw error(std::string("infer failed: ") + err.what());
+  }
+}
 
-    Vec obs = inputs.obs;
-    const std::array<std::int64_t, 2> obs_shape{
-        1, static_cast<std::int64_t>(kVelocityPolicyObsDim)};
+struct OnnxLocoLowerPolicyRuntime::Impl {
+  Impl(const std::filesystem::path& model_path,
+       const LocoLowerDeployConfig& deploy_config)
+      : deploy_config(deploy_config),
+        ort(model_path, "agentic_et1_loco_lower_policy_runtime") {
+    validateLocoLowerPolicyIoContract(deploy_config, ort.metadata());
+  }
 
-    Ort::MemoryInfo memory_info =
-        Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-    std::array<Ort::Value, 1> input_tensors{
-        Ort::Value::CreateTensor<float>(
-            memory_info, obs.data(), obs.size(), obs_shape.data(), obs_shape.size()),
-    };
+  LocoLowerDeployConfig deploy_config;
+  SingleInputOrtRuntimeState ort;
+};
 
-    const std::array<const char*, 1> input_names{"obs"};
-    const std::array<const char*, 1> output_names{"actions"};
+OnnxLocoLowerPolicyRuntime::OnnxLocoLowerPolicyRuntime(
+    OnnxLocoLowerPolicyRuntimeConfig config) {
+  try {
+    validateModelFile(config.model_path);
+    validateLocoLowerDeployConfig(config.deploy_config);
+    impl_ = std::make_unique<Impl>(config.model_path, config.deploy_config);
+  } catch (const PolicyRuntimeError&) {
+    throw;
+  } catch (const PolicyIoContractError& err) {
+    throw error(err.what());
+  } catch (const Ort::Exception& err) {
+    throw error(std::string("ORT session init failed: ") + err.what());
+  } catch (const std::exception& err) {
+    throw error(std::string("init failed: ") + err.what());
+  }
+}
 
-    std::vector<Ort::Value> outputs = impl_->session->Run(
-        Ort::RunOptions{nullptr}, input_names.data(), input_tensors.data(),
-        input_tensors.size(), output_names.data(), output_names.size());
+OnnxLocoLowerPolicyRuntime::~OnnxLocoLowerPolicyRuntime() = default;
+OnnxLocoLowerPolicyRuntime::OnnxLocoLowerPolicyRuntime(
+    OnnxLocoLowerPolicyRuntime&&) noexcept = default;
+OnnxLocoLowerPolicyRuntime& OnnxLocoLowerPolicyRuntime::operator=(
+    OnnxLocoLowerPolicyRuntime&&) noexcept = default;
 
-    if (outputs.size() != 1) {
-      throw error("ORT returned wrong output count");
-    }
-    requireOutputTensor(outputs[0], kVelocityPolicyJointDim);
-
-    const float* data = outputs[0].GetTensorData<float>();
-    Vec actions(data, data + kVelocityPolicyJointDim);
-    requireFiniteActions(actions);
-    return actions;
+Vec OnnxLocoLowerPolicyRuntime::infer(const VelocityPolicyInputs& inputs) {
+  try {
+    validateLocoLowerPolicyInputs(impl_->deploy_config, inputs.obs);
+    return runSingleInputModel(
+        *impl_->ort.session, inputs.obs, impl_->deploy_config.obs_dim,
+        impl_->deploy_config.joint_dim);
   } catch (const PolicyRuntimeError&) {
     throw;
   } catch (const PolicyIoContractError& err) {

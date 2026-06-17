@@ -27,6 +27,7 @@ struct MotionStatus {
   std::uint64_t sequence{0};
   std::string id;
   std::string path;
+  MotionExecutor executor{MotionExecutor::GeneralTracker};
   MotionState state{MotionState::Queued};
   std::size_t frame{0};
   std::size_t frames{0};
@@ -34,6 +35,7 @@ struct MotionStatus {
   double duration_s{0.0};
   double progress{0.0};
   bool hold{false};
+  LocoRunStatus loco;
   StopReason stop_reason{StopReason::None};
   ErrorCode err{ErrorCode::Ok};
 };
@@ -88,6 +90,7 @@ struct StatusSnapshot {
   std::string block;
   ErrorCode err{ErrorCode::Ok};
   PoseSnapshot pose;
+  LocoUpperCapability loco_upper;
 };
 
 double computeProgress(std::size_t frame, std::size_t frames, MotionState state);

@@ -10,6 +10,14 @@ struct RuntimeConfig {
   double hz{1000.0};
   double stop_hold_s{0.0};
   double transition_duration_s{0.30};
+  double loco_upper_max_hold_s{10.0};
+  double radius_tolerance_m{0.05};
+  bool loco_upper_strict_pose{false};
+  std::size_t loco_upper_pose_fresh_timeout_ms{100};
+  double loco_upper_pose_jump_reject_m{0.25};
+  double loco_upper_max_lin_accel_mps2{0.4};
+  double loco_upper_max_yaw_accel_radps2{0.5};
+  std::size_t loco_upper_smoothing_window_frames{5};
 };
 
 }  // namespace agentic_et1_tracker

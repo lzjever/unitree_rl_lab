@@ -45,6 +45,15 @@ check_exec() {
   printf 'ok exec %s\n' "$1"
 }
 
+check_not_lfs_pointer() {
+  local path="$1"
+  check_file "$path"
+  if head -n 1 "$path" | grep -q '^version https://git-lfs.github.com/spec/v1$'; then
+    die "git-lfs pointer detected: $path"
+  fi
+  printf 'ok blob %s\n' "$path"
+}
+
 check_sha256() {
   local path="$1"
   local expected="$2"
@@ -85,8 +94,32 @@ check_sha256 "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/general_t
   "de8ba00c0b79590b2ccc0a7d84fcc0db4a8869ad9111e54e46c9427b89ffaf84"
 check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/velocity/v0/exported/policy.onnx"
 check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/velocity/v0/params/deploy.yaml"
+check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/loco_lower/et1_low/README.md"
+check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/loco_lower/et1_low/ASSET_MANIFEST.yaml"
+check_contains "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/loco_lower/et1_low/ASSET_MANIFEST.yaml" \
+  "profile: LocoLowerEt1Low"
+check_contains "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/loco_lower/et1_low/ASSET_MANIFEST.yaml" \
+  "runtime_use: \"used by /execute_loco_upper lower locomotion runtime; simulation-only handoff, not true-robot GA\""
+check_not_lfs_pointer "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/loco_lower/et1_low/exported/policy.onnx"
+check_not_lfs_pointer "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/loco_lower/et1_low/params/deploy_lowobs10k.yaml"
+check_sha256 "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/loco_lower/et1_low/exported/policy.onnx" \
+  "c76686a5b952a10eded30b87673cf098d23d469f596ad6289bbc05b81bdb5203"
+check_sha256 "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/loco_lower/et1_low/params/deploy_lowobs10k.yaml" \
+  "29cab8fe979f6f8c1647c555916b250a3061664427ff62b0aac7cf09aef87aef"
 check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/posture/fixstand/v0/fixstand.yaml"
 check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/posture/passive/v0/passive.yaml"
+check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/limits/et1_upper_body/v0/README.md"
+check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/limits/et1_upper_body/v0/ASSET_MANIFEST.yaml"
+check_contains "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/limits/et1_upper_body/v0/ASSET_MANIFEST.yaml" \
+  "profile: Et1UpperBodyLimits"
+check_contains "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/limits/et1_upper_body/v0/ASSET_MANIFEST.yaml" \
+  "runtime_contract:"
+check_not_lfs_pointer "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/limits/et1_upper_body/v0/limits.yaml"
+check_not_lfs_pointer "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/limits/et1_upper_body/v0/joint_map.yaml"
+check_sha256 "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/limits/et1_upper_body/v0/limits.yaml" \
+  "d50716e222211c6ca476da70cc46cd2c386470577eb16b267c7bc9bc51d95d99"
+check_sha256 "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/limits/et1_upper_body/v0/joint_map.yaml" \
+  "f0e93b20f38352c071f09f68c01c9a907e709c4e37c01b449ac3433ce96bc0c0"
 check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/reference/standby/v0/ASSET_MANIFEST.yaml"
 check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/reference/standby/v0/README.md"
 check_sha256 "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/reference/standby/v0/standby_ref.trk" \

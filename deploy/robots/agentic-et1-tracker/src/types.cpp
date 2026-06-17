@@ -98,6 +98,76 @@ std::string toString(MotionMode mode) {
   return "queue";
 }
 
+std::string toString(MotionExecutor executor) {
+  switch (executor) {
+    case MotionExecutor::GeneralTracker:
+      return "general_tracker";
+    case MotionExecutor::LocoUpper:
+      return "loco_upper";
+  }
+  return "general_tracker";
+}
+
+std::string toString(LocoPhase phase) {
+  switch (phase) {
+    case LocoPhase::Queued:
+      return "queued";
+    case LocoPhase::Entry:
+      return "entry";
+    case LocoPhase::Motion:
+      return "motion";
+    case LocoPhase::Holding:
+      return "holding";
+    case LocoPhase::Exit:
+      return "exit";
+    case LocoPhase::Stopping:
+      return "stopping";
+    case LocoPhase::Done:
+      return "done";
+    case LocoPhase::Stopped:
+      return "stopped";
+    case LocoPhase::Failed:
+      return "failed";
+    case LocoPhase::Canceled:
+      return "canceled";
+  }
+  return "failed";
+}
+
+std::string toString(LocoReason reason) {
+  switch (reason) {
+    case LocoReason::None:
+      return "null";
+    case LocoReason::RootInvalid:
+      return "root_invalid";
+    case LocoReason::UpperLimit:
+      return "upper_limit";
+    case LocoReason::UpperDynamic:
+      return "upper_dynamic";
+    case LocoReason::RadiusLimit:
+      return "radius_limit";
+    case LocoReason::PoseMissing:
+      return "pose_missing";
+    case LocoReason::PoseJump:
+      return "pose_jump";
+    case LocoReason::PolicyNan:
+      return "policy_nan";
+    case LocoReason::PolicyInfer:
+      return "policy_infer";
+    case LocoReason::LowerLimit:
+      return "lower_limit";
+    case LocoReason::MappingInvalid:
+      return "mapping_invalid";
+    case LocoReason::HoldTimeout:
+      return "hold_timeout";
+    case LocoReason::PathError:
+      return "path_error";
+    case LocoReason::DeadlineMiss:
+      return "deadline_miss";
+  }
+  return "null";
+}
+
 std::string toString(ActiveKind kind) {
   switch (kind) {
     case ActiveKind::None:

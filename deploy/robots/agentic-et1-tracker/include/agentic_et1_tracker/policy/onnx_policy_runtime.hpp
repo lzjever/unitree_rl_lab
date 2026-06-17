@@ -4,6 +4,7 @@
 #include <memory>
 #include <stdexcept>
 
+#include "agentic_et1_tracker/loco_upper/loco_lower_policy.hpp"
 #include "agentic_et1_tracker/policy/policy_io_contract.hpp"
 #include "agentic_et1_tracker/policy/policy_step_runner.hpp"
 #include "agentic_et1_tracker/policy/velocity_policy_runner.hpp"
@@ -18,6 +19,11 @@ struct OnnxPolicyRuntimeConfig {
 struct OnnxVelocityPolicyRuntimeConfig {
   std::filesystem::path model_path;
   VelocityDeployConfig deploy_config;
+};
+
+struct OnnxLocoLowerPolicyRuntimeConfig {
+  std::filesystem::path model_path;
+  LocoLowerDeployConfig deploy_config;
 };
 
 class PolicyRuntimeError : public std::runtime_error {
@@ -51,6 +57,23 @@ class OnnxVelocityPolicyRuntime final : public VelocityPolicyInference {
   OnnxVelocityPolicyRuntime& operator=(const OnnxVelocityPolicyRuntime&) = delete;
   OnnxVelocityPolicyRuntime(OnnxVelocityPolicyRuntime&&) noexcept;
   OnnxVelocityPolicyRuntime& operator=(OnnxVelocityPolicyRuntime&&) noexcept;
+
+  Vec infer(const VelocityPolicyInputs& inputs) override;
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
+class OnnxLocoLowerPolicyRuntime final : public VelocityPolicyInference {
+ public:
+  explicit OnnxLocoLowerPolicyRuntime(OnnxLocoLowerPolicyRuntimeConfig config);
+  ~OnnxLocoLowerPolicyRuntime() override;
+
+  OnnxLocoLowerPolicyRuntime(const OnnxLocoLowerPolicyRuntime&) = delete;
+  OnnxLocoLowerPolicyRuntime& operator=(const OnnxLocoLowerPolicyRuntime&) = delete;
+  OnnxLocoLowerPolicyRuntime(OnnxLocoLowerPolicyRuntime&&) noexcept;
+  OnnxLocoLowerPolicyRuntime& operator=(OnnxLocoLowerPolicyRuntime&&) noexcept;
 
   Vec infer(const VelocityPolicyInputs& inputs) override;
 

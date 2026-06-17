@@ -3,10 +3,14 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <string>
 
 #include "agentic_et1_tracker/app/app_runtime_factory.hpp"
+#include "agentic_et1_tracker/policy/deploy_config.hpp"
+#include "agentic_et1_tracker/policy/policy_step_runner.hpp"
+#include "agentic_et1_tracker/policy/velocity_policy_runner.hpp"
 
 #ifndef AGENTIC_ET1_TRACKER_REAL_FACTORY
 #define AGENTIC_ET1_TRACKER_REAL_FACTORY 0
@@ -19,6 +23,7 @@ TrkValidationConfig internalStandbyTrkValidationConfig(
     const AppConfig& config,
     const std::filesystem::path& standby_reference);
 bool referencesEt1RuntimeDependency(const std::filesystem::path& path);
+void tryAttachLocoUpperDeps(const AppConfig& config, AppRuntimeDeps& deps);
 
 }  // namespace app_internal
 namespace {
@@ -219,6 +224,82 @@ void writeMinimalGaOnnx(const std::filesystem::path& path) {
   std::ofstream out(path, std::ios::binary);
   REQUIRE(out);
   out.write(reinterpret_cast<const char*>(kModel), sizeof(kModel));
+}
+
+void writeMinimalLocoLowerOnnx(const std::filesystem::path& path) {
+  static constexpr unsigned char kModel[] = {
+      0x08, 0x08, 0x12, 0x11, 0x61, 0x67, 0x65, 0x6e, 0x74, 0x69, 0x63, 0x5f,
+      0x65, 0x74, 0x31, 0x5f, 0x74, 0x65, 0x73, 0x74, 0x73, 0x3a, 0xad, 0x01,
+      0x0a, 0x60, 0x12, 0x07, 0x61, 0x63, 0x74, 0x69, 0x6f, 0x6e, 0x73, 0x22,
+      0x08, 0x43, 0x6f, 0x6e, 0x73, 0x74, 0x61, 0x6e, 0x74, 0x2a, 0x4b, 0x0a,
+      0x05, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x2a, 0x3f, 0x08, 0x01, 0x08, 0x0c,
+      0x10, 0x01, 0x22, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x42, 0x05, 0x76, 0x61, 0x6c, 0x75, 0x65, 0xa0,
+      0x01, 0x04, 0x12, 0x17, 0x61, 0x67, 0x65, 0x6e, 0x74, 0x69, 0x63, 0x5f,
+      0x65, 0x74, 0x31, 0x5f, 0x74, 0x65, 0x73, 0x74, 0x5f, 0x70, 0x6f, 0x6c,
+      0x69, 0x63, 0x79, 0x5a, 0x15, 0x0a, 0x03, 0x6f, 0x62, 0x73, 0x12, 0x0e,
+      0x0a, 0x0c, 0x08, 0x01, 0x12, 0x08, 0x0a, 0x02, 0x08, 0x01, 0x0a, 0x02,
+      0x08, 0x2d, 0x62, 0x19, 0x0a, 0x07, 0x61, 0x63, 0x74, 0x69, 0x6f, 0x6e,
+      0x73, 0x12, 0x0e, 0x0a, 0x0c, 0x08, 0x01, 0x12, 0x08, 0x0a, 0x02, 0x08,
+      0x01, 0x0a, 0x02, 0x08, 0x0c, 0x42, 0x04, 0x0a, 0x00, 0x10, 0x0d};
+  std::ofstream out(path, std::ios::binary);
+  REQUIRE(out);
+  out.write(reinterpret_cast<const char*>(kModel), sizeof(kModel));
+}
+
+void writeWrongLocoLowerInputShapeOnnx(const std::filesystem::path& path) {
+  static constexpr unsigned char kModel[] = {
+      0x08, 0x08, 0x12, 0x11, 0x61, 0x67, 0x65, 0x6e, 0x74, 0x69, 0x63, 0x5f,
+      0x65, 0x74, 0x31, 0x5f, 0x74, 0x65, 0x73, 0x74, 0x73, 0x3a, 0xad, 0x01,
+      0x0a, 0x60, 0x12, 0x07, 0x61, 0x63, 0x74, 0x69, 0x6f, 0x6e, 0x73, 0x22,
+      0x08, 0x43, 0x6f, 0x6e, 0x73, 0x74, 0x61, 0x6e, 0x74, 0x2a, 0x4b, 0x0a,
+      0x05, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x2a, 0x3f, 0x08, 0x01, 0x08, 0x0c,
+      0x10, 0x01, 0x22, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x42, 0x05, 0x76, 0x61, 0x6c, 0x75, 0x65, 0xa0,
+      0x01, 0x04, 0x12, 0x17, 0x61, 0x67, 0x65, 0x6e, 0x74, 0x69, 0x63, 0x5f,
+      0x65, 0x74, 0x31, 0x5f, 0x74, 0x65, 0x73, 0x74, 0x5f, 0x70, 0x6f, 0x6c,
+      0x69, 0x63, 0x79, 0x5a, 0x15, 0x0a, 0x03, 0x6f, 0x62, 0x73, 0x12, 0x0e,
+      0x0a, 0x0c, 0x08, 0x01, 0x12, 0x08, 0x0a, 0x02, 0x08, 0x01, 0x0a, 0x02,
+      0x08, 0x2e, 0x62, 0x19, 0x0a, 0x07, 0x61, 0x63, 0x74, 0x69, 0x6f, 0x6e,
+      0x73, 0x12, 0x0e, 0x0a, 0x0c, 0x08, 0x01, 0x12, 0x08, 0x0a, 0x02, 0x08,
+      0x01, 0x0a, 0x02, 0x08, 0x0c, 0x42, 0x04, 0x0a, 0x00, 0x10, 0x0d};
+  std::ofstream out(path, std::ios::binary);
+  REQUIRE(out);
+  out.write(reinterpret_cast<const char*>(kModel), sizeof(kModel));
+}
+
+class DummyRobotIO final : public RobotIO {
+ public:
+  std::optional<LowStateSample> readLowState() const override { return std::nullopt; }
+  std::optional<HighStateSample> readHighState() const override { return std::nullopt; }
+  LowCmdOccupancy lowCmdOccupancy() const override { return {}; }
+  void writeLowCmd(const LowCmdFrame&) override {}
+};
+
+class DummyPolicy final : public PolicyInference {
+ public:
+  Vec infer(const PolicyInputs&) override { return {}; }
+};
+
+class DummyVelocityPolicy final : public VelocityPolicyInference {
+ public:
+  Vec infer(const VelocityPolicyInputs&) override { return {}; }
+};
+
+AppRuntimeDeps baseDepsForLocoAttach() {
+  AppRuntimeDeps deps;
+  deps.robot_io = std::make_unique<DummyRobotIO>();
+  deps.policy = std::make_unique<DummyPolicy>();
+  deps.velocity_policy = std::make_unique<DummyVelocityPolicy>();
+  deps.deploy_config = loadDeployConfig(
+      appRoot() / "config/policy/general_tracker_cln/params/deploy_fut_multi_footstate.yaml");
+  return deps;
 }
 
 void requireModelNotReady(const AppRuntimeFactoryResult& result) {
@@ -487,6 +568,157 @@ TEST_CASE("AppRuntimeFactory releases Unitree motion mode only for real mode_mac
   config.mode_machine = 1;
   config.release_motion_mode_on_startup = false;
   REQUIRE_FALSE(shouldReleaseMotionModeOnStartup(config));
+}
+
+TEST_CASE("AppRuntimeFactory loco attach keeps failures isolated from base deps") {
+#if AGENTIC_ET1_TRACKER_REAL_FACTORY
+  TempTree tmp;
+  AppConfig config = realFactoryConfigWithRepoAssets();
+  config.loco_upper.enabled = true;
+  config.loco_upper.policy_dir = tmp.policy_dir.string();
+  config.loco_upper.policy_file = "loco.onnx";
+  config.loco_upper.deploy =
+      (appRoot() / "config/policy/loco_lower/et1_low/params/deploy_lowobs10k.yaml").string();
+  config.loco_upper.limits =
+      (appRoot() / "config/limits/et1_upper_body/v0/limits.yaml").string();
+  config.loco_upper.joint_map =
+      (appRoot() / "config/limits/et1_upper_body/v0/joint_map.yaml").string();
+
+  SECTION("valid app-owned assets attach all loco deps") {
+    writeMinimalLocoLowerOnnx(tmp.exported_dir / config.loco_upper.policy_file);
+    AppRuntimeDeps deps = baseDepsForLocoAttach();
+
+    app_internal::tryAttachLocoUpperDeps(config, deps);
+
+    REQUIRE(deps.loco_lower_policy);
+    REQUIRE(deps.loco_lower_deploy_config.has_value());
+    REQUIRE(deps.loco_upper_composer_config.has_value());
+  }
+
+  SECTION("bad model path keeps baseline deps untouched") {
+    AppRuntimeDeps deps = baseDepsForLocoAttach();
+    RobotIO* const robot = deps.robot_io.get();
+    PolicyInference* const policy = deps.policy.get();
+    VelocityPolicyInference* const velocity_policy = deps.velocity_policy.get();
+
+    app_internal::tryAttachLocoUpperDeps(config, deps);
+
+    REQUIRE_FALSE(deps.loco_lower_policy);
+    REQUIRE_FALSE(deps.loco_lower_deploy_config.has_value());
+    REQUIRE_FALSE(deps.loco_upper_composer_config.has_value());
+    REQUIRE(deps.robot_io.get() == robot);
+    REQUIRE(deps.policy.get() == policy);
+    REQUIRE(deps.velocity_policy.get() == velocity_policy);
+  }
+
+  SECTION("bad lower policy IO contract keeps baseline deps untouched") {
+    writeWrongLocoLowerInputShapeOnnx(tmp.exported_dir / config.loco_upper.policy_file);
+    AppRuntimeDeps deps = baseDepsForLocoAttach();
+    RobotIO* const robot = deps.robot_io.get();
+    PolicyInference* const policy = deps.policy.get();
+    VelocityPolicyInference* const velocity_policy = deps.velocity_policy.get();
+
+    app_internal::tryAttachLocoUpperDeps(config, deps);
+
+    REQUIRE_FALSE(deps.loco_lower_policy);
+    REQUIRE_FALSE(deps.loco_lower_deploy_config.has_value());
+    REQUIRE_FALSE(deps.loco_upper_composer_config.has_value());
+    REQUIRE(deps.robot_io.get() == robot);
+    REQUIRE(deps.policy.get() == policy);
+    REQUIRE(deps.velocity_policy.get() == velocity_policy);
+  }
+
+  SECTION("bad upper limits keep baseline deps untouched") {
+    writeMinimalLocoLowerOnnx(tmp.exported_dir / config.loco_upper.policy_file);
+    config.loco_upper.limits = (tmp.root / "missing_limits.yaml").string();
+    AppRuntimeDeps deps = baseDepsForLocoAttach();
+    RobotIO* const robot = deps.robot_io.get();
+    PolicyInference* const policy = deps.policy.get();
+    VelocityPolicyInference* const velocity_policy = deps.velocity_policy.get();
+
+    app_internal::tryAttachLocoUpperDeps(config, deps);
+
+    REQUIRE_FALSE(deps.loco_lower_policy);
+    REQUIRE_FALSE(deps.loco_lower_deploy_config.has_value());
+    REQUIRE_FALSE(deps.loco_upper_composer_config.has_value());
+    REQUIRE(deps.robot_io.get() == robot);
+    REQUIRE(deps.policy.get() == policy);
+    REQUIRE(deps.velocity_policy.get() == velocity_policy);
+  }
+#else
+  SUCCEED("real factory is not compiled in this build");
+#endif
+}
+
+TEST_CASE("AppRuntimeFactory enabled loco_upper asset failures surface as model-not-ready") {
+#if AGENTIC_ET1_TRACKER_REAL_FACTORY
+  TempTree tmp;
+  AppConfig config = realFactoryConfigWithRepoAssets();
+  config.loco_upper.enabled = true;
+  config.loco_upper.policy_dir = tmp.policy_dir.string();
+  config.loco_upper.policy_file = "loco.onnx";
+  config.loco_upper.deploy =
+      (appRoot() / "config/policy/loco_lower/et1_low/params/deploy_lowobs10k.yaml").string();
+  config.loco_upper.limits =
+      (appRoot() / "config/limits/et1_upper_body/v0/limits.yaml").string();
+  config.loco_upper.joint_map =
+      (appRoot() / "config/limits/et1_upper_body/v0/joint_map.yaml").string();
+
+  SECTION("missing lower model fails startup") {
+    const AppRuntimeFactoryResult result = createAppRuntimeDeps(config);
+
+    requireModelNotReady(result);
+    requireMode(result, RuntimeMode::Sim);
+  }
+
+  SECTION("bad lower policy IO contract fails startup") {
+    writeWrongLocoLowerInputShapeOnnx(tmp.exported_dir / config.loco_upper.policy_file);
+
+    const AppRuntimeFactoryResult result = createAppRuntimeDeps(config);
+
+    requireModelNotReady(result);
+    requireMode(result, RuntimeMode::Sim);
+  }
+
+  SECTION("missing upper limits fail startup") {
+    writeMinimalLocoLowerOnnx(tmp.exported_dir / config.loco_upper.policy_file);
+    config.loco_upper.limits = (tmp.root / "missing_limits.yaml").string();
+
+    const AppRuntimeFactoryResult result = createAppRuntimeDeps(config);
+
+    requireModelNotReady(result);
+    requireMode(result, RuntimeMode::Sim);
+  }
+#else
+  SUCCEED("real factory is not compiled in this build");
+#endif
+}
+
+TEST_CASE("AppRuntimeFactory loco attach skips disabled config without touching bogus assets") {
+#if AGENTIC_ET1_TRACKER_REAL_FACTORY
+  AppConfig config = realFactoryConfigWithRepoAssets();
+  config.loco_upper.enabled = false;
+  config.loco_upper.policy_dir = "/tmp/does-not-exist/policy";
+  config.loco_upper.policy_file = "missing.onnx";
+  config.loco_upper.deploy = "/tmp/does-not-exist/deploy.yaml";
+  config.loco_upper.limits = "/tmp/does-not-exist/limits.yaml";
+  config.loco_upper.joint_map = "/tmp/does-not-exist/joint_map.yaml";
+  AppRuntimeDeps deps = baseDepsForLocoAttach();
+  RobotIO* const robot = deps.robot_io.get();
+  PolicyInference* const policy = deps.policy.get();
+  VelocityPolicyInference* const velocity_policy = deps.velocity_policy.get();
+
+  app_internal::tryAttachLocoUpperDeps(config, deps);
+
+  REQUIRE_FALSE(deps.loco_lower_policy);
+  REQUIRE_FALSE(deps.loco_lower_deploy_config.has_value());
+  REQUIRE_FALSE(deps.loco_upper_composer_config.has_value());
+  REQUIRE(deps.robot_io.get() == robot);
+  REQUIRE(deps.policy.get() == policy);
+  REQUIRE(deps.velocity_policy.get() == velocity_policy);
+#else
+  SUCCEED("real factory is not compiled in this build");
+#endif
 }
 
 }  // namespace agentic_et1_tracker

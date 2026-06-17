@@ -7,11 +7,45 @@ nlohmann::json nullableString(const std::string& value) {
   return value.empty() ? nlohmann::json(nullptr) : nlohmann::json(value);
 }
 
+nlohmann::json nullableLocoReason(LocoReason reason) {
+  return reason == LocoReason::None ? nlohmann::json(nullptr)
+                                    : nlohmann::json(toString(reason));
+}
+
 ErrorCode publicErrorCode(ErrorCode code) {
   if (code == ErrorCode::RunStateConflict) {
     return ErrorCode::InternalError;
   }
   return code;
+}
+
+nlohmann::json locoRunStatusJson(const LocoRunStatus& status) {
+  return {
+      {"max_radius_m", status.max_radius_m},
+      {"distance_m", status.distance_m},
+      {"radius_source", nullableString(status.radius_source)},
+      {"phase", toString(status.phase)},
+      {"radius_clamped", status.radius_clamped},
+      {"radius_limit_reached", status.radius_limit_reached},
+      {"envelope_clamped", status.envelope_clamped},
+      {"raw_action_clamped", status.raw_action_clamped},
+      {"lower_q_limited", status.lower_q_limited},
+      {"lower_action_clamped", status.lower_action_clamped},
+      {"reason", nullableLocoReason(status.reason)},
+  };
+}
+
+nlohmann::json locoUpperCapabilityJson(LocoUpperCapability capability) {
+  if (!capability.enabled) {
+    capability.ready = false;
+  }
+  return {
+      {"enabled", capability.enabled},
+      {"ready", capability.ready},
+      {"default_radius_m", capability.default_radius_m},
+      {"max_radius_m", capability.max_radius_m},
+      {"strict_pose", capability.strict_pose},
+  };
 }
 
 }  // namespace
@@ -67,6 +101,10 @@ nlohmann::json motionStatusJson(const MotionStatus& status, bool include_path) {
   };
   if (include_path) {
     out["path"] = status.path;
+  }
+  if (status.executor == MotionExecutor::LocoUpper) {
+    out["executor"] = toString(status.executor);
+    out["loco"] = locoRunStatusJson(status.loco);
   }
   return out;
 }
@@ -163,6 +201,7 @@ nlohmann::json statusSnapshotJson(const StatusSnapshot& snapshot) {
       {"block", nullableString(snapshot.block)},
       {"err", nullableErrorJson(snapshot.err)},
       {"pose", poseSnapshotJson(snapshot.pose)},
+      {"cap", {{"loco_upper", locoUpperCapabilityJson(snapshot.loco_upper)}}},
   };
 }
 

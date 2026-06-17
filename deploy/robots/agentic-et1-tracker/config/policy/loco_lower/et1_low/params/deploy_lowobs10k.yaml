@@ -1,0 +1,278 @@
+policy_path: exported/policy.onnx
+step_dt: 0.02
+policy_decimation: 10
+joint_names:
+- left_hip_pitch_joint
+- left_hip_roll_joint
+- left_hip_yaw_joint
+- left_knee_joint
+- left_ankle_pitch_joint
+- left_ankle_roll_joint
+- right_hip_pitch_joint
+- right_hip_roll_joint
+- right_hip_yaw_joint
+- right_knee_joint
+- right_ankle_pitch_joint
+- right_ankle_roll_joint
+
+joint_ids_map:
+- 0
+- 1
+- 2
+- 3
+- 4
+- 5
+- 6
+- 7
+- 8
+- 9
+- 10
+- 11
+
+sdk_joint_ids_map:
+- 0
+- 1
+- 2
+- 3
+- 4
+- 5
+- 6
+- 7
+- 8
+- 9
+- 10
+- 11
+
+stiffness:
+- 80.0
+- 80.0
+- 80.0
+- 80.0
+- 40.0
+- 40.0
+- 80.0
+- 80.0
+- 80.0
+- 80.0
+- 40.0
+- 40.0
+
+damping:
+- 5.0
+- 5.0
+- 5.0
+- 5.0
+- 3.0
+- 3.0
+- 5.0
+- 5.0
+- 5.0
+- 5.0
+- 3.0
+- 3.0
+
+default_joint_pos:
+- -0.5799999833106995
+- 0.054042741656303406
+- 0.0
+- 0.75
+- -0.2800000011920929
+- 0.0
+- -0.5799999833106995
+- -0.054042741656303406
+- 0.0
+- 0.75
+- -0.2800000011920929
+- 0.0
+
+joint_min_q:
+- -2.35
+- -0.9
+- -1.2
+- -0.1
+- -1.1
+- -0.6
+- -2.35
+- -0.9
+- -1.2
+- -0.1
+- -1.1
+- -0.6
+
+joint_max_q:
+- 1.2
+- 0.9
+- 1.2
+- 2.4
+- 1.1
+- 0.6
+- 1.2
+- 0.9
+- 1.2
+- 2.4
+- 1.1
+- 0.6
+
+commands:
+  base_velocity:
+    ranges:
+      lin_vel_x:
+      - -0.5
+      - 1.0
+      lin_vel_y:
+      - -0.3
+      - 0.3
+      ang_vel_z:
+      - -0.2
+      - 0.2
+      heading: null
+actions:
+  JointPositionAction:
+    clip: null
+    joint_names:
+    - .*
+    scale:
+    - 0.1875
+    - 0.1875
+    - 0.1875
+    - 0.1875
+    - 0.3125
+    - 0.3125
+    - 0.1875
+    - 0.1875
+    - 0.1875
+    - 0.1875
+    - 0.3125
+    - 0.3125
+    offset:
+    - -0.5799999833106995
+    - 0.054042741656303406
+    - 0.0
+    - 0.75
+    - -0.2800000011920929
+    - 0.0
+    - -0.5799999833106995
+    - -0.054042741656303406
+    - 0.0
+    - 0.75
+    - -0.2800000011920929
+    - 0.0
+    joint_ids:
+    - 0
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    - 8
+    - 9
+    - 10
+    - 11
+observations:
+  obs:
+    base_ang_vel:
+      params: {}
+      clip: null
+      scale:
+      - 1.0
+      - 1.0
+      - 1.0
+      history_length: 1
+    projected_gravity:
+      params: {}
+      clip: null
+      scale:
+      - 1.0
+      - 1.0
+      - 1.0
+      history_length: 1
+    keyboard_velocity_commands:
+      params:
+        command_name: base_velocity
+      clip: null
+      scale:
+      - 1.0
+      - 1.0
+      - 1.0
+      history_length: 1
+    joint_pos_rel:
+      params:
+        asset_cfg:
+          joint_ids:
+          - 0
+          - 1
+          - 2
+          - 3
+          - 4
+          - 5
+          - 6
+          - 7
+          - 8
+          - 9
+          - 10
+          - 11
+      clip: null
+      scale:
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      history_length: 1
+    joint_vel_rel:
+      params:
+        asset_cfg:
+          joint_ids:
+          - 0
+          - 1
+          - 2
+          - 3
+          - 4
+          - 5
+          - 6
+          - 7
+          - 8
+          - 9
+          - 10
+          - 11
+      clip: null
+      scale:
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      history_length: 1
+    last_action:
+      params: {}
+      clip: null
+      scale:
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      history_length: 1

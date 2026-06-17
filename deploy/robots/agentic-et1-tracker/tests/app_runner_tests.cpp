@@ -25,6 +25,9 @@
 #include "agentic_et1_tracker/app/app_runtime_factory.hpp"
 #include "agentic_et1_tracker/app/app_runner.hpp"
 #include "agentic_et1_tracker/core/types.hpp"
+#include "agentic_et1_tracker/loco_upper/lowcmd_composer.hpp"
+#include "agentic_et1_tracker/loco_upper/loco_lower_policy.hpp"
+#include "agentic_et1_tracker/loco_upper/validator.hpp"
 #include "agentic_et1_tracker/policy/policy_io_contract.hpp"
 #include "agentic_et1_tracker/trk/schema.hpp"
 
@@ -222,6 +225,63 @@ std::filesystem::path validTrk(const std::filesystem::path& dir,
   return path;
 }
 
+void writeFloatArray(std::ofstream& out,
+                     const char* name,
+                     const std::vector<std::uint64_t>& shape,
+                     const std::vector<float>& values) {
+  writeScalar(out, static_cast<std::uint32_t>(std::char_traits<char>::length(name)));
+  out.write(name, static_cast<std::streamsize>(std::char_traits<char>::length(name)));
+  writeScalar(out, static_cast<std::uint32_t>(TrkDtype::Float32));
+  writeScalar(out, static_cast<std::uint32_t>(shape.size()));
+  for (const auto dim : shape) {
+    writeScalar(out, static_cast<std::uint32_t>(dim));
+  }
+  writeScalar(out, values.size() * sizeof(float));
+  out.write(reinterpret_cast<const char*>(values.data()),
+            static_cast<std::streamsize>(values.size() * sizeof(float)));
+}
+
+void writeContactArray(std::ofstream& out,
+                       const char* name,
+                       const std::vector<std::uint64_t>& shape,
+                       const std::vector<std::int64_t>& values) {
+  writeScalar(out, static_cast<std::uint32_t>(std::char_traits<char>::length(name)));
+  out.write(name, static_cast<std::streamsize>(std::char_traits<char>::length(name)));
+  writeScalar(out, static_cast<std::uint32_t>(TrkDtype::Int64));
+  writeScalar(out, static_cast<std::uint32_t>(shape.size()));
+  for (const auto dim : shape) {
+    writeScalar(out, static_cast<std::uint32_t>(dim));
+  }
+  writeScalar(out, values.size() * sizeof(std::int64_t));
+  out.write(reinterpret_cast<const char*>(values.data()),
+            static_cast<std::streamsize>(values.size() * sizeof(std::int64_t)));
+}
+
+void writeTrack(const std::filesystem::path& path, const TrkTrack& track) {
+  std::ofstream out(path, std::ios::binary);
+  REQUIRE(out);
+  out.write(TrkSchema::kMagic.data(), static_cast<std::streamsize>(TrkSchema::kMagic.size()));
+  writeScalar(out, TrkSchema::kVersion);
+  writeScalar(out, static_cast<std::uint32_t>(TrkSchema::kRequiredArrays.size()));
+
+  writeFloatArray(out, "joint_pos", track.joint_pos.shape, track.joint_pos.values);
+  writeFloatArray(out, "joint_vel", track.joint_vel.shape, track.joint_vel.values);
+  writeFloatArray(out, "body_pos_w", track.body_pos_w.shape, track.body_pos_w.values);
+  writeFloatArray(out, "body_quat_w", track.body_quat_w.shape, track.body_quat_w.values);
+  writeFloatArray(out, "body_lin_vel_w", track.body_lin_vel_w.shape, track.body_lin_vel_w.values);
+  writeFloatArray(out, "body_ang_vel_w", track.body_ang_vel_w.shape, track.body_ang_vel_w.values);
+  writeContactArray(out,
+                    "left_foot_contact_state",
+                    track.left_foot_contact_state.shape,
+                    track.left_foot_contact_state.values);
+  writeContactArray(out,
+                    "right_foot_contact_state",
+                    track.right_foot_contact_state.shape,
+                    track.right_foot_contact_state.values);
+  writeFloatArray(out, "ref_com_rel_navi", track.ref_com_rel_navi.shape, track.ref_com_rel_navi.values);
+  writeFloatArray(out, "ref_com_vel_navi", track.ref_com_vel_navi.shape, track.ref_com_vel_navi.values);
+}
+
 std::vector<float> floatSeq(float start, std::size_t count) {
   std::vector<float> values;
   values.reserve(count);
@@ -314,6 +374,22 @@ TrkTrack inMemoryTrack(std::size_t frames) {
     track.right_foot_contact_state.values.at(frame) = 2;
   }
   return track;
+}
+
+std::filesystem::path writeLocoUpperTrack(const std::filesystem::path& dir,
+                                          const std::string& name,
+                                          std::size_t frames) {
+  const auto path = dir / name;
+  writeTrack(path, inMemoryTrack(frames));
+  return path;
+}
+
+void configureLocoUpperAppPaths(AppConfig& config) {
+  const auto root = appRoot();
+  config.loco_upper.limits =
+      (root / "config/limits/et1_upper_body/v0/limits.yaml").string();
+  config.loco_upper.joint_map =
+      (root / "config/limits/et1_upper_body/v0/joint_map.yaml").string();
 }
 
 DeployConfig deployConfig() {
@@ -436,6 +512,16 @@ class FakeVelocityPolicy final : public VelocityPolicyInference {
   std::atomic<int> calls{0};
 };
 
+class FakeLocoLowerPolicy final : public VelocityPolicyInference {
+ public:
+  Vec infer(const VelocityPolicyInputs&) override {
+    ++calls;
+    return Vec(kLocoLowerPolicyJointDim, 0.0F);
+  }
+
+  std::atomic<int> calls{0};
+};
+
 VelocityDeployConfig velocityDeployConfig() {
   VelocityDeployConfig config;
   config.joint_dim = kVelocityPolicyJointDim;
@@ -479,24 +565,91 @@ PassiveConfig passiveConfig() {
   return config;
 }
 
+LocoLowerDeployConfig locoLowerDeployConfig() {
+  LocoLowerDeployConfig config;
+  config.joint_dim = kLocoLowerPolicyJointDim;
+  config.joint_ids_map = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+  config.sdk_joint_ids_map = config.joint_ids_map;
+  config.stiffness = std::vector<double>(kLocoLowerPolicyJointDim, 20.0);
+  config.damping = std::vector<double>(kLocoLowerPolicyJointDim, 0.5);
+  config.default_joint_pos = std::vector<double>(kLocoLowerPolicyJointDim, 0.0);
+  config.joint_min_q = std::vector<double>(kLocoLowerPolicyJointDim, -1000.0);
+  config.joint_max_q = std::vector<double>(kLocoLowerPolicyJointDim, 1000.0);
+  config.action_scale = std::vector<double>(kLocoLowerPolicyJointDim, 0.25);
+  config.action_offset = std::vector<double>(kLocoLowerPolicyJointDim, 0.0);
+  config.observation_terms = {
+      {"base_ang_vel", 3, 0, {0.2, 0.2, 0.2}},
+      {"projected_gravity", 3, 3, {1.0, 1.0, 1.0}},
+      {"keyboard_velocity_commands", 3, 6, {1.0, 1.0, 1.0}},
+      {"joint_pos_rel", kLocoLowerPolicyJointDim, 9,
+       std::vector<double>(kLocoLowerPolicyJointDim, 1.0)},
+      {"joint_vel_rel", kLocoLowerPolicyJointDim, 21,
+       std::vector<double>(kLocoLowerPolicyJointDim, 0.05)},
+      {"last_action", kLocoLowerPolicyJointDim, 33,
+       std::vector<double>(kLocoLowerPolicyJointDim, 1.0)},
+  };
+  config.obs_row_width = kLocoLowerPolicyObsRowWidth;
+  config.obs_history_length = kLocoLowerPolicyHistoryLength;
+  config.obs_dim = kLocoLowerPolicyObsDim;
+  config.policy_decimation = 10;
+  config.step_dt = 0.02;
+  config.command_ranges.lin_vel_x = {-0.5, 0.5};
+  config.command_ranges.lin_vel_y = {-0.5, 0.5};
+  config.command_ranges.ang_vel_z = {-0.5, 0.5};
+  return config;
+}
+
+LocoUpperLowCmdComposerConfig locoUpperComposerConfig() {
+  LocoUpperLowCmdComposerConfig config;
+  config.logical_to_sdk = frozenSdkMap();
+  config.upper_kp.assign(kPolicyJointDim, 0.0F);
+  config.upper_kd.assign(kPolicyJointDim, 0.0F);
+  config.lower_min_q.assign(kLocoLowerPolicyJointDim, -1000.0F);
+  config.lower_max_q.assign(kLocoLowerPolicyJointDim, 1000.0F);
+  config.upper_min_q.assign(kPolicyJointDim, -10.0F);
+  config.upper_max_q.assign(kPolicyJointDim, 10.0F);
+  config.upper_max_vel_radps.assign(kPolicyJointDim, 0.0F);
+  config.upper_max_accel_radps2.assign(kPolicyJointDim, 0.0F);
+  for (std::size_t logical = 12; logical < kPolicyJointDim; ++logical) {
+    config.upper_kp.at(logical) = 40.0F;
+    config.upper_kd.at(logical) = 1.0F;
+    config.upper_min_q.at(logical) = -2.0F;
+    config.upper_max_q.at(logical) = 2.0F;
+    config.upper_max_vel_radps.at(logical) = 4.0F;
+    config.upper_max_accel_radps2.at(logical) = 20.0F;
+  }
+  config.expected_mode_machine = kExpectedModeMachine;
+  return config;
+}
+
 AppRuntimeDeps makeDeps(FakeRobotIO*& robot,
                         FakePolicy*& policy,
                         std::uint8_t mode_machine = kExpectedModeMachine,
                         RuntimeMode mode = RuntimeMode::Sim,
                         std::shared_ptr<std::atomic<int>> robot_destroy_counter = nullptr,
-                        std::shared_ptr<std::atomic<int>> policy_destroy_counter = nullptr) {
+                        std::shared_ptr<std::atomic<int>> policy_destroy_counter = nullptr,
+                        bool with_loco_upper = false,
+                        FakeVelocityPolicy** velocity_policy = nullptr,
+                        FakeLocoLowerPolicy** loco_lower_policy = nullptr) {
   const DeployConfig config = deployConfig();
   auto robot_owner =
       std::make_unique<FakeRobotIO>(readyLowState(config, mode_machine),
                                     std::move(robot_destroy_counter));
   auto policy_owner = std::make_unique<FakePolicy>(std::move(policy_destroy_counter));
+  auto velocity_owner = std::make_unique<FakeVelocityPolicy>();
   robot = robot_owner.get();
   policy = policy_owner.get();
+  if (velocity_policy != nullptr) {
+    *velocity_policy = velocity_owner.get();
+  }
+  if (loco_lower_policy != nullptr) {
+    *loco_lower_policy = nullptr;
+  }
 
   AppRuntimeDeps deps;
   deps.robot_io = std::move(robot_owner);
   deps.policy = std::move(policy_owner);
-  deps.velocity_policy = std::make_unique<FakeVelocityPolicy>();
+  deps.velocity_policy = std::move(velocity_owner);
   deps.deploy_config = config;
   deps.velocity_deploy_config = velocityDeployConfig();
   deps.fixstand_config = fixStandConfig();
@@ -504,6 +657,15 @@ AppRuntimeDeps makeDeps(FakeRobotIO*& robot,
   deps.startup_control = ControlMode::FixStand;
   deps.mode = mode;
   deps.standby_track = std::make_shared<TrkTrack>(inMemoryTrack(2));
+  if (with_loco_upper) {
+    auto loco_lower_owner = std::make_unique<FakeLocoLowerPolicy>();
+    if (loco_lower_policy != nullptr) {
+      *loco_lower_policy = loco_lower_owner.get();
+    }
+    deps.loco_lower_policy = std::move(loco_lower_owner);
+    deps.loco_lower_deploy_config = locoLowerDeployConfig();
+    deps.loco_upper_composer_config = locoUpperComposerConfig();
+  }
   return deps;
 }
 
@@ -526,6 +688,22 @@ class RunningApp {
 
 nlohmann::json body(const httplib::Result& result, int status) {
   return RunningApp::body(result, status);
+}
+
+void requireLocoUpperCapability(const nlohmann::json& body,
+                                bool enabled,
+                                bool ready,
+                                double default_radius_m,
+                                double max_radius_m,
+                                bool strict_pose) {
+  REQUIRE(body.contains("cap"));
+  REQUIRE(body.at("cap").contains("loco_upper"));
+  const auto& cap = body.at("cap").at("loco_upper");
+  REQUIRE(cap.at("enabled") == enabled);
+  REQUIRE(cap.at("ready") == ready);
+  REQUIRE(cap.at("default_radius_m") == default_radius_m);
+  REQUIRE(cap.at("max_radius_m") == max_radius_m);
+  REQUIRE(cap.at("strict_pose") == strict_pose);
 }
 
 template <typename Predicate>
@@ -564,6 +742,38 @@ TEST_CASE("Default AppRunner starts HTTP as not-ready until policy runtime is at
 
   const auto hidden = RunningApp::body(client.Get("/_sim/reference_frame"), 404);
   REQUIRE(hidden.at("ok") == false);
+}
+
+TEST_CASE("AppRunner exposes configured loco_upper as enabled but not runtime-ready") {
+  auto config = productionTestConfig();
+  config.loco_upper.enabled = true;
+  config.loco_upper.default_radius_m = 0.7;
+  config.loco_upper.max_radius_m = 1.5;
+  config.loco_upper.strict_pose = true;
+
+  AppRunner runner(config);
+  REQUIRE(runner.start());
+  auto client = httplib::Client("127.0.0.1", runner.boundPort());
+
+  const auto status = body(client.Get("/status"), 200);
+  REQUIRE(status.at("ready") == false);
+  REQUIRE(status.at("err").at("code") == "MODEL_NOT_READY");
+  requireLocoUpperCapability(status, true, false, 0.7, 1.5, true);
+
+  const auto health = body(client.Get("/health"), 200);
+  REQUIRE(health.at("ok") == false);
+  REQUIRE(health.at("state") == "starting");
+  requireLocoUpperCapability(health, true, false, 0.7, 1.5, true);
+
+  const auto loco = body(client.Post("/execute_loco_upper",
+                                    R"({"path":"/tmp/a.trk"})",
+                                    "application/json"),
+                         503);
+  REQUIRE(loco.at("error").at("code") == "MODEL_NOT_READY");
+  REQUIRE(loco.at("error").at("message") == "policy model is not ready");
+  REQUIRE(loco.at("next") == "status");
+
+  runner.stop();
 }
 
 TEST_CASE("AppRunner enables hidden reference endpoint only for sim config") {
@@ -841,6 +1051,243 @@ TEST_CASE("HTTP execute reaches RuntimeControlLoop policy write") {
           kClnFootstatePolicyObsHistoryLength * kClnFootstatePolicyObsHistoryWidth);
   REQUIRE(robot->write_low_cmd_calls.load() >= 1);
   REQUIRE(robot->last_mode_machine.load() == config.mode_machine);
+
+  runner.stop();
+}
+
+TEST_CASE("HTTP execute keeps baseline behavior when loco_upper is enabled but unused") {
+  TempTree tmp;
+  FakeRobotIO* robot = nullptr;
+  FakePolicy* policy = nullptr;
+  auto config = productionTestConfig(tmp);
+  config.loco_upper.enabled = true;
+  const auto path = validTrk(tmp.allowed, "policy_http_loco_unused.trk", 3);
+  AppRunner runner(config, makeDeps(robot, policy));
+  REQUIRE(runner.start());
+  auto client = httplib::Client("127.0.0.1", runner.boundPort());
+
+  const auto status = pollJson(client, "/status", [](const nlohmann::json& json) {
+    return json.at("ready") == true;
+  });
+  REQUIRE(status.at("ready") == true);
+  requireLocoUpperCapability(status, true, false, 0.8, 2.0, false);
+
+  body(client.Post("/standby_velocity", "", "application/json"), 200);
+  pollJson(client, "/status", [](const nlohmann::json& json) {
+    return json.at("ctrl") == "standby_velocity";
+  });
+
+  const auto execute =
+      body(client.Post("/execute",
+                       (std::string(R"({"path":")") + path.string() + R"("})").c_str(),
+                       "application/json"),
+           200);
+  const std::string id = execute.at("id");
+
+  const auto done = pollJson(client, "/status?id=" + id, [](const nlohmann::json& json) {
+    return json.at("state") == "done";
+  });
+  REQUIRE(done.at("err").is_null());
+  REQUIRE(policy->calls.load() >= 1);
+  REQUIRE(robot->write_low_cmd_calls.load() >= 1);
+
+  const auto loco = body(client.Post("/execute_loco_upper",
+                                     (std::string(R"({"path":")") + path.string() +
+                                      R"("})")
+                                         .c_str(),
+                                     "application/json"),
+                         503);
+  REQUIRE(loco.at("error").at("code") == "MODEL_NOT_READY");
+  REQUIRE(loco.at("next") == "status");
+
+  runner.stop();
+}
+
+TEST_CASE("AppRunner reports loco_upper ready when injected runtime includes loco deps") {
+  TempTree tmp;
+  FakeRobotIO* robot = nullptr;
+  FakePolicy* policy = nullptr;
+  auto config = productionTestConfig(tmp);
+  config.loco_upper.enabled = true;
+  AppRunner runner(config, makeDeps(robot, policy, kExpectedModeMachine, RuntimeMode::Sim,
+                                    nullptr, nullptr, true));
+  REQUIRE(runner.start());
+  auto client = httplib::Client("127.0.0.1", runner.boundPort());
+
+  const auto status = pollJson(client, "/status", [](const nlohmann::json& json) {
+    return json.at("ready") == true && json.at("cap").at("loco_upper").at("ready") == true;
+  });
+  requireLocoUpperCapability(status, true, true, 0.8, 2.0, false);
+
+  const auto health = body(client.Get("/health"), 200);
+  REQUIRE(health.at("ok") == true);
+  requireLocoUpperCapability(health, true, true, 0.8, 2.0, false);
+
+  runner.stop();
+}
+
+TEST_CASE("HTTP standby_velocity uses legacy runner when loco_upper runtime is ready but unused") {
+  TempTree tmp;
+  FakeRobotIO* robot = nullptr;
+  FakePolicy* policy = nullptr;
+  FakeVelocityPolicy* velocity_policy = nullptr;
+  FakeLocoLowerPolicy* loco_lower_policy = nullptr;
+  auto config = productionTestConfig(tmp);
+  config.loco_upper.enabled = true;
+  AppRunner runner(config,
+                   makeDeps(robot,
+                            policy,
+                            kExpectedModeMachine,
+                            RuntimeMode::Sim,
+                            nullptr,
+                            nullptr,
+                            true,
+                            &velocity_policy,
+                            &loco_lower_policy));
+  REQUIRE(runner.start());
+  auto client = httplib::Client("127.0.0.1", runner.boundPort());
+
+  pollJson(client, "/status", [](const nlohmann::json& json) {
+    return json.at("ready") == true &&
+           json.at("cap").at("loco_upper").at("ready") == true;
+  });
+
+  body(client.Post("/standby_velocity", "", "application/json"), 200);
+  pollJson(client, "/status", [&](const nlohmann::json& json) {
+    return json.at("ctrl") == "standby_velocity" &&
+           velocity_policy->calls.load() >= 3;
+  });
+
+  REQUIRE(velocity_policy->calls.load() >= 3);
+  REQUIRE(loco_lower_policy->calls.load() == 0);
+  REQUIRE(policy->calls.load() == 0);
+  REQUIRE(robot->write_low_cmd_calls.load() >= 3);
+
+  runner.stop();
+}
+
+TEST_CASE("HTTP loco_upper disabled ignores injected loco deps and rejects execute_loco_upper") {
+  TempTree tmp;
+  FakeRobotIO* robot = nullptr;
+  FakePolicy* policy = nullptr;
+  FakeVelocityPolicy* velocity_policy = nullptr;
+  FakeLocoLowerPolicy* loco_lower_policy = nullptr;
+  auto config = productionTestConfig(tmp);
+  config.loco_upper.enabled = false;
+  AppRunner runner(config,
+                   makeDeps(robot,
+                            policy,
+                            kExpectedModeMachine,
+                            RuntimeMode::Sim,
+                            nullptr,
+                            nullptr,
+                            true,
+                            &velocity_policy,
+                            &loco_lower_policy));
+  REQUIRE(runner.start());
+  auto client = httplib::Client("127.0.0.1", runner.boundPort());
+
+  const auto status = pollJson(client, "/status", [](const nlohmann::json& json) {
+    return json.at("ready") == true;
+  });
+  requireLocoUpperCapability(status, false, false, 0.8, 2.0, false);
+
+  const auto health = body(client.Get("/health"), 200);
+  REQUIRE(health.at("ok") == true);
+  requireLocoUpperCapability(health, false, false, 0.8, 2.0, false);
+
+  const auto failure = body(client.Post("/execute_loco_upper",
+                                       R"({"path":"/tmp/a.trk"})",
+                                       "application/json"),
+                            503);
+  REQUIRE(failure.at("error").at("code") == "MODEL_NOT_READY");
+  REQUIRE(failure.at("error").at("message") == "loco_upper disabled");
+  REQUIRE(failure.at("next") == "status");
+  REQUIRE(loco_lower_policy->calls.load() == 0);
+
+  body(client.Post("/standby_velocity", "", "application/json"), 200);
+  pollJson(client, "/status", [&](const nlohmann::json& json) {
+    return json.at("ctrl") == "standby_velocity" &&
+           velocity_policy->calls.load() >= 3;
+  });
+
+  REQUIRE(velocity_policy->calls.load() >= 3);
+  REQUIRE(loco_lower_policy->calls.load() == 0);
+  REQUIRE(policy->calls.load() == 0);
+  REQUIRE(robot->write_low_cmd_calls.load() >= 3);
+
+  runner.stop();
+}
+
+TEST_CASE("HTTP execute_loco_upper queues valid fixture with app-owned upper limits") {
+  TempTree tmp;
+  FakeRobotIO* robot = nullptr;
+  FakePolicy* policy = nullptr;
+  auto config = productionTestConfig(tmp);
+  config.loco_upper.enabled = true;
+  configureLocoUpperAppPaths(config);
+  const auto path = writeLocoUpperTrack(tmp.allowed, "loco_upper_valid.trk", 3);
+  AppRunner runner(config, makeDeps(robot, policy, kExpectedModeMachine, RuntimeMode::Sim,
+                                    nullptr, nullptr, true));
+  REQUIRE(runner.start());
+  auto client = httplib::Client("127.0.0.1", runner.boundPort());
+
+  pollJson(client, "/status", [](const nlohmann::json& json) {
+    return json.at("ready") == true && json.at("cap").at("loco_upper").at("ready") == true;
+  });
+
+  body(client.Post("/standby_velocity", "", "application/json"), 200);
+  pollJson(client, "/status", [](const nlohmann::json& json) {
+    return json.at("ctrl") == "standby_velocity";
+  });
+
+  const auto execute =
+      body(client.Post("/execute_loco_upper",
+                       (std::string(R"({"path":")") + path.string() + R"("})").c_str(),
+                       "application/json"),
+           200);
+  REQUIRE(execute.at("executor") == "loco_upper");
+  REQUIRE(execute.at("state") == "queued");
+  REQUIRE(execute.at("id").is_string());
+
+  runner.stop();
+}
+
+TEST_CASE("HTTP execute_loco_upper rejects upper limit violations before queueing") {
+  TempTree tmp;
+  FakeRobotIO* robot = nullptr;
+  FakePolicy* policy = nullptr;
+  auto config = productionTestConfig(tmp);
+  config.loco_upper.enabled = true;
+  configureLocoUpperAppPaths(config);
+  TrkTrack track = inMemoryTrack(2);
+  track.joint_pos.values.at(kLocoUpperJointFirst) = 10.0F;
+  const auto path = tmp.allowed / "loco_upper_invalid_position.trk";
+  writeTrack(path, track);
+  AppRunner runner(config, makeDeps(robot, policy, kExpectedModeMachine, RuntimeMode::Sim,
+                                    nullptr, nullptr, true));
+  REQUIRE(runner.start());
+  auto client = httplib::Client("127.0.0.1", runner.boundPort());
+
+  pollJson(client, "/status", [](const nlohmann::json& json) {
+    return json.at("ready") == true && json.at("cap").at("loco_upper").at("ready") == true;
+  });
+
+  body(client.Post("/standby_velocity", "", "application/json"), 200);
+  pollJson(client, "/status", [](const nlohmann::json& json) {
+    return json.at("ctrl") == "standby_velocity";
+  });
+
+  const auto failure =
+      body(client.Post("/execute_loco_upper",
+                       (std::string(R"({"path":")") + path.string() + R"("})").c_str(),
+                       "application/json"),
+           400);
+  REQUIRE(failure.at("error").at("code") == "TRK_VALIDATION_FAILED");
+  REQUIRE_FALSE(failure.contains("id"));
+
+  const auto status = body(client.Get("/status"), 200);
+  REQUIRE(status.at("queue").at("n") == 0);
 
   runner.stop();
 }

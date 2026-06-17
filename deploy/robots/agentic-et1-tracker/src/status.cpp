@@ -4,6 +4,31 @@
 #include <limits>
 
 namespace agentic_et1_tracker {
+namespace {
+
+LocoPhase locoPhaseForState(MotionState state) {
+  switch (state) {
+    case MotionState::Queued:
+      return LocoPhase::Queued;
+    case MotionState::Running:
+      return LocoPhase::Motion;
+    case MotionState::Holding:
+      return LocoPhase::Holding;
+    case MotionState::Stopping:
+      return LocoPhase::Stopping;
+    case MotionState::Done:
+      return LocoPhase::Done;
+    case MotionState::Stopped:
+      return LocoPhase::Stopped;
+    case MotionState::Canceled:
+      return LocoPhase::Canceled;
+    case MotionState::Failed:
+      return LocoPhase::Failed;
+  }
+  return LocoPhase::Failed;
+}
+
+}  // namespace
 
 double computeProgress(std::size_t frame, std::size_t frames, MotionState state) {
   if (state == MotionState::Queued || state == MotionState::Canceled ||
@@ -32,6 +57,7 @@ MotionStatus makeMotionStatus(const MotionRequest& request) {
   status.sequence = request.sequence;
   status.id = request.id;
   status.path = request.path;
+  status.executor = request.executor;
   status.state = request.state;
   status.frame = request.frame;
   status.frames = request.frames;
@@ -40,6 +66,16 @@ MotionStatus makeMotionStatus(const MotionRequest& request) {
   status.duration_s = request.duration_s;
   status.progress = computeProgress(request.frame, request.frames, request.state);
   status.hold = request.hold;
+  status.loco = request.loco;
+  if (status.executor == MotionExecutor::LocoUpper) {
+    if (status.loco.max_radius_m <= 0.0) {
+      status.loco.max_radius_m = request.loco_options.max_radius_m;
+    }
+    if (request.state == MotionState::Queued ||
+        status.loco.phase == LocoPhase::Queued) {
+      status.loco.phase = locoPhaseForState(request.state);
+    }
+  }
   status.stop_reason = request.stop_reason;
   status.err = request.err;
   return status;

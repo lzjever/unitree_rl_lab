@@ -386,4 +386,75 @@ void validateVelocityPolicyInputs(const Vec& obs) {
   requireSize("obs", obs.size(), kVelocityPolicyObsDim);
 }
 
+void validateLocoLowerDeployConfig(const LocoLowerDeployConfig& config) {
+  requireSize("joint_dim", config.joint_dim, kLocoLowerPolicyJointDim);
+  requireSize("joint_ids_map", config.joint_ids_map.size(), kLocoLowerPolicyJointDim);
+  if (!config.sdk_joint_ids_map.empty()) {
+    requireSize("sdk_joint_ids_map", config.sdk_joint_ids_map.size(),
+                kLocoLowerPolicyJointDim);
+  }
+  requireSize("stiffness", config.stiffness.size(), kLocoLowerPolicyJointDim);
+  requireSize("damping", config.damping.size(), kLocoLowerPolicyJointDim);
+  requireSize("default_joint_pos", config.default_joint_pos.size(),
+              kLocoLowerPolicyJointDim);
+  requireSize("action_scale", config.action_scale.size(), kLocoLowerPolicyJointDim);
+  requireSize("action_offset", config.action_offset.size(), kLocoLowerPolicyJointDim);
+  requireSize("obs_row_width", config.obs_row_width, kLocoLowerPolicyObsRowWidth);
+  requireSize("obs_history_length", config.obs_history_length,
+              kLocoLowerPolicyHistoryLength);
+  requireSize("obs_dim", config.obs_dim, kLocoLowerPolicyObsDim);
+  requireFiniteDoubles("stiffness", config.stiffness, false);
+  requireFiniteDoubles("damping", config.damping, false);
+  requireFiniteDoubles("default_joint_pos", config.default_joint_pos, false);
+  requireFiniteDoubles("action_scale", config.action_scale, true);
+  requireFiniteDoubles("action_offset", config.action_offset, false);
+  requireSize("observation_terms", config.observation_terms.size(), 6);
+
+  const std::array<ExpectedObservationTerm, 6> expected{{
+      {"base_ang_vel", 3},
+      {"projected_gravity", 3},
+      {"keyboard_velocity_commands", 3},
+      {"joint_pos_rel", kLocoLowerPolicyJointDim},
+      {"joint_vel_rel", kLocoLowerPolicyJointDim},
+      {"last_action", kLocoLowerPolicyJointDim},
+  }};
+  std::size_t offset = 0;
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    const auto& actual = config.observation_terms.at(i);
+    const std::string prefix = "observation_terms[" + std::to_string(i) + "]";
+    if (actual.name != expected.at(i).name) {
+      throw error(prefix + ".name must be '" + expected.at(i).name + "'");
+    }
+    requireSize(prefix + ".width", actual.width, expected.at(i).width);
+    requireSize(prefix + ".offset", actual.offset, offset);
+    requireSize(prefix + ".scale", actual.scale.size(), expected.at(i).width);
+    requireFiniteDoubles(prefix + ".scale", actual.scale, false);
+    offset += actual.width;
+  }
+}
+
+void validateLocoLowerPolicyIoContract(const LocoLowerDeployConfig& config,
+                                       const PolicyModelMetadata& metadata) {
+  validateLocoLowerDeployConfig(config);
+  requireSize("input count", metadata.inputs.size(), 1);
+  requireSize("output count", metadata.outputs.size(), 1);
+
+  const PolicyTensorMetadata& obs = metadata.inputs[0];
+  requireName("input[0]", obs.name, "obs");
+  requireDtype("obs", obs.element_type);
+  requireShape("obs", obs.shape, {1, static_cast<std::int64_t>(config.obs_dim)});
+
+  const PolicyTensorMetadata& actions = metadata.outputs[0];
+  requireName("output[0]", actions.name, "actions");
+  requireDtype("actions", actions.element_type);
+  requireShape("actions", actions.shape,
+               {1, static_cast<std::int64_t>(config.joint_dim)});
+}
+
+void validateLocoLowerPolicyInputs(const LocoLowerDeployConfig& config,
+                                   const Vec& obs) {
+  validateLocoLowerDeployConfig(config);
+  requireSize("obs", obs.size(), config.obs_dim);
+}
+
 }  // namespace agentic_et1_tracker

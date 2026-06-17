@@ -10,6 +10,8 @@
 
 #include "agentic_et1_tracker/control/fixstand.hpp"
 #include "agentic_et1_tracker/control/passive.hpp"
+#include "agentic_et1_tracker/loco_upper/loco_lower_policy.hpp"
+#include "agentic_et1_tracker/loco_upper/lowcmd_composer.hpp"
 #include "agentic_et1_tracker/policy/deploy_config.hpp"
 #include "agentic_et1_tracker/policy/onnx_policy_runtime.hpp"
 #include "agentic_et1_tracker/policy/velocity_deploy_config.hpp"
@@ -82,6 +84,19 @@ std::filesystem::path velocityModelPath(const ControlConfig& config) {
          config.velocity_policy_file;
 }
 
+std::filesystem::path locoLowerModelPath(const LocoUpperConfig& config) {
+  return std::filesystem::path(config.policy_dir) / "exported" / config.policy_file;
+}
+
+bool hasLocoUpperRuntimeDeps(const AppConfig& config, const AppRuntimeDeps& deps) {
+  if (!config.loco_upper.enabled) {
+    return true;
+  }
+  return deps.loco_lower_policy != nullptr &&
+         deps.loco_lower_deploy_config.has_value() &&
+         deps.loco_upper_composer_config.has_value();
+}
+
 }  // namespace
 
 namespace app_internal {
@@ -93,6 +108,40 @@ TrkValidationConfig internalStandbyTrkValidationConfig(
   trk_config.allowlist_dirs = {standby_reference.parent_path()};
   trk_config.max_duration_s = kInternalStandbyMaxTrackDurationS;
   return trk_config;
+}
+
+void tryAttachLocoUpperDeps(const AppConfig& config, AppRuntimeDeps& deps) {
+  if (!config.loco_upper.enabled) {
+    return;
+  }
+
+  try {
+    const LocoLowerDeployConfig loco_lower_deploy_config =
+        loadLocoLowerDeployConfig(config.loco_upper.deploy);
+    LocoUpperLowCmdComposerConfig composer_config =
+        loadLocoUpperLowCmdComposerConfig(config.loco_upper.limits,
+                                          config.loco_upper.joint_map,
+                                          deps.deploy_config,
+                                          loco_lower_deploy_config);
+    composer_config.expected_mode_machine =
+        static_cast<std::uint8_t>(config.mode_machine);
+
+    const std::filesystem::path model_path = locoLowerModelPath(config.loco_upper);
+    if (referencesEt1RuntimeDependency(model_path)) {
+      return;
+    }
+
+    auto loco_lower_policy = std::make_unique<OnnxLocoLowerPolicyRuntime>(
+        OnnxLocoLowerPolicyRuntimeConfig{model_path, loco_lower_deploy_config});
+
+    deps.loco_lower_policy = std::move(loco_lower_policy);
+    deps.loco_lower_deploy_config = std::move(loco_lower_deploy_config);
+    deps.loco_upper_composer_config = std::move(composer_config);
+  } catch (const LocoLowerDeployConfigError&) {
+  } catch (const LocoUpperLowCmdComposerError&) {
+  } catch (const PolicyRuntimeError&) {
+  } catch (const std::exception&) {
+  }
 }
 
 }  // namespace app_internal
@@ -197,6 +246,10 @@ AppRuntimeFactoryResult createAppRuntimeDeps(const AppConfig& config) {
     deps.startup_control = startupControl(config.control);
     deps.mode = runtimeMode(config);
     deps.standby_track = std::move(standby_track);
+    app_internal::tryAttachLocoUpperDeps(config, deps);
+    if (!hasLocoUpperRuntimeDeps(config, deps)) {
+      return modelNotReady(config);
+    }
 
     AppRuntimeFactoryResult result;
     result.deps.emplace(std::move(deps));

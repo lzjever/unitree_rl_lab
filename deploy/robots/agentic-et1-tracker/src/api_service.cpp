@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <exception>
 #include <string>
 #include <vector>
@@ -249,6 +250,63 @@ nlohmann::json idleSummaryJson(const IdleStatus& idle) {
   };
 }
 
+bool finitePositive(double value) {
+  return std::isfinite(value) && value > 0.0;
+}
+
+LocoUpperCapability normalizedLocoUpperCapability(LocoUpperCapability capability) {
+  if (!capability.enabled) {
+    capability.ready = false;
+  }
+  return capability;
+}
+
+LocoUpperCapability effectiveLocoUpperCapability(const LocoUpperCapability& configured,
+                                                 const LocoUpperCapability& observed) {
+  LocoUpperCapability capability;
+  capability.enabled = configured.enabled;
+  capability.ready = configured.enabled && observed.ready;
+  capability.default_radius_m = configured.default_radius_m;
+  capability.max_radius_m = configured.max_radius_m;
+  capability.strict_pose = configured.strict_pose;
+  return normalizedLocoUpperCapability(capability);
+}
+
+nlohmann::json locoUpperCapabilityJson(LocoUpperCapability capability) {
+  capability = normalizedLocoUpperCapability(capability);
+  return {
+      {"enabled", capability.enabled},
+      {"ready", capability.ready},
+      {"default_radius_m", capability.default_radius_m},
+      {"max_radius_m", capability.max_radius_m},
+      {"strict_pose", capability.strict_pose},
+  };
+}
+
+bool validLocoRadiusConfig(const LocoUpperCapability& capability) {
+  return finitePositive(capability.default_radius_m) &&
+         finitePositive(capability.max_radius_m) &&
+         capability.default_radius_m <= capability.max_radius_m;
+}
+
+ErrorInfo locoUpperDisabledInfo() {
+  return {ErrorCode::ModelNotReady, "loco_upper disabled", false, NextAction::Status};
+}
+
+class DefaultLocoUpperPrechecker final : public LocoUpperPrecheckPort {
+ public:
+  LocoUpperPrecheckResult precheck(
+      const std::string&,
+      const LocoUpperPrecheckOptions&) override {
+    return {};
+  }
+};
+
+LocoUpperPrecheckPort& defaultLocoUpperPrechecker() {
+  static DefaultLocoUpperPrechecker prechecker;
+  return prechecker;
+}
+
 ServiceHealth projectedHealthState(const HealthSnapshot& health) {
   if (health.state != ServiceHealth::Ready) {
     return health.state;
@@ -275,10 +333,24 @@ AgentApiService::AgentApiService(AgentApiConfig config,
                                  StatusReader& status,
                                  TrackValidatorPort& validator,
                                  RunIdGenerator& ids)
+    : AgentApiService(config,
+                      commands,
+                      status,
+                      validator,
+                      defaultLocoUpperPrechecker(),
+                      ids) {}
+
+AgentApiService::AgentApiService(AgentApiConfig config,
+                                 ExecutionCommandSink& commands,
+                                 StatusReader& status,
+                                 TrackValidatorPort& validator,
+                                 LocoUpperPrecheckPort& loco_precheck,
+                                 RunIdGenerator& ids)
     : config_(config),
       commands_(commands),
       status_(status),
       validator_(validator),
+      loco_precheck_(loco_precheck),
       ids_(ids) {}
 
 ApiResponse AgentApiService::handle(const ApiRequest& request) {
@@ -286,6 +358,9 @@ ApiResponse AgentApiService::handle(const ApiRequest& request) {
     const auto target = parseTarget(request.target);
     if (request.method == "POST" && target.path == "/execute") {
       return execute(request.body);
+    }
+    if (request.method == "POST" && target.path == "/execute_loco_upper") {
+      return executeLocoUpper(request.body);
     }
     if (request.method == "POST" && target.path == "/idle") {
       return idle(request.body);
@@ -381,6 +456,128 @@ ApiResponse AgentApiService::execute(const std::string& body) {
   out["state"] = toString(result.state);
   out["q"] = result.q;
   out["hold"] = hold;
+  return {200, out};
+}
+
+ApiResponse AgentApiService::executeLocoUpper(const std::string& body) {
+  if (blank(body)) {
+    return error(ErrorCode::RequestInvalid);
+  }
+
+  auto input = nlohmann::json::parse(body, nullptr, false);
+  if (input.is_discarded() || !input.is_object()) {
+    return error(ErrorCode::RequestInvalid);
+  }
+  if (!hasOnlyKeys(input, {"path", "mode", "hold", "max_radius_m"})) {
+    return error(ErrorCode::RequestInvalid);
+  }
+
+  const auto path_it = input.find("path");
+  if (path_it == input.end() || !path_it->is_string() ||
+      path_it->get<std::string>().empty()) {
+    return error(ErrorCode::RequestInvalid);
+  }
+
+  MotionMode mode = MotionMode::Queue;
+  if (!parseMode(input, mode)) {
+    return error(ErrorCode::RequestInvalid);
+  }
+  bool hold = false;
+  if (!parseHold(input, hold)) {
+    return error(ErrorCode::RequestInvalid);
+  }
+
+  bool explicit_radius = false;
+  double requested_radius_m = 0.0;
+  const auto radius_it = input.find("max_radius_m");
+  if (radius_it != input.end()) {
+    if (!radius_it->is_number()) {
+      return error(ErrorCode::RequestInvalid);
+    }
+    try {
+      requested_radius_m = radius_it->get<double>();
+    } catch (const std::exception&) {
+      return error(ErrorCode::RequestInvalid);
+    }
+    explicit_radius = true;
+  }
+  if (explicit_radius && !finitePositive(requested_radius_m)) {
+    return error(ErrorCode::RequestInvalid);
+  }
+
+  const LocoUpperCapability configured =
+      normalizedLocoUpperCapability(config_.loco_upper);
+  if (!configured.enabled) {
+    return error(locoUpperDisabledInfo());
+  }
+  if (!validLocoRadiusConfig(configured)) {
+    return error(ErrorCode::ModelNotReady);
+  }
+
+  const auto snapshot = status_.snapshot();
+  const LocoUpperCapability capability =
+      effectiveLocoUpperCapability(configured, snapshot.loco_upper);
+  if (!capability.ready) {
+    return error(ErrorCode::ModelNotReady);
+  }
+
+  const double max_radius_m =
+      explicit_radius ? requested_radius_m : capability.default_radius_m;
+  if (!finitePositive(max_radius_m) || max_radius_m > capability.max_radius_m) {
+    return error(ErrorCode::RequestInvalid);
+  }
+
+  const ErrorCode readiness = readinessError(snapshot);
+  if (readiness != ErrorCode::Ok) {
+    if (snapshot.block == "lowcmd_occupied") {
+      return error(manualReadinessInfo(readiness));
+    }
+    return error(readiness);
+  }
+  if (executeBlockedByController(snapshot.ctrl)) {
+    return controlStateConflict(snapshot.ctrl);
+  }
+
+  const std::string path = *path_it;
+  const TrackValidation validation = validator_.validate(path);
+  if (!validation.ok()) {
+    return error(validation.code);
+  }
+
+  LocoUpperPrecheckOptions precheck_options;
+  precheck_options.max_radius_m = max_radius_m;
+  precheck_options.strict_pose = capability.strict_pose;
+  precheck_options.hold = hold;
+  const LocoUpperPrecheckResult precheck =
+      loco_precheck_.precheck(validation.metadata.canonical_path, precheck_options);
+  if (!precheck.ok()) {
+    return error(precheck.code);
+  }
+
+  ExecuteCommand command;
+  command.id = ids_.generate();
+  command.path = validation.metadata.canonical_path;
+  command.executor = MotionExecutor::LocoUpper;
+  command.mode = mode;
+  command.hold = hold;
+  command.loco_options.max_radius_m = max_radius_m;
+  command.loco_options.hold = hold;
+  command.track = validation.metadata;
+
+  const ExecuteResult result =
+      mode == MotionMode::Interrupt ? commands_.submitInterrupt(command)
+                                    : commands_.submitQueue(command);
+  if (!result.ok()) {
+    return error(result.code);
+  }
+
+  auto out = successBase();
+  out["id"] = result.id;
+  out["state"] = toString(result.state);
+  out["q"] = result.q;
+  out["hold"] = hold;
+  out["executor"] = toString(MotionExecutor::LocoUpper);
+  out["max_radius_m"] = max_radius_m;
   return {200, out};
 }
 
@@ -548,6 +745,8 @@ ApiResponse AgentApiService::status(const std::string& target) {
     if (snapshot.queue.limit == 0) {
       snapshot.queue.limit = config_.queue_limit;
     }
+    snapshot.loco_upper =
+        effectiveLocoUpperCapability(config_.loco_upper, snapshot.loco_upper);
     return {200, statusSnapshotJson(snapshot)};
   }
   if (id.value.empty()) {
@@ -581,6 +780,10 @@ ApiResponse AgentApiService::health() {
               {"state", toString(state)},
               {"mode", toString(current.mode == RuntimeMode::Unknown ? config_.mode
                                                                       : current.mode)},
+              {"cap",
+               {{"loco_upper",
+                 locoUpperCapabilityJson(effectiveLocoUpperCapability(
+                     config_.loco_upper, current.loco_upper))}}},
           }};
 }
 

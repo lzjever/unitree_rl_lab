@@ -1,0 +1,16 @@
+profile: Et1UpperBodyLimits
+owner: agentic-et1-tracker
+asset_dir: config/limits/et1_upper_body/v0
+purpose: release/package audit only
+runtime_use: "not a runtime fallback, downloader config, or registry"
+runtime_contract:
+  logical_joint_range: [12, 26]
+  logical_to_sdk_source: joint_map.yaml
+required_files:
+  - path: limits.yaml
+    sha256: "d50716e222211c6ca476da70cc46cd2c386470577eb16b267c7bc9bc51d95d99"
+    size_bytes: 471
+  - path: joint_map.yaml
+    sha256: "f0e93b20f38352c071f09f68c01c9a907e709c4e37c01b449ac3433ce96bc0c0"
+    size_bytes: 116
+source_notes: "app-owned upper-body limits and frozen joint map for loco_upper lowcmd composition"

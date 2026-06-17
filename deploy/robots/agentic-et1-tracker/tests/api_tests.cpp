@@ -37,6 +37,9 @@ class FakeSink final : public ExecutionCommandSink {
 
   ExecuteResult submitQueue(const ExecuteCommand& command) override {
     ++queue_calls;
+    if (events) {
+      events->push_back("queue");
+    }
     queue_commands.push_back(command);
     auto result = queue_result;
     result.id = command.id;
@@ -45,6 +48,9 @@ class FakeSink final : public ExecutionCommandSink {
 
   ExecuteResult submitInterrupt(const ExecuteCommand& command) override {
     ++interrupt_calls;
+    if (events) {
+      events->push_back("interrupt");
+    }
     interrupt_commands.push_back(command);
     auto result = interrupt_result;
     result.id = command.id;
@@ -95,6 +101,7 @@ class FakeSink final : public ExecutionCommandSink {
   std::vector<ExecuteCommand> queue_commands;
   std::vector<ExecuteCommand> interrupt_commands;
   std::vector<IdleMotion> idle_motions;
+  std::vector<std::string>* events{nullptr};
 };
 
 class FakeStatus final : public StatusReader {
@@ -128,6 +135,9 @@ class FakeValidator final : public TrackValidatorPort {
  public:
   TrackValidation validate(const std::string& path) override {
     ++calls;
+    if (events) {
+      events->push_back("validate");
+    }
     paths.push_back(path);
     const auto override = results.find(path);
     if (override != results.end()) {
@@ -148,25 +158,59 @@ class FakeValidator final : public TrackValidatorPort {
   std::vector<std::string> paths;
   TrackValidation result{ErrorCode::Ok, TrackMetadata{12, 0.22}, ""};
   std::map<std::string, TrackValidation> results;
+  std::vector<std::string>* events{nullptr};
+};
+
+class FakeLocoPrechecker final : public LocoUpperPrecheckPort {
+ public:
+  LocoUpperPrecheckResult precheck(const std::string& canonical_path,
+                                   const LocoUpperPrecheckOptions& options) override {
+    ++calls;
+    if (events) {
+      events->push_back("precheck");
+    }
+    paths.push_back(canonical_path);
+    received_options.push_back(options);
+    return result;
+  }
+
+  int calls{0};
+  std::vector<std::string> paths;
+  std::vector<LocoUpperPrecheckOptions> received_options;
+  LocoUpperPrecheckResult result{ErrorCode::Ok, ""};
+  std::vector<std::string>* events{nullptr};
 };
 
 class FakeIds final : public RunIdGenerator {
  public:
   std::string generate() override {
     ++calls;
+    if (events) {
+      events->push_back("id");
+    }
     return calls == 1 ? "a7K3p9Qx" : "B8m2Z5rT";
   }
 
   int calls{0};
+  std::vector<std::string>* events{nullptr};
 };
 
 struct Harness {
+  explicit Harness(AgentApiConfig config_value = {}) : config(std::move(config_value)),
+                                                       service(config,
+                                                               sink,
+                                                               status,
+                                                               validator,
+                                                               prechecker,
+                                                               ids) {}
+
   AgentApiConfig config;
   FakeSink sink;
   FakeStatus status;
   FakeValidator validator;
+  FakeLocoPrechecker prechecker;
   FakeIds ids;
-  AgentApiService service{config, sink, status, validator, ids};
+  AgentApiService service;
 };
 
 std::string errorCode(const ApiResponse& response) {
@@ -202,6 +246,25 @@ void requireFailure(const ApiResponse& response, const std::string& code) {
   REQUIRE_FALSE(nextAction(response).empty());
 }
 
+void requireLocoCapability(const nlohmann::json& body,
+                           bool enabled,
+                           bool ready,
+                           double default_radius_m,
+                           double max_radius_m,
+                           bool strict_pose) {
+  REQUIRE(body.contains("cap"));
+  REQUIRE(body.at("cap").contains("loco_upper"));
+  const auto& cap = body.at("cap").at("loco_upper");
+  requireFields(cap,
+                {"enabled", "ready", "default_radius_m", "max_radius_m",
+                 "strict_pose"});
+  REQUIRE(cap.at("enabled") == enabled);
+  REQUIRE(cap.at("ready") == ready);
+  REQUIRE(cap.at("default_radius_m") == default_radius_m);
+  REQUIRE(cap.at("max_radius_m") == max_radius_m);
+  REQUIRE(cap.at("strict_pose") == strict_pose);
+}
+
 bool isBase62RunId(const std::string& id) {
   static const std::regex pattern{"^[0-9A-Za-z]{8,10}$"};
   return std::regex_match(id, pattern);
@@ -216,6 +279,27 @@ MotionStatus run(std::string id, MotionState state) {
   status.duration_s = 0.38;
   status.progress = state == MotionState::Done ? 1.0 : 0.0;
   return status;
+}
+
+AgentApiConfig locoEnabledConfig() {
+  AgentApiConfig config;
+  config.loco_upper.enabled = true;
+  config.loco_upper.ready = true;
+  config.loco_upper.default_radius_m = 0.8;
+  config.loco_upper.max_radius_m = 2.0;
+  config.loco_upper.strict_pose = false;
+  return config;
+}
+
+AgentApiConfig locoEnabledNotReadyConfig() {
+  AgentApiConfig config = locoEnabledConfig();
+  config.loco_upper.ready = false;
+  return config;
+}
+
+void observeLocoUpperReady(Harness& h) {
+  h.status.snapshot_value.loco_upper.ready = true;
+  h.status.health_value.loco_upper.ready = true;
 }
 
 }  // namespace
@@ -306,6 +390,279 @@ TEST_CASE("POST execute accepts boolean hold without changing mode semantics") {
     REQUIRE(h.sink.interrupt_calls == 1);
     REQUIRE(h.sink.interrupt_commands.at(0).mode == MotionMode::Interrupt);
     REQUIRE_FALSE(h.sink.interrupt_commands.at(0).hold);
+  }
+}
+
+TEST_CASE("POST execute rejects explicit executor and loco-upper request fields") {
+  const std::vector<std::string> bodies{
+      R"({"path":"/tracks/a.trk","executor":"loco_upper"})",
+      R"({"path":"/tracks/a.trk","kind":"loco_upper"})",
+      R"({"path":"/tracks/a.trk","profile":"loco_upper"})",
+      R"({"path":"/tracks/a.trk","max_radius_m":0.8})",
+  };
+
+  for (const auto& body : bodies) {
+    Harness h(locoEnabledConfig());
+    const auto response = h.service.handle({"POST", "/execute", body});
+
+    CAPTURE(body);
+    REQUIRE(response.status == 400);
+    requireFailure(response, "REQUEST_INVALID");
+    REQUIRE(h.validator.calls == 0);
+    REQUIRE(h.sink.queue_calls == 0);
+    REQUIRE(h.sink.interrupt_calls == 0);
+    REQUIRE(h.ids.calls == 0);
+  }
+}
+
+TEST_CASE("POST execute ignores enabled but not-ready loco-upper capability") {
+  Harness h(locoEnabledNotReadyConfig());
+
+  const auto response =
+      h.service.handle({"POST", "/execute", R"({"path":"/tracks/wave.trk"})"});
+
+  REQUIRE(response.status == 200);
+  REQUIRE(response.body.at("ok") == true);
+  REQUIRE(response.body.at("state") == "queued");
+  REQUIRE(h.validator.calls == 1);
+  REQUIRE(h.prechecker.calls == 0);
+  REQUIRE(h.sink.queue_calls == 1);
+  REQUIRE(h.sink.queue_commands.at(0).executor == MotionExecutor::GeneralTracker);
+}
+
+TEST_CASE("POST execute never calls loco-upper precheck") {
+  Harness h(locoEnabledConfig());
+
+  const auto response =
+      h.service.handle({"POST", "/execute", R"({"path":"/tracks/wave.trk"})"});
+
+  REQUIRE(response.status == 200);
+  REQUIRE(h.validator.calls == 1);
+  REQUIRE(h.prechecker.calls == 0);
+  REQUIRE(h.ids.calls == 1);
+  REQUIRE(h.sink.queue_calls == 1);
+  REQUIRE(h.sink.queue_commands.at(0).executor == MotionExecutor::GeneralTracker);
+}
+
+TEST_CASE("POST execute_loco_upper disabled returns compact model-not-ready failure") {
+  Harness h;
+
+  const auto response = h.service.handle(
+      {"POST", "/execute_loco_upper", R"({"path":"/tracks/walk-wave.trk"})"});
+
+  REQUIRE(response.status == 503);
+  requireFailure(response, "MODEL_NOT_READY");
+  REQUIRE(errorMessage(response) == "loco_upper disabled");
+  REQUIRE(nextAction(response) == "status");
+  REQUIRE(h.validator.calls == 0);
+  REQUIRE(h.prechecker.calls == 0);
+  REQUIRE(h.sink.queue_calls == 0);
+  REQUIRE(h.sink.interrupt_calls == 0);
+  REQUIRE(h.ids.calls == 0);
+}
+
+TEST_CASE("POST execute_loco_upper queues when config is enabled and runtime is ready") {
+  Harness h(locoEnabledNotReadyConfig());
+  observeLocoUpperReady(h);
+
+  const auto response = h.service.handle(
+      {"POST", "/execute_loco_upper", R"({"path":"/tracks/walk-wave.trk"})"});
+
+  REQUIRE(response.status == 200);
+  requireFields(response.body,
+                {"ok", "id", "state", "q", "hold", "executor", "max_radius_m"});
+  REQUIRE(response.body.at("ok") == true);
+  REQUIRE(response.body.at("id") == "a7K3p9Qx");
+  REQUIRE(response.body.at("state") == "queued");
+  REQUIRE(response.body.at("q") == 1);
+  REQUIRE(response.body.at("hold") == false);
+  REQUIRE(response.body.at("executor") == "loco_upper");
+  REQUIRE(response.body.at("max_radius_m") == 0.8);
+  REQUIRE(h.validator.calls == 1);
+  REQUIRE(h.prechecker.calls == 1);
+  REQUIRE(h.prechecker.paths == std::vector<std::string>{"/tracks/walk-wave.trk"});
+  REQUIRE(h.prechecker.received_options.at(0).max_radius_m == 0.8);
+  REQUIRE_FALSE(h.prechecker.received_options.at(0).hold);
+  REQUIRE_FALSE(h.prechecker.received_options.at(0).strict_pose);
+  REQUIRE(h.sink.queue_calls == 1);
+  REQUIRE(h.sink.interrupt_calls == 0);
+  const auto& command = h.sink.queue_commands.at(0);
+  REQUIRE(command.id == "a7K3p9Qx");
+  REQUIRE(command.path == "/tracks/walk-wave.trk");
+  REQUIRE(command.mode == MotionMode::Queue);
+  REQUIRE(command.executor == MotionExecutor::LocoUpper);
+  REQUIRE(command.loco_options.max_radius_m == 0.8);
+  REQUIRE_FALSE(command.loco_options.hold);
+}
+
+TEST_CASE("POST execute_loco_upper rejects enabled config when runtime is not ready") {
+  Harness h(locoEnabledNotReadyConfig());
+
+  const auto response = h.service.handle(
+      {"POST", "/execute_loco_upper", R"({"path":"/tracks/walk-wave.trk"})"});
+
+  REQUIRE(response.status == 503);
+  requireFailure(response, "MODEL_NOT_READY");
+  REQUIRE(errorMessage(response) == "policy model is not ready");
+  REQUIRE(h.validator.calls == 0);
+  REQUIRE(h.prechecker.calls == 0);
+  REQUIRE(h.sink.queue_calls == 0);
+  REQUIRE(h.sink.interrupt_calls == 0);
+  REQUIRE(h.ids.calls == 0);
+}
+
+TEST_CASE("POST execute_loco_upper prechecks validator canonical path before id and queue") {
+  Harness h(locoEnabledConfig());
+  observeLocoUpperReady(h);
+  h.validator.result.metadata.canonical_path = "/canonical/walk-wave.trk";
+  std::vector<std::string> events;
+  h.validator.events = &events;
+  h.prechecker.events = &events;
+  h.ids.events = &events;
+  h.sink.events = &events;
+
+  const auto response = h.service.handle(
+      {"POST", "/execute_loco_upper", R"({"path":"/tracks/link/walk-wave.trk"})"});
+
+  REQUIRE(response.status == 200);
+  REQUIRE(h.validator.paths == std::vector<std::string>{"/tracks/link/walk-wave.trk"});
+  REQUIRE(h.prechecker.paths == std::vector<std::string>{"/canonical/walk-wave.trk"});
+  REQUIRE(h.sink.queue_commands.at(0).path == "/canonical/walk-wave.trk");
+  REQUIRE(events == std::vector<std::string>{"validate", "precheck", "id", "queue"});
+}
+
+TEST_CASE("POST execute_loco_upper interrupt accepts explicit finite bounded radius") {
+  Harness h(locoEnabledConfig());
+  observeLocoUpperReady(h);
+
+  const auto response = h.service.handle(
+      {"POST",
+       "/execute_loco_upper",
+       R"({"path":"/tracks/urgent.trk","mode":"interrupt","hold":true,"max_radius_m":1.25})"});
+
+  REQUIRE(response.status == 200);
+  REQUIRE(response.body.at("executor") == "loco_upper");
+  REQUIRE(response.body.at("max_radius_m") == 1.25);
+  REQUIRE(response.body.at("hold") == true);
+  REQUIRE(h.sink.queue_calls == 0);
+  REQUIRE(h.sink.interrupt_calls == 1);
+  const auto& command = h.sink.interrupt_commands.at(0);
+  REQUIRE(command.mode == MotionMode::Interrupt);
+  REQUIRE(command.hold);
+  REQUIRE(command.executor == MotionExecutor::LocoUpper);
+  REQUIRE(command.loco_options.max_radius_m == 1.25);
+  REQUIRE(command.loco_options.hold);
+  REQUIRE(h.prechecker.calls == 1);
+  REQUIRE(h.prechecker.received_options.at(0).max_radius_m == 1.25);
+  REQUIRE(h.prechecker.received_options.at(0).hold);
+}
+
+TEST_CASE("POST execute_loco_upper rejects invalid schema and radius before ports") {
+  const std::vector<std::string> bodies{
+      "",
+      "not-json",
+      R"({})",
+      R"({"path":3})",
+      R"({"path":"/tracks/a.trk","mode":"replace"})",
+      R"({"path":"/tracks/a.trk","hold":"true"})",
+      R"({"path":"/tracks/a.trk","executor":"loco_upper"})",
+      R"({"path":"/tracks/a.trk","kind":"loco_upper"})",
+      R"({"path":"/tracks/a.trk","profile":"loco_upper"})",
+      R"({"path":"/tracks/a.trk","max_radius_m":null})",
+      R"({"path":"/tracks/a.trk","max_radius_m":"0.8"})",
+      R"({"path":"/tracks/a.trk","max_radius_m":0})",
+      R"({"path":"/tracks/a.trk","max_radius_m":-0.1})",
+      R"({"path":"/tracks/a.trk","max_radius_m":2.01})",
+      R"({"path":"/tracks/a.trk","extra":true})",
+  };
+
+  for (const auto& body : bodies) {
+    Harness h(locoEnabledConfig());
+    observeLocoUpperReady(h);
+    const auto response =
+        h.service.handle({"POST", "/execute_loco_upper", body});
+
+    CAPTURE(body);
+    REQUIRE(response.status == 400);
+    requireFailure(response, "REQUEST_INVALID");
+    REQUIRE(h.validator.calls == 0);
+    REQUIRE(h.prechecker.calls == 0);
+    REQUIRE(h.sink.queue_calls == 0);
+    REQUIRE(h.sink.interrupt_calls == 0);
+    REQUIRE(h.ids.calls == 0);
+  }
+}
+
+TEST_CASE("POST execute_loco_upper reuses execute readiness and controller gates") {
+  struct Case {
+    ErrorCode code;
+    StatusSnapshot snapshot;
+    int status;
+  };
+
+  auto model = readySnapshot();
+  model.ready = false;
+  model.err = ErrorCode::ModelNotReady;
+  model.block = "policy_not_loaded";
+  model.loco_upper.ready = true;
+
+  auto fixstand = readySnapshot();
+  fixstand.ctrl = ControllerState::FixStand;
+  fixstand.loco_upper.ready = true;
+
+  auto stopping = readySnapshot();
+  stopping.ctrl = ControllerState::Stopping;
+  stopping.loco_upper.ready = true;
+
+  for (const auto& item : std::vector<Case>{
+           {ErrorCode::ModelNotReady, model, 503},
+           {ErrorCode::ControlStateConflict, fixstand, 409},
+           {ErrorCode::ControlStateConflict, stopping, 409},
+       }) {
+    Harness h(locoEnabledConfig());
+    h.status.snapshot_value = item.snapshot;
+
+    const auto response = h.service.handle(
+        {"POST", "/execute_loco_upper", R"({"path":"/tracks/a.trk"})"});
+
+    CAPTURE(toString(item.code));
+    REQUIRE(response.status == item.status);
+    requireFailure(response, toString(item.code));
+    REQUIRE(h.validator.calls == 0);
+    REQUIRE(h.prechecker.calls == 0);
+    REQUIRE(h.sink.queue_calls == 0);
+    REQUIRE(h.sink.interrupt_calls == 0);
+    REQUIRE(h.ids.calls == 0);
+  }
+}
+
+TEST_CASE("POST execute_loco_upper precheck failure does not allocate id or enqueue") {
+  for (const auto& item : std::vector<std::pair<std::string, std::string>>{
+           {"loco upper joint_pos is above limit", "/canonical/upper-limit.trk"},
+           {"loco upper joint velocity exceeds limit", "/canonical/upper-dynamic.trk"},
+       }) {
+    Harness h(locoEnabledConfig());
+    observeLocoUpperReady(h);
+    h.validator.result.metadata.canonical_path = item.second;
+    h.prechecker.result = {ErrorCode::TrkValidationFailed, item.first};
+    std::vector<std::string> events;
+    h.validator.events = &events;
+    h.prechecker.events = &events;
+    h.ids.events = &events;
+    h.sink.events = &events;
+
+    const auto response =
+        h.service.handle({"POST", "/execute_loco_upper", R"({"path":"/tracks/bad.trk"})"});
+
+    REQUIRE(response.status == 400);
+    requireFailure(response, "TRK_VALIDATION_FAILED");
+    REQUIRE(h.validator.calls == 1);
+    REQUIRE(h.prechecker.calls == 1);
+    REQUIRE(h.prechecker.paths == std::vector<std::string>{item.second});
+    REQUIRE(h.ids.calls == 0);
+    REQUIRE(h.sink.queue_calls == 0);
+    REQUIRE(h.sink.interrupt_calls == 0);
+    REQUIRE(events == std::vector<std::string>{"validate", "precheck"});
   }
 }
 
@@ -784,8 +1141,9 @@ TEST_CASE("POST passive uses configured password") {
   FakeSink sink;
   FakeStatus status;
   FakeValidator validator;
+  FakeLocoPrechecker prechecker;
   FakeIds ids;
-  AgentApiService service{config, sink, status, validator, ids};
+  AgentApiService service{config, sink, status, validator, prechecker, ids};
 
   auto response = service.handle({"POST", "/passive", R"({"password":"galaxy"})"});
   REQUIRE(response.status == 400);
@@ -1174,6 +1532,58 @@ TEST_CASE("GET status renders running progress and top-level stopping reason") {
   REQUIRE(response.body.at("stop_reason") == "stop");
 }
 
+TEST_CASE("GET status exposes loco-upper capability and keeps GeneralTracker status compact") {
+  Harness h(locoEnabledConfig());
+  observeLocoUpperReady(h);
+  MotionStatus exec = run("active", MotionState::Running);
+  h.status.snapshot_value.ctrl = ControllerState::Running;
+  h.status.snapshot_value.robot = RobotState::Running;
+  h.status.snapshot_value.exec = exec;
+
+  const auto response = h.service.handle({"GET", "/status", ""});
+
+  REQUIRE(response.status == 200);
+  requireLocoCapability(response.body, true, true, 0.8, 2.0, false);
+  REQUIRE(response.body.at("exec").at("id") == "active");
+  REQUIRE_FALSE(response.body.at("exec").contains("loco"));
+  REQUIRE_FALSE(response.body.at("exec").contains("executor"));
+}
+
+TEST_CASE("GET status and health expose config-enabled but runtime-not-ready loco-upper") {
+  Harness h(locoEnabledNotReadyConfig());
+  h.status.snapshot_value.ready = false;
+  h.status.snapshot_value.err = ErrorCode::ModelNotReady;
+  h.status.snapshot_value.block = "policy_not_loaded";
+  h.status.health_value = {ServiceHealth::Starting, RuntimeMode::Unknown,
+                           ErrorCode::ModelNotReady, "policy_not_loaded"};
+
+  const auto status = h.service.handle({"GET", "/status", ""});
+  REQUIRE(status.status == 200);
+  REQUIRE(status.body.at("ready") == false);
+  REQUIRE(status.body.at("err").at("code") == "MODEL_NOT_READY");
+  REQUIRE(status.body.at("block") == "policy_not_loaded");
+  requireLocoCapability(status.body, true, false, 0.8, 2.0, false);
+
+  const auto health = h.service.handle({"GET", "/health", ""});
+  REQUIRE(health.status == 200);
+  REQUIRE(health.body.at("ok") == false);
+  REQUIRE(health.body.at("state") == "starting");
+  requireLocoCapability(health.body, true, false, 0.8, 2.0, false);
+}
+
+TEST_CASE("GET status and health expose runtime-ready loco-upper capability from observed state") {
+  Harness h(locoEnabledNotReadyConfig());
+  observeLocoUpperReady(h);
+
+  const auto status = h.service.handle({"GET", "/status", ""});
+  REQUIRE(status.status == 200);
+  requireLocoCapability(status.body, true, true, 0.8, 2.0, false);
+
+  const auto health = h.service.handle({"GET", "/health", ""});
+  REQUIRE(health.status == 200);
+  requireLocoCapability(health.body, true, true, 0.8, 2.0, false);
+}
+
 TEST_CASE("GET status by id exposes hold metadata for queued running and holding runs") {
   Harness h;
   auto queued = run("queued-hold", MotionState::Queued);
@@ -1199,6 +1609,57 @@ TEST_CASE("GET status by id exposes hold metadata for queued running and holding
     REQUIRE(response.body.at("id") == item.first);
     REQUIRE(response.body.at("hold") == item.second);
   }
+}
+
+TEST_CASE("GET status by id renders queued loco-upper run payload") {
+  Harness h(locoEnabledConfig());
+  auto queued = run("queued-loco", MotionState::Queued);
+  queued.executor = MotionExecutor::LocoUpper;
+  queued.loco.max_radius_m = 0.8;
+  queued.loco.phase = LocoPhase::Queued;
+  h.status.snapshot_value.queue = {1, 8, {queued.id}};
+  h.status.runs.emplace(queued.id, queued);
+
+  const auto response =
+      h.service.handle({"GET", std::string("/status?id=") + queued.id, ""});
+
+  REQUIRE(response.status == 200);
+  REQUIRE(response.body.at("ok") == true);
+  REQUIRE(response.body.at("id") == queued.id);
+  REQUIRE(response.body.at("executor") == "loco_upper");
+  REQUIRE(response.body.at("queue_pos") == 1);
+  REQUIRE(response.body.contains("loco"));
+  const auto& loco = response.body.at("loco");
+  requireFields(loco,
+                {"max_radius_m", "distance_m", "radius_source", "phase",
+                 "radius_clamped", "radius_limit_reached", "envelope_clamped",
+                 "raw_action_clamped", "lower_q_limited", "lower_action_clamped",
+                 "reason"});
+  REQUIRE(loco.at("max_radius_m") == 0.8);
+  REQUIRE(loco.at("distance_m") == 0.0);
+  REQUIRE(loco.at("radius_source").is_null());
+  REQUIRE(loco.at("phase") == "queued");
+  REQUIRE(loco.at("radius_clamped") == false);
+  REQUIRE(loco.at("radius_limit_reached") == false);
+  REQUIRE(loco.at("envelope_clamped") == false);
+  REQUIRE(loco.at("raw_action_clamped") == false);
+  REQUIRE(loco.at("lower_q_limited") == false);
+  REQUIRE(loco.at("lower_action_clamped") == false);
+  REQUIRE(loco.at("reason").is_null());
+}
+
+TEST_CASE("GET status by id keeps GeneralTracker run payload without loco fields") {
+  Harness h(locoEnabledConfig());
+  auto general = run("general", MotionState::Queued);
+  h.status.runs.emplace(general.id, general);
+
+  const auto response =
+      h.service.handle({"GET", std::string("/status?id=") + general.id, ""});
+
+  REQUIRE(response.status == 200);
+  REQUIRE(response.body.at("id") == general.id);
+  REQUIRE_FALSE(response.body.contains("executor"));
+  REQUIRE_FALSE(response.body.contains("loco"));
 }
 
 TEST_CASE("GET status by id covers active queued and recent run states") {
@@ -1255,42 +1716,60 @@ TEST_CASE("GET status rejects explicitly empty id query values") {
 }
 
 TEST_CASE("GET health maps service health and runtime mode strings") {
-  Harness h;
+  Harness h(locoEnabledConfig());
+  observeLocoUpperReady(h);
+  const auto setHealth = [&](ServiceHealth state,
+                             RuntimeMode mode,
+                             ErrorCode err,
+                             std::string block) {
+    h.status.health_value = {state, mode, err, std::move(block)};
+    h.status.health_value.loco_upper.ready = true;
+  };
 
-  h.status.health_value = {ServiceHealth::Starting, RuntimeMode::Unknown,
-                           ErrorCode::ServiceNotReady, "service_initializing"};
+  setHealth(ServiceHealth::Starting,
+            RuntimeMode::Unknown,
+            ErrorCode::ServiceNotReady,
+            "service_initializing");
   auto response = h.service.handle({"GET", "/health", ""});
   REQUIRE(response.status == 200);
-  requireFields(response.body, {"ok", "state", "mode"});
+  requireFields(response.body, {"ok", "state", "mode", "cap"});
   REQUIRE(response.body.at("ok") == false);
   REQUIRE(response.body.at("state") == "starting");
   REQUIRE(response.body.at("mode") == "unknown");
+  requireLocoCapability(response.body, true, true, 0.8, 2.0, false);
   REQUIRE_FALSE(response.body.contains("health"));
   REQUIRE_FALSE(response.body.contains("err"));
   REQUIRE_FALSE(response.body.contains("block"));
 
-  h.status.health_value = {ServiceHealth::Ready, RuntimeMode::Real, ErrorCode::Ok, ""};
+  setHealth(ServiceHealth::Ready, RuntimeMode::Real, ErrorCode::Ok, "");
   response = h.service.handle({"GET", "/health", ""});
-  requireFields(response.body, {"ok", "state", "mode"});
+  requireFields(response.body, {"ok", "state", "mode", "cap"});
   REQUIRE(response.body.at("ok") == true);
   REQUIRE(response.body.at("state") == "ready");
   REQUIRE(response.body.at("mode") == "real");
+  requireLocoCapability(response.body, true, true, 0.8, 2.0, false);
 
-  h.status.health_value = {ServiceHealth::Ready, RuntimeMode::Real,
-                           ErrorCode::ModelNotReady, "policy_not_loaded"};
+  setHealth(ServiceHealth::Ready,
+            RuntimeMode::Real,
+            ErrorCode::ModelNotReady,
+            "policy_not_loaded");
   response = h.service.handle({"GET", "/health", ""});
-  requireFields(response.body, {"ok", "state", "mode"});
+  requireFields(response.body, {"ok", "state", "mode", "cap"});
   REQUIRE(response.body.at("ok") == false);
   REQUIRE(response.body.at("state") == "starting");
   REQUIRE(response.body.at("mode") == "real");
+  requireLocoCapability(response.body, true, true, 0.8, 2.0, false);
 
-  h.status.health_value = {ServiceHealth::Error, RuntimeMode::Sim,
-                           ErrorCode::SafetyLimitTriggered, "safety_limit"};
+  setHealth(ServiceHealth::Error,
+            RuntimeMode::Sim,
+            ErrorCode::SafetyLimitTriggered,
+            "safety_limit");
   response = h.service.handle({"GET", "/health", ""});
-  requireFields(response.body, {"ok", "state", "mode"});
+  requireFields(response.body, {"ok", "state", "mode", "cap"});
   REQUIRE(response.body.at("ok") == false);
   REQUIRE(response.body.at("state") == "error");
   REQUIRE(response.body.at("mode") == "sim");
+  requireLocoCapability(response.body, true, true, 0.8, 2.0, false);
 }
 
 TEST_CASE("Core status exposes runtime mode and PRD block strings") {

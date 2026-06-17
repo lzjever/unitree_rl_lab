@@ -51,6 +51,16 @@ Commands:
 - `POST /execute`: `{"path":"/absolute/file.trk","mode":"queue|interrupt","hold":true}`.
   Only `path`, optional `mode`, and optional boolean `hold` are allowed;
   `mode` defaults to `queue`, and omitted `hold` behaves as `false`.
+- `POST /execute_loco_upper`:
+  `{"path":"/absolute/file.trk","mode":"queue|interrupt","hold":true,"max_radius_m":0.8}`.
+  Same local `.trk` allowlist contract as `/execute`, but routes the motion
+  through the loco-upper executor when `loco_upper.enabled: true` and runtime
+  `cap.loco_upper.ready: true`. `max_radius_m` is optional and must be finite,
+  positive, and `<= cap.loco_upper.max_radius_m`. The sim example keeps this
+  disabled by default; turn it on manually in `config.sim.yaml.example` only
+  when testing `/execute_loco_upper`. The loco radius guard applies while the
+  loco-upper executor itself is active in `entry`, `motion`, `holding`, and
+  bounded `exit`; `/stop` still cancels that executor immediately.
 - `POST /idle`: `{"paths":["/absolute/idle-a.trk","/absolute/idle-b.trk"]}`.
 - `POST /idle`: `{"paths":[]}` clears the idle pool.
 - `POST /stop`: empty body; stops active work and cancels queued work.
@@ -81,7 +91,9 @@ not use `queue.limit`, `queue.ids`, `exec`, or `GET /status?id=...`.
 aborts holding runs and internal transitions, and clears the idle config. It
 does not play `standby_ref.trk`. It preserves the stop watermark: user
 queue/interrupt requests accepted after a pending stop are not canceled by that
-older stop.
+older stop. For loco-upper this is an immediate cancellation path: runtime
+clears the active loco executor state and returns through the existing
+stopping/standby bookkeeping without further loco radius-guard ticks.
 
 Control-changing routes return the current `/status.err` readiness error before
 claiming success when the runtime is unavailable or not ready. Passworded
@@ -168,6 +180,38 @@ the full `/status.err` code or `null`.
 `[w,x,y,z]`, `g` is lowstate gyro `[x,y,z]`, `p` is highstate position or
 `null`, and `v` is highstate linear velocity or `null`.
 
+Short loco-upper handoff entry:
+
+```yaml
+agentic_et1_tracker:
+  loco_upper:
+    enabled: true
+    policy_dir: "config/policy/loco_lower/et1_low"
+    policy_file: "policy.onnx"
+    deploy: "config/policy/loco_lower/et1_low/params/deploy_lowobs10k.yaml"
+    limits: "config/limits/et1_upper_body/v0/limits.yaml"
+    joint_map: "config/limits/et1_upper_body/v0/joint_map.yaml"
+```
+
+```sh
+curl -sS http://127.0.0.1:8083/health
+curl -sS -X POST http://127.0.0.1:8083/execute_loco_upper \
+  -H 'Content-Type: application/json' \
+  -d '{"path":"/absolute/walk-wave.trk","mode":"queue","max_radius_m":0.8}'
+curl -sS 'http://127.0.0.1:8083/status?id=<run_id>'
+```
+
+- Readiness/status fields:
+  `cap.loco_upper.enabled`, `cap.loco_upper.ready`,
+  `cap.loco_upper.default_radius_m`, `cap.loco_upper.max_radius_m`,
+  `cap.loco_upper.strict_pose`.
+- `GET /status?id=<run_id>` for a loco-upper run also returns
+  `executor:"loco_upper"` and
+  `loco.{max_radius_m,distance_m,radius_source,phase,radius_clamped,radius_limit_reached,envelope_clamped,raw_action_clamped,lower_q_limited,lower_action_clamped,reason}`.
+- Difference from old `/execute`: `/execute` stays on the existing
+  GeneralTracker path and does not accept `max_radius_m` or return the loco
+  run payload.
+
 Controller states:
 
 | ctrl | robot behavior | accepts | rejects/notes |
@@ -209,6 +253,8 @@ Release policy/control assets are owned by `agentic-et1-tracker` and live under
 - FixStand posture: `config/posture/fixstand/v0/fixstand.yaml`
 - Passive posture: `config/posture/passive/v0/passive.yaml`
 - Standby reference asset: `config/reference/standby/v0/standby_ref.trk`
+- Loco-upper lower locomotion policy: `config/policy/loco_lower/et1_low`
+- Loco-upper upper-body limits/joint map: `config/limits/et1_upper_body/v0`
 
 Runtime configuration must point at these app-local release assets. Runtime
 does not fall back to the ET1 app tree under `deploy/robots/et1`.

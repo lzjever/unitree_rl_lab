@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -11,6 +12,9 @@
 #include "agentic_et1_tracker/core/types.hpp"
 #include "agentic_et1_tracker/control/fixstand.hpp"
 #include "agentic_et1_tracker/control/passive.hpp"
+#include "agentic_et1_tracker/loco_upper/loco_lower_policy.hpp"
+#include "agentic_et1_tracker/loco_upper/lowcmd_composer.hpp"
+#include "agentic_et1_tracker/loco_upper/planner.hpp"
 #include "agentic_et1_tracker/policy/policy_step_runner.hpp"
 #include "agentic_et1_tracker/policy/velocity_policy_runner.hpp"
 #include "agentic_et1_tracker/reference/reference_frame.hpp"
@@ -28,6 +32,7 @@ enum class RuntimeInternalState {
   GeneralTrackerIdle,
   GeneralTrackerActive,
   GeneralTrackerTransition,
+  LocoUpperActive,
   Stopping,
   Fault,
 };
@@ -57,6 +62,25 @@ class RuntimeControlLoop final {
                      DeployConfig deploy_config,
                      PassiveConfig passive_config,
                      std::uint8_t expected_mode_machine,
+                     RuntimeMode mode = RuntimeMode::Real,
+                     ReferenceFrameSink* reference_sink = nullptr,
+                     std::shared_ptr<const TrkTrack> standby_track = nullptr);
+  RuntimeControlLoop(RuntimeConfig config,
+                     RuntimeBridge& bridge,
+                     RuntimeStatusStore& status,
+                     TrkLoader loader,
+                     RobotIO& robot_io,
+                     PolicyInference& policy,
+                     DeployConfig deploy_config,
+                     VelocityPolicyInference& velocity_policy,
+                     VelocityDeployConfig velocity_deploy_config,
+                     FixStandConfig fixstand_config,
+                     PassiveConfig passive_config,
+                     ControlMode startup_control,
+                     std::uint8_t expected_mode_machine,
+                     VelocityPolicyInference& loco_lower_policy,
+                     LocoLowerDeployConfig loco_lower_deploy_config,
+                     LocoUpperLowCmdComposerConfig loco_upper_composer_config,
                      RuntimeMode mode = RuntimeMode::Real,
                      ReferenceFrameSink* reference_sink = nullptr,
                      std::shared_ptr<const TrkTrack> standby_track = nullptr);
@@ -115,6 +139,35 @@ class RuntimeControlLoop final {
     ErrorCode source_completion_error{ErrorCode::Ok};
   };
 
+  struct LocoUpperRuntimeState {
+    LocoUpperRootPlan root_plan;
+    std::vector<LocoUpperVelocityCommand> commands_world;
+    std::optional<LocoLowerStepRunner> lower_runner;
+    std::vector<float> entry_start_upper;
+    std::vector<float> lower_entry_start_q;
+    std::vector<float> first_upper;
+    std::vector<float> final_upper;
+    std::vector<float> last_upper;
+    VelocityCommand current_command;
+    std::vector<float> current_upper;
+    std::vector<float> transition_start_upper;
+    std::vector<float> transition_target_upper;
+    std::size_t phase_ticks_remaining{0};
+    std::size_t phase_total_ticks{0};
+    std::size_t hold_ticks_remaining{0};
+    bool radius_clamped{false};
+    bool radius_limit_reached{false};
+    bool envelope_clamped{false};
+    bool raw_action_clamped{false};
+    bool lower_q_limited{false};
+    bool lower_action_clamped{false};
+    std::array<double, 2> integrated_xy{{0.0, 0.0}};
+    std::array<double, 2> highstate_start_xy{{0.0, 0.0}};
+    std::array<double, 2> last_highstate_xy{{0.0, 0.0}};
+    bool has_highstate_start{false};
+    bool has_last_highstate_xy{false};
+  };
+
   bool consumePendingCommands();
   void consumeStoppingCommands();
   void handleStop(std::uint64_t sequence, bool requires_stopping);
@@ -142,6 +195,8 @@ class RuntimeControlLoop final {
   bool isBackgroundOwnedTransitionOrPlayback() const;
   void runPassiveState();
   void startNext();
+  void startLocoUpper(MotionRequest request);
+  bool prepareLocoUpperTrack(MotionRequest& request);
   bool hasIdleStartCandidate() const;
   bool canStartIdle() const;
   void startIdle();
@@ -152,6 +207,33 @@ class RuntimeControlLoop final {
       std::optional<LowStateSample> entry_low_state);
   void completePreparing();
   void advanceActive();
+  void advanceLocoUpperActive();
+  void advanceLocoUpperEntry();
+  void advanceLocoUpperMotion();
+  void advanceLocoUpperExit();
+  void advanceLocoUpperHolding();
+  void advanceLocoUpperStopping();
+  void beginLocoUpperExit(LocoReason reason);
+  bool requireStrictPoseForLocoUpper(std::array<double, 2>& estimate_xy);
+  void failLocoUpperSafety(LocoReason reason, const char* block);
+  bool updateLocoUpperRadiusState(std::array<double, 2>& estimate_xy);
+  bool enforceLocoUpperRadiusLimit(const std::array<double, 2>& estimate_xy);
+  void failLocoUpperPolicy(LocoReason reason,
+                           const RobotReadinessStatus& readiness);
+  bool writeLocoUpperStep(VelocityCommand command,
+                          const std::vector<float>& upper_targets,
+                          std::optional<float> lower_entry_alpha = std::nullopt);
+  bool prepareLocoUpperFrameStep(std::size_t frame, bool zero_lower_command);
+  bool writeLocoUpperFrame(std::size_t frame, bool zero_lower_command);
+  bool writeLocoUpperFinalHold(bool zero_lower_command);
+  bool writeLocoUpperUpperTransitionStep();
+  std::vector<float> fixstandUpperTargets() const;
+  std::vector<float> locoUpperStandbyTargets() const;
+  std::vector<float> currentLocoUpperTargets() const;
+  void beginLocoUpperStopping(StopReason reason);
+  void completeLocoUpperStopped();
+  void finishLocoUpperDone();
+  void setLocoPhase(LocoPhase phase);
   void advanceActiveWithPolicy();
   bool advanceUserPolicyStartupHold();
   void advanceHolding();
@@ -219,6 +301,7 @@ class RuntimeControlLoop final {
   RobotState robotState() const;
   bool hasPolicyRuntime() const;
   bool hasControlRuntime() const;
+  bool hasLocoUpperRuntime() const;
   void refreshReadinessForPolicyRuntime();
   void applyReadiness(const RobotReadinessStatus& readiness);
   bool readinessRequiresFault(const RobotReadinessStatus& readiness) const;
@@ -244,6 +327,9 @@ class RuntimeControlLoop final {
   std::optional<DeployConfig> deploy_config_;
   VelocityPolicyInference* velocity_policy_{nullptr};
   std::optional<VelocityDeployConfig> velocity_deploy_config_;
+  VelocityPolicyInference* loco_lower_policy_{nullptr};
+  std::optional<LocoLowerDeployConfig> loco_lower_deploy_config_;
+  std::optional<LocoUpperLowCmdComposerConfig> loco_upper_composer_config_;
   std::optional<FixStandConfig> fixstand_config_;
   std::optional<PassiveConfig> passive_config_;
   std::optional<FixStandRunner> fixstand_runner_;
@@ -255,6 +341,7 @@ class RuntimeControlLoop final {
   ActiveKind active_kind_{ActiveKind::None};
   std::shared_ptr<const TrkTrack> active_track_;
   std::optional<PendingTransition> transition_;
+  std::optional<LocoUpperRuntimeState> loco_upper_;
   std::optional<PolicyStepRunner> policy_runner_;
   std::vector<IdleMotion> idle_config_;
   std::size_t idle_next_index_{0};

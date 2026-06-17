@@ -100,6 +100,19 @@ void requireTermHistory(const Vec& obs, std::size_t offset, const Vec& values) {
   }
 }
 
+Vec velocityCommandValues(const VelocityCommand& command) {
+  return {command.vx, command.vy, command.yaw_rate};
+}
+
+std::size_t keyboardCommandObsOffset() {
+  return kVelocityPolicyHistoryLength * (3 + 3);
+}
+
+std::size_t lastActionObsOffset() {
+  return kVelocityPolicyHistoryLength *
+         (3 + 3 + 3 + kVelocityPolicyJointDim + kVelocityPolicyJointDim);
+}
+
 }  // namespace
 
 TEST_CASE("VelocityDeployConfig accepts app-owned ET1 velocity deploy") {
@@ -150,6 +163,25 @@ TEST_CASE("Velocity policy IO contract accepts single obs input and 12 actions o
   };
   REQUIRE_THROWS_WITH(validateVelocityPolicyIoContract(config, ga_metadata),
                       ContainsSubstring("input count"));
+}
+
+TEST_CASE("Velocity policy inputs accept explicit velocity command and preserve zero default") {
+  const VelocityDeployConfig config = minimalVelocityConfig();
+  const LowStateSample low_state = readyLowState(config);
+  const Vec last_action(kVelocityPolicyJointDim, 0.25F);
+
+  const VelocityPolicyInputs default_inputs =
+      makeVelocityPolicyInputs(config, low_state, last_action);
+  const VelocityPolicyInputs explicit_zero_inputs =
+      makeVelocityPolicyInputs(config, low_state, last_action, VelocityCommand{});
+  REQUIRE(explicit_zero_inputs.obs == default_inputs.obs);
+
+  const VelocityCommand command{1.25F, -0.5F, 0.75F};
+  const VelocityPolicyInputs commanded_inputs =
+      makeVelocityPolicyInputs(config, low_state, last_action, command);
+
+  requireTermHistory(commanded_inputs.obs, keyboardCommandObsOffset(),
+                     velocityCommandValues(command));
 }
 
 TEST_CASE("StandbyVelocity runner builds zero-command obs and maps 12 actions to SDK slots") {
@@ -214,6 +246,53 @@ TEST_CASE("StandbyVelocity runner builds zero-command obs and maps 12 actions to
   }
   REQUIRE(step.low_cmd.motors.at(12).kp == 0.0F);
   REQUIRE(step.low_cmd.motors.at(12).kd == 0.0F);
+}
+
+TEST_CASE("StandbyVelocity runner injects explicit velocity command into obs history") {
+  const VelocityDeployConfig config = minimalVelocityConfig();
+  const LowStateSample low_state = readyLowState(config);
+  CaptureVelocityPolicy policy;
+  VelocityStepRunner runner(config, kExpectedModeMachine);
+  const VelocityCommand first_command{0.8F, -0.3F, 1.1F};
+  const VelocityCommand second_command{-0.2F, 0.4F, -0.6F};
+
+  runner.step(low_state, policy, first_command);
+
+  REQUIRE(policy.inputs_seen.size() == 1);
+  requireTermHistory(policy.inputs_seen.back().obs, keyboardCommandObsOffset(),
+                     velocityCommandValues(first_command));
+
+  const Vec first_raw = policy.raw_actions;
+  policy.raw_actions = Vec(kVelocityPolicyJointDim, -0.5F);
+  runner.step(low_state, policy, second_command);
+
+  REQUIRE(policy.inputs_seen.size() == 2);
+  const Vec& second_obs = policy.inputs_seen.back().obs;
+  for (std::size_t h = 0; h < kVelocityPolicyHistoryLength - 1; ++h) {
+    for (std::size_t i = 0; i < 3; ++i) {
+      REQUIRE(second_obs.at(keyboardCommandObsOffset() + h * 3 + i) ==
+              velocityCommandValues(first_command).at(i));
+    }
+  }
+  for (std::size_t i = 0; i < 3; ++i) {
+    REQUIRE(second_obs.at(keyboardCommandObsOffset() +
+                          (kVelocityPolicyHistoryLength - 1) * 3 + i) ==
+            velocityCommandValues(second_command).at(i));
+  }
+  for (std::size_t i = 0; i < kVelocityPolicyJointDim; ++i) {
+    REQUIRE(second_obs.at(lastActionObsOffset() +
+                          (kVelocityPolicyHistoryLength - 1) *
+                              kVelocityPolicyJointDim +
+                          i) == first_raw.at(i));
+  }
+
+  runner.reset();
+  policy.inputs_seen.clear();
+  runner.step(low_state, policy, second_command);
+
+  REQUIRE(policy.inputs_seen.size() == 1);
+  requireTermHistory(policy.inputs_seen.back().obs, keyboardCommandObsOffset(),
+                     velocityCommandValues(second_command));
 }
 
 TEST_CASE("StandbyVelocity projected gravity matches ET1 inverse quaternion rotation") {

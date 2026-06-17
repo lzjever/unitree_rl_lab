@@ -55,6 +55,26 @@ target_link_libraries(agentic_et1_tracker_trk
     agentic_et1_tracker_core
 )
 
+add_library(agentic_et1_tracker_loco_upper
+  src/loco_lower_policy.cpp
+  src/loco_upper_lowcmd_composer.cpp
+  src/loco_upper_precheck.cpp
+  src/loco_upper_planner.cpp
+  src/loco_upper_validator.cpp
+)
+
+target_compile_features(agentic_et1_tracker_loco_upper PUBLIC cxx_std_17)
+target_include_directories(agentic_et1_tracker_loco_upper
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+target_link_libraries(agentic_et1_tracker_loco_upper
+  PUBLIC
+    agentic_et1_tracker_trk
+  PRIVATE
+    ${AGENTIC_ET1_YAML_TARGET}
+)
+
 add_library(agentic_et1_tracker_api
   src/api_service.cpp
   src/json_codec.cpp
@@ -102,6 +122,7 @@ target_include_directories(agentic_et1_tracker_runtime
 target_link_libraries(agentic_et1_tracker_runtime
   PUBLIC
     agentic_et1_tracker_api
+    agentic_et1_tracker_loco_upper
     agentic_et1_tracker_reference
     agentic_et1_tracker_trk
 )
@@ -116,6 +137,11 @@ elseif(TARGET yaml-cpp)
 else()
   message(FATAL_ERROR "yaml-cpp target not found")
 endif()
+
+target_link_libraries(agentic_et1_tracker_loco_upper
+  PRIVATE
+    ${AGENTIC_ET1_YAML_TARGET}
+)
 
 add_library(agentic_et1_tracker_policy_math
   src/observation_builder.cpp
@@ -259,6 +285,7 @@ target_link_libraries(agentic_et1_tracker_app
     agentic_et1_tracker_http
     agentic_et1_tracker_runtime
   PRIVATE
+    agentic_et1_tracker_loco_upper
     agentic_et1_tracker_policy
     Threads::Threads
     ${AGENTIC_ET1_YAML_TARGET}
@@ -380,6 +407,20 @@ if(AGENTIC_ET1_BUILD_TESTS)
   )
 
   add_test(NAME agentic_et1_tracker_trk_tests COMMAND agentic_et1_tracker_trk_tests)
+
+  add_executable(agentic_et1_tracker_loco_upper_tests
+    tests/loco_lower_policy_tests.cpp
+    tests/loco_upper_lowcmd_composer_tests.cpp
+    tests/loco_upper_planner_tests.cpp
+  )
+  target_link_libraries(agentic_et1_tracker_loco_upper_tests
+    PRIVATE
+      agentic_et1_tracker_loco_upper
+      Catch2::Catch2WithMain
+  )
+
+  add_test(NAME agentic_et1_tracker_loco_upper_tests
+           COMMAND agentic_et1_tracker_loco_upper_tests)
 
   add_executable(agentic_et1_tracker_api_tests
     tests/api_tests.cpp

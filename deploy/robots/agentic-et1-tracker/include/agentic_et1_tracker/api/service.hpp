@@ -10,6 +10,7 @@
 #include "agentic_et1_tracker/core/status.hpp"
 #include "agentic_et1_tracker/core/tracker_controller.hpp"
 #include "agentic_et1_tracker/core/types.hpp"
+#include "agentic_et1_tracker/loco_upper/precheck.hpp"
 
 namespace agentic_et1_tracker {
 
@@ -17,13 +18,16 @@ struct AgentApiConfig {
   RuntimeMode mode{RuntimeMode::Unknown};
   std::size_t queue_limit{8};
   std::string passive_password{"galaxy"};
+  LocoUpperCapability loco_upper;
 };
 
 struct ExecuteCommand {
   std::string id;
   std::string path;
+  MotionExecutor executor{MotionExecutor::GeneralTracker};
   MotionMode mode{MotionMode::Queue};
   bool hold{false};
+  LocoRunOptions loco_options;
   TrackMetadata track;
 };
 
@@ -40,6 +44,7 @@ struct HealthSnapshot {
   RuntimeMode mode{RuntimeMode::Unknown};
   ErrorCode err{ErrorCode::Ok};
   std::string block;
+  LocoUpperCapability loco_upper;
 };
 
 struct ApiRequest {
@@ -105,11 +110,18 @@ class AgentApiService {
                   StatusReader& status,
                   TrackValidatorPort& validator,
                   RunIdGenerator& ids);
+  AgentApiService(AgentApiConfig config,
+                  ExecutionCommandSink& commands,
+                  StatusReader& status,
+                  TrackValidatorPort& validator,
+                  LocoUpperPrecheckPort& loco_precheck,
+                  RunIdGenerator& ids);
 
   ApiResponse handle(const ApiRequest& request);
 
  private:
   ApiResponse execute(const std::string& body);
+  ApiResponse executeLocoUpper(const std::string& body);
   ApiResponse idle(const std::string& body);
   ApiResponse stop(const std::string& body);
   ApiResponse passive(const std::string& body);
@@ -127,6 +139,7 @@ class AgentApiService {
   ExecutionCommandSink& commands_;
   StatusReader& status_;
   TrackValidatorPort& validator_;
+  LocoUpperPrecheckPort& loco_precheck_;
   RunIdGenerator& ids_;
 };
 

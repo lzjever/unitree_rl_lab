@@ -17,10 +17,12 @@
 #include "agentic_et1_tracker/app/process_lock.hpp"
 #include "agentic_et1_tracker/core/id_generator.hpp"
 #include "agentic_et1_tracker/http/server.hpp"
+#include "agentic_et1_tracker/loco_upper/precheck.hpp"
 #include "agentic_et1_tracker/reference/reference_frame_store.hpp"
 #include "agentic_et1_tracker/runtime/runtime_bridge.hpp"
 #include "agentic_et1_tracker/runtime/runtime_control_loop.hpp"
 #include "agentic_et1_tracker/runtime/runtime_status_store.hpp"
+#include "agentic_et1_tracker/trk/loader.hpp"
 #include "agentic_et1_tracker/trk/validator.hpp"
 
 namespace agentic_et1_tracker {
@@ -49,6 +51,41 @@ class AppTrackValidator final : public TrackValidatorPort {
 
  private:
   TrkValidator validator_;
+};
+
+class AppLocoUpperPrechecker final : public LocoUpperPrecheckPort {
+ public:
+  AppLocoUpperPrechecker(TrkValidationConfig config,
+                         bool enabled,
+                         std::string limits_path)
+      : loader_(std::move(config)) {
+    if (!enabled) {
+      return;
+    }
+    try {
+      validation_options_ =
+          loadLocoUpperJointValidationOptions(std::filesystem::path(limits_path));
+    } catch (const std::exception& err) {
+      load_error_ = err.what();
+    }
+  }
+
+  LocoUpperPrecheckResult precheck(
+      const std::string& canonical_path,
+      const LocoUpperPrecheckOptions& options) override {
+    if (!load_error_.empty()) {
+      return {ErrorCode::ModelNotReady, load_error_};
+    }
+
+    LocoUpperPrecheckOptions configured = options;
+    configured.upper_joint_limits = validation_options_;
+    return precheckLocoUpperTrackFile(loader_, canonical_path, configured);
+  }
+
+ private:
+  TrkLoader loader_;
+  std::optional<LocoUpperJointValidationOptions> validation_options_;
+  std::string load_error_;
 };
 
 class AppRunIdGenerator final : public RunIdGenerator {
@@ -80,6 +117,19 @@ AppRuntimeFactoryResult initialNotReady(const AppConfig& config) {
                    ErrorCode::ModelNotReady,
                    kPolicyNotLoadedBlock};
   return result;
+}
+
+AgentApiConfig makeAgentApiConfig(RuntimeMode mode, const AppConfig& config) {
+  AgentApiConfig api;
+  api.mode = mode;
+  api.queue_limit = config.runtime.queue_limit;
+  api.passive_password = config.passive_password;
+  api.loco_upper.enabled = config.loco_upper.enabled;
+  api.loco_upper.ready = false;
+  api.loco_upper.default_radius_m = config.loco_upper.default_radius_m;
+  api.loco_upper.max_radius_m = config.loco_upper.max_radius_m;
+  api.loco_upper.strict_pose = config.loco_upper.strict_pose;
+  return api;
 }
 
 AppRuntimeFactoryResult injectedRuntime(AppRuntimeDeps deps) {
@@ -122,12 +172,12 @@ class AppRunner::Impl {
         status_(config_.runtime),
         bridge_(config_.runtime, status_),
         validator_(config_.trk),
-        api_({initialRuntimeMode(config_),
-              config_.runtime.queue_limit,
-              config_.passive_password},
+        loco_prechecker_(config_.trk, config_.loco_upper.enabled, config_.loco_upper.limits),
+        api_(makeAgentApiConfig(initialRuntimeMode(config_), config_),
              bridge_,
              status_,
              validator_,
+             loco_prechecker_,
              ids_),
         reference_store_(config_.reference.enabled ? std::make_unique<ReferenceFrameStore>()
                                                    : nullptr),
@@ -140,12 +190,12 @@ class AppRunner::Impl {
         status_(config_.runtime),
         bridge_(config_.runtime, status_),
         validator_(config_.trk),
-        api_({factory_result_.deps->mode,
-              config_.runtime.queue_limit,
-              config_.passive_password},
+        loco_prechecker_(config_.trk, config_.loco_upper.enabled, config_.loco_upper.limits),
+        api_(makeAgentApiConfig(factory_result_.deps->mode, config_),
              bridge_,
              status_,
              validator_,
+             loco_prechecker_,
              ids_),
         reference_store_(config_.reference.enabled ? std::make_unique<ReferenceFrameStore>()
                                                    : nullptr),
@@ -227,6 +277,32 @@ class AppRunner::Impl {
  private:
   void attachRuntimeLoop(AppRuntimeDeps& deps) {
     if (deps.velocity_policy) {
+      const bool enable_loco_upper_runtime =
+          config_.loco_upper.enabled && deps.loco_lower_policy &&
+          deps.loco_lower_deploy_config && deps.loco_upper_composer_config;
+      if (enable_loco_upper_runtime) {
+        runtime_loop_.emplace(config_.runtime,
+                              bridge_,
+                              status_,
+                              TrkLoader(config_.trk),
+                              *deps.robot_io,
+                              *deps.policy,
+                              deps.deploy_config,
+                              *deps.velocity_policy,
+                              deps.velocity_deploy_config,
+                              deps.fixstand_config,
+                              deps.passive_config,
+                              deps.startup_control,
+                              static_cast<std::uint8_t>(config_.mode_machine),
+                              *deps.loco_lower_policy,
+                              *deps.loco_lower_deploy_config,
+                              *deps.loco_upper_composer_config,
+                              deps.mode,
+                              reference_store_.get(),
+                              deps.standby_track);
+        return;
+      }
+
       runtime_loop_.emplace(config_.runtime,
                             bridge_,
                             status_,
@@ -292,6 +368,7 @@ class AppRunner::Impl {
   RuntimeStatusStore status_;
   RuntimeBridge bridge_;
   AppTrackValidator validator_;
+  AppLocoUpperPrechecker loco_prechecker_;
   AppRunIdGenerator ids_;
   AgentApiService api_;
   std::unique_ptr<ReferenceFrameStore> reference_store_;

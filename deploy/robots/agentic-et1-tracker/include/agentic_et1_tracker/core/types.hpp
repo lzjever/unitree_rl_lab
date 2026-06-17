@@ -62,6 +62,41 @@ enum class MotionMode {
   Interrupt,
 };
 
+enum class MotionExecutor {
+  GeneralTracker,
+  LocoUpper,
+};
+
+enum class LocoPhase {
+  Queued,
+  Entry,
+  Motion,
+  Holding,
+  Exit,
+  Stopping,
+  Done,
+  Stopped,
+  Failed,
+  Canceled,
+};
+
+enum class LocoReason {
+  None,
+  RootInvalid,
+  UpperLimit,
+  UpperDynamic,
+  RadiusLimit,
+  PoseMissing,
+  PoseJump,
+  PolicyNan,
+  PolicyInfer,
+  LowerLimit,
+  MappingInvalid,
+  HoldTimeout,
+  PathError,
+  DeadlineMiss,
+};
+
 enum class ActiveKind {
   None,
   User,
@@ -108,16 +143,46 @@ enum class StopReason {
   Interrupt,
 };
 
+struct LocoRunOptions {
+  double max_radius_m{0.0};
+  bool hold{false};
+};
+
+struct LocoRunStatus {
+  double max_radius_m{0.0};
+  double distance_m{0.0};
+  std::string radius_source;
+  LocoPhase phase{LocoPhase::Queued};
+  bool radius_clamped{false};
+  bool radius_limit_reached{false};
+  bool envelope_clamped{false};
+  bool raw_action_clamped{false};
+  bool lower_q_limited{false};
+  bool lower_action_clamped{false};
+  LocoReason reason{LocoReason::None};
+};
+
+struct LocoUpperCapability {
+  bool enabled{false};
+  bool ready{false};
+  double default_radius_m{0.0};
+  double max_radius_m{0.0};
+  bool strict_pose{false};
+};
+
 struct MotionRequest {
   std::uint64_t sequence{0};
   std::string id;
   std::string path;
+  MotionExecutor executor{MotionExecutor::GeneralTracker};
   MotionState state{MotionState::Queued};
   std::size_t frame{0};
   std::size_t frames{0};
   double fps{50.0};
   double duration_s{0.0};
   bool hold{false};
+  LocoRunOptions loco_options;
+  LocoRunStatus loco;
   ErrorCode err{ErrorCode::Ok};
   StopReason stop_reason{StopReason::None};
   std::chrono::steady_clock::time_point enqueued_at{};
@@ -141,6 +206,9 @@ std::string toString(ErrorCode code);
 std::string toString(NextAction next);
 std::string toString(MotionState state);
 std::string toString(MotionMode mode);
+std::string toString(MotionExecutor executor);
+std::string toString(LocoPhase phase);
+std::string toString(LocoReason reason);
 std::string toString(ActiveKind kind);
 std::string toString(RuntimeMode mode);
 std::string toString(ControllerState state);

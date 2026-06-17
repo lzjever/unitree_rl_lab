@@ -7,11 +7,21 @@
 namespace agentic_et1_tracker {
 namespace {
 
+LocoRunStatus queuedLocoStatus(const LocoRunOptions& options) {
+  LocoRunStatus status;
+  status.max_radius_m = options.max_radius_m;
+  status.distance_m = 0.0;
+  status.radius_source.clear();
+  status.phase = LocoPhase::Queued;
+  return status;
+}
+
 MotionStatus queuedStatus(const ExecuteCommand& command, std::uint64_t sequence) {
   MotionStatus status;
   status.sequence = sequence;
   status.id = command.id;
   status.path = command.path;
+  status.executor = command.executor;
   status.state = MotionState::Queued;
   status.frame = 0;
   status.frames = command.track.frames;
@@ -19,6 +29,9 @@ MotionStatus queuedStatus(const ExecuteCommand& command, std::uint64_t sequence)
   status.duration_s = command.track.duration_s;
   status.progress = computeProgress(0, command.track.frames, MotionState::Queued);
   status.hold = command.hold;
+  if (status.executor == MotionExecutor::LocoUpper) {
+    status.loco = queuedLocoStatus(command.loco_options);
+  }
   status.stop_reason = StopReason::None;
   status.err = ErrorCode::Ok;
   return status;
@@ -111,6 +124,9 @@ MotionStatus canceledStatus(const std::deque<MotionStatus>& accepted,
   status.state = MotionState::Canceled;
   status.stop_reason = reason;
   status.progress = 0.0;
+  if (status.executor == MotionExecutor::LocoUpper) {
+    status.loco.phase = LocoPhase::Canceled;
+  }
   status.err = ErrorCode::Ok;
   return status;
 }

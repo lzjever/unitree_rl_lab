@@ -182,6 +182,24 @@ agentic_et1_tracker:
               .lexically_normal()
               .string());
   REQUIRE_FALSE(config.reference.enabled);
+  REQUIRE_FALSE(config.loco_upper.enabled);
+  REQUIRE(config.loco_upper.default_radius_m == 0.8);
+  REQUIRE(config.loco_upper.max_radius_m == 2.0);
+  REQUIRE(config.loco_upper.radius_tolerance_m == 0.05);
+  REQUIRE(config.loco_upper.max_hold_s == 10.0);
+  REQUIRE(config.runtime.loco_upper_max_hold_s == 10.0);
+  REQUIRE(config.runtime.radius_tolerance_m == 0.05);
+  REQUIRE_FALSE(config.loco_upper.strict_pose);
+  REQUIRE(config.loco_upper.pose_fresh_timeout_ms == 100);
+  REQUIRE(config.loco_upper.pose_jump_reject_m == 0.25);
+  REQUIRE(config.loco_upper.max_lin_accel_mps2 == 0.4);
+  REQUIRE(config.loco_upper.max_yaw_accel_radps2 == 0.5);
+  REQUIRE(config.loco_upper.smoothing_window_frames == 5);
+  REQUIRE(config.runtime.loco_upper_pose_fresh_timeout_ms == 100);
+  REQUIRE(config.runtime.loco_upper_pose_jump_reject_m == 0.25);
+  REQUIRE(config.runtime.loco_upper_max_lin_accel_mps2 == 0.4);
+  REQUIRE(config.runtime.loco_upper_max_yaw_accel_radps2 == 0.5);
+  REQUIRE(config.runtime.loco_upper_smoothing_window_frames == 5);
 }
 
 TEST_CASE("AppConfig default file keeps StandbyVelocity and posture assets app-owned") {
@@ -217,6 +235,7 @@ TEST_CASE("AppConfig default file keeps StandbyVelocity and posture assets app-o
   REQUIRE(config.runtime.transition_duration_s == 0.30);
   REQUIRE(config.passive_password == "galaxy");
   REQUIRE_FALSE(config.reference.enabled);
+  REQUIRE_FALSE(config.loco_upper.enabled);
 }
 
 TEST_CASE("AppConfig simulation example is ready for local MuJoCo acceptance") {
@@ -253,6 +272,7 @@ TEST_CASE("AppConfig simulation example is ready for local MuJoCo acceptance") {
   REQUIRE(config.runtime.transition_duration_s == 0.7);
   REQUIRE(config.passive_password == "galaxy");
   REQUIRE(config.reference.enabled);
+  REQUIRE_FALSE(config.loco_upper.enabled);
 }
 
 TEST_CASE("AppConfig release template resolves internal standby reference to release asset") {
@@ -375,6 +395,23 @@ agentic_et1_tracker:
     standby_reference: "config/reference/standby/custom/standby_ref.trk"
   reference:
     enabled: true
+  loco_upper:
+    enabled: true
+    policy_dir: "config/policy/loco_lower/et1_low"
+    policy_file: "loco.onnx"
+    deploy: "config/policy/loco_lower/et1_low/params/deploy_lowobs10k.yaml"
+    default_radius_m: 0.7
+    max_radius_m: 1.5
+    radius_tolerance: 0.04
+    max_hold_s: 2.5
+    strict_pose: true
+    pose_fresh_timeout_ms: 80
+    pose_jump_reject_m: 0.12
+    max_lin_accel_mps2: 0.7
+    max_yaw_accel_radps2: 0.8
+    smoothing_window_frames: 3
+    limits: "config/limits/et1_upper_body/v0/limits.yaml"
+    joint_map: "config/limits/et1_upper_body/v0/joint_map.yaml"
 )yaml");
   const auto config = tmp.load();
   const auto config_dir = tmp.path.parent_path();
@@ -430,6 +467,75 @@ agentic_et1_tracker:
               .lexically_normal()
               .string());
   REQUIRE(config.reference.enabled);
+  REQUIRE(config.loco_upper.enabled);
+  REQUIRE(config.loco_upper.policy_dir ==
+          (config_dir / "config/policy/loco_lower/et1_low").lexically_normal().string());
+  REQUIRE(config.loco_upper.policy_file == "loco.onnx");
+  REQUIRE(config.loco_upper.deploy ==
+          (config_dir / "config/policy/loco_lower/et1_low/params/deploy_lowobs10k.yaml")
+              .lexically_normal()
+              .string());
+  REQUIRE(config.loco_upper.default_radius_m == 0.7);
+  REQUIRE(config.loco_upper.max_radius_m == 1.5);
+  REQUIRE(config.loco_upper.radius_tolerance_m == 0.04);
+  REQUIRE(config.loco_upper.max_hold_s == 2.5);
+  REQUIRE(config.runtime.loco_upper_max_hold_s == 2.5);
+  REQUIRE(config.runtime.radius_tolerance_m == 0.04);
+  REQUIRE(config.loco_upper.strict_pose);
+  REQUIRE(config.loco_upper.pose_fresh_timeout_ms == 80);
+  REQUIRE(config.loco_upper.pose_jump_reject_m == 0.12);
+  REQUIRE(config.loco_upper.max_lin_accel_mps2 == 0.7);
+  REQUIRE(config.loco_upper.max_yaw_accel_radps2 == 0.8);
+  REQUIRE(config.loco_upper.smoothing_window_frames == 3);
+  REQUIRE(config.runtime.loco_upper_strict_pose);
+  REQUIRE(config.runtime.loco_upper_pose_fresh_timeout_ms == 80);
+  REQUIRE(config.runtime.loco_upper_pose_jump_reject_m == 0.12);
+  REQUIRE(config.runtime.loco_upper_max_lin_accel_mps2 == 0.7);
+  REQUIRE(config.runtime.loco_upper_max_yaw_accel_radps2 == 0.8);
+  REQUIRE(config.runtime.loco_upper_smoothing_window_frames == 3);
+  REQUIRE(config.loco_upper.limits ==
+          (config_dir / "config/limits/et1_upper_body/v0/limits.yaml")
+              .lexically_normal()
+              .string());
+  REQUIRE(config.loco_upper.joint_map ==
+          (config_dir / "config/limits/et1_upper_body/v0/joint_map.yaml")
+              .lexically_normal()
+              .string());
+}
+
+TEST_CASE("AppConfig parses PRD loco_upper key aliases") {
+  TempConfig tmp(R"yaml(
+agentic_et1_tracker:
+  motion_dirs: ["/tmp/motions"]
+  loco_upper:
+    enabled: true
+    policy_dir: "config/policy/loco_lower/et1_low"
+    policy_file: "policy.onnx"
+    deploy: "config/policy/loco_lower/et1_low/params/deploy_lowobs10k.yaml"
+    default_max_radius_m: 0.9
+    max_radius_m: 1.8
+    radius_tolerance_m: 0.06
+    strict_radius_requires_pose: true
+    pose_fresh_timeout_ms: 90
+    pose_jump_reject_m: 0.2
+    max_lin_accel_mps2: 0.6
+    max_yaw_accel_radps2: 0.7
+    smoothing_window_frames: 4
+    upper_body_limits: "config/limits/et1_upper_body/v0/limits.yaml"
+    joint_map: "config/limits/et1_upper_body/v0/joint_map.yaml"
+)yaml");
+  const auto config = tmp.load();
+
+  REQUIRE(config.loco_upper.enabled);
+  REQUIRE(config.loco_upper.default_radius_m == 0.9);
+  REQUIRE(config.loco_upper.max_radius_m == 1.8);
+  REQUIRE(config.loco_upper.radius_tolerance_m == 0.06);
+  REQUIRE(config.loco_upper.strict_pose);
+  REQUIRE(config.loco_upper.pose_fresh_timeout_ms == 90);
+  REQUIRE(config.loco_upper.pose_jump_reject_m == 0.2);
+  REQUIRE(config.loco_upper.max_lin_accel_mps2 == 0.6);
+  REQUIRE(config.loco_upper.max_yaw_accel_radps2 == 0.7);
+  REQUIRE(config.loco_upper.smoothing_window_frames == 4);
 }
 
 TEST_CASE("AppConfig resolves relative policy paths from config file directory") {
@@ -660,6 +766,159 @@ agentic_et1_tracker:
                                    value + "\n"),
                           ContainsSubstring("transition_duration_s"));
     }
+  }
+
+  SECTION("enabled loco_upper radius config must be finite and bounded") {
+    for (const auto& body : {
+             "    default_radius_m: 0\n",
+             "    default_radius_m: .nan\n",
+             "    max_radius_m: 0\n",
+             "    max_radius_m: .nan\n",
+             "    default_radius_m: 2.1\n    max_radius_m: 2.0\n",
+             "    radius_tolerance_m: -0.01\n",
+             "    radius_tolerance: .nan\n",
+             "    max_hold_s: 0\n",
+             "    max_hold_s: .nan\n",
+         }) {
+      CAPTURE(body);
+      REQUIRE_THROWS_WITH(loadYaml(std::string("agentic_et1_tracker:\n"
+                                              "  motion_dirs: [\"/tmp/motions\"]\n"
+                                              "  loco_upper:\n"
+                                              "    enabled: true\n") +
+                                   body),
+                          ContainsSubstring("loco_upper"));
+    }
+  }
+}
+
+TEST_CASE("AppConfig ignores invalid disabled loco_upper capability fields") {
+  const auto config = loadYaml(R"yaml(
+agentic_et1_tracker:
+  motion_dirs: ["/tmp/motions"]
+  loco_upper:
+    enabled: false
+    policy_dir: "/home/galbot/works/et1/unitree_rl_lab/deploy/robots/et1/config/policy/loco"
+    policy_file: ""
+    deploy: "/opt/agentic/other/params/deploy.yaml"
+    default_radius_m: 0
+    max_radius_m: .nan
+    radius_tolerance_m: -0.01
+    max_hold_s: 0
+    pose_fresh_timeout_ms: 0
+    pose_jump_reject_m: .nan
+    max_lin_accel_mps2: 0
+    max_yaw_accel_radps2: -1
+    smoothing_window_frames: 0
+    limits: "/home/galbot/works/et1/unitree_rl_lab/deploy/robots/et1/config/limits/upper.yaml"
+    joint_map: ""
+)yaml");
+
+  const LocoUpperConfig defaults;
+  REQUIRE_FALSE(config.loco_upper.enabled);
+  REQUIRE(config.loco_upper.policy_dir == defaults.policy_dir);
+  REQUIRE(config.loco_upper.policy_file == defaults.policy_file);
+  REQUIRE(config.loco_upper.deploy == defaults.deploy);
+  REQUIRE(config.loco_upper.default_radius_m == defaults.default_radius_m);
+  REQUIRE(config.loco_upper.max_radius_m == defaults.max_radius_m);
+  REQUIRE(config.loco_upper.radius_tolerance_m == defaults.radius_tolerance_m);
+  REQUIRE(config.loco_upper.max_hold_s == defaults.max_hold_s);
+  REQUIRE(config.loco_upper.strict_pose == defaults.strict_pose);
+  REQUIRE(config.loco_upper.pose_fresh_timeout_ms ==
+          defaults.pose_fresh_timeout_ms);
+  REQUIRE(config.loco_upper.pose_jump_reject_m ==
+          defaults.pose_jump_reject_m);
+  REQUIRE(config.loco_upper.max_lin_accel_mps2 ==
+          defaults.max_lin_accel_mps2);
+  REQUIRE(config.loco_upper.max_yaw_accel_radps2 ==
+          defaults.max_yaw_accel_radps2);
+  REQUIRE(config.loco_upper.smoothing_window_frames ==
+          defaults.smoothing_window_frames);
+  REQUIRE(config.loco_upper.limits == defaults.limits);
+  REQUIRE(config.loco_upper.joint_map == defaults.joint_map);
+}
+
+TEST_CASE("AppConfig keeps disabled loco_upper startup independent of asset paths") {
+  const auto config = loadYaml(R"yaml(
+agentic_et1_tracker:
+  motion_dirs: ["/tmp/motions"]
+  loco_upper:
+    enabled: false
+    limits: "/tmp/does-not-exist/limits.yaml"
+    joint_map: "/tmp/does-not-exist/joint_map.yaml"
+)yaml");
+
+  REQUIRE_FALSE(config.loco_upper.enabled);
+  REQUIRE(config.loco_upper.limits == LocoUpperConfig().limits);
+  REQUIRE(config.loco_upper.joint_map == LocoUpperConfig().joint_map);
+}
+
+TEST_CASE("AppConfig validates enabled loco_upper asset path guards") {
+  SECTION("policy_file must not be empty") {
+    REQUIRE_THROWS_WITH(loadYaml(R"yaml(
+agentic_et1_tracker:
+  motion_dirs: ["/tmp/motions"]
+  loco_upper:
+    enabled: true
+    policy_file: ""
+)yaml"),
+                        ContainsSubstring("policy_file"));
+  }
+
+  SECTION("policy_file must remain a file name") {
+    REQUIRE_THROWS_WITH(loadYaml(R"yaml(
+agentic_et1_tracker:
+  motion_dirs: ["/tmp/motions"]
+  loco_upper:
+    enabled: true
+    policy_file: "exported/policy.onnx"
+)yaml"),
+                        ContainsSubstring("loco_upper.policy_file"));
+  }
+
+  SECTION("deploy must stay under loco_upper policy params") {
+    REQUIRE_THROWS_WITH(loadYaml(R"yaml(
+agentic_et1_tracker:
+  motion_dirs: ["/tmp/motions"]
+  loco_upper:
+    enabled: true
+    policy_dir: "/opt/agentic/loco"
+    deploy: "/opt/agentic/other/params/deploy.yaml"
+)yaml"),
+                        ContainsSubstring("loco_upper.deploy"));
+  }
+
+  SECTION("policy_dir must not reference ET1 runtime config tree") {
+    REQUIRE_THROWS_WITH(loadYaml(R"yaml(
+agentic_et1_tracker:
+  motion_dirs: ["/tmp/motions"]
+  loco_upper:
+    enabled: true
+    policy_dir: "/home/galbot/works/et1/unitree_rl_lab/deploy/robots/et1/config/policy/loco"
+    deploy: "/home/galbot/works/et1/unitree_rl_lab/deploy/robots/et1/config/policy/loco/params/deploy.yaml"
+)yaml"),
+                        ContainsSubstring("ET1 app"));
+  }
+
+  SECTION("limits must not reference ET1 runtime config tree") {
+    REQUIRE_THROWS_WITH(loadYaml(R"yaml(
+agentic_et1_tracker:
+  motion_dirs: ["/tmp/motions"]
+  loco_upper:
+    enabled: true
+    limits: "/home/galbot/works/et1/unitree_rl_lab/deploy/robots/et1/config/limits/upper.yaml"
+)yaml"),
+                        ContainsSubstring("ET1 app"));
+  }
+
+  SECTION("joint_map must not reference ET1 runtime config tree") {
+    REQUIRE_THROWS_WITH(loadYaml(R"yaml(
+agentic_et1_tracker:
+  motion_dirs: ["/tmp/motions"]
+  loco_upper:
+    enabled: true
+    joint_map: "/home/galbot/works/et1/unitree_rl_lab/deploy/robots/et1/config/limits/joint_map.yaml"
+)yaml"),
+                        ContainsSubstring("ET1 app"));
   }
 }
 

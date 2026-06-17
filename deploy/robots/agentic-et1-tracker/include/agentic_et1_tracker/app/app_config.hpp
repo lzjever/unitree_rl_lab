@@ -33,6 +33,25 @@ struct ReferenceConfig {
   bool enabled{false};
 };
 
+struct LocoUpperConfig {
+  bool enabled{false};
+  std::string policy_dir{"config/policy/loco_lower/et1_low"};
+  std::string policy_file{"policy.onnx"};
+  std::string deploy{"config/policy/loco_lower/et1_low/params/deploy_lowobs10k.yaml"};
+  double default_radius_m{0.8};
+  double max_radius_m{2.0};
+  double radius_tolerance_m{0.05};
+  double max_hold_s{10.0};
+  bool strict_pose{false};
+  std::size_t pose_fresh_timeout_ms{100};
+  double pose_jump_reject_m{0.25};
+  double max_lin_accel_mps2{0.4};
+  double max_yaw_accel_radps2{0.5};
+  std::size_t smoothing_window_frames{5};
+  std::string limits{"config/limits/et1_upper_body/v0/limits.yaml"};
+  std::string joint_map{"config/limits/et1_upper_body/v0/joint_map.yaml"};
+};
+
 struct AppConfig {
   HttpServerConfig http;
   RuntimeConfig runtime;
@@ -53,6 +72,7 @@ struct AppConfig {
   PolicyConfig policy;
   ControlConfig control;
   ReferenceConfig reference;
+  LocoUpperConfig loco_upper;
 };
 
 class ConfigError final : public std::runtime_error {

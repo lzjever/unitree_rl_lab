@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "agentic_et1_tracker/loco_upper/loco_lower_policy.hpp"
 #include "agentic_et1_tracker/policy/policy_math.hpp"
 #include "agentic_et1_tracker/policy/velocity_deploy_config.hpp"
 
@@ -52,5 +53,10 @@ void validateVelocityDeployConfig(const VelocityDeployConfig& config);
 void validateVelocityPolicyIoContract(const VelocityDeployConfig& config,
                                       const PolicyModelMetadata& metadata);
 void validateVelocityPolicyInputs(const Vec& obs);
+void validateLocoLowerDeployConfig(const LocoLowerDeployConfig& config);
+void validateLocoLowerPolicyIoContract(const LocoLowerDeployConfig& config,
+                                       const PolicyModelMetadata& metadata);
+void validateLocoLowerPolicyInputs(const LocoLowerDeployConfig& config,
+                                   const Vec& obs);
 
 }  // namespace agentic_et1_tracker

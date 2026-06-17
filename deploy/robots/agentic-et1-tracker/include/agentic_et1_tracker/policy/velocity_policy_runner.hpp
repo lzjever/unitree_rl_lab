@@ -11,6 +11,12 @@
 
 namespace agentic_et1_tracker {
 
+struct VelocityCommand {
+  float vx{0.0F};
+  float vy{0.0F};
+  float yaw_rate{0.0F};
+};
+
 struct VelocityPolicyInputs {
   Vec obs;
 };
@@ -41,6 +47,10 @@ class VelocityStepRunner {
   VelocityStepResult step(const LowStateSample& low_state,
                           VelocityPolicyInference& policy,
                           const LowCmdFrame* base_frame = nullptr);
+  VelocityStepResult step(const LowStateSample& low_state,
+                          VelocityPolicyInference& policy,
+                          VelocityCommand command,
+                          const LowCmdFrame* base_frame = nullptr);
 
  private:
   VelocityDeployConfig config_;
@@ -52,6 +62,10 @@ class VelocityStepRunner {
 VelocityPolicyInputs makeVelocityPolicyInputs(const VelocityDeployConfig& config,
                                               const LowStateSample& low_state,
                                               const Vec& last_action);
+VelocityPolicyInputs makeVelocityPolicyInputs(const VelocityDeployConfig& config,
+                                              const LowStateSample& low_state,
+                                              const Vec& last_action,
+                                              VelocityCommand command);
 LowCmdFrame makeVelocityLowCmdFrame(const VelocityDeployConfig& config,
                                     const Vec& raw_action,
                                     std::uint8_t expected_mode_machine,
