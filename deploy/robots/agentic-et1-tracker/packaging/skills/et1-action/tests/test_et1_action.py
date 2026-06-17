@@ -29,6 +29,7 @@ P0_NEXT = {
     "standby",
     "fixstand",
     "passive",
+    "motion-mode",
     "status",
     "urgent-stop",
     "idle-load",
@@ -46,6 +47,8 @@ DEFAULT_FIELDS = {
     "segments",
     "hold",
     "matched",
+    "motion_mode",
+    "executor",
     "next",
     "error",
 }
@@ -113,6 +116,8 @@ class Handler(BaseHTTPRequestHandler):
         payload = self.body()
         state.records.append(("POST", self.path, payload))
         if self.path == "/execute":
+            self.send_json({"ok": True, "id": state.run_id()})
+        elif self.path == "/execute_loco_upper":
             self.send_json({"ok": True, "id": state.run_id()})
         elif self.path == "/standby_velocity":
             self.send_json({"ok": True, "ctrl": "standby_velocity"})
@@ -258,11 +263,11 @@ print(json.dumps({"ok": True}))
     def wait_for_execs(self, count, timeout=5.0):
         deadline = time.time() + timeout
         while time.time() < deadline:
-            records = [r for r in self.tracker.records if r[0] == "POST" and r[1] == "/execute"]
+            records = [r for r in self.tracker.records if r[0] == "POST" and r[1] in {"/execute", "/execute_loco_upper"}]
             if len(records) >= count:
                 return records
             time.sleep(0.05)
-        return [r for r in self.tracker.records if r[0] == "POST" and r[1] == "/execute"]
+        return [r for r in self.tracker.records if r[0] == "POST" and r[1] in {"/execute", "/execute_loco_upper"}]
 
     def load_action_module(self):
         name = f"et1_action_under_test_{time.time_ns()}"
@@ -386,6 +391,8 @@ print(json.dumps({"ok": True}))
     def test_run_text_preset_hit_skips_nl2trk_and_runs_staged_path(self):
         out, _ = self.cli("run-text", "wave", "--stage-dir", str(self.stage), env_extra={"FAKE_PRESET_MODE": "hit"})
         self.assertTrue(out["ok"])
+        self.assertEqual(out["motion_mode"], "fullbody")
+        self.assertEqual(out["executor"], "fullbody")
         self.assertEqual([c[0] for c in self.calls()], ["preset"])
         execute = self.tracker.records[-1]
         self.assertEqual(execute[1], "/execute")
@@ -394,6 +401,36 @@ print(json.dumps({"ok": True}))
         self.assertTrue((Path(execute[2]["path"]).parent / "prompt.txt").exists())
         self.assertTrue((Path(execute[2]["path"]).parent / "meta.json").exists())
         self.assertFalse((Path(execute[2]["path"]).parent / "action.bvh").exists())
+
+    def test_motion_mode_switches_later_runs_to_loco_upper(self):
+        out, _ = self.cli("motion-mode")
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["motion_mode"], "fullbody")
+        self.assertEqual(out["executor"], "fullbody")
+
+        out, _ = self.cli("motion-mode", "base")
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["motion_mode"], "base")
+        self.assertEqual(out["executor"], "loco_upper")
+
+        out, _ = self.cli("run-trk", str(self.ready_trk))
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["motion_mode"], "base")
+        self.assertEqual(out["executor"], "loco_upper")
+        execute = self.tracker.records[-1]
+        self.assertEqual(execute[1], "/execute_loco_upper")
+        self.assertEqual(execute[2]["mode"], "interrupt")
+        self.assertEqual(execute[2]["path"], str(self.ready_trk))
+
+        out, _ = self.cli("motion-mode", "fullbody")
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["motion_mode"], "fullbody")
+
+        out, _ = self.cli("run-trk", str(self.ready_trk))
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["motion_mode"], "fullbody")
+        self.assertEqual(out["executor"], "fullbody")
+        self.assertEqual(self.tracker.records[-1][1], "/execute")
 
     def test_run_text_cancels_existing_sequence_before_interrupt_execute(self):
         state_path = self.write_active_sequence()

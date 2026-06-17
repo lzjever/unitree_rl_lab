@@ -17,6 +17,8 @@ Prefer natural-language commands through `run-text`; it checks bundled presets f
 For generated motions, translate user intent to a concise English Kimodo-style prompt and choose a short physical duration. Use `--seed` when the user asks to retry/compare variants or reproduce a result; use `--diffusion-steps` only when explicitly needed.
 For precise left/right limb actions or final-pose requests, use `run-text ... --hold --no-preset`. The command also auto-detects common "hold the pose" phrasing and bypasses risky presets for precise left/right limb prompts.
 
+Motion submission has two persistent skill modes. The default is `fullbody`, which submits TRK through the normal whole-body tracker (`/execute`). Only switch to `base` when the user explicitly asks to use base/chassis/loco-upper mode; then later `run-text`, `run-trk`, and sequence submissions use `/execute_loco_upper` until the user explicitly switches back to `fullbody`. Do not infer base mode from ordinary walking requests.
+
 Common commands:
 
 ```bash
@@ -24,6 +26,9 @@ scripts/et1-action run-text "<concise English motion prompt>" --duration 3
 scripts/et1-action run-text "<concise English final-pose prompt>" --duration 4 --hold --no-preset
 scripts/et1-action run-trk /abs/path/motion.trk
 scripts/et1-action run-trk relative/name-under-user-motion
+scripts/et1-action motion-mode              # query current fullbody/base mode
+scripts/et1-action motion-mode base         # explicit base/chassis/loco-upper mode
+scripts/et1-action motion-mode fullbody     # explicit normal whole-body mode
 scripts/et1-action status
 scripts/et1-action standby
 scripts/et1-action fixstand  # explicit "enter stand configuration" only

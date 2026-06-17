@@ -33,11 +33,13 @@ P0_NEXT = {
     "standby",
     "fixstand",
     "passive",
+    "motion-mode",
     "status",
     "urgent-stop",
     "idle-load",
     "cache-clear",
 }
+MOTION_MODES = {"fullbody", "base"}
 
 
 class CliError(Exception):
@@ -106,6 +108,61 @@ def state_dir():
         root = skill_dir() / ".state"
     root.mkdir(parents=True, exist_ok=True)
     return root
+
+
+def motion_mode_path():
+    return state_dir() / "motion-mode.json"
+
+
+def normalize_motion_mode(value):
+    raw = (value or "").strip().lower().replace("_", "-")
+    aliases = {
+        "full": "fullbody",
+        "full-body": "fullbody",
+        "fullbody": "fullbody",
+        "whole-body": "fullbody",
+        "wholebody": "fullbody",
+        "base": "base",
+        "chassis": "base",
+        "loco": "base",
+        "loco-upper": "base",
+        "locoupper": "base",
+    }
+    mode = aliases.get(raw, raw)
+    if mode not in MOTION_MODES:
+        raise CliError("REQUEST_INVALID", "motion mode must be fullbody or base", next_step="motion-mode")
+    return mode
+
+
+def current_motion_mode():
+    raw_env = os.environ.get("ET1_ACTION_MOTION_MODE")
+    if raw_env:
+        return normalize_motion_mode(raw_env)
+    path = motion_mode_path()
+    if not path.exists():
+        return "fullbody"
+    try:
+        data = read_json(path)
+    except (OSError, json.JSONDecodeError):
+        return "fullbody"
+    try:
+        return normalize_motion_mode(data.get("mode"))
+    except CliError:
+        return "fullbody"
+
+
+def write_motion_mode(mode):
+    mode = normalize_motion_mode(mode)
+    write_json(motion_mode_path(), {"mode": mode, "updated_at": now()})
+    return mode
+
+
+def executor_for_motion_mode(mode):
+    return "loco_upper" if mode == "base" else "fullbody"
+
+
+def endpoint_for_motion_mode(mode):
+    return "/execute_loco_upper" if mode == "base" else "/execute"
 
 
 def default_stage_dir():
@@ -439,10 +496,11 @@ def resolve_run_trk_path(raw):
 
 def execute_trk(base, path, mode, wait, timeout, poll, hold=False):
     path = validate_trk(path)
+    motion_mode = current_motion_mode()
     started = http_request(
         base,
         "POST",
-        "/execute",
+        endpoint_for_motion_mode(motion_mode),
         {"path": path, "mode": mode, "hold": bool(hold)},
         timeout,
     )
@@ -759,7 +817,8 @@ def run_text_cmd(args, base, timeout, poll):
         error = started.get("error", {})
         return err_doc("run-text", error.get("code", "TRACKER_RUN_FAILED"), error.get("message", "tracker run failed"), "run-text")
     active = {"run_id": started.get("id")} if started.get("id") else None
-    return ok_doc("run-text", "standby", intent="run_text", state="running", active=active, segments={"submitted": 1}, hold=hold)
+    motion_mode = current_motion_mode()
+    return ok_doc("run-text", "standby", intent="run_text", state="running", active=active, segments={"submitted": 1}, hold=hold, motion_mode=motion_mode, executor=executor_for_motion_mode(motion_mode))
 
 
 def run_trk_cmd(args, base, timeout, poll):
@@ -770,7 +829,8 @@ def run_trk_cmd(args, base, timeout, poll):
         error = started.get("error", {})
         return err_doc("run-trk", error.get("code", "TRACKER_RUN_FAILED"), error.get("message", "tracker run failed"), "run-trk")
     active = {"run_id": started.get("id")} if started.get("id") else None
-    return ok_doc("run-trk", "standby", intent="run_trk", state="running", active=active, segments={"submitted": 1}, hold=args.hold, matched=matched)
+    motion_mode = current_motion_mode()
+    return ok_doc("run-trk", "standby", intent="run_trk", state="running", active=active, segments={"submitted": 1}, hold=args.hold, matched=matched, motion_mode=motion_mode, executor=executor_for_motion_mode(motion_mode))
 
 
 def compact_tracker_state(status):
@@ -1682,7 +1742,16 @@ def tracker_status_cmd(base, timeout, cmd="tracker-status"):
     if not out.get("ok"):
         error = out.get("error", {})
         return err_doc(cmd, error.get("code", "TRACKER_STATE_CONFLICT"), error.get("message", "status failed"), "standby")
-    return ok_doc(cmd, "standby", state=out.get("state") or out.get("ctrl"))
+    motion_mode = current_motion_mode()
+    return ok_doc(cmd, "standby", state=out.get("state") or out.get("ctrl"), motion_mode=motion_mode, executor=executor_for_motion_mode(motion_mode))
+
+
+def motion_mode_cmd(args):
+    if args.mode:
+        motion_mode = write_motion_mode(args.mode)
+    else:
+        motion_mode = current_motion_mode()
+    return ok_doc("motion-mode", "run-text", intent="motion_mode", state=motion_mode, motion_mode=motion_mode, executor=executor_for_motion_mode(motion_mode))
 
 
 def cache_clear_cmd(args):
@@ -1726,6 +1795,8 @@ def parse(argv):
     sub.add_parser("fixstand")
     ps = sub.add_parser("passive")
     ps.add_argument("--password")
+    mm = sub.add_parser("motion-mode")
+    mm.add_argument("mode", nargs="?", choices=("fullbody", "base", "full", "full-body", "whole-body", "loco", "loco-upper", "chassis"))
     sub.add_parser("status")
 
     us = sub.add_parser("urgent-stop")
@@ -1797,6 +1868,8 @@ def main(argv):
             out = fixstand_cmd(base, args.timeout)
         elif args.cmd == "passive":
             out = passive_cmd(args, base, args.timeout)
+        elif args.cmd == "motion-mode":
+            out = motion_mode_cmd(args)
         elif args.cmd == "urgent-stop":
             out = urgent_stop_cmd(args, base, args.timeout)
         elif args.cmd == "idle-load":

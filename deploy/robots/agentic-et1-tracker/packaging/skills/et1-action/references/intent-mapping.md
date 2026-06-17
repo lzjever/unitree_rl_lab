@@ -2,6 +2,9 @@
 
 Map user interruptions to one workflow command:
 
+- Switch to base/chassis/loco-upper mode: `motion-mode base`, then later motion commands use `/execute_loco_upper`.
+- Switch back to normal whole-body tracking: `motion-mode fullbody`.
+- Ordinary walking, turning, or motion prompts do not imply base mode; use the current `motion-mode`.
 - Add after current work: `sequence-append`.
 - Replace later work while current motion continues: `sequence-replace-tail`.
 - New user motion request while anything is running: use `run-text` or a new `sequence-start`; these cancel old local sequences and submit the first motion with tracker interrupt.
