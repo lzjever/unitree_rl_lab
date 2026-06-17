@@ -40,12 +40,20 @@ ExecuteCommand locoCommand(std::string id,
                            std::size_t frames = 120,
                            double duration_s = 2.4,
                            bool hold = false,
-                           double max_radius_m = 0.8) {
+                           double max_radius_m = 0.8,
+                           bool radius_clamped = false,
+                           bool envelope_clamped = false,
+                           bool upper_clamped = false,
+                           bool upper_rate_limited = false) {
   ExecuteCommand command =
       executeCommand(std::move(id), mode, frames, duration_s, hold);
   command.executor = MotionExecutor::LocoUpper;
   command.loco_options.max_radius_m = max_radius_m;
   command.loco_options.hold = hold;
+  command.loco_options.radius_clamped = radius_clamped;
+  command.loco_options.envelope_clamped = envelope_clamped;
+  command.loco_options.upper_clamped = upper_clamped;
+  command.loco_options.upper_rate_limited = upper_rate_limited;
   return command;
 }
 
@@ -133,7 +141,8 @@ TEST_CASE("RuntimeBridge preserves loco-upper metadata through status and comman
   store.publishSnapshot(readySnapshot());
 
   const auto result = bridge.submitQueue(
-      locoCommand("loco-run", MotionMode::Queue, 80, 1.6, true, 1.25));
+      locoCommand("loco-run", MotionMode::Queue, 80, 1.6, true, 1.25, true,
+                  true, true, true));
 
   REQUIRE(result.code == ErrorCode::Ok);
   auto lookup = store.findRun("loco-run");
@@ -145,9 +154,11 @@ TEST_CASE("RuntimeBridge preserves loco-upper metadata through status and comman
   REQUIRE(lookup.run->loco.distance_m == 0.0);
   REQUIRE(lookup.run->loco.radius_source.empty());
   REQUIRE(lookup.run->loco.phase == LocoPhase::Queued);
-  REQUIRE_FALSE(lookup.run->loco.radius_clamped);
+  REQUIRE(lookup.run->loco.radius_clamped);
   REQUIRE_FALSE(lookup.run->loco.radius_limit_reached);
-  REQUIRE_FALSE(lookup.run->loco.envelope_clamped);
+  REQUIRE(lookup.run->loco.envelope_clamped);
+  REQUIRE(lookup.run->loco.upper_clamped);
+  REQUIRE(lookup.run->loco.upper_rate_limited);
   REQUIRE_FALSE(lookup.run->loco.lower_action_clamped);
   REQUIRE(lookup.run->loco.reason == LocoReason::None);
 
@@ -158,6 +169,10 @@ TEST_CASE("RuntimeBridge preserves loco-upper metadata through status and comman
   REQUIRE(command->request.executor == MotionExecutor::LocoUpper);
   REQUIRE(command->request.loco_options.max_radius_m == 1.25);
   REQUIRE(command->request.loco_options.hold);
+  REQUIRE(command->request.loco_options.radius_clamped);
+  REQUIRE(command->request.loco_options.envelope_clamped);
+  REQUIRE(command->request.loco_options.upper_clamped);
+  REQUIRE(command->request.loco_options.upper_rate_limited);
 }
 
 TEST_CASE("RuntimeStatusStore preserves loco-upper payload when queued run is canceled") {
@@ -167,7 +182,7 @@ TEST_CASE("RuntimeStatusStore preserves loco-upper payload when queued run is ca
   store.publishSnapshot(readySnapshot());
 
   REQUIRE(bridge.submitQueue(locoCommand("old-loco", MotionMode::Queue, 80, 1.6,
-                                         false, 0.9))
+                                         false, 0.9, true, true, true, true))
               .ok());
 
   REQUIRE(bridge.submitInterrupt(executeCommand("urgent", MotionMode::Interrupt)).ok());
@@ -178,6 +193,10 @@ TEST_CASE("RuntimeStatusStore preserves loco-upper payload when queued run is ca
   REQUIRE(canceled.run->state == MotionState::Canceled);
   REQUIRE(canceled.run->executor == MotionExecutor::LocoUpper);
   REQUIRE(canceled.run->loco.max_radius_m == 0.9);
+  REQUIRE(canceled.run->loco.radius_clamped);
+  REQUIRE(canceled.run->loco.envelope_clamped);
+  REQUIRE(canceled.run->loco.upper_clamped);
+  REQUIRE(canceled.run->loco.upper_rate_limited);
   REQUIRE(canceled.run->loco.phase == LocoPhase::Canceled);
   REQUIRE(canceled.run->stop_reason == StopReason::Interrupt);
 
@@ -185,6 +204,34 @@ TEST_CASE("RuntimeStatusStore preserves loco-upper payload when queued run is ca
   REQUIRE(urgent.code == ErrorCode::Ok);
   REQUIRE(urgent.run.has_value());
   REQUIRE(urgent.run->executor == MotionExecutor::GeneralTracker);
+}
+
+TEST_CASE("RuntimeStatusStore preserves loco-upper flags for active snapshot lookup") {
+  const RuntimeConfig config = runtimeConfig(4);
+  RuntimeStatusStore store(config);
+
+  MotionStatus active;
+  active.id = "active-loco";
+  active.path = "/tmp/active-loco.trk";
+  active.executor = MotionExecutor::LocoUpper;
+  active.state = MotionState::Running;
+  active.loco.max_radius_m = 0.8;
+  active.loco.phase = LocoPhase::Motion;
+  active.loco.upper_clamped = true;
+  active.loco.upper_rate_limited = true;
+
+  auto snapshot = readySnapshot(ControllerState::Running);
+  snapshot.exec = active;
+  snapshot.active = {ActiveKind::User, active.id};
+  store.publishSnapshot(snapshot);
+
+  const auto lookup = store.findRun(active.id);
+  REQUIRE(lookup.code == ErrorCode::Ok);
+  REQUIRE(lookup.run.has_value());
+  REQUIRE(lookup.run->state == MotionState::Running);
+  REQUIRE(lookup.run->executor == MotionExecutor::LocoUpper);
+  REQUIRE(lookup.run->loco.upper_clamped);
+  REQUIRE(lookup.run->loco.upper_rate_limited);
 }
 
 TEST_CASE("RuntimeStatusStore keeps holding runs queryable without queue ids") {

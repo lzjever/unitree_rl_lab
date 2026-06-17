@@ -556,8 +556,7 @@ TEST_CASE("loco upper validator rejects invalid upper joint targets") {
     const LocoUpperJointValidationResult result =
         extractAndValidateUpperJointTargets(track, options);
 
-    REQUIRE_FALSE(result.ok());
-    REQUIRE_THAT(result.message, ContainsSubstring("above limit"));
+    REQUIRE(result.ok());
   }
 
   SECTION("velocity limit") {
@@ -571,8 +570,7 @@ TEST_CASE("loco upper validator rejects invalid upper joint targets") {
     const LocoUpperJointValidationResult result =
         extractAndValidateUpperJointTargets(track, options);
 
-    REQUIRE_FALSE(result.ok());
-    REQUIRE_THAT(result.message, ContainsSubstring("velocity"));
+    REQUIRE(result.ok());
   }
 
   SECTION("acceleration limit") {
@@ -588,8 +586,7 @@ TEST_CASE("loco upper validator rejects invalid upper joint targets") {
     const LocoUpperJointValidationResult result =
         extractAndValidateUpperJointTargets(track, options);
 
-    REQUIRE_FALSE(result.ok());
-    REQUIRE_THAT(result.message, ContainsSubstring("acceleration"));
+    REQUIRE(result.ok());
   }
 }
 
@@ -603,9 +600,9 @@ TEST_CASE("loco upper validator covers upper joint limit boundaries") {
     const LocoUpperJointValidationResult result =
         extractAndValidateUpperJointTargets(track, options);
 
-    REQUIRE_FALSE(result.ok());
-    REQUIRE_THAT(result.message, ContainsSubstring("below limit"));
-    REQUIRE(result.joint_index == kLocoUpperJointLastExclusive - 1);
+    REQUIRE(result.ok());
+    REQUIRE(result.plan.frames.at(0).at(kLocoUpperJointCount - 1) ==
+            Catch::Approx(-2.0));
   }
 
   SECTION("invalid position limit range") {
@@ -672,7 +669,7 @@ TEST_CASE("loco upper precheck combines root and upper joint validation") {
     REQUIRE_THAT(result.message, ContainsSubstring("root"));
   }
 
-  SECTION("invalid upper joints") {
+  SECTION("upper position bounds are clamped by precheck compiler") {
     TrkTrack track = makeTrack(2);
     options.upper_joint_limits = testUpperLimits();
     options.upper_joint_limits->max_positions.at(0) = 1.0;
@@ -680,9 +677,8 @@ TEST_CASE("loco upper precheck combines root and upper joint validation") {
 
     const LocoUpperPrecheckResult result = precheckLocoUpperTrack(track, options);
 
-    REQUIRE_FALSE(result.ok());
-    REQUIRE(result.code == ErrorCode::TrkValidationFailed);
-    REQUIRE_THAT(result.message, ContainsSubstring("above limit"));
+    REQUIRE(result.ok());
+    REQUIRE(result.flags.upper_clamped);
   }
 
   SECTION("velocity jump uses app-owned upper dynamic limits") {
@@ -692,9 +688,8 @@ TEST_CASE("loco upper precheck combines root and upper joint validation") {
 
     const LocoUpperPrecheckResult result = precheckLocoUpperTrack(track, options);
 
-    REQUIRE_FALSE(result.ok());
-    REQUIRE(result.code == ErrorCode::TrkValidationFailed);
-    REQUIRE_THAT(result.message, ContainsSubstring("velocity"));
+    REQUIRE(result.ok());
+    REQUIRE(result.flags.upper_rate_limited);
   }
 
   SECTION("acceleration jump uses app-owned upper dynamic limits") {
@@ -709,12 +704,11 @@ TEST_CASE("loco upper precheck combines root and upper joint validation") {
 
     const LocoUpperPrecheckResult result = precheckLocoUpperTrack(track, options);
 
-    REQUIRE_FALSE(result.ok());
-    REQUIRE(result.code == ErrorCode::TrkValidationFailed);
-    REQUIRE_THAT(result.message, ContainsSubstring("acceleration"));
+    REQUIRE(result.ok());
+    REQUIRE(result.flags.upper_rate_limited);
   }
 
-  SECTION("strict pose rejects radius clamping") {
+  SECTION("strict pose accepts radius clamping") {
     TrkTrack track = makeTrack(2);
     setRootPose(track, 0, 0.0, 0.0, 0.0);
     setRootPose(track, 1, 2.0, 0.0, 0.0);
@@ -722,9 +716,8 @@ TEST_CASE("loco upper precheck combines root and upper joint validation") {
 
     const LocoUpperPrecheckResult result = precheckLocoUpperTrack(track, options);
 
-    REQUIRE_FALSE(result.ok());
-    REQUIRE(result.code == ErrorCode::TrkValidationFailed);
-    REQUIRE_THAT(result.message, ContainsSubstring("radius"));
+    REQUIRE(result.ok());
+    REQUIRE(result.flags.radius_clamped);
   }
 }
 

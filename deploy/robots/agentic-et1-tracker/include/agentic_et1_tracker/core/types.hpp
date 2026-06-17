@@ -146,6 +146,10 @@ enum class StopReason {
 struct LocoRunOptions {
   double max_radius_m{0.0};
   bool hold{false};
+  bool radius_clamped{false};
+  bool envelope_clamped{false};
+  bool upper_clamped{false};
+  bool upper_rate_limited{false};
 };
 
 struct LocoRunStatus {
@@ -156,6 +160,8 @@ struct LocoRunStatus {
   bool radius_clamped{false};
   bool radius_limit_reached{false};
   bool envelope_clamped{false};
+  bool upper_clamped{false};
+  bool upper_rate_limited{false};
   bool raw_action_clamped{false};
   bool lower_q_limited{false};
   bool lower_action_clamped{false};

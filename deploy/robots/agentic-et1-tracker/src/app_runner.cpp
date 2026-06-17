@@ -17,6 +17,7 @@
 #include "agentic_et1_tracker/app/process_lock.hpp"
 #include "agentic_et1_tracker/core/id_generator.hpp"
 #include "agentic_et1_tracker/http/server.hpp"
+#include "agentic_et1_tracker/loco_upper/command_limits.hpp"
 #include "agentic_et1_tracker/loco_upper/precheck.hpp"
 #include "agentic_et1_tracker/reference/reference_frame_store.hpp"
 #include "agentic_et1_tracker/runtime/runtime_bridge.hpp"
@@ -56,11 +57,19 @@ class AppTrackValidator final : public TrackValidatorPort {
 class AppLocoUpperPrechecker final : public LocoUpperPrecheckPort {
  public:
   AppLocoUpperPrechecker(TrkValidationConfig config,
+                         RuntimeConfig runtime_config,
                          bool enabled,
-                         std::string limits_path)
-      : loader_(std::move(config)) {
+                         std::string limits_path,
+                         std::optional<LocoLowerDeployConfig> lower_deploy_config =
+                             std::nullopt)
+      : loader_(std::move(config)),
+        runtime_config_(runtime_config),
+        enabled_(enabled) {
     if (!enabled) {
       return;
+    }
+    if (lower_deploy_config) {
+      configureCommandLimits(*lower_deploy_config);
     }
     try {
       validation_options_ =
@@ -70,20 +79,35 @@ class AppLocoUpperPrechecker final : public LocoUpperPrecheckPort {
     }
   }
 
+  void configureCommandLimits(const LocoLowerDeployConfig& lower_deploy_config) {
+    if (!enabled_) {
+      return;
+    }
+    command_limits_ =
+        locoUpperCommandLimitsFromConfig(runtime_config_, lower_deploy_config);
+  }
+
   LocoUpperPrecheckResult precheck(
       const std::string& canonical_path,
       const LocoUpperPrecheckOptions& options) override {
     if (!load_error_.empty()) {
       return {ErrorCode::ModelNotReady, load_error_};
     }
+    if (!command_limits_) {
+      return {ErrorCode::ModelNotReady, "loco_upper command limits not loaded"};
+    }
 
     LocoUpperPrecheckOptions configured = options;
     configured.upper_joint_limits = validation_options_;
+    configured.command_limits = *command_limits_;
     return precheckLocoUpperTrackFile(loader_, canonical_path, configured);
   }
 
  private:
   TrkLoader loader_;
+  RuntimeConfig runtime_config_;
+  bool enabled_{false};
+  std::optional<LocoUpperCommandLimits> command_limits_;
   std::optional<LocoUpperJointValidationOptions> validation_options_;
   std::string load_error_;
 };
@@ -138,6 +162,14 @@ AppRuntimeFactoryResult injectedRuntime(AppRuntimeDeps deps) {
   return result;
 }
 
+std::optional<LocoLowerDeployConfig> lowerDeployConfigForPrecheck(
+    const AppRuntimeFactoryResult& result) {
+  if (!result.deps || !result.deps->loco_lower_deploy_config) {
+    return std::nullopt;
+  }
+  return *result.deps->loco_lower_deploy_config;
+}
+
 std::string lockNamePart(std::string value) {
   for (char& ch : value) {
     const auto uch = static_cast<unsigned char>(ch);
@@ -172,7 +204,10 @@ class AppRunner::Impl {
         status_(config_.runtime),
         bridge_(config_.runtime, status_),
         validator_(config_.trk),
-        loco_prechecker_(config_.trk, config_.loco_upper.enabled, config_.loco_upper.limits),
+        loco_prechecker_(config_.trk,
+                         config_.runtime,
+                         config_.loco_upper.enabled,
+                         config_.loco_upper.limits),
         api_(makeAgentApiConfig(initialRuntimeMode(config_), config_),
              bridge_,
              status_,
@@ -184,13 +219,20 @@ class AppRunner::Impl {
         server_(config_.http, api_, reference_store_.get()) {}
 
   Impl(AppConfig config, AppRuntimeDeps deps)
+      : Impl(std::move(config), injectedRuntime(std::move(deps))) {}
+
+  Impl(AppConfig config, AppRuntimeFactoryResult factory_result)
       : config_(std::move(config)),
         runtime_factory_(),
-        factory_result_(injectedRuntime(std::move(deps))),
+        factory_result_(std::move(factory_result)),
         status_(config_.runtime),
         bridge_(config_.runtime, status_),
         validator_(config_.trk),
-        loco_prechecker_(config_.trk, config_.loco_upper.enabled, config_.loco_upper.limits),
+        loco_prechecker_(config_.trk,
+                         config_.runtime,
+                         config_.loco_upper.enabled,
+                         config_.loco_upper.limits,
+                         lowerDeployConfigForPrecheck(factory_result_)),
         api_(makeAgentApiConfig(factory_result_.deps->mode, config_),
              bridge_,
              status_,
@@ -281,6 +323,7 @@ class AppRunner::Impl {
           config_.loco_upper.enabled && deps.loco_lower_policy &&
           deps.loco_lower_deploy_config && deps.loco_upper_composer_config;
       if (enable_loco_upper_runtime) {
+        loco_prechecker_.configureCommandLimits(*deps.loco_lower_deploy_config);
         runtime_loop_.emplace(config_.runtime,
                               bridge_,
                               status_,

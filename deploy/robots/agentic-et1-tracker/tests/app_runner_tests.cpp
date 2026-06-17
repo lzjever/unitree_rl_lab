@@ -384,6 +384,18 @@ std::filesystem::path writeLocoUpperTrack(const std::filesystem::path& dir,
   return path;
 }
 
+std::filesystem::path writeLocoUpperEnvelopeClampedTrack(const std::filesystem::path& dir,
+                                                         const std::string& name) {
+  TrkTrack track = inMemoryTrack(4);
+  for (std::size_t frame = 0; frame < track.metadata.frames; ++frame) {
+    const std::size_t offset = frame * track.body_pos_w.frame_size;
+    track.body_pos_w.values.at(offset) = frame == 0 ? 0.0F : 0.25F;
+  }
+  const auto path = dir / name;
+  writeTrack(path, track);
+  return path;
+}
+
 void configureLocoUpperAppPaths(AppConfig& config) {
   const auto root = appRoot();
   config.loco_upper.limits =
@@ -1253,7 +1265,48 @@ TEST_CASE("HTTP execute_loco_upper queues valid fixture with app-owned upper lim
   runner.stop();
 }
 
-TEST_CASE("HTTP execute_loco_upper rejects upper limit violations before queueing") {
+TEST_CASE("HTTP execute_loco_upper queued status reports runtime envelope clamp") {
+  TempTree tmp;
+  FakeRobotIO* robot = nullptr;
+  FakePolicy* policy = nullptr;
+  auto config = productionTestConfig(tmp);
+  config.loco_upper.enabled = true;
+  configureLocoUpperAppPaths(config);
+  const auto path =
+      writeLocoUpperEnvelopeClampedTrack(tmp.allowed, "loco_upper_envelope_clamped.trk");
+  AppRunner runner(config, makeDeps(robot, policy, kExpectedModeMachine, RuntimeMode::Sim,
+                                    nullptr, nullptr, true));
+  REQUIRE(runner.start());
+  auto client = httplib::Client("127.0.0.1", runner.boundPort());
+
+  pollJson(client, "/status", [](const nlohmann::json& json) {
+    return json.at("ready") == true && json.at("cap").at("loco_upper").at("ready") == true;
+  });
+
+  body(client.Post("/standby_velocity", "", "application/json"), 200);
+  pollJson(client, "/status", [](const nlohmann::json& json) {
+    return json.at("ctrl") == "standby_velocity";
+  });
+
+  const auto execute =
+      body(client.Post("/execute_loco_upper",
+                       (std::string(R"({"path":")") + path.string() + R"("})").c_str(),
+                       "application/json"),
+           200);
+  REQUIRE(execute.at("executor") == "loco_upper");
+  REQUIRE(execute.at("state") == "queued");
+  REQUIRE(execute.at("id").is_string());
+
+  const std::string id = execute.at("id");
+  const auto queued = body(client.Get(("/status?id=" + id).c_str()), 200);
+  REQUIRE(queued.at("state") == "queued");
+  REQUIRE(queued.at("executor") == "loco_upper");
+  REQUIRE(queued.at("loco").at("envelope_clamped") == true);
+
+  runner.stop();
+}
+
+TEST_CASE("HTTP execute_loco_upper accepts bounded upper limit violations and reports flags") {
   TempTree tmp;
   FakeRobotIO* robot = nullptr;
   FakePolicy* policy = nullptr;
@@ -1278,16 +1331,24 @@ TEST_CASE("HTTP execute_loco_upper rejects upper limit violations before queuein
     return json.at("ctrl") == "standby_velocity";
   });
 
-  const auto failure =
+  const auto execute =
       body(client.Post("/execute_loco_upper",
                        (std::string(R"({"path":")") + path.string() + R"("})").c_str(),
                        "application/json"),
-           400);
-  REQUIRE(failure.at("error").at("code") == "TRK_VALIDATION_FAILED");
-  REQUIRE_FALSE(failure.contains("id"));
+           200);
+  REQUIRE(execute.at("executor") == "loco_upper");
+  REQUIRE(execute.at("state") == "queued");
+  REQUIRE(execute.at("id").is_string());
 
-  const auto status = body(client.Get("/status"), 200);
-  REQUIRE(status.at("queue").at("n") == 0);
+  const std::string id = execute.at("id");
+  const auto status = pollJson(client, "/status?id=" + id, [](const nlohmann::json& json) {
+    return json.contains("loco") &&
+           json.at("loco").at("upper_clamped") == true &&
+           json.at("loco").at("upper_rate_limited") == true;
+  });
+  REQUIRE(status.at("executor") == "loco_upper");
+  REQUIRE(status.at("loco").at("upper_clamped") == true);
+  REQUIRE(status.at("loco").at("upper_rate_limited") == true);
 
   runner.stop();
 }

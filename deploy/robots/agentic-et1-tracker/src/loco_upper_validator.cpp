@@ -1,6 +1,5 @@
 #include "agentic_et1_tracker/loco_upper/validator.hpp"
 
-#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <limits>
@@ -42,13 +41,6 @@ bool validJointArrayForFrames(const TrkFloatArray& array, std::size_t frames) {
     return false;
   }
   return array.values.size() >= frames * array.frame_size;
-}
-
-double finiteNonnegativeLimitOrInfinity(double value) {
-  if (!std::isfinite(value)) {
-    return std::numeric_limits<double>::infinity();
-  }
-  return std::max(0.0, value);
 }
 
 template <typename T>
@@ -122,21 +114,34 @@ double upperPositionLimit(const LocoUpperJointValidationOptions& options,
   return options.max_position;
 }
 
-double velocityLimit(const LocoUpperJointValidationOptions& options,
-                     std::size_t upper_joint) {
+double rawVelocityLimit(const LocoUpperJointValidationOptions& options,
+                        std::size_t upper_joint) {
   if (options.max_velocities.size() == kLocoUpperJointCount) {
-    return finiteNonnegativeLimitOrInfinity(options.max_velocities.at(upper_joint));
+    return options.max_velocities.at(upper_joint);
   }
-  return finiteNonnegativeLimitOrInfinity(options.max_velocity);
+  return options.max_velocity;
 }
 
-double accelerationLimit(const LocoUpperJointValidationOptions& options,
-                         std::size_t upper_joint) {
+double rawAccelerationLimit(const LocoUpperJointValidationOptions& options,
+                            std::size_t upper_joint) {
   if (options.max_accelerations.size() == kLocoUpperJointCount) {
-    return finiteNonnegativeLimitOrInfinity(
-        options.max_accelerations.at(upper_joint));
+    return options.max_accelerations.at(upper_joint);
   }
-  return finiteNonnegativeLimitOrInfinity(options.max_acceleration);
+  return options.max_acceleration;
+}
+
+bool validNonnegativeLimit(double value) {
+  if (std::isnan(value)) {
+    return false;
+  }
+  if (std::isinf(value)) {
+    return value > 0.0;
+  }
+  return value >= 0.0;
+}
+
+bool validPositionLimit(double value) {
+  return !std::isnan(value);
 }
 
 LocoUpperJointValidationResult validatePerJointConfiguration(
@@ -156,6 +161,12 @@ LocoUpperJointValidationResult validatePerJointConfiguration(
   for (std::size_t joint = 0; joint < kLocoUpperJointCount; ++joint) {
     const double min_position = lowerPositionLimit(options, joint);
     const double max_position = upperPositionLimit(options, joint);
+    if (!validPositionLimit(min_position) || !validPositionLimit(max_position)) {
+      return fail("loco upper joint position limits are invalid",
+                  0,
+                  kLocoUpperJointFirst + joint,
+                  LocoUpperJointValidationFailureKind::InvalidConfig);
+    }
     if (std::isfinite(min_position) && std::isfinite(max_position) &&
         min_position > max_position) {
       return fail("loco upper joint position limits are invalid",
@@ -163,15 +174,15 @@ LocoUpperJointValidationResult validatePerJointConfiguration(
                   kLocoUpperJointFirst + joint,
                   LocoUpperJointValidationFailureKind::InvalidConfig);
     }
-    const double max_velocity = velocityLimit(options, joint);
-    const double max_acceleration = accelerationLimit(options, joint);
-    if (std::isfinite(max_velocity) && max_velocity < 0.0) {
+    const double max_velocity = rawVelocityLimit(options, joint);
+    const double max_acceleration = rawAccelerationLimit(options, joint);
+    if (!validNonnegativeLimit(max_velocity)) {
       return fail("loco upper joint velocity limits are invalid",
                   0,
                   kLocoUpperJointFirst + joint,
                   LocoUpperJointValidationFailureKind::InvalidConfig);
     }
-    if (std::isfinite(max_acceleration) && max_acceleration < 0.0) {
+    if (!validNonnegativeLimit(max_acceleration)) {
       return fail("loco upper joint acceleration limits are invalid",
                   0,
                   kLocoUpperJointFirst + joint,
@@ -233,64 +244,9 @@ LocoUpperJointValidationResult extractAndValidateUpperJointTargets(
                     LocoUpperJointValidationFailureKind::InvalidTrack);
       }
       const double value = static_cast<double>(raw);
-      const std::size_t upper_joint = joint - kLocoUpperJointFirst;
-      const double min_position = lowerPositionLimit(options, upper_joint);
-      const double max_position = upperPositionLimit(options, upper_joint);
-      if (std::isfinite(min_position) && value < min_position) {
-        return fail("loco upper joint_pos is below limit",
-                    frame,
-                    joint,
-                    LocoUpperJointValidationFailureKind::Position);
-      }
-      if (std::isfinite(max_position) && value > max_position) {
-        return fail("loco upper joint_pos is above limit",
-                    frame,
-                    joint,
-                    LocoUpperJointValidationFailureKind::Position);
-      }
       target.at(joint - kLocoUpperJointFirst) = value;
     }
     plan.frames.push_back(target);
-  }
-
-  for (std::size_t frame = 1; frame < plan.frames.size(); ++frame) {
-    for (std::size_t joint = 0; joint < kLocoUpperJointCount; ++joint) {
-      const double max_velocity = velocityLimit(options, joint);
-      if (std::isfinite(max_velocity)) {
-        const double velocity =
-            (plan.frames.at(frame).at(joint) - plan.frames.at(frame - 1).at(joint)) /
-            plan.dt_s;
-        if (std::abs(velocity) > max_velocity) {
-          return fail("loco upper joint velocity exceeds limit",
-                      frame,
-                      kLocoUpperJointFirst + joint,
-                      LocoUpperJointValidationFailureKind::Velocity);
-        }
-      }
-    }
-  }
-
-  for (std::size_t frame = 2; frame < plan.frames.size(); ++frame) {
-    for (std::size_t joint = 0; joint < kLocoUpperJointCount; ++joint) {
-      const double max_acceleration = accelerationLimit(options, joint);
-      if (std::isfinite(max_acceleration)) {
-        const double previous_velocity =
-            (plan.frames.at(frame - 1).at(joint) -
-             plan.frames.at(frame - 2).at(joint)) /
-            plan.dt_s;
-        const double velocity =
-            (plan.frames.at(frame).at(joint) -
-             plan.frames.at(frame - 1).at(joint)) /
-            plan.dt_s;
-        const double acceleration = (velocity - previous_velocity) / plan.dt_s;
-        if (std::abs(acceleration) > max_acceleration) {
-          return fail("loco upper joint acceleration exceeds limit",
-                      frame,
-                      kLocoUpperJointFirst + joint,
-                      LocoUpperJointValidationFailureKind::Acceleration);
-        }
-      }
-    }
   }
 
   LocoUpperJointValidationResult result;

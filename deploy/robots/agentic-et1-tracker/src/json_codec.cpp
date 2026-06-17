@@ -28,6 +28,8 @@ nlohmann::json locoRunStatusJson(const LocoRunStatus& status) {
       {"radius_clamped", status.radius_clamped},
       {"radius_limit_reached", status.radius_limit_reached},
       {"envelope_clamped", status.envelope_clamped},
+      {"upper_clamped", status.upper_clamped},
+      {"upper_rate_limited", status.upper_rate_limited},
       {"raw_action_clamped", status.raw_action_clamped},
       {"lower_q_limited", status.lower_q_limited},
       {"lower_action_clamped", status.lower_action_clamped},

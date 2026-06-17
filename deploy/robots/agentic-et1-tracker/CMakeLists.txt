@@ -58,6 +58,7 @@ target_link_libraries(agentic_et1_tracker_trk
 add_library(agentic_et1_tracker_loco_upper
   src/loco_lower_policy.cpp
   src/loco_upper_lowcmd_composer.cpp
+  src/loco_upper_plan_compiler.cpp
   src/loco_upper_precheck.cpp
   src/loco_upper_planner.cpp
   src/loco_upper_validator.cpp
@@ -411,6 +412,7 @@ if(AGENTIC_ET1_BUILD_TESTS)
   add_executable(agentic_et1_tracker_loco_upper_tests
     tests/loco_lower_policy_tests.cpp
     tests/loco_upper_lowcmd_composer_tests.cpp
+    tests/loco_upper_plan_compiler_tests.cpp
     tests/loco_upper_planner_tests.cpp
   )
   target_link_libraries(agentic_et1_tracker_loco_upper_tests

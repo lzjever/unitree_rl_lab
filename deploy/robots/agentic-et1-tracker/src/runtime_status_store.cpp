@@ -13,6 +13,10 @@ LocoRunStatus queuedLocoStatus(const LocoRunOptions& options) {
   status.distance_m = 0.0;
   status.radius_source.clear();
   status.phase = LocoPhase::Queued;
+  status.radius_clamped = options.radius_clamped;
+  status.envelope_clamped = options.envelope_clamped;
+  status.upper_clamped = options.upper_clamped;
+  status.upper_rate_limited = options.upper_rate_limited;
   return status;
 }
 

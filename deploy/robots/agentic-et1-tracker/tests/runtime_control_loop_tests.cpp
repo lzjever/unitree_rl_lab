@@ -74,6 +74,7 @@ struct ArrayFixture {
   std::vector<std::array<float, 3>> root_body_positions;
   std::optional<std::array<float, 4>> root_body_quat;
   std::vector<std::array<float, 4>> root_body_quats;
+  std::vector<Vec> joint_pos_frames;
   bool identity_quaternions{false};
   bool invalid_contact{false};
   std::size_t invalid_contact_index{0};
@@ -152,6 +153,20 @@ void writePayload(std::ofstream& out, const ArrayFixture& array) {
         }
       } else if (array.root_body_quat && i < 4) {
         value = array.root_body_quat->at(i);
+      }
+    }
+    if (array.name == "joint_pos" && !array.joint_pos_frames.empty() &&
+        array.shape.size() >= 2) {
+      std::uint64_t frame_size = 1;
+      for (std::size_t dim = 1; dim < array.shape.size(); ++dim) {
+        frame_size *= array.shape.at(dim);
+      }
+      const std::uint64_t frame = frame_size == 0 ? 0 : i / frame_size;
+      const std::uint64_t frame_offset = frame_size == 0 ? i : i % frame_size;
+      if (frame < array.joint_pos_frames.size() &&
+          frame_offset < array.joint_pos_frames.at(static_cast<std::size_t>(frame)).size()) {
+        value = array.joint_pos_frames.at(static_cast<std::size_t>(frame))
+                    .at(static_cast<std::size_t>(frame_offset));
       }
     }
     writeScalar(out, value);
@@ -316,6 +331,17 @@ std::filesystem::path yawOnlyTrk(TempTree& tmp,
   for (const float yaw_rad : yaws_rad) {
     quat.root_body_quats.push_back(yawQuat(yaw_rad));
   }
+  const auto path = tmp.allowed / name;
+  writeTrk(path, arrays);
+  return path;
+}
+
+std::filesystem::path jointPosTrk(TempTree& tmp,
+                                  const std::string& name,
+                                  const std::vector<Vec>& joint_pos_frames) {
+  auto arrays = requiredArrays(joint_pos_frames.size());
+  arrayNamed(arrays, "body_quat_w").identity_quaternions = true;
+  arrayNamed(arrays, "joint_pos").joint_pos_frames = joint_pos_frames;
   const auto path = tmp.allowed / name;
   writeTrk(path, arrays);
   return path;
@@ -918,6 +944,13 @@ void requireLocoUpperFrame(const LowCmdFrame& frame,
             Catch::Approx(config.upper_kd.at(logical)).margin(1.0e-5F));
     REQUIRE(frame.motors.at(sdk_slot).tau == 0.0F);
   }
+}
+
+float locoUpperWrittenQ(const LowCmdFrame& frame,
+                        const LocoUpperLowCmdComposerConfig& config,
+                        std::size_t logical) {
+  const auto sdk_slot = static_cast<std::size_t>(config.logical_to_sdk.at(logical));
+  return frame.motors.at(sdk_slot).q;
 }
 
 void requireFixStandUpperFrame(const LowCmdFrame& frame,
@@ -5463,6 +5496,286 @@ TEST_CASE("RuntimeControlLoop loco_upper starts from StandbyVelocity without Gen
   REQUIRE(loco_lower_policy.inputs_seen.back().obs.size() == kLocoLowerPolicyObsDim);
   const Vec& obs = loco_lower_policy.inputs_seen.back().obs;
   REQUIRE((obs.at(6) != 0.0F || obs.at(7) != 0.0F || obs.at(8) != 0.0F));
+}
+
+TEST_CASE("RuntimeControlLoop loco_upper writes compiled position-clamped upper targets") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.001;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  LocoUpperLowCmdComposerConfig composer_config = locoUpperComposerConfig();
+  composer_config.upper_max_q.at(12) = 1.0F;
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.1F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy,
+                                  deploy_config,
+                                  velocityDeployConfig(),
+                                  fixStandConfig(),
+                                  ControlMode::StandbyVelocity,
+                                  passiveConfig(),
+                                  locoLowerDeployConfig(),
+                                  composer_config);
+
+  std::vector<Vec> frames(3, Vec(kPolicyJointDim, 0.0F));
+  for (Vec& frame : frames) {
+    frame.at(12) = 5.0F;
+  }
+  const auto path = jointPosTrk(tmp, "loco_upper_position_clamped.trk", frames);
+  REQUIRE(bridge.submitQueue(
+              locoUpperCommand("loco-upper-position-clamped", path, MotionMode::Queue, 3))
+              .ok());
+
+  loop.tick();
+  const StatusSnapshot snapshot = advanceThroughFirstLocoMotionWrite(loop, store);
+
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->loco.upper_clamped);
+  REQUIRE_FALSE(snapshot.exec->loco.upper_rate_limited);
+  REQUIRE_FALSE(robot.writes.empty());
+  REQUIRE(locoUpperWrittenQ(robot.writes.back(), composer_config, 12) ==
+          Catch::Approx(1.0F).margin(1.0e-5F));
+}
+
+TEST_CASE("RuntimeControlLoop loco_upper writes compiled rate-limited upper targets") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.001;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  LocoUpperLowCmdComposerConfig composer_config = locoUpperComposerConfig();
+  composer_config.upper_max_vel_radps.at(12) = 1.0F;
+  composer_config.upper_max_accel_radps2.at(12) = 10000.0F;
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.1F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy,
+                                  deploy_config,
+                                  velocityDeployConfig(),
+                                  fixStandConfig(),
+                                  ControlMode::StandbyVelocity,
+                                  passiveConfig(),
+                                  locoLowerDeployConfig(),
+                                  composer_config);
+
+  std::vector<Vec> frames(3, Vec(kPolicyJointDim, 0.0F));
+  frames.at(1).at(12) = 10.0F;
+  frames.at(2).at(12) = 10.0F;
+  const auto path = jointPosTrk(tmp, "loco_upper_rate_limited.trk", frames);
+  REQUIRE(bridge.submitQueue(
+              locoUpperCommand("loco-upper-rate-limited", path, MotionMode::Queue, 3))
+              .ok());
+
+  bool saw_frame_one = false;
+  StatusSnapshot snapshot;
+  for (int i = 0; i < 128; ++i) {
+    loop.tick();
+    snapshot = store.snapshot();
+    if (snapshot.exec && snapshot.exec->loco.phase == LocoPhase::Motion &&
+        snapshot.exec->frame == 1 && !robot.writes.empty()) {
+      saw_frame_one = true;
+      break;
+    }
+  }
+
+  REQUIRE(saw_frame_one);
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE_FALSE(snapshot.exec->loco.upper_clamped);
+  REQUIRE(snapshot.exec->loco.upper_rate_limited);
+  REQUIRE(locoUpperWrittenQ(robot.writes.back(), composer_config, 12) ==
+          Catch::Approx(0.02F).margin(1.0e-5F));
+}
+
+TEST_CASE("RuntimeControlLoop loco_upper hold and stopping use compiled upper fallback") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.001;
+  config.loco_upper_max_hold_s = 0.10;
+  const DeployConfig deploy_config = deployConfig();
+  LocoUpperLowCmdComposerConfig composer_config = locoUpperComposerConfig();
+  composer_config.upper_max_q.at(12) = 1.0F;
+
+  SECTION("final hold uses compiled final frame") {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeRobotIO robot(readyLowState(deploy_config));
+    FakePolicy tracker_policy;
+    FakeVelocityPolicy velocity_policy;
+    FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.1F));
+    auto loop = makeLocoControlLoop(config,
+                                    bridge,
+                                    store,
+                                    tmp.trkConfig(),
+                                    robot,
+                                    tracker_policy,
+                                    velocity_policy,
+                                    loco_lower_policy,
+                                    deploy_config,
+                                    velocityDeployConfig(),
+                                    fixStandConfig(),
+                                    ControlMode::StandbyVelocity,
+                                    passiveConfig(),
+                                    locoLowerDeployConfig(),
+                                    composer_config);
+
+    std::vector<Vec> frames(2, Vec(kPolicyJointDim, 0.0F));
+    frames.at(1).at(12) = 5.0F;
+    const auto path = jointPosTrk(tmp, "loco_upper_hold_compiled.trk", frames);
+    REQUIRE(bridge.submitQueue(
+                locoUpperCommand("loco-upper-hold-compiled",
+                                 path,
+                                 MotionMode::Queue,
+                                 2,
+                                 true))
+                .ok());
+
+    bool saw_holding_write = false;
+    StatusSnapshot snapshot;
+    for (int i = 0; i < 128; ++i) {
+      loop.tick();
+      snapshot = store.snapshot();
+      if (snapshot.exec && snapshot.exec->state == MotionState::Holding &&
+          snapshot.exec->loco.phase == LocoPhase::Holding && !robot.writes.empty()) {
+        saw_holding_write = true;
+        break;
+      }
+    }
+
+    REQUIRE(saw_holding_write);
+    REQUIRE(snapshot.exec.has_value());
+    REQUIRE(snapshot.exec->loco.upper_clamped);
+    REQUIRE(locoUpperWrittenQ(robot.writes.back(), composer_config, 12) ==
+            Catch::Approx(1.0F).margin(1.0e-5F));
+  }
+
+  SECTION("stopping after motion uses compiled last frame") {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeRobotIO robot(readyLowState(deploy_config));
+    FakePolicy tracker_policy;
+    FakeVelocityPolicy velocity_policy;
+    FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.1F));
+    auto loop = makeLocoControlLoop(config,
+                                    bridge,
+                                    store,
+                                    tmp.trkConfig(),
+                                    robot,
+                                    tracker_policy,
+                                    velocity_policy,
+                                    loco_lower_policy,
+                                    deploy_config,
+                                    velocityDeployConfig(),
+                                    fixStandConfig(),
+                                    ControlMode::StandbyVelocity,
+                                    passiveConfig(),
+                                    locoLowerDeployConfig(),
+                                    composer_config);
+
+    std::vector<Vec> frames(3, Vec(kPolicyJointDim, 0.0F));
+    frames.at(0).at(12) = 5.0F;
+    frames.at(1).at(12) = 5.0F;
+    const auto path = jointPosTrk(tmp, "loco_upper_stop_compiled.trk", frames);
+    REQUIRE(bridge.submitQueue(
+                locoUpperCommand("loco-upper-stop-compiled", path, MotionMode::Queue, 3))
+                .ok());
+
+    StatusSnapshot snapshot = advanceThroughFirstLocoMotionWrite(loop, store);
+    REQUIRE(snapshot.exec.has_value());
+    REQUIRE(snapshot.exec->loco.upper_clamped);
+    REQUIRE(locoUpperWrittenQ(robot.writes.back(), composer_config, 12) ==
+            Catch::Approx(1.0F).margin(1.0e-5F));
+    REQUIRE(bridge.standbyVelocity().ok());
+
+    bool saw_stopping_write = false;
+    for (int i = 0; i < 128; ++i) {
+      loop.tick();
+      snapshot = store.snapshot();
+      if (snapshot.exec && snapshot.exec->state == MotionState::Stopping &&
+          snapshot.exec->loco.phase == LocoPhase::Stopping && !robot.writes.empty()) {
+        saw_stopping_write = true;
+        break;
+      }
+    }
+
+    REQUIRE(saw_stopping_write);
+    REQUIRE(snapshot.exec.has_value());
+    REQUIRE(snapshot.exec->loco.upper_clamped);
+    REQUIRE(locoUpperWrittenQ(robot.writes.back(), composer_config, 12) <= 1.0F);
+  }
+}
+
+TEST_CASE("RuntimeControlLoop loco_upper keeps root commands aligned to frame count") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.001;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.1F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy);
+
+  const auto path = rootPositionsTrk(tmp,
+                                     "loco_upper_aligned_terminal_zero.trk",
+                                     {{{0.0F, 0.0F, 0.0F},
+                                       {0.02F, 0.0F, 0.0F},
+                                       {0.04F, 0.0F, 0.0F}}});
+  REQUIRE(bridge.submitQueue(
+              locoUpperCommand("loco-upper-aligned-terminal-zero",
+                               path,
+                               MotionMode::Queue,
+                               3))
+              .ok());
+
+  bool saw_terminal_frame = false;
+  StatusSnapshot snapshot;
+  for (int i = 0; i < 128; ++i) {
+    loop.tick();
+    snapshot = store.snapshot();
+    if (snapshot.exec && snapshot.exec->frame == 2) {
+      saw_terminal_frame = true;
+      break;
+    }
+  }
+
+  REQUIRE(saw_terminal_frame);
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->frame == 2);
+  REQUIRE(snapshot.exec->frames == 3);
+  REQUIRE(loco_lower_policy.inputs_seen.back().obs.at(6) ==
+          Catch::Approx(0.0F).margin(1.0e-5F));
+  REQUIRE(loco_lower_policy.inputs_seen.back().obs.at(7) ==
+          Catch::Approx(0.0F).margin(1.0e-5F));
+  REQUIRE(loco_lower_policy.inputs_seen.back().obs.at(8) ==
+          Catch::Approx(0.0F).margin(1.0e-5F));
 }
 
 TEST_CASE("RuntimeControlLoop loco_upper entry handoff starts lower target from current q") {

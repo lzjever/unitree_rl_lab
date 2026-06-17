@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <utility>
 
+#include "agentic_et1_tracker/loco_upper/command_limits.hpp"
 #include "agentic_et1_tracker/policy/observation_builder.hpp"
 #include "agentic_et1_tracker/loco_upper/validator.hpp"
 #include "agentic_et1_tracker/trk/reference_alignment.hpp"
@@ -79,24 +80,6 @@ std::optional<std::array<double, 2>> freshHighstatePlanarPosition(
       static_cast<double>(high_state->position[0]),
       static_cast<double>(high_state->position[1]),
   };
-}
-
-double maxAbsRangeValue(const LocoLowerRange& range) {
-  return std::max(std::abs(range.min), std::abs(range.max));
-}
-
-LocoUpperCommandLimits locoUpperCommandLimitsFromConfig(
-    const RuntimeConfig& runtime_config,
-    const LocoLowerDeployConfig& lower_config) {
-  LocoUpperCommandLimits limits;
-  const double max_vx = maxAbsRangeValue(lower_config.command_ranges.lin_vel_x);
-  const double max_vy = maxAbsRangeValue(lower_config.command_ranges.lin_vel_y);
-  limits.max_linear_velocity = std::hypot(max_vx, max_vy);
-  limits.max_yaw_rate = maxAbsRangeValue(lower_config.command_ranges.ang_vel_z);
-  limits.max_linear_acceleration = runtime_config.loco_upper_max_lin_accel_mps2;
-  limits.max_yaw_acceleration = runtime_config.loco_upper_max_yaw_accel_radps2;
-  limits.smoothing_window_frames = runtime_config.loco_upper_smoothing_window_frames;
-  return limits;
 }
 
 double locoCommandDtS(double root_plan_dt_s, double active_fps, double runtime_hz) {
@@ -219,6 +202,16 @@ std::vector<float> upperTargetsFromFrame(const TrkFrameView& frame) {
   }
   return std::vector<float>(frame.joint_pos.ptr,
                             frame.joint_pos.ptr + frame.joint_pos.size);
+}
+
+std::vector<float> upperTargetsFromCompiledFrame(
+    const LocoUpperLogicalJointFrame& frame) {
+  std::vector<float> out;
+  out.reserve(kPolicyJointCount);
+  for (const double value : frame) {
+    out.push_back(static_cast<float>(value));
+  }
+  return out;
 }
 
 std::vector<float> upperTargetsFromLowState(
@@ -1310,49 +1303,48 @@ bool RuntimeControlLoop::prepareLocoUpperTrack(MotionRequest& request) {
   request.duration_s = loaded.track->metadata.duration_s;
   active_track_ = std::make_shared<TrkTrack>(std::move(*loaded.track));
 
-  LocoUpperRootPlanResult root = extractRootPlanarPath(*active_track_);
-  if (!root.ok()) {
-    request.err = ErrorCode::TrkValidationFailed;
-    request.loco.reason = LocoReason::RootInvalid;
-    return false;
-  }
+  LocoUpperCompileOptions compile_options;
+  compile_options.max_radius_m =
+      request.loco_options.max_radius_m > 0.0
+          ? request.loco_options.max_radius_m
+          : std::numeric_limits<double>::max();
+  compile_options.root_options = LocoUpperPlannerOptions{};
+  compile_options.command_limits =
+      locoUpperCommandLimitsFromConfig(config_, *loco_lower_deploy_config_);
+  compile_options.upper_joint_limits =
+      jointValidationOptionsFromComposerConfig(*loco_upper_composer_config_);
 
-  const LocoUpperJointValidationResult upper =
-      extractAndValidateUpperJointTargets(
-          *active_track_,
-          jointValidationOptionsFromComposerConfig(*loco_upper_composer_config_));
-  if (!upper.ok()) {
-    request.err = ErrorCode::TrkValidationFailed;
-    request.loco.reason = locoReasonFromValidationFailure(upper.failure_kind);
+  const LocoUpperCompileResult compiled =
+      compileLocoUpperPlan(*active_track_, compile_options);
+  if (!compiled.ok()) {
+    request.err = compiled.failure_kind == LocoUpperCompileFailureKind::InvalidConfig ||
+                          compiled.failure_kind ==
+                              LocoUpperCompileFailureKind::InvalidOptions
+                      ? ErrorCode::InternalError
+                      : ErrorCode::TrkValidationFailed;
+    request.loco.reason = compiled.failure_kind == LocoUpperCompileFailureKind::InvalidTrack
+                              ? LocoReason::RootInvalid
+                              : LocoReason::UpperLimit;
     return false;
   }
 
   LocoUpperRuntimeState runtime;
-  runtime.root_plan = alignRootPlanToStart(root.plan);
-  if (request.loco_options.max_radius_m > 0.0) {
-    LocoUpperProjectionResult projected =
-        projectRootPlanToRadius(runtime.root_plan, request.loco_options.max_radius_m);
-    runtime.root_plan = std::move(projected.plan);
-    runtime.radius_clamped = projected.radius_clamped;
-  }
-  const LocoUpperVelocityCommandPlan command_plan =
-      rootPlanToVelocityCommandPlan(
-          runtime.root_plan,
-          locoUpperCommandLimitsFromConfig(config_, *loco_lower_deploy_config_));
-  runtime.commands_world = command_plan.commands;
-  runtime.envelope_clamped = command_plan.limits_clamped;
+  runtime.root_plan = compiled.plan.root_plan;
+  runtime.commands_world = compiled.plan.root_velocity_commands;
+  runtime.upper_frames = compiled.plan.joint_pos_frames;
+  runtime.radius_clamped = compiled.flags.radius_clamped;
+  runtime.envelope_clamped = compiled.flags.envelope_clamped;
+  runtime.upper_clamped = compiled.flags.upper_clamped;
+  runtime.upper_rate_limited = compiled.flags.upper_rate_limited;
   runtime.lower_runner.emplace(*loco_lower_deploy_config_, expected_mode_machine_);
-  const auto first_frame = active_track_->frame(0);
-  const auto final_frame =
-      active_track_->frame(active_track_->metadata.frames == 0
-                               ? 0
-                               : active_track_->metadata.frames - 1);
-  if (!first_frame || !final_frame) {
+  if (compiled.plan.frame_count == 0 ||
+      runtime.commands_world.size() != compiled.plan.frame_count ||
+      runtime.upper_frames.size() != compiled.plan.frame_count) {
     request.err = ErrorCode::InternalError;
     return false;
   }
-  runtime.first_upper = upperTargetsFromFrame(*first_frame);
-  runtime.final_upper = upperTargetsFromFrame(*final_frame);
+  runtime.first_upper = upperTargetsFromCompiledFrame(runtime.upper_frames.front());
+  runtime.final_upper = upperTargetsFromCompiledFrame(runtime.upper_frames.back());
   if (runtime.first_upper.size() < kPolicyJointCount ||
       runtime.final_upper.size() < kPolicyJointCount) {
     request.err = ErrorCode::InternalError;
@@ -1360,6 +1352,12 @@ bool RuntimeControlLoop::prepareLocoUpperTrack(MotionRequest& request) {
   }
   request.loco.radius_clamped = runtime.radius_clamped;
   request.loco.envelope_clamped = runtime.envelope_clamped;
+  request.loco.upper_clamped = runtime.upper_clamped;
+  request.loco.upper_rate_limited = runtime.upper_rate_limited;
+  request.loco_options.radius_clamped = runtime.radius_clamped;
+  request.loco_options.envelope_clamped = runtime.envelope_clamped;
+  request.loco_options.upper_clamped = runtime.upper_clamped;
+  request.loco_options.upper_rate_limited = runtime.upper_rate_limited;
   request.loco.distance_m = 0.0;
   loco_upper_ = std::move(runtime);
   return true;
@@ -2199,6 +2197,8 @@ bool RuntimeControlLoop::writeLocoUpperStep(
   loco_upper_->envelope_clamped =
       loco_upper_->envelope_clamped || lower.command_clamped;
   active_->loco.envelope_clamped = loco_upper_->envelope_clamped;
+  active_->loco.upper_clamped = loco_upper_->upper_clamped;
+  active_->loco.upper_rate_limited = loco_upper_->upper_rate_limited;
   loco_upper_->raw_action_clamped =
       loco_upper_->raw_action_clamped || lower.raw_action_clamped;
   active_->loco.raw_action_clamped = loco_upper_->raw_action_clamped;
@@ -2214,7 +2214,13 @@ bool RuntimeControlLoop::writeLocoUpperStep(
 
 bool RuntimeControlLoop::prepareLocoUpperFrameStep(std::size_t frame,
                                                    bool zero_lower_command) {
-  if (!active_ || !active_track_ || !loco_upper_) {
+  if (!active_ || !loco_upper_) {
+    return false;
+  }
+  if (frame >= loco_upper_->upper_frames.size()) {
+    failActiveWithFault(ErrorCode::InternalError,
+                        RobotState::Fault,
+                        "policy_inference_failed");
     return false;
   }
 
@@ -2288,17 +2294,13 @@ bool RuntimeControlLoop::prepareLocoUpperFrameStep(std::size_t frame,
     }
   }
 
-  const std::optional<TrkFrameView> upper_frame = active_track_->frame(frame);
-  if (!upper_frame) {
-    failActiveWithFault(ErrorCode::InternalError,
-                        RobotState::Fault,
-                        "policy_inference_failed");
-    return false;
-  }
   active_->loco.radius_limit_reached = loco_upper_->radius_limit_reached;
   active_->loco.envelope_clamped = loco_upper_->envelope_clamped;
+  active_->loco.upper_clamped = loco_upper_->upper_clamped;
+  active_->loco.upper_rate_limited = loco_upper_->upper_rate_limited;
   loco_upper_->current_command = command;
-  loco_upper_->current_upper = upperTargetsFromFrame(*upper_frame);
+  loco_upper_->current_upper =
+      upperTargetsFromCompiledFrame(loco_upper_->upper_frames.at(frame));
   return true;
 }
 
@@ -2382,10 +2384,11 @@ std::vector<float> RuntimeControlLoop::currentLocoUpperTargets() const {
   if (loco_upper_->last_upper.size() >= kPolicyJointCount) {
     return loco_upper_->last_upper;
   }
-  const std::optional<TrkFrameView> current_frame =
-      active_track_ ? active_track_->frame(active_->frame) : std::nullopt;
-  std::vector<float> current =
-      current_frame ? upperTargetsFromFrame(*current_frame) : std::vector<float>{};
+  std::vector<float> current;
+  if (active_->frame < loco_upper_->upper_frames.size()) {
+    current = upperTargetsFromCompiledFrame(
+        loco_upper_->upper_frames.at(active_->frame));
+  }
   if (current.size() < kPolicyJointCount) {
     current = loco_upper_->final_upper;
   }
@@ -2449,6 +2452,11 @@ void RuntimeControlLoop::setLocoPhase(LocoPhase phase) {
                   : active_->loco.radius_limit_reached;
   active_->loco.envelope_clamped =
       loco_upper_ ? loco_upper_->envelope_clamped : active_->loco.envelope_clamped;
+  active_->loco.upper_clamped =
+      loco_upper_ ? loco_upper_->upper_clamped : active_->loco.upper_clamped;
+  active_->loco.upper_rate_limited =
+      loco_upper_ ? loco_upper_->upper_rate_limited
+                  : active_->loco.upper_rate_limited;
   active_->loco.raw_action_clamped =
       loco_upper_ ? loco_upper_->raw_action_clamped : active_->loco.raw_action_clamped;
   active_->loco.lower_q_limited =

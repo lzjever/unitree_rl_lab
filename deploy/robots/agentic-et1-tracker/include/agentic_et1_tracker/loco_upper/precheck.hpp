@@ -5,6 +5,7 @@
 #include <string>
 
 #include "agentic_et1_tracker/core/types.hpp"
+#include "agentic_et1_tracker/loco_upper/compiler.hpp"
 #include "agentic_et1_tracker/loco_upper/validator.hpp"
 
 namespace agentic_et1_tracker {
@@ -16,12 +17,15 @@ struct LocoUpperPrecheckOptions {
   double max_radius_m{0.0};
   bool strict_pose{false};
   bool hold{false};
+  LocoUpperPlannerOptions root_options;
+  LocoUpperCommandLimits command_limits;
   std::optional<LocoUpperJointValidationOptions> upper_joint_limits;
 };
 
 struct LocoUpperPrecheckResult {
   ErrorCode code{ErrorCode::Ok};
   std::string message;
+  LocoUpperCompileFlags flags;
 
   bool ok() const { return code == ErrorCode::Ok; }
 };

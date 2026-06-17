@@ -562,6 +562,10 @@ ApiResponse AgentApiService::executeLocoUpper(const std::string& body) {
   command.hold = hold;
   command.loco_options.max_radius_m = max_radius_m;
   command.loco_options.hold = hold;
+  command.loco_options.radius_clamped = precheck.flags.radius_clamped;
+  command.loco_options.envelope_clamped = precheck.flags.envelope_clamped;
+  command.loco_options.upper_clamped = precheck.flags.upper_clamped;
+  command.loco_options.upper_rate_limited = precheck.flags.upper_rate_limited;
   command.track = validation.metadata;
 
   const ExecuteResult result =

@@ -4,6 +4,7 @@
 #include <string>
 #include <utility>
 
+#include "agentic_et1_tracker/loco_upper/compiler.hpp"
 #include "agentic_et1_tracker/loco_upper/planner.hpp"
 #include "agentic_et1_tracker/loco_upper/validator.hpp"
 #include "agentic_et1_tracker/trk/loader.hpp"
@@ -20,6 +21,18 @@ LocoUpperPrecheckResult fail(ErrorCode code, std::string message) {
   result.code = code;
   result.message = std::move(message);
   return result;
+}
+
+LocoUpperCompileOptions compileOptionsFromPrecheck(
+    const LocoUpperPrecheckOptions& options) {
+  LocoUpperCompileOptions compile_options;
+  compile_options.max_radius_m = options.max_radius_m;
+  compile_options.root_options = options.root_options;
+  compile_options.command_limits = options.command_limits;
+  compile_options.upper_joint_limits =
+      options.upper_joint_limits.value_or(LocoUpperJointValidationOptions{});
+  compile_options.probe_only = true;
+  return compile_options;
 }
 
 LocoUpperPrecheckResult validateOptions(const LocoUpperPrecheckOptions& options) {
@@ -39,33 +52,20 @@ LocoUpperPrecheckResult precheckLocoUpperTrack(
     return option_check;
   }
 
-  const LocoUpperRootPlanResult root = extractRootPlanarPath(track);
-  if (!root.ok()) {
-    return fail(ErrorCode::TrkValidationFailed, root.message);
+  const LocoUpperCompileResult compiled =
+      compileLocoUpperPlan(track, compileOptionsFromPrecheck(options));
+  if (!compiled.ok()) {
+    const ErrorCode code =
+        compiled.failure_kind == LocoUpperCompileFailureKind::InvalidOptions ||
+                compiled.failure_kind == LocoUpperCompileFailureKind::InvalidConfig
+            ? ErrorCode::RequestInvalid
+            : ErrorCode::TrkValidationFailed;
+    return fail(code, compiled.message);
   }
 
-  const LocoUpperJointValidationResult upper =
-      extractAndValidateUpperJointTargets(track,
-                                          options.upper_joint_limits.value_or(
-                                              LocoUpperJointValidationOptions{}));
-  if (!upper.ok()) {
-    return fail(ErrorCode::TrkValidationFailed, upper.message);
-  }
-
-  if (root.plan.samples.size() != upper.plan.frames.size()) {
-    return fail(ErrorCode::TrkValidationFailed,
-                "loco upper root and joint plans have mismatched frame counts");
-  }
-
-  const LocoUpperRootPlan aligned = alignRootPlanToStart(root.plan);
-  const LocoUpperProjectionResult projected =
-      projectRootPlanToRadius(aligned, options.max_radius_m);
-  if (options.strict_pose && projected.radius_clamped) {
-    return fail(ErrorCode::TrkValidationFailed,
-                "loco upper root path exceeds max radius");
-  }
-
-  return {};
+  LocoUpperPrecheckResult result;
+  result.flags = compiled.flags;
+  return result;
 }
 
 LocoUpperPrecheckResult precheckLocoUpperTrackFile(

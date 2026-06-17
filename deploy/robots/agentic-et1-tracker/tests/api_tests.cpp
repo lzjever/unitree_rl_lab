@@ -493,6 +493,10 @@ TEST_CASE("POST execute_loco_upper queues when config is enabled and runtime is 
   REQUIRE(command.executor == MotionExecutor::LocoUpper);
   REQUIRE(command.loco_options.max_radius_m == 0.8);
   REQUIRE_FALSE(command.loco_options.hold);
+  REQUIRE_FALSE(command.loco_options.radius_clamped);
+  REQUIRE_FALSE(command.loco_options.envelope_clamped);
+  REQUIRE_FALSE(command.loco_options.upper_clamped);
+  REQUIRE_FALSE(command.loco_options.upper_rate_limited);
 }
 
 TEST_CASE("POST execute_loco_upper rejects enabled config when runtime is not ready") {
@@ -560,6 +564,11 @@ TEST_CASE("POST execute_loco_upper prechecks validator canonical path before id 
   Harness h(locoEnabledConfig());
   observeLocoUpperReady(h);
   h.validator.result.metadata.canonical_path = "/canonical/walk-wave.trk";
+  h.prechecker.result.flags.radius_clamped = true;
+  h.prechecker.result.flags.envelope_clamped = true;
+  h.prechecker.result.flags.upper_clamped = true;
+  h.prechecker.result.flags.upper_accel_limited = true;
+  h.prechecker.result.flags.upper_rate_limited = true;
   std::vector<std::string> events;
   h.validator.events = &events;
   h.prechecker.events = &events;
@@ -573,6 +582,10 @@ TEST_CASE("POST execute_loco_upper prechecks validator canonical path before id 
   REQUIRE(h.validator.paths == std::vector<std::string>{"/tracks/link/walk-wave.trk"});
   REQUIRE(h.prechecker.paths == std::vector<std::string>{"/canonical/walk-wave.trk"});
   REQUIRE(h.sink.queue_commands.at(0).path == "/canonical/walk-wave.trk");
+  REQUIRE(h.sink.queue_commands.at(0).loco_options.radius_clamped);
+  REQUIRE(h.sink.queue_commands.at(0).loco_options.envelope_clamped);
+  REQUIRE(h.sink.queue_commands.at(0).loco_options.upper_clamped);
+  REQUIRE(h.sink.queue_commands.at(0).loco_options.upper_rate_limited);
   REQUIRE(events == std::vector<std::string>{"validate", "precheck", "id", "queue"});
 }
 
@@ -681,10 +694,10 @@ TEST_CASE("POST execute_loco_upper reuses execute readiness and controller gates
   }
 }
 
-TEST_CASE("POST execute_loco_upper precheck failure does not allocate id or enqueue") {
+TEST_CASE("POST execute_loco_upper precheck validation failure does not allocate id or enqueue") {
   for (const auto& item : std::vector<std::pair<std::string, std::string>>{
-           {"loco upper joint_pos is above limit", "/canonical/upper-limit.trk"},
-           {"loco upper joint velocity exceeds limit", "/canonical/upper-dynamic.trk"},
+           {"invalid trk schema", "/canonical/invalid-schema.trk"},
+           {"loco upper config is invalid", "/canonical/invalid-config.trk"},
        }) {
     Harness h(locoEnabledConfig());
     observeLocoUpperReady(h);
@@ -1662,6 +1675,8 @@ TEST_CASE("GET status by id renders queued loco-upper run payload") {
   queued.executor = MotionExecutor::LocoUpper;
   queued.loco.max_radius_m = 0.8;
   queued.loco.phase = LocoPhase::Queued;
+  queued.loco.upper_clamped = true;
+  queued.loco.upper_rate_limited = true;
   h.status.snapshot_value.queue = {1, 8, {queued.id}};
   h.status.runs.emplace(queued.id, queued);
 
@@ -1678,6 +1693,7 @@ TEST_CASE("GET status by id renders queued loco-upper run payload") {
   requireFields(loco,
                 {"max_radius_m", "distance_m", "radius_source", "phase",
                  "radius_clamped", "radius_limit_reached", "envelope_clamped",
+                 "upper_clamped", "upper_rate_limited",
                  "raw_action_clamped", "lower_q_limited", "lower_action_clamped",
                  "reason"});
   REQUIRE(loco.at("max_radius_m") == 0.8);
@@ -1687,6 +1703,8 @@ TEST_CASE("GET status by id renders queued loco-upper run payload") {
   REQUIRE(loco.at("radius_clamped") == false);
   REQUIRE(loco.at("radius_limit_reached") == false);
   REQUIRE(loco.at("envelope_clamped") == false);
+  REQUIRE(loco.at("upper_clamped") == true);
+  REQUIRE(loco.at("upper_rate_limited") == true);
   REQUIRE(loco.at("raw_action_clamped") == false);
   REQUIRE(loco.at("lower_q_limited") == false);
   REQUIRE(loco.at("lower_action_clamped") == false);

@@ -12,6 +12,7 @@
 #include "agentic_et1_tracker/core/types.hpp"
 #include "agentic_et1_tracker/control/fixstand.hpp"
 #include "agentic_et1_tracker/control/passive.hpp"
+#include "agentic_et1_tracker/loco_upper/compiler.hpp"
 #include "agentic_et1_tracker/loco_upper/loco_lower_policy.hpp"
 #include "agentic_et1_tracker/loco_upper/lowcmd_composer.hpp"
 #include "agentic_et1_tracker/loco_upper/planner.hpp"
@@ -142,6 +143,7 @@ class RuntimeControlLoop final {
   struct LocoUpperRuntimeState {
     LocoUpperRootPlan root_plan;
     std::vector<LocoUpperVelocityCommand> commands_world;
+    std::vector<LocoUpperLogicalJointFrame> upper_frames;
     std::optional<LocoLowerStepRunner> lower_runner;
     std::vector<float> entry_start_upper;
     std::vector<float> lower_entry_start_q;
@@ -158,6 +160,8 @@ class RuntimeControlLoop final {
     bool radius_clamped{false};
     bool radius_limit_reached{false};
     bool envelope_clamped{false};
+    bool upper_clamped{false};
+    bool upper_rate_limited{false};
     bool raw_action_clamped{false};
     bool lower_q_limited{false};
     bool lower_action_clamped{false};
