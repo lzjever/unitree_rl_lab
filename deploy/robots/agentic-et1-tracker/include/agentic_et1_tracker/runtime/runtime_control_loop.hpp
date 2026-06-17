@@ -142,7 +142,7 @@ class RuntimeControlLoop final {
 
   struct LocoUpperRuntimeState {
     LocoUpperRootPlan root_plan;
-    std::vector<LocoUpperVelocityCommand> commands_world;
+    std::vector<LocoUpperVelocityCommand> commands_body;
     std::vector<LocoUpperLogicalJointFrame> upper_frames;
     std::optional<LocoLowerStepRunner> lower_runner;
     std::vector<float> entry_start_upper;

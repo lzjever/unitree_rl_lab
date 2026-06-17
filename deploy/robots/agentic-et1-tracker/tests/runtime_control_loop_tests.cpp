@@ -5318,6 +5318,70 @@ TEST_CASE("RuntimeControlLoop loco_upper planner limits are applied before lower
   REQUIRE(saw_smoothed_command);
 }
 
+TEST_CASE("RuntimeControlLoop loco_upper keeps forward root motion in body frame") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.hz = 50.0;
+  config.transition_duration_s = 0.001;
+  config.loco_upper_smoothing_window_frames = 1;
+  config.loco_upper_max_lin_accel_mps2 = 10000.0;
+  config.loco_upper_max_yaw_accel_radps2 = 10000.0;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  LocoLowerDeployConfig loco_lower_config = locoLowerDeployConfig();
+  loco_lower_config.command_ranges.lin_vel_x = {-100.0, 100.0};
+  loco_lower_config.command_ranges.lin_vel_y = {-100.0, 100.0};
+  loco_lower_config.command_ranges.ang_vel_z = {-100.0, 100.0};
+  LowStateSample low_state = readyLowState(deploy_config);
+  low_state.quat_wxyz = yawQuat(3.14159265359F);
+  FakeRobotIO robot(low_state);
+  FakePolicy tracker_policy;
+  FakeVelocityPolicy velocity_policy;
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.1F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy,
+                                  deploy_config,
+                                  velocityDeployConfig(),
+                                  fixStandConfig(),
+                                  ControlMode::StandbyVelocity,
+                                  passiveConfig(),
+                                  loco_lower_config);
+
+  const auto path = rootPositionsTrk(tmp,
+                                     "loco_runtime_body_forward.trk",
+                                     {{{0.0F, 0.0F, 0.0F},
+                                       {0.0F, 0.0F, 0.0F},
+                                       {1.0F, 0.0F, 0.0F},
+                                       {2.0F, 0.0F, 0.0F}}});
+  REQUIRE(bridge.submitQueue(
+              locoUpperCommand("loco-runtime-body-forward", path, MotionMode::Queue, 4))
+              .ok());
+
+  bool saw_forward_body_command = false;
+  for (int i = 0; i < 64; ++i) {
+    loop.tick();
+    if (loco_lower_policy.inputs_seen.empty()) {
+      continue;
+    }
+    const Vec& obs = loco_lower_policy.inputs_seen.back().obs;
+    if (std::abs(obs.at(6)) <= 1.0e-5F) {
+      continue;
+    }
+    REQUIRE(obs.at(6) > 0.0F);
+    saw_forward_body_command = true;
+    break;
+  }
+
+  REQUIRE(saw_forward_body_command);
+}
+
 TEST_CASE("RuntimeControlLoop loco_upper planner linear acceleration clamp sets telemetry") {
   TempTree tmp;
   RuntimeConfig config = runtimeConfig();

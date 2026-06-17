@@ -117,17 +117,24 @@ VelocityCommand clampBodyCommand(const LocoLowerCommandRanges& ranges,
 }
 
 LocoUpperVelocityCommand bodyVelocityToWorldCommand(
-    const VelocityCommand& command_body,
+    const LocoUpperVelocityCommand& command_body,
     double robot_yaw) {
   const double cos_yaw = std::cos(robot_yaw);
   const double sin_yaw = std::sin(robot_yaw);
-  LocoUpperVelocityCommand command_world;
-  command_world.vx = cos_yaw * static_cast<double>(command_body.vx) -
-                     sin_yaw * static_cast<double>(command_body.vy);
-  command_world.vy = sin_yaw * static_cast<double>(command_body.vx) +
-                     cos_yaw * static_cast<double>(command_body.vy);
-  command_world.yaw_rate = static_cast<double>(command_body.yaw_rate);
+  LocoUpperVelocityCommand command_world = command_body;
+  command_world.vx = cos_yaw * command_body.vx - sin_yaw * command_body.vy;
+  command_world.vy = sin_yaw * command_body.vx + cos_yaw * command_body.vy;
   return command_world;
+}
+
+LocoUpperVelocityCommand bodyVelocityToWorldCommand(
+    const VelocityCommand& command_body,
+    double robot_yaw) {
+  LocoUpperVelocityCommand command;
+  command.vx = static_cast<double>(command_body.vx);
+  command.vy = static_cast<double>(command_body.vy);
+  command.yaw_rate = static_cast<double>(command_body.yaw_rate);
+  return bodyVelocityToWorldCommand(command, robot_yaw);
 }
 
 ServiceHealth healthStateForSnapshot(const StatusSnapshot& snapshot) {
@@ -1330,7 +1337,7 @@ bool RuntimeControlLoop::prepareLocoUpperTrack(MotionRequest& request) {
 
   LocoUpperRuntimeState runtime;
   runtime.root_plan = compiled.plan.root_plan;
-  runtime.commands_world = compiled.plan.root_velocity_commands;
+  runtime.commands_body = compiled.plan.root_velocity_commands;
   runtime.upper_frames = compiled.plan.joint_pos_frames;
   runtime.radius_clamped = compiled.flags.radius_clamped;
   runtime.envelope_clamped = compiled.flags.envelope_clamped;
@@ -1338,7 +1345,7 @@ bool RuntimeControlLoop::prepareLocoUpperTrack(MotionRequest& request) {
   runtime.upper_rate_limited = compiled.flags.upper_rate_limited;
   runtime.lower_runner.emplace(*loco_lower_deploy_config_, expected_mode_machine_);
   if (compiled.plan.frame_count == 0 ||
-      runtime.commands_world.size() != compiled.plan.frame_count ||
+      runtime.commands_body.size() != compiled.plan.frame_count ||
       runtime.upper_frames.size() != compiled.plan.frame_count) {
     request.err = ErrorCode::InternalError;
     return false;
@@ -2228,11 +2235,11 @@ bool RuntimeControlLoop::prepareLocoUpperFrameStep(std::size_t frame,
     robot_yaw = yawFromLowState(*low_state);
   }
 
-  if (!zero_lower_command && !loco_upper_->commands_world.empty()) {
+  if (!zero_lower_command && !loco_upper_->commands_body.empty()) {
     const std::size_t command_index =
-        std::min(frame, loco_upper_->commands_world.size() - 1);
-    LocoUpperVelocityCommand command_world =
-        loco_upper_->commands_world.at(command_index);
+        std::min(frame, loco_upper_->commands_body.size() - 1);
+    LocoUpperVelocityCommand command_body =
+        loco_upper_->commands_body.at(command_index);
 
     std::array<double, 2> estimate_xy = loco_upper_->integrated_xy;
     std::string radius_source;
@@ -2254,6 +2261,8 @@ bool RuntimeControlLoop::prepareLocoUpperFrameStep(std::size_t frame,
     }
 
     if (active_->loco_options.max_radius_m > 0.0) {
+      LocoUpperVelocityCommand command_world =
+          bodyVelocityToWorldCommand(command_body, robot_yaw);
       command_world = suppressOutwardRadialVelocityNearRadius(
           planarSampleFromXY(estimate_xy),
           command_world,
@@ -2261,13 +2270,12 @@ bool RuntimeControlLoop::prepareLocoUpperFrameStep(std::size_t frame,
           kLocoUpperRadiusSuppressMarginM);
       loco_upper_->radius_limit_reached =
           loco_upper_->radius_limit_reached || command_world.radius_limit_reached;
+      command_body = worldVelocityToBodyCommand(command_world, robot_yaw);
     }
 
-    const LocoUpperVelocityCommand body =
-        worldVelocityToBodyCommand(command_world, robot_yaw);
-    command.vx = static_cast<float>(body.vx);
-    command.vy = static_cast<float>(body.vy);
-    command.yaw_rate = static_cast<float>(body.yaw_rate);
+    command.vx = static_cast<float>(command_body.vx);
+    command.vy = static_cast<float>(command_body.vy);
+    command.yaw_rate = static_cast<float>(command_body.yaw_rate);
     bool command_clamped = false;
     command = clampBodyCommand(loco_lower_deploy_config_->command_ranges,
                                command,

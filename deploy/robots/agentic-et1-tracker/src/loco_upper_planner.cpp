@@ -319,9 +319,13 @@ LocoUpperVelocityCommandPlan rootPlanToVelocityCommandPlan(
   for (std::size_t i = 1; i < plan.samples.size(); ++i) {
     const LocoUpperPlanarSample& previous_sample = plan.samples.at(i - 1);
     const LocoUpperPlanarSample& sample = plan.samples.at(i);
+    const double dx = sample.x - previous_sample.x;
+    const double dy = sample.y - previous_sample.y;
+    const double cos_yaw = std::cos(previous_sample.yaw);
+    const double sin_yaw = std::sin(previous_sample.yaw);
     LocoUpperVelocityCommand command;
-    command.vx = (sample.x - previous_sample.x) / plan.dt_s;
-    command.vy = (sample.y - previous_sample.y) / plan.dt_s;
+    command.vx = (cos_yaw * dx + sin_yaw * dy) / plan.dt_s;
+    command.vy = (-sin_yaw * dx + cos_yaw * dy) / plan.dt_s;
     command.yaw_rate = (sample.yaw - previous_sample.yaw) / plan.dt_s;
     raw_commands.push_back(command);
   }

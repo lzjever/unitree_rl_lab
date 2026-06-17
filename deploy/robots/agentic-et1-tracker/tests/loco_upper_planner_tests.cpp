@@ -171,6 +171,20 @@ TEST_CASE("loco upper planner preserves forward velocity sign") {
   REQUIRE(commands.at(0).vy == Catch::Approx(0.0));
 }
 
+TEST_CASE("loco upper planner converts root deltas to reference body frame") {
+  TrkTrack track = makeTrack(3);
+  setRootPose(track, 0, 0.0, 0.0, kPi / 2.0);
+  setRootPose(track, 1, 0.0, 0.5, kPi / 2.0);
+  setRootPose(track, 2, 0.0, 1.0, kPi / 2.0);
+
+  const std::vector<LocoUpperVelocityCommand> commands =
+      rootPlanToVelocityCommands(alignRootPlanToStart(extractPlan(track)));
+
+  REQUIRE(commands.size() == 2);
+  REQUIRE(commands.at(0).vx > 0.0);
+  REQUIRE(commands.at(0).vy == Catch::Approx(0.0).margin(1.0e-5));
+}
+
 TEST_CASE("loco upper planner preserves lateral velocity sign") {
   TrkTrack track = makeTrack(3);
   setRootPose(track, 0, 0.0, 0.0, 0.0);
