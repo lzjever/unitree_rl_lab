@@ -1,7 +1,7 @@
 # LOCO Upper Bounded Execution Plan
 
-状态：handoff-ready plan  
-日期：2026-06-17  
+状态：handoff-ready plan
+日期：2026-06-17
 Scope：simulation-first，仅要求本机 MuJoCo 验收，不包含真机 GA
 
 ## 1. 背景
