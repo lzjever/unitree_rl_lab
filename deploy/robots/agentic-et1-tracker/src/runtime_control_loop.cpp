@@ -29,7 +29,6 @@ constexpr std::size_t kStartupUpperBodyLastPolicyJointExclusive = 26;
 constexpr double kLocoUpperRadiusSuppressMarginM = 0.02;
 constexpr double kStandbyRawStartFallbackMaxGap = 25.0;
 constexpr double kStandbyRawStartFallbackEpsilon = 1.0e-9;
-constexpr double kRootYawResidualLimitRad = 0.05;
 constexpr std::size_t kRootBodyIndex = 0;
 constexpr std::size_t kBodyQuatDimensions = 4;
 
@@ -157,18 +156,22 @@ double shortestAngleAbs(double lhs, double rhs) {
 }
 
 std::optional<bool> rootYawResidualWithinLimit(const TrkFrameView& source,
-                                               const TrkFrameView& target) {
+                                               const TrkFrameView& target,
+                                               double limit_rad) {
+  if (!std::isfinite(limit_rad) || limit_rad < 0.0) {
+    return std::nullopt;
+  }
   const std::optional<double> source_yaw = rootYawFromFrame(source);
   const std::optional<double> target_yaw = rootYawFromFrame(target);
   if (!source_yaw || !target_yaw) {
     return std::nullopt;
   }
-  return shortestAngleAbs(*source_yaw, *target_yaw) <= kRootYawResidualLimitRad;
+  return shortestAngleAbs(*source_yaw, *target_yaw) <= limit_rad;
 }
 
 bool endpointVelocitiesAllowStandbyRawStartFallback(const TrkFrameView& source,
-                                                    const TrkFrameView& target) {
-  const SyntheticTransitionLimits limits = defaultSyntheticTransitionLimits();
+                                                    const TrkFrameView& target,
+                                                    const SyntheticTransitionLimits& limits) {
   return viewMaxAtMost(source.joint_vel, limits.max_velocity) &&
          viewMaxAtMost(target.joint_vel, limits.max_velocity) &&
          viewMaxAtMost(source.body_lin_vel_w, limits.max_velocity) &&
@@ -182,7 +185,8 @@ bool endpointVelocitiesAllowStandbyRawStartFallback(const TrkFrameView& source,
 bool transitionGapAllowsStandbyRawStartFallback(const TrkFrameView& source,
                                                 const TrkFrameView& target,
                                                 double transition_duration_s,
-                                                double target_fps) {
+                                                double target_fps,
+                                                const SyntheticTransitionLimits& limits) {
   if (!std::isfinite(transition_duration_s) || !std::isfinite(target_fps) ||
       transition_duration_s <= 0.0 || target_fps <= 0.0) {
     return false;
@@ -195,7 +199,6 @@ bool transitionGapAllowsStandbyRawStartFallback(const TrkFrameView& source,
   }
 
   const double effective_duration_s = intervals / target_fps;
-  const SyntheticTransitionLimits limits = defaultSyntheticTransitionLimits();
   const double dynamic_gap_limit =
       limits.max_velocity * effective_duration_s +
       0.5 * limits.max_acceleration * effective_duration_s *
@@ -219,15 +222,18 @@ bool transitionGapAllowsStandbyRawStartFallback(const TrkFrameView& source,
 bool allowStandbyRawStartAfterTransitionBuildFailure(const TrkFrameView& source,
                                                      const TrkFrameView& target,
                                                      double transition_duration_s,
-                                                     double target_fps) {
+                                                     double target_fps,
+                                                     double root_yaw_residual_limit_rad,
+                                                     const SyntheticTransitionLimits& limits) {
   const std::optional<bool> yaw_residual_ok =
-      rootYawResidualWithinLimit(source, target);
+      rootYawResidualWithinLimit(source, target, root_yaw_residual_limit_rad);
   return yaw_residual_ok.has_value() && *yaw_residual_ok &&
-         endpointVelocitiesAllowStandbyRawStartFallback(source, target) &&
+         endpointVelocitiesAllowStandbyRawStartFallback(source, target, limits) &&
          transitionGapAllowsStandbyRawStartFallback(source,
                                                    target,
                                                    transition_duration_s,
-                                                   target_fps);
+                                                   target_fps,
+                                                   limits);
 }
 
 std::optional<std::array<double, 2>> highstatePlanarPosition(
@@ -640,9 +646,15 @@ std::optional<bool> RuntimeControlLoop::rootYawResidualAllowsBridge(
     if (!std::isfinite(residual)) {
       return std::nullopt;
     }
-    return std::abs(residual) <= kRootYawResidualLimitRad;
+    if (!std::isfinite(config_.transition_root_yaw_residual_limit_rad) ||
+        config_.transition_root_yaw_residual_limit_rad < 0.0) {
+      return std::nullopt;
+    }
+    return std::abs(residual) <= config_.transition_root_yaw_residual_limit_rad;
   }
-  return rootYawResidualWithinLimit(source, target);
+  return rootYawResidualWithinLimit(source,
+                                    target,
+                                    config_.transition_root_yaw_residual_limit_rad);
 }
 
 void RuntimeControlLoop::tick() {
@@ -1710,7 +1722,9 @@ bool RuntimeControlLoop::startTransitionFromIdleToUser(MotionRequest target_requ
     if (!allowStandbyRawStartAfterTransitionBuildFailure(*source_frame,
                                                          *target_frame,
                                                          *transition_duration_s,
-                                                         transition_fps)) {
+                                                         transition_fps,
+                                                         config_.transition_root_yaw_residual_limit_rad,
+                                                         transitionLimitsForUse())) {
       failTarget(std::move(target_request), ErrorCode::InternalError);
       return true;
     }
@@ -1842,7 +1856,9 @@ void RuntimeControlLoop::startTransitionFromStandbyToUser(
     if (!allowStandbyRawStartAfterTransitionBuildFailure(*source_frame,
                                                          *target_frame,
                                                          *transition_duration_s,
-                                                         transition_fps)) {
+                                                         transition_fps,
+                                                         config_.transition_root_yaw_residual_limit_rad,
+                                                         transitionLimitsForUse())) {
       failTarget(std::move(target_request), ErrorCode::InternalError);
       return;
     }
@@ -3248,7 +3264,9 @@ bool RuntimeControlLoop::startTransitionFromCurrentReferenceToUser(
         allowStandbyRawStartAfterTransitionBuildFailure(*source_frame,
                                                         *target_frame,
                                                         *transition_duration_s,
-                                                        transition_fps)) {
+                                                        transition_fps,
+                                                        config_.transition_root_yaw_residual_limit_rad,
+                                                        transitionLimitsForUse())) {
       abortPreemptedTransition();
       active_ = std::move(target_request);
       active_kind_ = ActiveKind::User;
@@ -3511,7 +3529,9 @@ bool RuntimeControlLoop::startTransitionFromCompletedUserToNextUser() {
         allowStandbyRawStartAfterTransitionBuildFailure(*source_frame,
                                                         *target_frame,
                                                         *transition_duration_s,
-                                                        transition_fps)) {
+                                                        transition_fps,
+                                                        config_.transition_root_yaw_residual_limit_rad,
+                                                        transitionLimitsForUse())) {
       return false;
     }
     failQueuedTargetAndCompleteActive(ErrorCode::InternalError);
@@ -4819,6 +4839,14 @@ std::optional<double> RuntimeControlLoop::transitionDurationForUse() const {
   return config_.transition_duration_s;
 }
 
+SyntheticTransitionLimits RuntimeControlLoop::transitionLimitsForUse() const {
+  return SyntheticTransitionLimits{
+      config_.transition_max_velocity,
+      config_.transition_max_acceleration,
+      config_.transition_max_jerk,
+  };
+}
+
 double RuntimeControlLoop::transitionSampleFpsForTarget(const TrkTrack& target) const {
   if (hasPolicyRuntime()) {
     const double step_dt = generalTrackerPolicyStepDt();
@@ -4836,6 +4864,7 @@ SyntheticTransitionOptions RuntimeControlLoop::transitionOptionsForTarget(
   options.max_duration_s = config_.transition_duration_s;
   options.min_frames = config_.transition_min_frames;
   options.duration_dt_tolerance_s = config_.transition_duration_dt_tolerance_s;
+  options.limits = transitionLimitsForUse();
   return options;
 }
 

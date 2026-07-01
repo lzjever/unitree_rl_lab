@@ -73,7 +73,7 @@ root yaw 当前只做 post-alignment residual gate，不做 Ruckig。valid quate
 - Runtime 测试覆盖 A->B peek-before-commit、benign reject 后 B 仍为队首、background->user benign reject 使用 full startup hold。
 - Runtime 测试覆盖 unsafe/invalid transition failure 不走 normal start fallback，至少包含 raw-start guard 大 gap、Ruckig invalid input、target validation failure、robot unsafe/safety sink、root yaw invalid quaternion。
 - Startup 测试覆盖成功 A->B bridge 才 reduced warmup；cold/direct/standby/background/reject fallback 都 full startup hold。
-- Release selftest 覆盖 required GA knobs/limits/contact/root yaw guard 配置缺失时 fail fast；release/runtime 不暴露 legacy smoother 开关。
+- 本阶段已收口 release selftest/config fail-fast：required GA flat knobs、transition limits、contact guard、root yaw guard 缺失时由 release binary parse-only check fail fast，已安装 shared config 也由 parse-only check 覆盖；release template/help/scripts 不暴露 legacy smoother 开关。更广 runtime 合同和仿真验收仍按下方 checklist/验收项推进。
 - 仿真验收只保留 GA 必需断言：无 passive/fall/safety sink/NaN/Inf/policy runner error，bridge dt/fps/frame count/duration 一致，controlled DoF v/a/j limits 内，queue/run-id/history 无异常。
 
 ## Deferred / Future
@@ -105,5 +105,6 @@ root yaw 当前只做 post-alignment residual gate，不做 Ruckig。valid quate
 - [ ] background->user benign reject abort background，并用 full startup hold 启动 target user。
 - [ ] unsafe/invalid transition failure 不 normal-start 放行；root yaw invalid quaternion 走保守失败语义。
 - [ ] 成功 A->B bridge 才 reduced warmup；其他 startup/reject/safety 路径 full startup hold。
-- [ ] Release selftest 和 runtime/unit tests 覆盖上述合同，release/runtime 无 legacy smoother 开关。
+- [x] Release selftest/config fail-fast 覆盖 required GA flat knobs/limits/contact/root yaw guard，release template/help/scripts 无 legacy smoother 开关。
+- [ ] Runtime/unit tests 继续覆盖上述 bridge/startup/safety 合同。
 - [ ] Deferred 列表保持延期，不新增 API、dashboard、status field 或第二套 bridge 做法。

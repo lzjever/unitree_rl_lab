@@ -6,6 +6,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include "agentic_et1_tracker/app/app_config.hpp"
 
@@ -14,15 +15,17 @@ namespace {
 
 using Catch::Matchers::ContainsSubstring;
 
+std::string withRequiredGaConfig(std::string yaml);
+
 struct TempConfig {
-  explicit TempConfig(const std::string& yaml) {
+  explicit TempConfig(const std::string& yaml, bool inject_required_ga_config = true) {
     const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
     path = std::filesystem::temp_directory_path() /
            ("agentic_et1_tracker_app_config_tests_" + std::to_string(now) + ".yaml");
 
     std::ofstream out(path);
     REQUIRE(out);
-    out << yaml;
+    out << (inject_required_ga_config ? withRequiredGaConfig(yaml) : yaml);
   }
 
   ~TempConfig() {
@@ -48,21 +51,81 @@ struct TempConfigTree {
     std::filesystem::remove_all(root, ec);
   }
 
-  std::filesystem::path writeConfig(const std::string& yaml) const {
+  std::filesystem::path writeConfig(const std::string& yaml,
+                                    bool inject_required_ga_config = true) const {
     const auto path = root / "config.yaml";
     std::ofstream out(path);
     REQUIRE(out);
-    out << yaml;
+    out << (inject_required_ga_config ? withRequiredGaConfig(yaml) : yaml);
     return path;
   }
 
-  AppConfig load(const std::string& yaml) const { return loadAppConfig(writeConfig(yaml)); }
+  AppConfig load(const std::string& yaml, bool inject_required_ga_config = true) const {
+    return loadAppConfig(writeConfig(yaml, inject_required_ga_config));
+  }
 
   std::filesystem::path root;
 };
 
+struct RequiredGaConfigField {
+  const char* key;
+  const char* value;
+};
+
+const std::vector<RequiredGaConfigField>& requiredGaConfigFields() {
+  static const std::vector<RequiredGaConfigField> fields{
+      {"transition_duration_s", "0.30"},
+      {"transition_min_frames", "2"},
+      {"transition_duration_dt_tolerance_s", "1.0e-9"},
+      {"user_bridge_reduced_startup_hold_s", "0.10"},
+      {"transition_root_yaw_residual_limit_rad", "0.05"},
+      {"transition_contact_guard", "\"same_nonzero_contact\""},
+      {"transition_max_velocity", "250.0"},
+      {"transition_max_acceleration", "10000.0"},
+      {"transition_max_jerk", "1000000.0"},
+  };
+  return fields;
+}
+
+std::string withRequiredGaConfig(std::string yaml) {
+  if (!yaml.empty() && yaml.back() != '\n') {
+    yaml.push_back('\n');
+  }
+  for (const auto& field : requiredGaConfigFields()) {
+    const std::string needle = std::string("\n  ") + field.key + ":";
+    if (yaml.find(needle) == std::string::npos) {
+      yaml += "  ";
+      yaml += field.key;
+      yaml += ": ";
+      yaml += field.value;
+      yaml += "\n";
+    }
+  }
+  return yaml;
+}
+
+std::string requiredGaConfigExcept(const std::string& omitted_key) {
+  std::string yaml;
+  for (const auto& field : requiredGaConfigFields()) {
+    if (field.key == omitted_key) {
+      continue;
+    }
+    yaml += "  ";
+    yaml += field.key;
+    yaml += ": ";
+    yaml += field.value;
+    yaml += "\n";
+  }
+  return yaml;
+}
+
 AppConfig loadYaml(const std::string& yaml) {
   TempConfig tmp(yaml);
+  return tmp.load();
+}
+
+AppConfig loadRawYaml(const std::string& yaml) {
+  TempConfig tmp(yaml, false);
   return tmp.load();
 }
 
@@ -145,6 +208,14 @@ agentic_et1_tracker:
   REQUIRE(config.runtime.transition_min_frames == 2);
   REQUIRE(config.runtime.transition_duration_dt_tolerance_s == 1.0e-9);
   REQUIRE(config.runtime.user_bridge_reduced_startup_hold_s == 0.10);
+  REQUIRE(config.runtime.transition_root_yaw_residual_limit_rad == 0.05);
+  REQUIRE(config.transition_contact_guard == "same_nonzero_contact");
+  REQUIRE(config.transition_max_velocity == 250.0);
+  REQUIRE(config.transition_max_acceleration == 10000.0);
+  REQUIRE(config.transition_max_jerk == 1000000.0);
+  REQUIRE(config.runtime.transition_max_velocity == 250.0);
+  REQUIRE(config.runtime.transition_max_acceleration == 10000.0);
+  REQUIRE(config.runtime.transition_max_jerk == 1000000.0);
   REQUIRE(config.trk.fps == 50.0);
   REQUIRE(config.trk.max_duration_s == 120.0);
   REQUIRE(config.trk.allowlist_dirs == std::vector<std::filesystem::path>{"/home/galbot/motions"});
@@ -236,6 +307,11 @@ TEST_CASE("AppConfig default file keeps StandbyVelocity and posture assets app-o
   REQUIRE(config.stop_hold_s == 0.0);
   REQUIRE(config.runtime.stop_hold_s == 0.0);
   REQUIRE(config.runtime.transition_duration_s == 0.30);
+  REQUIRE(config.runtime.transition_root_yaw_residual_limit_rad == 0.05);
+  REQUIRE(config.transition_contact_guard == "same_nonzero_contact");
+  REQUIRE(config.runtime.transition_max_velocity == 250.0);
+  REQUIRE(config.runtime.transition_max_acceleration == 10000.0);
+  REQUIRE(config.runtime.transition_max_jerk == 1000000.0);
   REQUIRE(config.passive_password == "galaxy");
   REQUIRE_FALSE(config.reference.enabled);
   REQUIRE_FALSE(config.loco_upper.enabled);
@@ -273,6 +349,11 @@ TEST_CASE("AppConfig simulation example is ready for local MuJoCo acceptance") {
   REQUIRE(config.control.startup_control == "FixStand");
   REQUIRE(config.stop_hold_s == 0.0);
   REQUIRE(config.runtime.transition_duration_s == 0.7);
+  REQUIRE(config.runtime.transition_root_yaw_residual_limit_rad == 0.05);
+  REQUIRE(config.transition_contact_guard == "same_nonzero_contact");
+  REQUIRE(config.runtime.transition_max_velocity == 250.0);
+  REQUIRE(config.runtime.transition_max_acceleration == 10000.0);
+  REQUIRE(config.runtime.transition_max_jerk == 1000000.0);
   REQUIRE(config.passive_password == "galaxy");
   REQUIRE(config.reference.enabled);
   REQUIRE_FALSE(config.loco_upper.enabled);
@@ -381,6 +462,11 @@ agentic_et1_tracker:
   transition_min_frames: 3
   transition_duration_dt_tolerance_s: 0.02
   user_bridge_reduced_startup_hold_s: 0.08
+  transition_root_yaw_residual_limit_rad: 0.04
+  transition_contact_guard: "same_nonzero_contact"
+  transition_max_velocity: 300.0
+  transition_max_acceleration: 9000.0
+  transition_max_jerk: 800000.0
   stop_hold_s: 0.0
   idle_mode: "hold_current"
   passive_password: "secret"
@@ -432,6 +518,14 @@ agentic_et1_tracker:
   REQUIRE(config.runtime.transition_min_frames == 3);
   REQUIRE(config.runtime.transition_duration_dt_tolerance_s == 0.02);
   REQUIRE(config.runtime.user_bridge_reduced_startup_hold_s == 0.08);
+  REQUIRE(config.runtime.transition_root_yaw_residual_limit_rad == 0.04);
+  REQUIRE(config.transition_contact_guard == "same_nonzero_contact");
+  REQUIRE(config.transition_max_velocity == 300.0);
+  REQUIRE(config.transition_max_acceleration == 9000.0);
+  REQUIRE(config.transition_max_jerk == 800000.0);
+  REQUIRE(config.runtime.transition_max_velocity == 300.0);
+  REQUIRE(config.runtime.transition_max_acceleration == 9000.0);
+  REQUIRE(config.runtime.transition_max_jerk == 800000.0);
   REQUIRE(config.trk.allowlist_dirs ==
           std::vector<std::filesystem::path>{"/srv/motions/a", "/srv/motions/b"});
   REQUIRE(config.trk.max_duration_s == 42.5);
@@ -645,6 +739,16 @@ agentic_et1_tracker:
 }
 
 TEST_CASE("AppConfig rejects invalid scalar bounds") {
+  SECTION("GA config fields are required") {
+    for (const auto& field : requiredGaConfigFields()) {
+      CAPTURE(field.key);
+      REQUIRE_THROWS_WITH(loadRawYaml(std::string("agentic_et1_tracker:\n"
+                                                 "  motion_dirs: [\"/tmp/motions\"]\n") +
+                                      requiredGaConfigExcept(field.key)),
+                          ContainsSubstring(field.key));
+    }
+  }
+
   SECTION("port below range") {
     REQUIRE_THROWS_WITH(loadYaml(R"yaml(
 agentic_et1_tracker:
@@ -805,6 +909,44 @@ agentic_et1_tracker:
                                               "  user_bridge_reduced_startup_hold_s: ") +
                                    value + "\n"),
                           ContainsSubstring("user_bridge_reduced_startup_hold_s"));
+    }
+  }
+
+  SECTION("root yaw residual limit must be finite non-negative") {
+    for (const char* value : {"-0.1", ".nan"}) {
+      CAPTURE(value);
+      REQUIRE_THROWS_WITH(loadYaml(std::string("agentic_et1_tracker:\n"
+                                              "  motion_dirs: [\"/tmp/motions\"]\n"
+                                              "  transition_root_yaw_residual_limit_rad: ") +
+                                   value + "\n"),
+                          ContainsSubstring("transition_root_yaw_residual_limit_rad"));
+    }
+  }
+
+  SECTION("transition contact guard only accepts the GA contract value") {
+    for (const char* value : {"same_contact", "allow_any", "\"\""}) {
+      CAPTURE(value);
+      REQUIRE_THROWS_WITH(loadYaml(std::string("agentic_et1_tracker:\n"
+                                              "  motion_dirs: [\"/tmp/motions\"]\n"
+                                              "  transition_contact_guard: ") +
+                                   value + "\n"),
+                          ContainsSubstring("transition_contact_guard"));
+    }
+  }
+
+  SECTION("transition limits must be finite positive") {
+    for (const auto& key : {"transition_max_velocity",
+                            "transition_max_acceleration",
+                            "transition_max_jerk"}) {
+      for (const char* value : {"0.0", "-0.1", ".nan"}) {
+        CAPTURE(key);
+        CAPTURE(value);
+        REQUIRE_THROWS_WITH(loadYaml(std::string("agentic_et1_tracker:\n"
+                                                "  motion_dirs: [\"/tmp/motions\"]\n"
+                                                "  ") +
+                                     key + ": " + value + "\n"),
+                            ContainsSubstring(key));
+      }
     }
   }
 

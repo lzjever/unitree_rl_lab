@@ -25,6 +25,7 @@ struct SyntheticTransitionOptions {
   double max_duration_s = 0.0;
   std::size_t min_frames = 2;
   double duration_dt_tolerance_s = 1.0e-9;
+  SyntheticTransitionLimits limits = defaultSyntheticTransitionLimits();
   // Root yaw is intentionally not controlled in this slice. Keep the option explicit so a
   // future runtime/config change has one place to opt in without overloading body channels.
   SyntheticTransitionRootYawMode root_yaw_mode = SyntheticTransitionRootYawMode::kDisabled;

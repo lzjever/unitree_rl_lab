@@ -18,6 +18,11 @@ agentic_et1_tracker:
   transition_min_frames: 2
   transition_duration_dt_tolerance_s: 1.0e-9
   user_bridge_reduced_startup_hold_s: 0.10
+  transition_root_yaw_residual_limit_rad: 0.05
+  transition_contact_guard: "same_nonzero_contact"
+  transition_max_velocity: 250.0
+  transition_max_acceleration: 10000.0
+  transition_max_jerk: 1000000.0
   stop_hold_s: 0.0
   idle_mode: "hold_current"
   reference:

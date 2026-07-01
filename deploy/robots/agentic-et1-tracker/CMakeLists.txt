@@ -558,6 +558,7 @@ if(AGENTIC_ET1_BUILD_TESTS)
   add_test(NAME agentic_et1_tracker_http_tests COMMAND agentic_et1_tracker_http_tests)
 
   add_executable(agentic_et1_tracker_app_tests
+    tests/app_cli_tests.cpp
     tests/app_config_tests.cpp
     tests/app_runtime_factory_tests.cpp
     tests/app_runner_tests.cpp
@@ -567,6 +568,11 @@ if(AGENTIC_ET1_BUILD_TESTS)
       agentic_et1_tracker_app
       agentic_et1_tracker_httplib
       Catch2::Catch2WithMain
+  )
+  add_dependencies(agentic_et1_tracker_app_tests agentic-et1-tracker)
+  target_compile_definitions(agentic_et1_tracker_app_tests
+    PRIVATE
+      "AGENTIC_ET1_TRACKER_BINARY_PATH=\"$<TARGET_FILE:agentic-et1-tracker>\""
   )
 
   add_test(NAME agentic_et1_tracker_app_tests COMMAND agentic_et1_tracker_app_tests)

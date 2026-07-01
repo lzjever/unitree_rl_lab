@@ -72,6 +72,99 @@ check_contains() {
   printf 'ok contains %s %s\n' "$path" "$needle"
 }
 
+check_ga_config_parse_ok() {
+  local tmp_dir
+  local full_config
+  local stderr_file
+  tmp_dir="$(mktemp -d)"
+  full_config="$tmp_dir/full.yaml"
+  stderr_file="$tmp_dir/stderr.txt"
+
+  sed "s|@PREFIX@|$ET1_PREFIX|g" \
+    "$ET1_RELEASE_DIR/config/config.robot.yaml.template" >"$full_config"
+
+  if ! "$ET1_BIN" --check-config --config "$full_config" >/dev/null 2>"$stderr_file"; then
+    cat "$stderr_file" >&2 || true
+    rm -rf "$tmp_dir"
+    die "release config should pass --check-config"
+  fi
+  rm -rf "$tmp_dir"
+  printf 'ok release config check-config\n'
+}
+
+check_installed_config_parse_ok() {
+  local stderr_file
+  stderr_file="$(mktemp)"
+
+  if ! "$ET1_BIN" --check-config --config "$ET1_CONFIG" >/dev/null 2>"$stderr_file"; then
+    cat "$stderr_file" >&2 || true
+    rm -f "$stderr_file"
+    die "installed config should pass --check-config: $ET1_CONFIG"
+  fi
+  rm -f "$stderr_file"
+  printf 'ok installed config check-config %s\n' "$ET1_CONFIG"
+}
+
+check_ga_config_required_key() {
+  local key="$1"
+  local tmp_dir
+  local full_config
+  local bad_config
+  local stderr_file
+  local status
+  tmp_dir="$(mktemp -d)"
+  full_config="$tmp_dir/full.yaml"
+  bad_config="$tmp_dir/missing.yaml"
+  stderr_file="$tmp_dir/stderr.txt"
+
+  sed "s|@PREFIX@|$ET1_PREFIX|g" \
+    "$ET1_RELEASE_DIR/config/config.robot.yaml.template" >"$full_config"
+  grep -v -E "^[[:space:]]*${key}:" "$full_config" >"$bad_config"
+
+  set +e
+  "$ET1_BIN" --check-config --config "$bad_config" >/dev/null 2>"$stderr_file"
+  status=$?
+  set -e
+  if [[ "$status" -ne 2 ]]; then
+    cat "$stderr_file" >&2 || true
+    rm -rf "$tmp_dir"
+    die "missing required config key $key should exit 2, got $status"
+  fi
+  if ! grep -q "$key" "$stderr_file"; then
+    cat "$stderr_file" >&2 || true
+    rm -rf "$tmp_dir"
+    die "missing required config key $key did not mention key in stderr"
+  fi
+  rm -rf "$tmp_dir"
+  printf 'ok required config key %s fail-fast\n' "$key"
+}
+
+check_no_legacy_smoother_switches() {
+  local tmp_dir
+  local smooth
+  local pattern
+  tmp_dir="$(mktemp -d)"
+  smooth="smooth"
+  "$ET1_BIN" --help >"$tmp_dir/app.help" 2>&1
+  "$ET1_CLI" --help >"$tmp_dir/cli.help" 2>&1
+  for pattern in \
+    "adaptive_legacy_${smooth}er" \
+    "adaptive_${smooth}er_enabled" \
+    "legacy_transition_${smooth}er" \
+    "transition_legacy_${smooth}er" \
+    "enable_legacy_${smooth}er"; do
+    if grep -R -q -- "$pattern" \
+      "$ET1_RELEASE_DIR/config/config.robot.yaml.template" \
+      "$ET1_RELEASE_DIR/scripts" \
+      "$tmp_dir"; then
+      rm -rf "$tmp_dir"
+      die "legacy adaptive smoother switch exposed: $pattern"
+    fi
+  done
+  rm -rf "$tmp_dir"
+  printf 'ok no legacy adaptive smoother switches\n'
+}
+
 check_manifest_entry() {
   local entry="$1"
   check_contains "$ET1_RELEASE_DIR/manifest.sha256" "$entry"
@@ -158,6 +251,20 @@ check_manifest_entry "share/agentic-et1-tracker/third_party/ruckig/LICENSE"
 check_manifest_entry "share/agentic-et1-tracker/third_party/ruckig/VENDOR_MANIFEST.yaml"
 
 prepend_release_lib_path
+check_ga_config_parse_ok
+for key in \
+  transition_duration_s \
+  transition_min_frames \
+  transition_duration_dt_tolerance_s \
+  user_bridge_reduced_startup_hold_s \
+  transition_root_yaw_residual_limit_rad \
+  transition_contact_guard \
+  transition_max_velocity \
+  transition_max_acceleration \
+  transition_max_jerk; do
+  check_ga_config_required_key "$key"
+done
+check_no_legacy_smoother_switches
 "$ET1_BIN" --help >/dev/null 2>&1
 "$ET1_CLI" --help >/dev/null 2>&1
 printf 'ok help commands\n'
@@ -171,6 +278,7 @@ if [[ -f "$ET1_CONFIG" ]]; then
     check_contains "$ET1_CONFIG" "DR3-all.onnx"
     check_contains "$ET1_CONFIG" "deploy_fut_obs.yaml"
   fi
+  check_installed_config_parse_ok
   printf 'ok installed config %s\n' "$ET1_CONFIG"
 else
   printf 'skip installed config %s\n' "$ET1_CONFIG"

@@ -17,7 +17,7 @@ std::atomic<bool> g_stop_requested{false};
 void requestStop(int) { g_stop_requested.store(true); }
 
 void printUsage(const char* argv0) {
-  std::cerr << "Usage: " << argv0 << " --config PATH\n";
+  std::cerr << "Usage: " << argv0 << " [--check-config] --config PATH\n";
 }
 
 }  // namespace
@@ -27,16 +27,25 @@ int main(int argc, char** argv) {
     printUsage(argv[0]);
     return 0;
   }
-  if (argc != 3 || std::string(argv[1]) != "--config") {
+  const bool check_config_only =
+      argc == 4 && std::string(argv[1]) == "--check-config" &&
+      std::string(argv[2]) == "--config";
+  const bool run_service = argc == 3 && std::string(argv[1]) == "--config";
+  if (!check_config_only && !run_service) {
     printUsage(argv[0]);
     return 2;
   }
 
   try {
+    const char* config_path = check_config_only ? argv[3] : argv[2];
+    auto config = agentic_et1_tracker::loadAppConfig(config_path);
+    if (check_config_only) {
+      return 0;
+    }
+
     std::signal(SIGINT, requestStop);
     std::signal(SIGTERM, requestStop);
 
-    auto config = agentic_et1_tracker::loadAppConfig(argv[2]);
     const std::string host = config.http.host;
     agentic_et1_tracker::AppRunner runner(std::move(config));
     if (!runner.start()) {

@@ -13,6 +13,10 @@ struct RuntimeConfig {
   std::size_t transition_min_frames{2};
   double transition_duration_dt_tolerance_s{1.0e-9};
   double user_bridge_reduced_startup_hold_s{0.10};
+  double transition_root_yaw_residual_limit_rad{0.05};
+  double transition_max_velocity{250.0};
+  double transition_max_acceleration{10000.0};
+  double transition_max_jerk{1000000.0};
   double loco_upper_max_hold_s{10.0};
   double radius_tolerance_m{0.05};
   bool loco_upper_strict_pose{false};

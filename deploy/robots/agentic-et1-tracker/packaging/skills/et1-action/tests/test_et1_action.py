@@ -1110,6 +1110,8 @@ print(json.dumps({"ok": True}))
         self.assertNotIn("make_bin_wrapper et1-trk2motion", build)
         selftest = (PACKAGING / "scripts" / "selftest.sh").read_text(encoding="utf-8")
         self.assertIn('"$ET1_CLI" status', selftest)
+        self.assertIn('"$ET1_BIN" --check-config --config "$ET1_CONFIG"', selftest)
+        self.assertIn("installed config should pass --check-config", selftest)
         readme = (PACKAGING / "README.release.md").read_text(encoding="utf-8")
         self.assertIn("bin/et1-action status", readme)
 

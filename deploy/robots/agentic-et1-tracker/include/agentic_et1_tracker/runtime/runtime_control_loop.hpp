@@ -310,6 +310,7 @@ class RuntimeControlLoop final {
   std::size_t policyStartupHoldPolicySteps(double duration_s) const;
   std::size_t stopHoldTicks() const;
   std::optional<double> transitionDurationForUse() const;
+  SyntheticTransitionLimits transitionLimitsForUse() const;
   double transitionSampleFpsForTarget(const TrkTrack& target) const;
   SyntheticTransitionOptions transitionOptionsForTarget(const TrkTrack& target) const;
   std::optional<bool> rootYawResidualAllowsBridge(const TrkFrameView& source,

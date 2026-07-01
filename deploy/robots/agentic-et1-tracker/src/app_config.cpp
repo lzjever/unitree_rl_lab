@@ -24,6 +24,7 @@ constexpr const char* kDr3PolicyProfile = "GeneralTrackerDR3";
 constexpr const char* kStartupFixStand = "FixStand";
 constexpr const char* kStartupStandbyVelocity = "StandbyVelocity";
 constexpr const char* kIdleModeHoldCurrent = "hold_current";
+constexpr const char* kTransitionContactGuardSameNonzero = "same_nonzero_contact";
 constexpr int kMinPort = 1;
 constexpr int kMaxPort = 65535;
 constexpr int kMinDomainId = 0;
@@ -53,6 +54,61 @@ T scalarAs(const YAML::Node& node, const char* name) {
     out << name << " has invalid value: " << e.what();
     throw error(out.str());
   }
+}
+
+YAML::Node requiredScalarNode(const YAML::Node& section, const char* key) {
+  const YAML::Node node = section[key];
+  if (!node) {
+    throw error(std::string(key) + " is required");
+  }
+  if (!node.IsScalar()) {
+    throw error(std::string(key) + " must be a scalar");
+  }
+  return node;
+}
+
+std::string requiredString(const YAML::Node& section, const char* key) {
+  std::string value = scalarAs<std::string>(requiredScalarNode(section, key), key);
+  if (value.empty()) {
+    throw error(std::string(key) + " must not be empty");
+  }
+  return value;
+}
+
+std::size_t requiredPositiveSize(const YAML::Node& section, const char* key) {
+  const long long value = scalarAs<long long>(requiredScalarNode(section, key), key);
+  if (value <= 0) {
+    throw error(std::string(key) + " must be positive");
+  }
+  return static_cast<std::size_t>(value);
+}
+
+double requiredPositiveDouble(const YAML::Node& section, const char* key) {
+  const double value = scalarAs<double>(requiredScalarNode(section, key), key);
+  if (!std::isfinite(value) || value <= 0.0) {
+    throw error(std::string(key) + " must be positive");
+  }
+  return value;
+}
+
+double requiredNonNegativeDouble(const YAML::Node& section, const char* key) {
+  const double value = scalarAs<double>(requiredScalarNode(section, key), key);
+  if (!std::isfinite(value) || value < 0.0) {
+    throw error(std::string(key) + " must be non-negative");
+  }
+  return value;
+}
+
+double requiredBoundedPositiveDouble(const YAML::Node& section,
+                                     const char* key,
+                                     double max_value) {
+  const double value = scalarAs<double>(requiredScalarNode(section, key), key);
+  if (!std::isfinite(value) || value <= 0.0 || value > max_value) {
+    std::ostringstream out;
+    out << key << " must be in the range 0.." << max_value << " exclusive of 0";
+    throw error(out.str());
+  }
+  return value;
 }
 
 std::string optionalString(const YAML::Node& section,
@@ -143,23 +199,6 @@ double optionalRuntimeRate(const YAML::Node& section, const char* key, double cu
   if (!std::isfinite(value) || value < kMinRuntimeRate || value > kMaxRuntimeRate) {
     std::ostringstream out;
     out << key << " must be in the range " << kMinRuntimeRate << ".." << kMaxRuntimeRate;
-    throw error(out.str());
-  }
-  return value;
-}
-
-double optionalBoundedPositiveDouble(const YAML::Node& section,
-                                     const char* key,
-                                     double current,
-                                     double max_value) {
-  const YAML::Node node = section[key];
-  if (!node) {
-    return current;
-  }
-  const double value = scalarAs<double>(node, key);
-  if (!std::isfinite(value) || value <= 0.0 || value > max_value) {
-    std::ostringstream out;
-    out << key << " must be in the range 0.." << max_value << " exclusive of 0";
     throw error(out.str());
   }
   return value;
@@ -617,29 +656,42 @@ AppConfig loadAppConfig(const std::filesystem::path& path) {
     }
     config.runtime.stop_hold_s = config.stop_hold_s;
     config.transition_duration_s =
-        optionalBoundedPositiveDouble(section,
+        requiredBoundedPositiveDouble(section,
                                       "transition_duration_s",
-                                      config.transition_duration_s,
                                       kMaxTransitionDurationS);
     config.runtime.transition_duration_s = config.transition_duration_s;
     config.transition_min_frames =
-        optionalPositiveSize(section, "transition_min_frames", config.transition_min_frames);
+        requiredPositiveSize(section, "transition_min_frames");
     config.runtime.transition_min_frames = config.transition_min_frames;
     config.transition_duration_dt_tolerance_s =
-        optionalNonNegativeDouble(section,
-                                  "transition_duration_dt_tolerance_s",
-                                  config.transition_duration_dt_tolerance_s);
+        requiredNonNegativeDouble(section, "transition_duration_dt_tolerance_s");
     config.runtime.transition_duration_dt_tolerance_s =
         config.transition_duration_dt_tolerance_s;
     config.user_bridge_reduced_startup_hold_s =
-        optionalNonNegativeDouble(section,
-                                  "user_bridge_reduced_startup_hold_s",
-                                  config.user_bridge_reduced_startup_hold_s);
+        requiredNonNegativeDouble(section, "user_bridge_reduced_startup_hold_s");
     if (config.user_bridge_reduced_startup_hold_s > kPolicyStartupHoldDurationS) {
       throw error("user_bridge_reduced_startup_hold_s must be <= 0.5");
     }
     config.runtime.user_bridge_reduced_startup_hold_s =
         config.user_bridge_reduced_startup_hold_s;
+    config.transition_root_yaw_residual_limit_rad =
+        requiredNonNegativeDouble(section, "transition_root_yaw_residual_limit_rad");
+    config.runtime.transition_root_yaw_residual_limit_rad =
+        config.transition_root_yaw_residual_limit_rad;
+    config.transition_contact_guard = requiredString(section, "transition_contact_guard");
+    if (config.transition_contact_guard != kTransitionContactGuardSameNonzero) {
+      throw error("transition_contact_guard must be same_nonzero_contact");
+    }
+    config.transition_max_velocity =
+        requiredPositiveDouble(section, "transition_max_velocity");
+    config.runtime.transition_max_velocity = config.transition_max_velocity;
+    config.transition_max_acceleration =
+        requiredPositiveDouble(section, "transition_max_acceleration");
+    config.runtime.transition_max_acceleration =
+        config.transition_max_acceleration;
+    config.transition_max_jerk =
+        requiredPositiveDouble(section, "transition_max_jerk");
+    config.runtime.transition_max_jerk = config.transition_max_jerk;
     config.idle_mode = optionalString(section, "idle_mode", config.idle_mode);
     if (config.idle_mode != kIdleModeHoldCurrent) {
       throw error("idle_mode must be hold_current");

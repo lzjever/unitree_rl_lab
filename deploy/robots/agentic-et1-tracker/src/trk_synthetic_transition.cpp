@@ -252,7 +252,8 @@ std::optional<ruckig::Trajectory<ruckig::DynamicDOFs>> makeJointTrajectory(
     const TrkArrayView<float>& source_velocity,
     const TrkArrayView<float>& target_position,
     const TrkArrayView<float>& target_velocity,
-    double dt) {
+    double dt,
+    const SyntheticTransitionLimits& limits) {
   const std::size_t dofs = source_position.size;
   if (dofs != kJointDim || source_velocity.size != dofs || target_position.size != dofs ||
       target_velocity.size != dofs) {
@@ -262,7 +263,6 @@ std::optional<ruckig::Trajectory<ruckig::DynamicDOFs>> makeJointTrajectory(
   ruckig::Ruckig<ruckig::DynamicDOFs> ruckig(dofs, dt);
   ruckig::InputParameter<ruckig::DynamicDOFs> input(dofs);
   ruckig::Trajectory<ruckig::DynamicDOFs> trajectory(dofs);
-  const SyntheticTransitionLimits limits = defaultSyntheticTransitionLimits();
 
   for (std::size_t i = 0; i < dofs; ++i) {
     input.current_position[i] = static_cast<double>(source_position.ptr[i]);
@@ -338,6 +338,12 @@ bool allFinite(const TrkTrack& track) {
          allFinite(track.ref_com_rel_navi) && allFinite(track.ref_com_vel_navi);
 }
 
+bool validLimits(const SyntheticTransitionLimits& limits) {
+  return finite(limits.max_velocity) && limits.max_velocity > 0.0 &&
+         finite(limits.max_acceleration) && limits.max_acceleration > 0.0 &&
+         finite(limits.max_jerk) && limits.max_jerk > 0.0;
+}
+
 }  // namespace
 
 std::optional<TrkTrack> makeSyntheticTransitionTrk(const TrkFrameView& source,
@@ -352,6 +358,7 @@ std::optional<TrkTrack> makeSyntheticTransitionTrk(const TrkFrameView& source,
       options.min_frames == 0 ||
       !finite(options.duration_dt_tolerance_s) ||
       options.duration_dt_tolerance_s < 0.0 ||
+      !validLimits(options.limits) ||
       !validTimingCap(target_fps, options.max_duration_s) || !sameContacts(source, target)) {
     return std::nullopt;
   }
@@ -359,7 +366,7 @@ std::optional<TrkTrack> makeSyntheticTransitionTrk(const TrkFrameView& source,
   const double dt = 1.0 / target_fps;
   const std::optional<ruckig::Trajectory<ruckig::DynamicDOFs>> joint_trajectory =
       makeJointTrajectory(source.joint_pos, source.joint_vel, target.joint_pos, target.joint_vel,
-                          dt);
+                          dt, options.limits);
   if (!joint_trajectory.has_value()) {
     return std::nullopt;
   }

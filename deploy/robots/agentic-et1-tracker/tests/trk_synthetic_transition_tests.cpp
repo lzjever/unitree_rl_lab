@@ -340,6 +340,26 @@ TEST_CASE("Trk synthetic transition only applies velocity limits to controlled j
           .has_value());
 }
 
+TEST_CASE("Trk synthetic transition honors configured transition limits") {
+  TrkTrack source_track = makeSingleFrameTrack();
+  TrkTrack target_track = makeTargetTrack();
+  source_track.joint_vel.values.at(0) = 12.0F;
+  target_track.joint_vel.values.at(0) = 12.0F;
+
+  SyntheticTransitionOptions options;
+  options.max_duration_s = 1.0;
+  options.limits = defaultSyntheticTransitionLimits();
+  options.limits.max_velocity = 10.0;
+
+  REQUIRE_FALSE(
+      makeSyntheticTransitionTrk(*source_track.frame(0), *target_track.frame(0), 25.0, options)
+          .has_value());
+
+  options.limits.max_velocity = 20.0;
+  REQUIRE(makeSyntheticTransitionTrk(*source_track.frame(0), *target_track.frame(0), 25.0, options)
+              .has_value());
+}
+
 TEST_CASE("Trk synthetic transition rejects contact mismatch and preserves same contact") {
   TrkTrack source_track = makeSingleFrameTrack();
   TrkTrack target_track = makeTargetTrack();
