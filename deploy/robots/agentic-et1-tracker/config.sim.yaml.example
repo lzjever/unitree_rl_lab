@@ -32,10 +32,10 @@ agentic_et1_tracker:
     limits: "config/limits/et1_upper_body/v0/limits.yaml"
     joint_map: "config/limits/et1_upper_body/v0/joint_map.yaml"
   policy:
-    profile: "GeneralTrackerCLNFootstate"
-    policy_dir: "config/policy/general_tracker_cln"
-    policy_file: "multi_policy_footstate3.onnx"
-    deploy: "config/policy/general_tracker_cln/params/deploy_fut_multi_footstate.yaml"
+    profile: "GeneralTrackerDR3"
+    policy_dir: "config/policy/general_tracker_dr3"
+    policy_file: "DR3-all.onnx"
+    deploy: "config/policy/general_tracker_dr3/params/deploy_fut_obs.yaml"
     fps: 50
   control:
     startup_control: "FixStand"

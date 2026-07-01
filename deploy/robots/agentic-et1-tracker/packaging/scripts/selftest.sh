@@ -76,11 +76,11 @@ check_exec "$ET1_BIN"
 check_exec "$ET1_CLI"
 check_file "$ET1_RELEASE_DIR/config/config.robot.yaml.template"
 check_contains "$ET1_RELEASE_DIR/config/config.robot.yaml.template" \
-  "GeneralTrackerCLNFootstate"
+  "GeneralTrackerDR3"
 check_contains "$ET1_RELEASE_DIR/config/config.robot.yaml.template" \
-  "multi_policy_footstate3.onnx"
+  "DR3-all.onnx"
 check_contains "$ET1_RELEASE_DIR/config/config.robot.yaml.template" \
-  "deploy_fut_multi_footstate.yaml"
+  "deploy_fut_obs.yaml"
 [[ ! -d "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/general_tracker" ]] || \
   die "legacy policy directory must not be present: $ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/general_tracker"
 check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/general_tracker_cln/ASSET_MANIFEST.yaml"

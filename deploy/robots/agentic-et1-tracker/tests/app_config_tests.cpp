@@ -153,12 +153,12 @@ agentic_et1_tracker:
   REQUIRE(config.release_motion_mode_retry_interval_ms == 500);
   REQUIRE(config.lock_path.empty());
   REQUIRE(config.passive_password == "galaxy");
-  REQUIRE(config.policy.profile == "GeneralTrackerCLNFootstate");
+  REQUIRE(config.policy.profile == "GeneralTrackerDR3");
   REQUIRE(config.policy.policy_dir ==
-          (config_dir / "config/policy/general_tracker_cln").lexically_normal().string());
-  REQUIRE(config.policy.policy_file == "multi_policy_footstate3.onnx");
+          (config_dir / "config/policy/general_tracker_dr3").lexically_normal().string());
+  REQUIRE(config.policy.policy_file == "DR3-all.onnx");
   REQUIRE(config.policy.deploy ==
-          (config_dir / "config/policy/general_tracker_cln/params/deploy_fut_multi_footstate.yaml")
+          (config_dir / "config/policy/general_tracker_dr3/params/deploy_fut_obs.yaml")
               .lexically_normal()
               .string());
   REQUIRE(config.control.startup_control == "FixStand");
@@ -206,12 +206,12 @@ TEST_CASE("AppConfig default file keeps StandbyVelocity and posture assets app-o
   const auto root = appRoot();
   const auto config = loadAppConfig(root / "config.yaml");
 
-  REQUIRE(config.policy.profile == "GeneralTrackerCLNFootstate");
+  REQUIRE(config.policy.profile == "GeneralTrackerDR3");
   REQUIRE(pathIsAtOrWithin(config.policy.policy_dir,
-                           root / "config/policy/general_tracker_cln"));
-  REQUIRE(config.policy.policy_file == "multi_policy_footstate3.onnx");
+                           root / "config/policy/general_tracker_dr3"));
+  REQUIRE(config.policy.policy_file == "DR3-all.onnx");
   REQUIRE(config.policy.deploy ==
-          (root / "config/policy/general_tracker_cln/params/deploy_fut_multi_footstate.yaml")
+          (root / "config/policy/general_tracker_dr3/params/deploy_fut_obs.yaml")
               .lexically_normal()
               .string());
   REQUIRE(pathIsAtOrWithin(config.control.velocity_policy_dir,
@@ -249,12 +249,12 @@ TEST_CASE("AppConfig simulation example is ready for local MuJoCo acceptance") {
   REQUIRE_FALSE(config.release_motion_mode_on_startup);
   REQUIRE(config.trk.allowlist_dirs ==
           std::vector<std::filesystem::path>{"/home/galbot/works/agent-test/generated"});
-  REQUIRE(config.policy.profile == "GeneralTrackerCLNFootstate");
+  REQUIRE(config.policy.profile == "GeneralTrackerDR3");
   REQUIRE(pathIsAtOrWithin(config.policy.policy_dir,
-                           root / "config/policy/general_tracker_cln"));
-  REQUIRE(config.policy.policy_file == "multi_policy_footstate3.onnx");
+                           root / "config/policy/general_tracker_dr3"));
+  REQUIRE(config.policy.policy_file == "DR3-all.onnx");
   REQUIRE(config.policy.deploy ==
-          (root / "config/policy/general_tracker_cln/params/deploy_fut_multi_footstate.yaml")
+          (root / "config/policy/general_tracker_dr3/params/deploy_fut_obs.yaml")
               .lexically_normal()
               .string());
   REQUIRE(pathIsAtOrWithin(config.control.velocity_policy_dir,
@@ -282,15 +282,15 @@ TEST_CASE("AppConfig release template resolves internal standby reference to rel
   const std::string templ = readText(root / "packaging/config.robot.yaml.template");
   const auto config = tmp.load(replaceAll(templ, "@PREFIX@", prefix.string()));
 
-  REQUIRE(config.policy.profile == "GeneralTrackerCLNFootstate");
-  REQUIRE(config.policy.policy_file == "multi_policy_footstate3.onnx");
+  REQUIRE(config.policy.profile == "GeneralTrackerDR3");
+  REQUIRE(config.policy.policy_file == "DR3-all.onnx");
   REQUIRE(config.policy.policy_dir ==
-          (prefix / "current/share/agentic-et1-tracker/config/policy/general_tracker_cln")
+          (prefix / "current/share/agentic-et1-tracker/config/policy/general_tracker_dr3")
               .lexically_normal()
               .string());
   REQUIRE(config.policy.deploy ==
-          (prefix / "current/share/agentic-et1-tracker/config/policy/general_tracker_cln/params/"
-                    "deploy_fut_multi_footstate.yaml")
+          (prefix / "current/share/agentic-et1-tracker/config/policy/general_tracker_dr3/params/"
+                    "deploy_fut_obs.yaml")
               .lexically_normal()
               .string());
   REQUIRE(config.control.standby_reference ==
