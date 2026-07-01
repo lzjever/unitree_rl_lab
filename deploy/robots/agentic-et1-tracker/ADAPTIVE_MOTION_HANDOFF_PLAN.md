@@ -23,7 +23,9 @@ GA 策略保持 KISS/DRY/YAGNI：
 
 这些项目后续只需要通过合同测试和 release selftest 固化，避免出现第二套实现或旧 fixed-horizon/legacy smoother 语义回流。
 
-## Current GA Blockers
+## Closed GA Contract / Release Acceptance
+
+以下内容是当前 GA 已收口的合同和发布验收口径。仿真/真机 smoke 只作为 release acceptance，不再作为继续开发 blocker。
 
 ### 1. Conservative Bridge Contract
 
@@ -67,14 +69,14 @@ root yaw 当前只做 post-alignment residual gate，不做 Ruckig。valid quate
 
 ### 4. Release 和 Tests 验收
 
-下一阶段必须以测试和 release selftest 关闭合同，而不是扩大功能：
+GA 合同以测试和 release selftest 关闭，而不是扩大功能：
 
 - 单元测试覆盖 explicit same-contact allowed，以及 mismatch/unknown/no-contact/single-support switch/missing metadata rejected。
 - Runtime 测试覆盖 A->B peek-before-commit、benign reject 后 B 仍为队首、background->user benign reject 使用 full startup hold。
 - Runtime 测试覆盖 unsafe/invalid transition failure 不走 normal start fallback，至少包含 raw-start guard 大 gap、Ruckig invalid input、target validation failure、robot unsafe/safety sink、root yaw invalid quaternion。
 - Startup 测试覆盖成功 A->B bridge 才 reduced warmup；cold/direct/standby/background/reject fallback 都 full startup hold。
 - 本阶段已收口 release selftest/config fail-fast：required GA flat knobs、transition limits、contact guard、root yaw guard 缺失时由 release binary parse-only check fail fast，已安装 shared config 也由 parse-only check 覆盖；release template/help/scripts 不暴露 legacy smoother 开关。更广 runtime 合同和仿真验收仍按下方 checklist/验收项推进。
-- 仿真验收只保留 GA 必需断言：无 passive/fall/safety sink/NaN/Inf/policy runner error，bridge dt/fps/frame count/duration 一致，controlled DoF v/a/j limits 内，queue/run-id/history 无异常。
+- 仿真/真机 smoke 只保留 GA 必需断言：无 passive/fall/safety sink/NaN/Inf/policy runner error，bridge dt/fps/frame count/duration 一致，controlled DoF v/a/j limits 内，queue/run-id/history 无异常。
 
 ## Deferred / Future
 
@@ -99,12 +101,17 @@ root yaw 当前只做 post-alignment residual gate，不做 Ruckig。valid quate
 
 ## Handoff Checklist
 
-- [ ] 文档、代码和测试不再把已完成 core adaptive transition 能力列为待实现。
-- [ ] GA bridge 只有 explicit same-contact allowed；mismatch/unknown/no-contact/single-support switch/missing metadata 全部 reject。
-- [ ] A->B benign reject 保持 B 为 waiting 队首，后续 FIFO normal start / full startup hold，不 fail request。
-- [ ] background->user benign reject abort background，并用 full startup hold 启动 target user。
-- [ ] unsafe/invalid transition failure 不 normal-start 放行；root yaw invalid quaternion 走保守失败语义。
-- [ ] 成功 A->B bridge 才 reduced warmup；其他 startup/reject/safety 路径 full startup hold。
+- [x] 文档、代码和测试不再把已完成 core adaptive transition 能力列为待实现。
+- [x] GA bridge 只有 explicit same-contact allowed；mismatch/unknown/no-contact/single-support switch/missing metadata 全部 reject。
+- [x] A->B benign reject 保持 B 为 waiting 队首，后续 FIFO normal start / full startup hold，不 fail request。
+- [x] background->user benign reject abort background，并用 full startup hold 启动 target user。
+- [x] unsafe/invalid transition failure 不 normal-start 放行；root yaw invalid quaternion 走保守失败语义。
+- [x] 成功 A->B bridge 才 reduced warmup；其他 startup/reject/safety 路径 full startup hold。
 - [x] Release selftest/config fail-fast 覆盖 required GA flat knobs/limits/contact/root yaw guard，release template/help/scripts 无 legacy smoother 开关。
-- [ ] Runtime/unit tests 继续覆盖上述 bridge/startup/safety 合同。
-- [ ] Deferred 列表保持延期，不新增 API、dashboard、status field 或第二套 bridge 做法。
+- [x] Runtime/unit tests 继续覆盖上述 bridge/startup/safety 合同。
+- [x] Deferred 列表保持延期，不新增 API、dashboard、status field 或第二套 bridge 做法。
+
+## Release Acceptance Checklist
+
+- [ ] 仿真 smoke：按 GA 必需断言验收，不作为继续开发 blocker。
+- [ ] 真机 smoke：按 GA 必需断言验收，不作为继续开发 blocker。

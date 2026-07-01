@@ -2648,7 +2648,7 @@ TEST_CASE("RuntimeControlLoop completed user bridge benign gate reject keeps que
                           &reference);
 
   const auto source_path = identityQuaternionTrk(tmp, "bridge_benign_gate_a.trk", 2);
-  const auto target_path = identityQuaternionTrk(tmp, "bridge_benign_gate_b.trk", 2);
+  const auto target_path = identityQuaternionTrk(tmp, "bridge_benign_gate_b.trk", 3);
   REQUIRE(bridge.submitQueue(
               executeCommand("bridge-benign-gate-a",
                              source_path,
@@ -2666,7 +2666,7 @@ TEST_CASE("RuntimeControlLoop completed user bridge benign gate reject keeps que
               executeCommand("bridge-benign-gate-b",
                              target_path,
                              MotionMode::Queue,
-                             2))
+                             3))
               .ok());
   loop.tick();
 
@@ -2683,6 +2683,12 @@ TEST_CASE("RuntimeControlLoop completed user bridge benign gate reject keeps que
   REQUIRE(store.snapshot().exec->id == "bridge-benign-gate-b");
   REQUIRE(store.snapshot().exec->state == MotionState::Running);
   REQUIRE(store.snapshot().exec->frame == 0);
+  requireCurrentUserFullStartupHold(loop,
+                                    store,
+                                    policy,
+                                    "bridge-benign-gate-b",
+                                    0.0F,
+                                    6.5F);
 }
 
 TEST_CASE("RuntimeControlLoop completed user yaw residual gate reject keeps queued target") {
@@ -4359,18 +4365,12 @@ TEST_CASE("RuntimeControlLoop arrived via user bridge uses reduced startup hold 
                    store,
                    "standby-startup-hold-user",
                    StartQueuedRunMode::AllowStandbyTransition);
-    const int calls_at_target_start = tracker_policy.calls;
-
-    for (std::size_t tick = 0; tick < 3; ++tick) {
-      loop.tick();
-      REQUIRE(store.snapshot().exec.has_value());
-      REQUIRE(store.snapshot().exec->id == "standby-startup-hold-user");
-      REQUIRE(store.snapshot().exec->frame == 0);
-      REQUIRE(tracker_policy.calls == calls_at_target_start +
-                                      static_cast<int>(tick + 1));
-      REQUIRE(tracker_policy.inputs_seen.back()
-                  .obs_current.at(kObsCurrentCommandJointOffset) == 0.0F);
-    }
+    requireCurrentUserFullStartupHold(loop,
+                                      store,
+                                      tracker_policy,
+                                      "standby-startup-hold-user",
+                                      0.0F,
+                                      6.5F);
   }
 }
 
