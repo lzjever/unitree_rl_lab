@@ -19,6 +19,7 @@ enum class ObservationContract {
   GeneralTracker,
   GeneralTrackerCLN,
   GeneralTrackerCLNFootstate,
+  GeneralTrackerDR3,
 };
 
 struct DeployConfig {

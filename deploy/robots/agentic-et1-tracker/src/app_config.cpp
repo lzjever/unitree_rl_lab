@@ -20,6 +20,7 @@ constexpr const char* kRootKey = "agentic_et1_tracker";
 constexpr const char* kFootstatePolicyProfile = "GeneralTrackerCLNFootstate";
 constexpr const char* kClnPolicyProfile = "GeneralTrackerCLN";
 constexpr const char* kLegacyPolicyProfile = "GeneralTracker";
+constexpr const char* kDr3PolicyProfile = "GeneralTrackerDR3";
 constexpr const char* kStartupFixStand = "FixStand";
 constexpr const char* kStartupStandbyVelocity = "StandbyVelocity";
 constexpr const char* kIdleModeHoldCurrent = "hold_current";
@@ -392,6 +393,9 @@ std::optional<ObservationContract> expectedContractForProfile(const std::string&
   if (profile == kLegacyPolicyProfile) {
     return ObservationContract::GeneralTracker;
   }
+  if (profile == kDr3PolicyProfile) {
+    return ObservationContract::GeneralTrackerDR3;
+  }
   return std::nullopt;
 }
 
@@ -644,8 +648,8 @@ AppConfig loadAppConfig(const std::filesystem::path& path) {
       config.policy.profile = optionalString(policy, "profile", config.policy.profile);
       if (!expectedContractForProfile(config.policy.profile)) {
         throw error(
-            "policy.profile must be GeneralTrackerCLNFootstate, GeneralTrackerCLN, or "
-            "GeneralTracker");
+            "policy.profile must be GeneralTrackerCLNFootstate, GeneralTrackerCLN, "
+            "GeneralTracker, or GeneralTrackerDR3");
       }
       config.policy.policy_dir =
           optionalString(policy, "policy_dir", config.policy.policy_dir);

@@ -182,6 +182,8 @@ bool policyProfileMatchesDeployContract(const PolicyConfig& policy,
     expected_contract = ObservationContract::GeneralTrackerCLN;
   } else if (policy.profile == "GeneralTracker") {
     expected_contract = ObservationContract::GeneralTracker;
+  } else if (policy.profile == "GeneralTrackerDR3") {
+    expected_contract = ObservationContract::GeneralTrackerDR3;
   }
   return expected_contract && contract == *expected_contract;
 }

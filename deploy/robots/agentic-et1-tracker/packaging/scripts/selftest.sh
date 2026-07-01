@@ -92,6 +92,13 @@ check_sha256 "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/general_t
   "d4f37c972eb5e98e37a1d425302a70729343009a1564974921965c5faea0d911"
 check_sha256 "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/general_tracker_cln/params/deploy.yaml" \
   "de8ba00c0b79590b2ccc0a7d84fcc0db4a8869ad9111e54e46c9427b89ffaf84"
+check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/general_tracker_dr3/ASSET_MANIFEST.yaml"
+check_contains "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/general_tracker_dr3/ASSET_MANIFEST.yaml" \
+  "profile: GeneralTrackerDR3"
+check_sha256 "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/general_tracker_dr3/exported/DR3-all.onnx" \
+  "fb48e575d81951e6cd23e65cde12258bd5feccfb8dfc3c9bce549d6c55269e12"
+check_sha256 "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/general_tracker_dr3/params/deploy_fut_obs.yaml" \
+  "a92cd204343d513d0c74f14acfa2fcfbf38040f31c34baf293f3e5d465021bb2"
 check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/velocity/v0/exported/policy.onnx"
 check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/velocity/v0/params/deploy.yaml"
 check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/policy/loco_lower/et1_low/README.md"
@@ -133,6 +140,11 @@ printf 'ok help commands\n'
 if [[ -f "$ET1_CONFIG" ]]; then
   if grep -q '@PREFIX@' "$ET1_CONFIG"; then
     die "installed config still contains @PREFIX@: $ET1_CONFIG"
+  fi
+  if grep -q 'GeneralTrackerDR3' "$ET1_CONFIG"; then
+    check_contains "$ET1_CONFIG" "general_tracker_dr3"
+    check_contains "$ET1_CONFIG" "DR3-all.onnx"
+    check_contains "$ET1_CONFIG" "deploy_fut_obs.yaml"
   fi
   printf 'ok installed config %s\n' "$ET1_CONFIG"
 else

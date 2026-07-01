@@ -388,6 +388,8 @@ TEST_CASE("AppRuntimeFactory real factory fails before SDK on policy/deploy cont
   const auto cln_deploy = root / "config/policy/general_tracker_cln/params/deploy.yaml";
   const auto footstate_deploy =
       root / "config/policy/general_tracker_cln/params/deploy_fut_multi_footstate.yaml";
+  const auto dr3_deploy =
+      root / "config/policy/general_tracker_dr3/params/deploy_fut_obs.yaml";
 
   AppConfig config;
   config.mode_machine = 0;
@@ -416,6 +418,42 @@ TEST_CASE("AppRuntimeFactory real factory fails before SDK on policy/deploy cont
   SECTION("footstate profile with CLN deploy") {
     config.policy.profile = "GeneralTrackerCLNFootstate";
     config.policy.deploy = cln_deploy.string();
+    requireModelNotReady(createAppRuntimeDeps(config));
+  }
+
+  SECTION("legacy profile with DR3 deploy") {
+    config.policy.profile = "GeneralTracker";
+    config.policy.deploy = dr3_deploy.string();
+    requireModelNotReady(createAppRuntimeDeps(config));
+  }
+
+  SECTION("CLN profile with DR3 deploy") {
+    config.policy.profile = "GeneralTrackerCLN";
+    config.policy.deploy = dr3_deploy.string();
+    requireModelNotReady(createAppRuntimeDeps(config));
+  }
+
+  SECTION("footstate profile with DR3 deploy") {
+    config.policy.profile = "GeneralTrackerCLNFootstate";
+    config.policy.deploy = dr3_deploy.string();
+    requireModelNotReady(createAppRuntimeDeps(config));
+  }
+
+  SECTION("DR3 profile with legacy deploy") {
+    config.policy.profile = "GeneralTrackerDR3";
+    config.policy.deploy = legacy_deploy.string();
+    requireModelNotReady(createAppRuntimeDeps(config));
+  }
+
+  SECTION("DR3 profile with CLN deploy") {
+    config.policy.profile = "GeneralTrackerDR3";
+    config.policy.deploy = cln_deploy.string();
+    requireModelNotReady(createAppRuntimeDeps(config));
+  }
+
+  SECTION("DR3 profile with footstate deploy") {
+    config.policy.profile = "GeneralTrackerDR3";
+    config.policy.deploy = footstate_deploy.string();
     requireModelNotReady(createAppRuntimeDeps(config));
   }
 #else

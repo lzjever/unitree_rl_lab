@@ -73,6 +73,25 @@ std::vector<ObservationTerm> historyTerms() {
   });
 }
 
+std::vector<ObservationTerm> dr3CurrentTerms() {
+  return terms({
+      {"command_yaw", 2},
+      {"command_root_ori_b", 6},
+      {"command_jnt_pos", kGaPolicyJointDim},
+      {"projected_gravity", 3},
+      {"base_ang_vel", 3},
+      {"joint_pos_rel", kGaPolicyJointDim},
+      {"joint_vel_rel", kGaPolicyJointDim},
+      {"last_action", kGaPolicyJointDim},
+  });
+}
+
+std::vector<ObservationTerm> dr3HistoryTerms() {
+  return terms({
+      {"future_command", 32},
+  });
+}
+
 std::filesystem::path repoFile(const std::string& relative) {
   return (std::filesystem::path(__FILE__).parent_path().parent_path() / relative)
       .lexically_normal();
@@ -97,6 +116,17 @@ DeployConfig validConfig() {
   config.obs_history_length = kGaPolicyObsHistoryLength;
   config.obs_current_terms = currentTerms();
   config.obs_history_terms = historyTerms();
+  return config;
+}
+
+DeployConfig validDr3Config() {
+  DeployConfig config = validConfig();
+  config.observation_contract = ObservationContract::GeneralTrackerDR3;
+  config.obs_current_dim = 118;
+  config.obs_history_width = 32;
+  config.obs_history_length = 5;
+  config.obs_current_terms = dr3CurrentTerms();
+  config.obs_history_terms = dr3HistoryTerms();
   return config;
 }
 
@@ -286,6 +316,10 @@ PolicyInputs validFootstateInputs() {
               0.0F)};
 }
 
+PolicyInputs validDr3Inputs() {
+  return {Vec(118, 0.0F), Vec(5 * 32, 0.0F)};
+}
+
 void requireRuntimeRejects(const OnnxPolicyRuntimeConfig& config,
                            const std::string& message) {
   try {
@@ -401,6 +435,21 @@ TEST_CASE("OnnxPolicyRuntime constructs and runs the app-owned GeneralTrackerCLN
        deploy_config});
 
   const Vec actions = runtime.infer(validClnInputs());
+
+  REQUIRE(actions.size() == kGaPolicyJointDim);
+  REQUIRE(std::all_of(actions.begin(), actions.end(),
+                      [](float value) { return std::isfinite(value); }));
+}
+
+TEST_CASE("OnnxPolicyRuntime constructs and runs the app-owned GeneralTrackerDR3 policy") {
+  const DeployConfig deploy_config =
+      loadDeployConfig(repoFile("config/policy/general_tracker_dr3/params/deploy_fut_obs.yaml"));
+  REQUIRE(deploy_config.observation_contract == ObservationContract::GeneralTrackerDR3);
+
+  OnnxPolicyRuntime runtime(
+      {repoFile("config/policy/general_tracker_dr3/exported/DR3-all.onnx"), deploy_config});
+
+  const Vec actions = runtime.infer(validDr3Inputs());
 
   REQUIRE(actions.size() == kGaPolicyJointDim);
   REQUIRE(std::all_of(actions.begin(), actions.end(),

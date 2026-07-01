@@ -37,6 +37,12 @@ constexpr std::size_t kObsCurrentCommandJointOffset = 9;
 constexpr std::size_t kObsHistoryCommandJointOffset = 9;
 constexpr std::size_t kClnFutureCommandJointOffset = 9;
 constexpr std::size_t kClnFootstateFutureFootOffset = 35;
+constexpr std::size_t kDr3ObsCurrentDim = 118;
+constexpr std::size_t kDr3HistoryLength = 5;
+constexpr std::size_t kDr3HistoryWidth = 32;
+constexpr std::size_t kDr3ObsCurrentRootOffset = 2;
+constexpr std::size_t kDr3ObsCurrentLastActionOffset = 92;
+constexpr std::size_t kDr3FutureCommandJointOffset = 6;
 constexpr float kPi = 3.14159265358979323846F;
 
 std::array<float, 4> yawQuat(float radians) {
@@ -167,6 +173,28 @@ DeployConfig validClnFootstateConfig() {
   config.obs_current_dim = 127;
   config.obs_history_width = kClnFootstateHistoryWidth;
   config.obs_history_length = kClnFootstateHistoryLength;
+  return config;
+}
+
+DeployConfig validDr3Config() {
+  DeployConfig config = validConfig();
+  config.observation_contract = ObservationContract::GeneralTrackerDR3;
+  config.obs_current_terms = terms({
+      {"command_yaw", 2},
+      {"command_root_ori_b", 6},
+      {"command_jnt_pos", kJointDim},
+      {"projected_gravity", 3},
+      {"base_ang_vel", 3},
+      {"joint_pos_rel", kJointDim},
+      {"joint_vel_rel", kJointDim},
+      {"last_action", kJointDim},
+  });
+  config.obs_history_terms = terms({
+      {"future_command", kDr3HistoryWidth},
+  });
+  config.obs_current_dim = kDr3ObsCurrentDim;
+  config.obs_history_width = kDr3HistoryWidth;
+  config.obs_history_length = kDr3HistoryLength;
   return config;
 }
 
@@ -356,6 +384,14 @@ void requireClnFootstateFutureFootRow(const Vec& history,
   requireSliceApprox(history,
                      row * kClnFootstateHistoryWidth + kClnFootstateFutureFootOffset,
                      expected);
+}
+
+void requireDr3FutureJointRow(const Vec& history,
+                              std::size_t row,
+                              float joint_base) {
+  requireSliceApprox(history,
+                     row * kDr3HistoryWidth + kDr3FutureCommandJointOffset,
+                     seq(joint_base, kJointDim));
 }
 
 template <typename Fn>
@@ -604,6 +640,46 @@ TEST_CASE("PolicyStepRunner builds GeneralTrackerCLNFootstate future rows from .
   requireClnFootstateFutureFootRow(result.inputs.obs_history,
                                    kClnFootstateHistoryLength - 1,
                                    {0.0F, 0.0F, 1.0F, 1.0F, 0.0F, 0.0F});
+}
+
+TEST_CASE("PolicyStepRunner builds GeneralTrackerDR3 future_command directly and updates last action") {
+  const DeployConfig config = validDr3Config();
+  TrkTrack track = makeTrack(3);
+  setRootQuat(track, 1, yawQuat(kPi * 0.25F));
+  setRootQuat(track, 2, yawQuat(kPi * 0.5F));
+  setRootLinVel(track, 2, 4.0F, -5.0F, 9.0F);
+  setRootAngVel(track, 2, 0.0F, 0.0F, 6.0F);
+  track.left_foot_contact_state.values.at(1) = 3;
+  track.right_foot_contact_state.values.at(2) = 3;
+  const LowStateSample low = liveState(config);
+  PolicyStepRunner runner(config, track, low, 7);
+  const Vec raw0 = seq(-0.25F, kJointDim);
+  RecordingPolicy policy(raw0);
+
+  const PolicyStepResult first = runner.step(1, low, policy);
+
+  REQUIRE(policy.calls.size() == 1);
+  REQUIRE(first.inputs.obs_current.size() == kDr3ObsCurrentDim);
+  REQUIRE(first.inputs.obs_history.size() == kDr3HistoryLength * kDr3HistoryWidth);
+  requireSliceApprox(first.inputs.obs_current,
+                     kDr3ObsCurrentRootOffset,
+                     rootOriFromYaw(kPi * 0.25F));
+  requireZeroSlice(first.inputs.obs_current, kDr3ObsCurrentLastActionOffset, kJointDim);
+  requireSliceApprox(first.inputs.obs_history,
+                     0,
+                     rootOriFromYaw(kPi * 0.5F));
+  requireDr3FutureJointRow(first.inputs.obs_history, 0, frameJointBase(2));
+  requireSliceApprox(first.inputs.obs_history,
+                     (kDr3HistoryLength - 1) * kDr3HistoryWidth,
+                     rootOriFromYaw(kPi * 0.5F));
+  requireDr3FutureJointRow(first.inputs.obs_history, kDr3HistoryLength - 1, frameJointBase(2));
+
+  policy.next_raw = seq(0.75F, kJointDim);
+  const PolicyStepResult second = runner.step(2, low, policy);
+
+  REQUIRE(policy.calls.size() == 2);
+  requireSliceApprox(second.inputs.obs_current, kDr3ObsCurrentLastActionOffset, raw0);
+  requireDr3FutureJointRow(second.inputs.obs_history, 0, frameJointBase(2));
 }
 
 TEST_CASE("PolicyStepRunner keeps CLN future_commands root and velocity golden order") {

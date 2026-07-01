@@ -16,6 +16,7 @@ constexpr std::size_t kSdkDim = kSdkMotorCount;
 constexpr std::size_t kAnchorBodyIndex = 14;
 constexpr std::size_t kClnFutureCommandWidth = 35;
 constexpr std::size_t kClnFootstateFutureCommandWidth = 41;
+constexpr std::size_t kDr3FutureCommandWidth = 32;
 constexpr double kQuatNormEpsilon = 1.0e-12;
 const Vec kIdentityRootOriB{1.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F};
 const Vec kZeroXyYawVel{0.0F, 0.0F, 0.0F};
@@ -429,6 +430,58 @@ Vec futureCommands(const DeployConfig& config,
   return out;
 }
 
+void appendDr3FutureCommand(const TrkFrameView& future_frame,
+                            Quat robot_q,
+                            Vec& out,
+                            const ObservationBuilderState& state,
+                            const ObservationBuilderConfig& builder_config) {
+  const Quat future_ref_q_raw =
+      quatFromView(future_frame.body_quat_w, "future_command.body_quat_w");
+  const Quat future_ref_q =
+      alignReferenceQuat(future_ref_q_raw, state, builder_config.no_global_mode);
+  const Quat future_relative_q =
+      normalizeQuat(multiply(conjugate(robot_q), future_ref_q),
+                    "future_command.root_ori_b quaternion");
+
+  Vec future_root_ori_b;
+  if (builder_config.use_motion_root_command) {
+    rotationFirstTwoColumns(future_relative_q, future_root_ori_b);
+  } else {
+    future_root_ori_b = kIdentityRootOriB;
+  }
+  out.insert(out.end(), future_root_ori_b.begin(), future_root_ori_b.end());
+
+  const Vec future_joint_pos =
+      copyView("future_command.joint_pos", future_frame.joint_pos, kJointDim);
+  out.insert(out.end(), future_joint_pos.begin(), future_joint_pos.end());
+}
+
+Vec dr3FutureCommand(const DeployConfig& config,
+                     const TrkTrack& track,
+                     std::size_t frame_index,
+                     Quat robot_q,
+                     const ObservationBuilderState& state,
+                     const ObservationBuilderConfig& builder_config) {
+  if (track.metadata.frames == 0) {
+    throw error("track must contain at least one frame");
+  }
+  const std::size_t expected_size = config.obs_history_length * config.obs_history_width;
+  if (config.obs_history_width != kDr3FutureCommandWidth) {
+    throw error("DR3 future command width must be 32");
+  }
+
+  Vec out;
+  out.reserve(expected_size);
+  for (std::size_t horizon_idx = 0; horizon_idx < config.obs_history_length; ++horizon_idx) {
+    const std::size_t future_frame_index =
+        std::min(frame_index + horizon_idx + 1, track.metadata.frames - 1);
+    const TrkFrameView future_frame = requireTrackFrame(track, future_frame_index);
+    appendDr3FutureCommand(future_frame, robot_q, out, state, builder_config);
+  }
+  requireExactSize("future_command", out.size(), expected_size);
+  return out;
+}
+
 ObservationBuilderState makeObservationBuilderStateWithJoints(
     const TrkFrameView& first_frame,
     const LowStateSample& entry_low_state,
@@ -454,8 +507,11 @@ ObservationBuilderState makeObservationBuilderStateWithJoints(
 
 ObservationBuilderConfig defaultObservationBuilderConfig(const DeployConfig& config) {
   ObservationBuilderConfig builder_config;
-  if (config.observation_contract == ObservationContract::GeneralTracker) {
+  if (config.observation_contract == ObservationContract::GeneralTracker ||
+      config.observation_contract == ObservationContract::GeneralTrackerDR3) {
     builder_config.use_motion_root_command = true;
+  }
+  if (config.observation_contract == ObservationContract::GeneralTracker) {
     builder_config.use_motion_velocity_command = true;
   }
   return builder_config;
@@ -539,6 +595,11 @@ PolicyObservationParts buildObservationParts(
         frameKinematics(frame, low_state, state, builder_config);
     parts.future_commands =
         futureCommands(config, track, frame_index, kinematics.robot_q, state, builder_config);
+  } else if (config.observation_contract == ObservationContract::GeneralTrackerDR3) {
+    const FrameKinematics kinematics =
+        frameKinematics(frame, low_state, state, builder_config);
+    parts.future_command =
+        dr3FutureCommand(config, track, frame_index, kinematics.robot_q, state, builder_config);
   }
   return parts;
 }

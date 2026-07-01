@@ -5,6 +5,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
+#include <utility>
 #include <vector>
 
 #include "agentic_et1_tracker/policy/observation_builder.hpp"
@@ -21,6 +23,13 @@ constexpr std::size_t kAnchorBodyIndex = 14;
 constexpr std::size_t kClnFootstateHistoryLength = 5;
 constexpr std::size_t kClnFootstateHistoryWidth = 41;
 constexpr std::size_t kClnFootstateFutureFootOffset = 35;
+constexpr std::size_t kDr3ObsCurrentDim = 118;
+constexpr std::size_t kDr3ObsCurrentRootOffset = 2;
+constexpr std::size_t kDr3ObsCurrentJointOffset = 8;
+constexpr std::size_t kDr3ObsCurrentLastActionOffset = 92;
+constexpr std::size_t kDr3HistoryLength = 5;
+constexpr std::size_t kDr3HistoryWidth = 32;
+constexpr std::size_t kDr3FutureJointOffset = 6;
 constexpr float kPi = 3.14159265358979323846F;
 
 std::array<float, 4> yawQuat(float radians) {
@@ -118,6 +127,39 @@ DeployConfig validClnFootstateConfig() {
   config.observation_contract = ObservationContract::GeneralTrackerCLNFootstate;
   config.obs_history_width = kClnFootstateHistoryWidth;
   config.obs_history_length = kClnFootstateHistoryLength;
+  return config;
+}
+
+std::vector<ObservationTerm> terms(
+    std::initializer_list<std::pair<const char*, std::size_t>> specs) {
+  std::vector<ObservationTerm> out;
+  std::size_t offset = 0;
+  for (const auto& spec : specs) {
+    out.push_back({spec.first, spec.second, offset});
+    offset += spec.second;
+  }
+  return out;
+}
+
+DeployConfig validDr3Config() {
+  DeployConfig config = validConfig();
+  config.observation_contract = ObservationContract::GeneralTrackerDR3;
+  config.obs_current_terms = terms({
+      {"command_yaw", 2},
+      {"command_root_ori_b", 6},
+      {"command_jnt_pos", kJointDim},
+      {"projected_gravity", 3},
+      {"base_ang_vel", 3},
+      {"joint_pos_rel", kJointDim},
+      {"joint_vel_rel", kJointDim},
+      {"last_action", kJointDim},
+  });
+  config.obs_history_terms = terms({
+      {"future_command", kDr3HistoryWidth},
+  });
+  config.obs_current_dim = kDr3ObsCurrentDim;
+  config.obs_history_width = kDr3HistoryWidth;
+  config.obs_history_length = kDr3HistoryLength;
   return config;
 }
 
@@ -388,6 +430,47 @@ TEST_CASE("ObservationBuilder emits CLNFootstate current foot support one-hot") 
                    {0.0F, 0.0F, 1.0F, 0.0F, 1.0F, 0.0F});
 }
 
+TEST_CASE("ObservationBuilder emits DR3 current observations without velocity or footstate") {
+  DeployConfig config = validDr3Config();
+  FrameStorage first;
+  FrameStorage frame;
+  LowStateSample low = liveState(yawQuat(0.0F));
+  low.gyro = {0.3F, -0.4F, 0.5F};
+  fillPolicyMotors(low, config.sdk_joint_ids_map);
+  low.motors.at(static_cast<std::size_t>(config.sdk_joint_ids_map.at(12))).q = 0.0F;
+  low.motors.at(static_cast<std::size_t>(config.sdk_joint_ids_map.at(13))).q = 0.0F;
+  frame.setRootQuat(yawQuat(kPi * 0.5F));
+  frame.setRootLinVel(9.0F, 8.0F, 7.0F);
+  frame.setRootAngVel(6.0F, 5.0F, 4.0F);
+  frame.left_contact[0] = 2;
+  frame.right_contact[0] = 1;
+  for (std::size_t i = 0; i < kJointDim; ++i) {
+    frame.joint_pos[i] = 100.0F + static_cast<float>(i);
+  }
+  const Vec last_action = seq(-0.5F, kJointDim);
+  const ObservationBuilderConfig builder_config = defaultObservationBuilderConfig(config);
+
+  const ObservationBuilderState state =
+      makeObservationBuilderState(config, first.view(), low, builder_config);
+  const PolicyObservationParts parts =
+      buildObservationParts(config, frame.view(), low, last_action, state, builder_config);
+  const Vec obs_current = buildObsCurrent(config, parts);
+
+  REQUIRE(obs_current.size() == kDr3ObsCurrentDim);
+  requireVecApprox(parts.command_yaw, {0.0F, 1.0F});
+  requireVecApprox(parts.command_root_ori_b, {0.0F, -1.0F, 1.0F, 0.0F, 0.0F, 0.0F});
+  requireVecApprox(parts.command_xy_yaw_vel, {0.0F, 0.0F, 0.0F});
+  REQUIRE(parts.command_foot_support_state.empty());
+  REQUIRE(parts.ref_com_rel_navi.empty());
+  REQUIRE(parts.ref_com_vel_navi.empty());
+  requireSliceApprox(obs_current, 0, {0.0F, 1.0F});
+  requireSliceApprox(obs_current,
+                     kDr3ObsCurrentRootOffset,
+                     {0.0F, -1.0F, 1.0F, 0.0F, 0.0F, 0.0F});
+  requireSliceApprox(obs_current, kDr3ObsCurrentJointOffset, seq(100.0F, kJointDim));
+  requireSliceApprox(obs_current, kDr3ObsCurrentLastActionOffset, last_action);
+}
+
 TEST_CASE("ObservationBuilder keeps CLNFootstate future motion root velocity foot support and clamps to final frame") {
   const DeployConfig config = validClnFootstateConfig();
   TrkTrack track = makeTrack(3);
@@ -431,6 +514,39 @@ TEST_CASE("ObservationBuilder keeps CLNFootstate future motion root velocity foo
                      (kClnFootstateHistoryLength - 1) * kClnFootstateHistoryWidth +
                          kClnFootstateFutureFootOffset,
                          {0.0F, 0.0F, 1.0F, 1.0F, 0.0F, 0.0F});
+}
+
+TEST_CASE("ObservationBuilder builds DR3 future_command as root orientation plus joints only") {
+  const DeployConfig config = validDr3Config();
+  TrkTrack track = makeTrack(3);
+  track.left_foot_contact_state.values.at(2) = 3;
+  track.right_foot_contact_state.values.at(2) = 3;
+  setTrackBodyQuat(track, 2, 0, yawQuat(kPi * 0.5F));
+  const std::size_t frame_2_lin_offset = 2 * track.body_lin_vel_w.frame_size;
+  const std::size_t frame_2_ang_offset = 2 * track.body_ang_vel_w.frame_size;
+  track.body_lin_vel_w.values.at(frame_2_lin_offset) = 4.0F;
+  track.body_lin_vel_w.values.at(frame_2_lin_offset + 1) = -5.0F;
+  track.body_ang_vel_w.values.at(frame_2_ang_offset + 2) = 6.0F;
+  const LowStateSample low = liveState(yawQuat(0.0F));
+  const ObservationBuilderConfig builder_config = defaultObservationBuilderConfig(config);
+  const ObservationBuilderState state =
+      makeObservationBuilderState(config, *track.frame(0), low, builder_config);
+
+  const PolicyObservationParts parts =
+      buildObservationParts(config, track, 1, low, seq(0.0F, kJointDim), state, builder_config);
+
+  REQUIRE(parts.future_commands.empty());
+  REQUIRE(parts.future_command.size() == kDr3HistoryLength * kDr3HistoryWidth);
+  requireSliceApprox(parts.future_command, 0, {0.0F, -1.0F, 1.0F, 0.0F, 0.0F, 0.0F});
+  requireSliceApprox(parts.future_command,
+                     kDr3FutureJointOffset,
+                     seq(frameJointBase(2), kJointDim));
+  requireSliceApprox(parts.future_command,
+                     (kDr3HistoryLength - 1) * kDr3HistoryWidth,
+                     {0.0F, -1.0F, 1.0F, 0.0F, 0.0F, 0.0F});
+  requireSliceApprox(parts.future_command,
+                     (kDr3HistoryLength - 1) * kDr3HistoryWidth + kDr3FutureJointOffset,
+                     seq(frameJointBase(2), kJointDim));
 }
 
 TEST_CASE("ObservationBuilder rejects invalid CLNFootstate future contact state") {

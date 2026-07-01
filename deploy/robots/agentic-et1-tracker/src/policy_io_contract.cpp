@@ -105,6 +105,27 @@ const std::array<ExpectedObservationTerm, 1>& expectedClnFootstateHistoryTerms()
   return values;
 }
 
+const std::array<ExpectedObservationTerm, 8>& expectedDr3CurrentTerms() {
+  static constexpr std::array<ExpectedObservationTerm, 8> values{{
+      {"command_yaw", 2},
+      {"command_root_ori_b", 6},
+      {"command_jnt_pos", kGaPolicyJointDim},
+      {"projected_gravity", 3},
+      {"base_ang_vel", 3},
+      {"joint_pos_rel", kGaPolicyJointDim},
+      {"joint_vel_rel", kGaPolicyJointDim},
+      {"last_action", kGaPolicyJointDim},
+  }};
+  return values;
+}
+
+const std::array<ExpectedObservationTerm, 1>& expectedDr3HistoryTerms() {
+  static constexpr std::array<ExpectedObservationTerm, 1> values{{
+      {"future_command", kDr3PolicyObsHistoryWidth},
+  }};
+  return values;
+}
+
 PolicyIoContractError error(const std::string& message) {
   return PolicyIoContractError("policy io contract error: " + message);
 }
@@ -278,6 +299,17 @@ void validateGaDeployConfig(const DeployConfig& config) {
                                     expectedClnFootstateCurrentTerms());
       requireFrozenObservationTerms("obs_history_terms", config.obs_history_terms,
                                     expectedClnFootstateHistoryTerms());
+      break;
+    case ObservationContract::GeneralTrackerDR3:
+      requireSize("obs_current_dim", config.obs_current_dim, kDr3PolicyObsCurrentDim);
+      requireSize("obs_history_width", config.obs_history_width,
+                  kDr3PolicyObsHistoryWidth);
+      requireSize("obs_history_length", config.obs_history_length,
+                  kDr3PolicyObsHistoryLength);
+      requireFrozenObservationTerms("obs_current_terms", config.obs_current_terms,
+                                    expectedDr3CurrentTerms());
+      requireFrozenObservationTerms("obs_history_terms", config.obs_history_terms,
+                                    expectedDr3HistoryTerms());
       break;
   }
 }

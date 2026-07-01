@@ -70,6 +70,9 @@ const Vec& partByName(const PolicyObservationParts& parts, const std::string& na
   if (name == "future_commands") {
     return parts.future_commands;
   }
+  if (name == "future_command") {
+    return parts.future_command;
+  }
   if (name == "future_command_with_foot_support_state") {
     return parts.future_commands;
   }
@@ -160,6 +163,19 @@ bool usesTemporalHistory(const DeployConfig& config) {
   return config.observation_contract == ObservationContract::GeneralTracker;
 }
 
+const Vec& directFutureHistory(const DeployConfig& config,
+                               const PolicyObservationParts& current) {
+  requireSize("DeployConfig.obs_history_terms", config.obs_history_terms.size(), 1);
+  const std::string& name = config.obs_history_terms.front().name;
+  if (name == "future_command") {
+    return current.future_command;
+  }
+  if (name == "future_commands" || name == "future_command_with_foot_support_state") {
+    return current.future_commands;
+  }
+  throw error("unsupported non-temporal obs_history term '" + name + "'");
+}
+
 }  // namespace
 
 Vec buildObsCurrent(const DeployConfig& config, const PolicyObservationParts& parts) {
@@ -224,7 +240,7 @@ PolicyInputs buildPolicyInputs(const DeployConfig& config,
   PolicyInputs inputs;
   inputs.obs_current = buildObsCurrent(config, current);
   if (!usesTemporalHistory(config)) {
-    inputs.obs_history = current.future_commands;
+    inputs.obs_history = directFutureHistory(config, current);
     requireSize("PolicyInputs.obs_history", inputs.obs_history.size(),
                 config.obs_history_length * config.obs_history_width);
     return inputs;

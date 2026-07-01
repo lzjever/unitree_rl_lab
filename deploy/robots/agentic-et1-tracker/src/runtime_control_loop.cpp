@@ -909,11 +909,13 @@ void RuntimeControlLoop::enterInternalState(RuntimeInternalState state) {
   switch (state) {
     case RuntimeInternalState::Passive:
       active_policy_ticks_until_next_ = 0;
+      resetGeneralTrackerPolicyTiming();
       clearPolicyStartupHold();
       velocity_policy_ticks_until_next_ = 0;
       break;
     case RuntimeInternalState::FixStand:
       active_policy_ticks_until_next_ = 0;
+      resetGeneralTrackerPolicyTiming();
       clearPolicyStartupHold();
       velocity_policy_ticks_until_next_ = 0;
       if (fixstand_runner_) {
@@ -923,6 +925,7 @@ void RuntimeControlLoop::enterInternalState(RuntimeInternalState state) {
     case RuntimeInternalState::Velocity:
     case RuntimeInternalState::GeneralTrackerIdle:
       active_policy_ticks_until_next_ = 0;
+      resetGeneralTrackerPolicyTiming();
       clearPolicyStartupHold();
       velocity_policy_ticks_until_next_ = 0;
       if (velocity_runner_) {
@@ -932,11 +935,13 @@ void RuntimeControlLoop::enterInternalState(RuntimeInternalState state) {
     case RuntimeInternalState::GeneralTrackerActive:
       clearPolicyStartupHold();
       active_policy_ticks_until_next_ = 0;
+      resetGeneralTrackerPolicyTiming();
       active_first_advance_ = true;
       break;
     case RuntimeInternalState::GeneralTrackerTransition:
       clearPolicyStartupHold();
       active_policy_ticks_until_next_ = 0;
+      resetGeneralTrackerPolicyTiming();
       active_first_advance_ = true;
       break;
     case RuntimeInternalState::LocoUpperActive:
@@ -949,6 +954,7 @@ void RuntimeControlLoop::enterInternalState(RuntimeInternalState state) {
       break;
     case RuntimeInternalState::Fault:
       active_policy_ticks_until_next_ = 0;
+      resetGeneralTrackerPolicyTiming();
       clearPolicyStartupHold();
       velocity_policy_ticks_until_next_ = 0;
       break;
@@ -2500,7 +2506,7 @@ void RuntimeControlLoop::advanceActiveWithPolicy() {
     return;
   }
 
-  if (!consumeStepDue(active_policy_ticks_until_next_, activePolicyIntervalTicks())) {
+  if (!consumeGeneralTrackerPolicyDue()) {
     return;
   }
 
@@ -2537,11 +2543,9 @@ void RuntimeControlLoop::advanceActiveWithPolicy() {
 
   if (active_first_advance_) {
     active_->started_at = std::chrono::steady_clock::now();
-    active_->frame = 0;
     active_first_advance_ = false;
-  } else if (active_->frames > 0 && active_->frame + 1 < active_->frames) {
-    ++active_->frame;
   }
+  active_->frame = activePlaybackFrame();
   publishActive();
   publishReferenceActive();
 
@@ -2582,6 +2586,7 @@ void RuntimeControlLoop::advanceActiveWithPolicy() {
     return;
   }
 
+  advanceActivePlaybackTime();
   if (active_->frames == 0 || active_->frame + 1 >= active_->frames) {
     const std::size_t last_frame = active_->frames == 0 ? 0 : active_->frames - 1;
     active_->frame = last_frame;
@@ -2634,7 +2639,7 @@ bool RuntimeControlLoop::advanceUserPolicyStartupHold() {
     return true;
   };
 
-  if (!consumeStepDue(active_policy_ticks_until_next_, activePolicyIntervalTicks())) {
+  if (!consumeGeneralTrackerPolicyDue()) {
     return true;
   }
 
@@ -2676,6 +2681,7 @@ bool RuntimeControlLoop::advanceUserPolicyStartupHold() {
   if (policy_startup_hold_steps_remaining_ > 0) {
     return true;
   }
+  advanceActivePlaybackTime();
 
   try {
     policy_runner_->recalibrateObservationAnchor(*low_state);
@@ -2742,7 +2748,7 @@ void RuntimeControlLoop::advanceHoldingWithPolicy() {
     return;
   }
 
-  if (!consumeStepDue(active_policy_ticks_until_next_, activePolicyIntervalTicks())) {
+  if (!consumeGeneralTrackerPolicyDue()) {
     return;
   }
 
@@ -3586,7 +3592,7 @@ void RuntimeControlLoop::advanceTransitionWithPolicy() {
     return;
   }
 
-  if (!consumeStepDue(active_policy_ticks_until_next_, activePolicyIntervalTicks())) {
+  if (!consumeGeneralTrackerPolicyDue()) {
     return;
   }
 
@@ -3608,11 +3614,9 @@ void RuntimeControlLoop::advanceTransitionWithPolicy() {
 
   if (active_first_advance_) {
     active_->started_at = std::chrono::steady_clock::now();
-    active_->frame = 0;
     active_first_advance_ = false;
-  } else if (active_->frames > 0 && active_->frame + 1 < active_->frames) {
-    ++active_->frame;
   }
+  active_->frame = activePlaybackFrame();
   publishReferenceTransition();
 
   PolicyStepResult step;
@@ -3642,6 +3646,7 @@ void RuntimeControlLoop::advanceTransitionWithPolicy() {
     return;
   }
 
+  advanceActivePlaybackTime();
   if (active_->frames == 0 || active_->frame + 1 >= active_->frames) {
     active_->frame = active_->frames == 0 ? 0 : active_->frames - 1;
     publishReferenceTransition();
@@ -4230,6 +4235,73 @@ bool RuntimeControlLoop::consumeStepDue(std::size_t& ticks_until_next,
   return true;
 }
 
+double RuntimeControlLoop::generalTrackerPolicyStepDt() const {
+  if (deploy_config_ && std::isfinite(deploy_config_->step_dt) &&
+      deploy_config_->step_dt > 0.0) {
+    return deploy_config_->step_dt;
+  }
+  if (std::isfinite(config_.hz) && config_.hz > 0.0) {
+    return 1.0 / config_.hz;
+  }
+  return 0.02;
+}
+
+void RuntimeControlLoop::resetGeneralTrackerPolicyTiming(double playback_time_s) {
+  general_tracker_policy_phase_s_ = 0.0;
+  general_tracker_next_policy_time_s_ = 0.0;
+  active_playback_time_s_ =
+      std::isfinite(playback_time_s) && playback_time_s > 0.0
+          ? playback_time_s
+          : 0.0;
+}
+
+bool RuntimeControlLoop::consumeGeneralTrackerPolicyDue() {
+  const double step_dt = generalTrackerPolicyStepDt();
+  const double runtime_dt =
+      std::isfinite(config_.hz) && config_.hz > 0.0 ? 1.0 / config_.hz : step_dt;
+  constexpr double kPhaseEpsilon = 1.0e-12;
+  const bool due =
+      general_tracker_policy_phase_s_ + kPhaseEpsilon >=
+      general_tracker_next_policy_time_s_;
+  if (due) {
+    general_tracker_next_policy_time_s_ += step_dt;
+  }
+  general_tracker_policy_phase_s_ += runtime_dt;
+  return due;
+}
+
+std::size_t RuntimeControlLoop::activePlaybackFrame() const {
+  if (!active_ || active_->frames == 0) {
+    return 0;
+  }
+  return referenceFrameIndex(active_playback_time_s_, active_->fps, active_->frames);
+}
+
+double RuntimeControlLoop::activePlaybackEndTime() const {
+  if (!active_) {
+    return 0.0;
+  }
+  if (std::isfinite(active_->duration_s) && active_->duration_s >= 0.0) {
+    return active_->duration_s;
+  }
+  if (active_->frames > 0 && std::isfinite(active_->fps) && active_->fps > 0.0) {
+    return static_cast<double>(active_->frames - 1) / active_->fps;
+  }
+  return 0.0;
+}
+
+void RuntimeControlLoop::advanceActivePlaybackTime() {
+  if (!active_) {
+    active_playback_time_s_ = 0.0;
+    return;
+  }
+  const double end_time = activePlaybackEndTime();
+  const double next_time = active_playback_time_s_ + generalTrackerPolicyStepDt();
+  active_playback_time_s_ =
+      std::isfinite(end_time) && end_time >= 0.0 ? std::min(next_time, end_time)
+                                                 : next_time;
+}
+
 std::size_t RuntimeControlLoop::velocityPolicyIntervalTicks() const {
   if (!velocity_deploy_config_) {
     return 1;
@@ -4245,14 +4317,14 @@ std::size_t RuntimeControlLoop::activePolicyIntervalTicks() const {
 }
 
 std::size_t RuntimeControlLoop::policyStartupHoldPolicySteps() const {
-  const double rate_hz = active_ ? active_->fps : 0.0;
-  if (!std::isfinite(rate_hz) || rate_hz <= 0.0) {
+  const double step_dt = generalTrackerPolicyStepDt();
+  if (!std::isfinite(step_dt) || step_dt <= 0.0) {
     return 1;
   }
 
   const double max_steps =
       static_cast<double>(std::numeric_limits<std::size_t>::max());
-  const double steps = std::ceil(kPolicyStartupHoldDurationS * rate_hz);
+  const double steps = std::ceil(kPolicyStartupHoldDurationS / step_dt);
   if (!std::isfinite(steps) || steps <= 1.0) {
     return 1;
   }

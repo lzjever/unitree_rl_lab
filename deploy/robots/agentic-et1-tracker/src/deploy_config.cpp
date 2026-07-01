@@ -18,6 +18,8 @@ constexpr std::size_t kClnFutureHorizon = 25;
 constexpr std::size_t kClnFutureCommandWidth = 35;
 constexpr std::size_t kClnFootstateFutureHorizon = 5;
 constexpr std::size_t kClnFootstateFutureCommandWidth = 41;
+constexpr std::size_t kDr3FutureHorizon = 5;
+constexpr std::size_t kDr3FutureCommandWidth = 32;
 constexpr std::array<int, kJointDim> kJointIdsMap{{
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
     13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
@@ -85,6 +87,19 @@ constexpr std::array<ObservationSpec, 10> kClnFootstateCurrentObs{{
 }};
 constexpr std::array<ObservationSpec, 1> kClnFootstateHistoryObs{{
     {"future_command_with_foot_support_state", kClnFootstateFutureCommandWidth},
+}};
+constexpr std::array<ObservationSpec, 8> kDr3CurrentObs{{
+    {"command_yaw", 2},
+    {"command_root_ori_b", 6},
+    {"command_jnt_pos", kJointDim},
+    {"projected_gravity", 3},
+    {"base_ang_vel", 3},
+    {"joint_pos_rel", kJointDim},
+    {"joint_vel_rel", kJointDim},
+    {"last_action", kJointDim},
+}};
+constexpr std::array<ObservationSpec, 1> kDr3HistoryObs{{
+    {"future_command", kDr3FutureCommandWidth},
 }};
 
 DeployConfigError error(const std::string& message) {
@@ -345,6 +360,26 @@ std::size_t footstateFutureHorizon(const YAML::Node& obs_history) {
   return kClnFootstateFutureHorizon;
 }
 
+std::size_t dr3FutureHorizon(const YAML::Node& obs_history) {
+  const YAML::Node future_command =
+      requiredMap(obs_history, "future_command", "observations.obs_history.future_command");
+  const YAML::Node params =
+      requiredMap(future_command,
+                  "params",
+                  "observations.obs_history.future_command.params");
+  const YAML::Node horizon =
+      requiredNode(params,
+                   "horizon",
+                   "observations.obs_history.future_command.params.horizon");
+  const long long value =
+      scalarAs<long long>(horizon,
+                          "observations.obs_history.future_command.params.horizon");
+  if (value != static_cast<long long>(kDr3FutureHorizon)) {
+    throw error("observations.obs_history.future_command.params.horizon must be 5");
+  }
+  return kDr3FutureHorizon;
+}
+
 template <std::size_t N>
 void validateObsKeysInOrder(const YAML::Node& group,
                             const std::array<ObservationSpec, N>& allowed,
@@ -522,9 +557,35 @@ DeployConfig loadDeployConfig(const std::filesystem::path& path) {
         requiredMap(observations, "obs_history", "observations.obs_history");
     const bool is_cln_footstate =
         groupHasObservationKey(obs_history, "future_command_with_foot_support_state");
+    const bool is_dr3 =
+        groupHasObservationKey(obs_current, "command_yaw") &&
+        groupHasObservationKey(obs_history, "future_command");
     const bool is_cln =
         groupHasObservationKey(obs_current, "command_yaw") &&
         groupHasObservationKey(obs_history, "future_commands");
+    const bool looks_dr3_current =
+        groupHasObservationKey(obs_current, "command_yaw") &&
+        !groupHasObservationKey(obs_current, "command_xy_yaw_vel") &&
+        !groupHasObservationKey(obs_current, "command_foot_support_state");
+    if (looks_dr3_current && groupHasObservationKey(obs_history, "future_commands")) {
+      throw error(
+          "observations.obs_history.future_commands is not allowed for frozen GeneralTrackerDR3");
+    }
+    if (looks_dr3_current &&
+        groupHasObservationKey(obs_history, "future_command_with_foot_support_state")) {
+      throw error("observations.obs_history.future_command_with_foot_support_state is not "
+                  "allowed for frozen GeneralTrackerDR3");
+    }
+    if (groupHasObservationKey(obs_history, "future_command") &&
+        groupHasObservationKey(obs_current, "command_xy_yaw_vel")) {
+      throw error(
+          "observations.obs_current.command_xy_yaw_vel is not allowed for frozen GeneralTrackerDR3");
+    }
+    if (groupHasObservationKey(obs_history, "future_command") &&
+        groupHasObservationKey(obs_current, "command_foot_support_state")) {
+      throw error("observations.obs_current.command_foot_support_state is not allowed for "
+                  "frozen GeneralTrackerDR3");
+    }
     if (is_cln_footstate) {
       config.observation_contract = ObservationContract::GeneralTrackerCLNFootstate;
       validateObservationGroup(obs_current,
@@ -543,6 +604,24 @@ DeployConfig loadDeployConfig(const std::filesystem::path& path) {
       config.obs_history_terms = toTerms(kClnFootstateHistoryObs);
       config.obs_current_dim = sumWidths(kClnFootstateCurrentObs);
       config.obs_history_width = sumWidths(kClnFootstateHistoryObs);
+    } else if (is_dr3) {
+      config.observation_contract = ObservationContract::GeneralTrackerDR3;
+      validateObservationGroup(obs_current,
+                               kDr3CurrentObs,
+                               "observations.obs_current",
+                               1);
+      validateObservationGroup(obs_history,
+                               kDr3HistoryObs,
+                               "observations.obs_history",
+                               1,
+                               false);
+      config.obs_history_length = dr3FutureHorizon(obs_history);
+      config.obs_current = toStrings(kDr3CurrentObs);
+      config.obs_history = toStrings(kDr3HistoryObs);
+      config.obs_current_terms = toTerms(kDr3CurrentObs);
+      config.obs_history_terms = toTerms(kDr3HistoryObs);
+      config.obs_current_dim = sumWidths(kDr3CurrentObs);
+      config.obs_history_width = sumWidths(kDr3HistoryObs);
     } else if (is_cln) {
       config.observation_contract = ObservationContract::GeneralTrackerCLN;
       validateObservationGroup(obs_current, kClnCurrentObs, "observations.obs_current", 1);

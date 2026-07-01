@@ -1,0 +1,48 @@
+profile: GeneralTrackerDR3
+source:
+  repository: /home/galbot/works/et1/.reference/unitree_ET1_lab_mjlab_hyx
+  head: e3c50ad6075ea8f146b3f1fca89bd44b272868a5
+assets:
+  model:
+    path: exported/DR3-all.onnx
+    source_path: robots/et1/config/policy/mimic/general_tracking/exported/DR3-all.onnx
+    size_bytes: 3590360
+    sha256: fb48e575d81951e6cd23e65cde12258bd5feccfb8dfc3c9bce549d6c55269e12
+    inputs:
+      - name: obs_current
+        dtype: float32
+        shape: [1, 118]
+      - name: obs_history
+        dtype: float32
+        shape: [1, 5, 32]
+    outputs:
+      - name: actions
+        dtype: float32
+        shape: [1, 26]
+  deploy:
+    path: params/deploy_fut_obs.yaml
+    source_path: robots/et1/config/policy/mimic/general_tracking/params/deploy_fut_obs.yaml
+    size_bytes: 3559
+    sha256: a92cd204343d513d0c74f14acfa2fcfbf38040f31c34baf293f3e5d465021bb2
+contract:
+  step_dt: 0.02
+  obs_current:
+    shape: [1, 118]
+    terms:
+      - {name: command_yaw, width: 2}
+      - {name: command_root_ori_b, width: 6}
+      - {name: command_jnt_pos, width: 26}
+      - {name: projected_gravity, width: 3}
+      - {name: base_ang_vel, width: 3}
+      - {name: joint_pos_rel, width: 26}
+      - {name: joint_vel_rel, width: 26}
+      - {name: last_action, width: 26}
+  obs_history:
+    shape: [1, 5, 32]
+    term: future_command
+    horizon: 5
+    row_terms:
+      - {name: root_ori_b, width: 6}
+      - {name: joint_pos, width: 26}
+  actions:
+    shape: [1, 26]

@@ -77,6 +77,21 @@ constexpr const char* kClnFootstateHistoryObs[] = {
     "future_command_with_foot_support_state",
 };
 
+constexpr const char* kDr3CurrentObs[] = {
+    "command_yaw",
+    "command_root_ori_b",
+    "command_jnt_pos",
+    "projected_gravity",
+    "base_ang_vel",
+    "joint_pos_rel",
+    "joint_vel_rel",
+    "last_action",
+};
+
+constexpr const char* kDr3HistoryObs[] = {
+    "future_command",
+};
+
 struct TempDeploy {
   explicit TempDeploy(const std::string& yaml) {
     const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -175,6 +190,18 @@ std::string footstateHistoryBlock(int horizon) {
   return out.str();
 }
 
+std::string dr3HistoryBlock(int horizon) {
+  std::ostringstream out;
+  out << "    use_gym_history: false\n";
+  out << "    " << kDr3HistoryObs[0] << ":\n";
+  out << "      params:\n";
+  out << "        horizon: " << horizon << "\n";
+  out << "      clip: null\n";
+  out << "      scale: null\n";
+  out << "      history_length: 1\n";
+  return out.str();
+}
+
 std::string validDeployYaml() {
   std::ostringstream out;
   out << "joint_ids_map: " << intRange(0, 26) << "\n";
@@ -238,6 +265,31 @@ std::string validClnFootstateDeployYaml() {
                               1, true);
   out << "  obs_history:\n";
   out << footstateHistoryBlock(5);
+  return out.str();
+}
+
+std::string validDr3DeployYaml() {
+  std::ostringstream out;
+  out << "joint_ids_map: " << intRange(0, 26) << "\n";
+  out << "sdk_joint_ids_map: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, "
+         "13, 15, 16, 17, 18, 19, 22, 23, 24, 25, 26, 29, 30]\n";
+  out << "step_dt: 0.02\n";
+  out << "default_joint_pos: " << repeatValues("0.25", 26) << "\n";
+  out << "actions:\n";
+  out << "  JointPositionAction:\n";
+  out << "    joint_names: [.*]\n";
+  out << "    scale: " << repeatValues("0.1", 26) << "\n";
+  out << "    offset: " << repeatValues("0.0", 26) << "\n";
+  out << "    joint_ids: null\n";
+  out << "policy_kp: " << repeatValues("1.0", 26) << "\n";
+  out << "policy_kd: " << repeatValues("0.1", 26) << "\n";
+  out << "observations:\n";
+  out << "  obs_current:\n";
+  out << obsBlockWithMetadata(kDr3CurrentObs,
+                              sizeof(kDr3CurrentObs) / sizeof(kDr3CurrentObs[0]),
+                              1, true);
+  out << "  obs_history:\n";
+  out << dr3HistoryBlock(5);
   return out.str();
 }
 
@@ -367,6 +419,40 @@ TEST_CASE("DeployConfig loads the GeneralTrackerCLNFootstate observation contrac
               "future_command_with_foot_support_state",
               41,
               0);
+}
+
+TEST_CASE("DeployConfig loads the GeneralTrackerDR3 observation contract") {
+  const DeployConfig config = loadYaml(validDr3DeployYaml());
+
+  REQUIRE(config.joint_dim == 26);
+  REQUIRE(config.observation_contract == ObservationContract::GeneralTrackerDR3);
+  REQUIRE(config.obs_current.size() == 8);
+  REQUIRE(config.obs_history.size() == 1);
+  REQUIRE(config.obs_current_terms.size() == 8);
+  REQUIRE(config.obs_history_terms.size() == 1);
+  REQUIRE(config.obs_current_dim == 118);
+  REQUIRE(config.obs_history_width == 32);
+  REQUIRE(config.obs_history_length == 5);
+  REQUIRE(config.step_dt == 0.02);
+
+  requireTerm(config.obs_current_terms, "command_yaw", 2, 0);
+  requireTerm(config.obs_current_terms, "command_root_ori_b", 6, 2);
+  requireTerm(config.obs_current_terms, "command_jnt_pos", 26, 8);
+  requireTerm(config.obs_current_terms, "last_action", 26, 92);
+  requireTerm(config.obs_history_terms, "future_command", 32, 0);
+}
+
+TEST_CASE("DeployConfig loads the app-owned GeneralTrackerDR3 deploy asset") {
+  const auto path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                    "config/policy/general_tracker_dr3/params/deploy_fut_obs.yaml";
+
+  const DeployConfig config = loadDeployConfig(path);
+
+  REQUIRE(config.observation_contract == ObservationContract::GeneralTrackerDR3);
+  REQUIRE(config.obs_current_dim == 118);
+  REQUIRE(config.obs_history_width == 32);
+  REQUIRE(config.obs_history_length == 5);
+  requireTerm(config.obs_history_terms, "future_command", 32, 0);
 }
 
 TEST_CASE("DeployConfig parses and validates default joint positions") {
@@ -592,6 +678,108 @@ TEST_CASE("DeployConfig rejects GeneralTrackerCLNFootstate deploy drift") {
                                          "      history_length: 2\n");
 
     REQUIRE_THROWS_WITH(loadYaml(yaml), ContainsSubstring("history_length"));
+  }
+}
+
+TEST_CASE("DeployConfig rejects GeneralTrackerDR3 deploy drift and profile mixing") {
+  SECTION("plural CLN future_commands is not DR3") {
+    const std::string yaml =
+        replaceOnce(validDr3DeployYaml(),
+                    "    future_command:\n"
+                    "      params:\n"
+                    "        horizon: 5\n"
+                    "      clip: null\n"
+                    "      scale: null\n"
+                    "      history_length: 1\n",
+                    "    future_commands:\n"
+                    "      params:\n"
+                    "        horizon: 5\n"
+                    "      clip: null\n"
+                    "      scale: null\n"
+                    "      history_length: 1\n");
+
+    REQUIRE_THROWS_WITH(loadYaml(yaml), ContainsSubstring("future_commands"));
+  }
+
+  SECTION("current velocity command is not allowed") {
+    const std::string yaml =
+        replaceOnce(validDr3DeployYaml(),
+                    "    command_jnt_pos:\n"
+                    "      params: {}\n"
+                    "      clip: null\n"
+                    "      scale: null\n"
+                    "      history_length: 1\n",
+                    "    command_xy_yaw_vel:\n"
+                    "      params: {}\n"
+                    "      clip: null\n"
+                    "      scale: null\n"
+                    "      history_length: 1\n"
+                    "    command_jnt_pos:\n"
+                    "      params: {}\n"
+                    "      clip: null\n"
+                    "      scale: null\n"
+                    "      history_length: 1\n");
+
+    REQUIRE_THROWS_WITH(loadYaml(yaml), ContainsSubstring("command_xy_yaw_vel"));
+  }
+
+  SECTION("current foot support is not allowed") {
+    const std::string yaml =
+        replaceOnce(validDr3DeployYaml(),
+                    "    last_action:\n"
+                    "      params: {}\n"
+                    "      clip: null\n"
+                    "      scale: null\n"
+                    "      history_length: 1\n",
+                    "    last_action:\n"
+                    "      params: {}\n"
+                    "      clip: null\n"
+                    "      scale: null\n"
+                    "      history_length: 1\n"
+                    "    command_foot_support_state:\n"
+                    "      params: {}\n"
+                    "      clip: null\n"
+                    "      scale: null\n"
+                    "      history_length: 1\n");
+
+    REQUIRE_THROWS_WITH(loadYaml(yaml), ContainsSubstring("command_foot_support_state"));
+  }
+
+  SECTION("future foot support is not allowed") {
+    const std::string yaml =
+        replaceOnce(validDr3DeployYaml(),
+                    "    future_command:\n"
+                    "      params:\n"
+                    "        horizon: 5\n"
+                    "      clip: null\n"
+                    "      scale: null\n"
+                    "      history_length: 1\n",
+                    "    future_command_with_foot_support_state:\n"
+                    "      params:\n"
+                    "        horizon: 5\n"
+                    "      clip: null\n"
+                    "      scale: null\n"
+                    "      history_length: 1\n");
+
+    REQUIRE_THROWS_WITH(loadYaml(yaml), ContainsSubstring("future_command_with_foot_support_state"));
+  }
+
+  SECTION("future horizon is frozen at five") {
+    const std::string yaml = replaceOnce(validDr3DeployYaml(),
+                                         "        horizon: 5\n",
+                                         "        horizon: 25\n");
+
+    REQUIRE_THROWS_WITH(loadYaml(yaml), ContainsSubstring("horizon"));
+  }
+
+  SECTION("future use_gym_history must be false") {
+    const std::string yaml = replaceOnce(validDr3DeployYaml(),
+                                         "  obs_history:\n"
+                                         "    use_gym_history: false\n",
+                                         "  obs_history:\n"
+                                         "    use_gym_history: true\n");
+
+    REQUIRE_THROWS_WITH(loadYaml(yaml), ContainsSubstring("use_gym_history"));
   }
 }
 

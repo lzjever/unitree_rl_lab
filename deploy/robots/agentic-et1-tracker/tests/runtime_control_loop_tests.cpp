@@ -426,6 +426,7 @@ DeployConfig deployConfig() {
   config.obs_current_dim = 131;
   config.obs_history_width = 105;
   config.obs_history_length = 25;
+  config.step_dt = 0.02;
   return config;
 }
 
@@ -8777,6 +8778,134 @@ TEST_CASE("RuntimeControlLoop active tracker advances one frame per policy perio
   REQUIRE(loop.internalStateForTest() == RuntimeInternalState::GeneralTrackerIdle);
   REQUIRE_FALSE(store.snapshot().exec.has_value());
   REQUIRE(store.findRun("high-rate-track").run->state == MotionState::Done);
+}
+
+TEST_CASE("RuntimeControlLoop active tracker uses deploy step_dt for fractional policy cadence") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.hz = 60.0;
+  const DeployConfig deploy_config = deployConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+  auto loop = makePolicyLoop(config,
+                             bridge,
+                             store,
+                             tmp.trkConfig(50.0),
+                             robot,
+                             tracker_policy,
+                             deploy_config);
+
+  const auto path = validTrk(tmp, "fractional_step_dt_track.trk", 100);
+  REQUIRE(bridge.submitQueue(
+              executeCommand("fractional-step-dt-track", path, MotionMode::Queue, 100))
+              .ok());
+  startQueuedRun(loop, store, "fractional-step-dt-track");
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::GeneralTrackerActive);
+
+  for (int tick = 0; tick < 60; ++tick) {
+    loop.tick();
+  }
+
+  REQUIRE(tracker_policy.calls == 50);
+  REQUIRE(store.snapshot().exec.has_value());
+  REQUIRE(store.snapshot().exec->state == MotionState::Running);
+}
+
+TEST_CASE("RuntimeControlLoop idle tracker samples reference frames by rounded playback time") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.hz = 50.0;
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  auto loop = makeControlLoop(config,
+                              bridge,
+                              store,
+                              tmp.trkConfig(30.0),
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              deploy_config,
+                              velocity_config,
+                              fixstand_config,
+                              ControlMode::StandbyVelocity,
+                              passiveConfig(),
+                              &reference);
+
+  const auto idle_path = validTrk(tmp, "idle_30fps_playback_sample.trk", 8);
+  REQUIRE(bridge.configureIdle({idleMotion(idle_path, 8)}).ok());
+
+  loop.tick();
+  loop.tick();
+  loop.tick();
+  REQUIRE(store.snapshot().active.kind == ActiveKind::Idle);
+  REQUIRE(reference.latest.active);
+  REQUIRE(reference.latest.frame == 0);
+
+  std::vector<std::size_t> frames_at_write;
+  robot.on_write = [&](const LowCmdFrame&) {
+    if (reference.latest.active) {
+      frames_at_write.push_back(reference.latest.frame);
+    }
+  };
+
+  for (int tick = 0; tick < 6; ++tick) {
+    loop.tick();
+  }
+
+  REQUIRE(frames_at_write == std::vector<std::size_t>{0, 1, 1, 2, 2, 3});
+}
+
+TEST_CASE("RuntimeControlLoop user startup hold step count is independent of track fps") {
+  struct Case {
+    double fps;
+    const char* suffix;
+  };
+
+  for (const Case& item : std::vector<Case>{{30.0, "30"}, {50.0, "50"}, {60.0, "60"}}) {
+    TempTree tmp;
+    RuntimeConfig config = runtimeConfig();
+    config.hz = 1000.0;
+    const DeployConfig deploy_config = deployConfig();
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeRobotIO robot(readyLowState(deploy_config));
+    FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+    auto loop = makePolicyLoop(config,
+                               bridge,
+                               store,
+                               tmp.trkConfig(item.fps),
+                               robot,
+                               tracker_policy,
+                               deploy_config);
+
+    const std::string id = std::string("startup-hold-fps-") + item.suffix;
+    const auto path = validTrk(tmp, id + ".trk", 64);
+    REQUIRE(bridge.submitQueue(executeCommand(id, path, MotionMode::Queue, 64)).ok());
+    startQueuedRun(loop, store, id);
+
+    bool saw_first_playback_frame = false;
+    for (int tick = 0; tick < 2048; ++tick) {
+      loop.tick();
+      const auto snapshot = store.snapshot();
+      REQUIRE(snapshot.exec.has_value());
+      if (snapshot.exec->frame > 0) {
+        saw_first_playback_frame = true;
+        break;
+      }
+    }
+
+    REQUIRE(saw_first_playback_frame);
+    REQUIRE(tracker_policy.calls == static_cast<int>(kStartupHoldPolicyStepsAt50Fps + 1));
+  }
 }
 
 TEST_CASE("RuntimeControlLoop stop transitions active run to StandbyVelocity") {

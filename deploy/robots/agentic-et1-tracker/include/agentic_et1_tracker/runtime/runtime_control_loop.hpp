@@ -286,6 +286,12 @@ class RuntimeControlLoop final {
   std::size_t ticksForPeriod(double seconds) const;
   std::size_t ticksForRate(double rate_hz) const;
   bool consumeStepDue(std::size_t& ticks_until_next, std::size_t interval_ticks);
+  double generalTrackerPolicyStepDt() const;
+  void resetGeneralTrackerPolicyTiming(double playback_time_s = 0.0);
+  bool consumeGeneralTrackerPolicyDue();
+  std::size_t activePlaybackFrame() const;
+  double activePlaybackEndTime() const;
+  void advanceActivePlaybackTime();
   std::size_t velocityPolicyIntervalTicks() const;
   std::size_t activePolicyIntervalTicks() const;
   std::size_t policyStartupHoldPolicySteps() const;
@@ -359,6 +365,9 @@ class RuntimeControlLoop final {
   bool active_first_advance_{false};
   std::size_t stopping_hold_ticks_remaining_{0};
   std::size_t active_policy_ticks_until_next_{0};
+  double general_tracker_policy_phase_s_{0.0};
+  double general_tracker_next_policy_time_s_{0.0};
+  double active_playback_time_s_{0.0};
   std::size_t policy_startup_hold_total_steps_{0};
   std::size_t policy_startup_hold_steps_remaining_{0};
   std::vector<float> policy_startup_upper_body_start_q_;

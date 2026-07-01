@@ -21,6 +21,9 @@ constexpr std::size_t kClnHistoryWidth = 35;
 constexpr std::size_t kClnFootstateObsCurrentDim = 127;
 constexpr std::size_t kClnFootstateHistoryLength = 5;
 constexpr std::size_t kClnFootstateHistoryWidth = 41;
+constexpr std::size_t kDr3ObsCurrentDim = 118;
+constexpr std::size_t kDr3HistoryLength = 5;
+constexpr std::size_t kDr3HistoryWidth = 32;
 
 std::vector<int> intRange(std::size_t count) {
   std::vector<int> values;
@@ -118,6 +121,25 @@ std::vector<ObservationTerm> clnFootstateHistoryTerms() {
   });
 }
 
+std::vector<ObservationTerm> dr3CurrentTerms() {
+  return terms({
+      {"command_yaw", 2},
+      {"command_root_ori_b", 6},
+      {"command_jnt_pos", kJointDim},
+      {"projected_gravity", 3},
+      {"base_ang_vel", 3},
+      {"joint_pos_rel", kJointDim},
+      {"joint_vel_rel", kJointDim},
+      {"last_action", kJointDim},
+  });
+}
+
+std::vector<ObservationTerm> dr3HistoryTerms() {
+  return terms({
+      {"future_command", kDr3HistoryWidth},
+  });
+}
+
 DeployConfig validConfig() {
   DeployConfig config;
   config.joint_dim = kJointDim;
@@ -160,6 +182,17 @@ DeployConfig validClnFootstateConfig() {
   return config;
 }
 
+DeployConfig validDr3Config() {
+  DeployConfig config = validConfig();
+  config.observation_contract = ObservationContract::GeneralTrackerDR3;
+  config.obs_current_dim = kDr3ObsCurrentDim;
+  config.obs_history_width = kDr3HistoryWidth;
+  config.obs_history_length = kDr3HistoryLength;
+  config.obs_current_terms = dr3CurrentTerms();
+  config.obs_history_terms = dr3HistoryTerms();
+  return config;
+}
+
 PolicyModelMetadata validMetadata() {
   return {
       {
@@ -189,6 +222,18 @@ PolicyModelMetadata validClnFootstateMetadata() {
       {
           {"obs_current", PolicyTensorElementType::Float32, {1, 127}},
           {"obs_history", PolicyTensorElementType::Float32, {1, 5, 41}},
+      },
+      {
+          {"actions", PolicyTensorElementType::Float32, {1, 26}},
+      },
+  };
+}
+
+PolicyModelMetadata validDr3Metadata() {
+  return {
+      {
+          {"obs_current", PolicyTensorElementType::Float32, {1, 118}},
+          {"obs_history", PolicyTensorElementType::Float32, {1, 5, 32}},
       },
       {
           {"actions", PolicyTensorElementType::Float32, {1, 26}},
@@ -235,6 +280,19 @@ TEST_CASE("GA policy IO contract accepts GeneralTrackerCLNFootstate deploy dims 
   REQUIRE_NOTHROW(validateGaDeployConfig(validClnFootstateConfig()));
   REQUIRE_NOTHROW(
       validateGaPolicyIoContract(validClnFootstateConfig(), validClnFootstateMetadata()));
+}
+
+TEST_CASE("GA policy IO contract accepts GeneralTrackerDR3 deploy dims and ONNX metadata") {
+  REQUIRE_NOTHROW(validateGaDeployConfig(validDr3Config()));
+  REQUIRE_NOTHROW(validateGaPolicyIoContract(validDr3Config(), validDr3Metadata()));
+}
+
+TEST_CASE("GA policy IO contract rejects DR3 and legacy profile shape mixing") {
+  requireContractRejects(validDr3Config(), validClnMetadata(), "obs_current shape");
+  requireContractRejects(validDr3Config(), validClnFootstateMetadata(), "obs_current shape");
+  requireContractRejects(validConfig(), validDr3Metadata(), "obs_current shape");
+  requireContractRejects(validClnConfig(), validDr3Metadata(), "obs_current shape");
+  requireContractRejects(validClnFootstateConfig(), validDr3Metadata(), "obs_current shape");
 }
 
 TEST_CASE("GA policy IO contract rejects old CLN ONNX shapes for Footstate profile") {
@@ -539,6 +597,43 @@ TEST_CASE("GA deploy config contract rejects frozen observation term drift") {
 
     requireDeployRejects(config, "obs_current_terms");
     requireContractRejects(config, validMetadata(), "obs_current_terms");
+  }
+}
+
+TEST_CASE("GA deploy config contract rejects GeneralTrackerDR3 term drift") {
+  SECTION("current cannot include CLN velocity command") {
+    auto config = validDr3Config();
+    config.obs_current_terms.insert(config.obs_current_terms.begin() + 2,
+                                    {"command_xy_yaw_vel", 3, 8});
+    config.obs_current_terms.at(3).offset = 11;
+
+    requireDeployRejects(config, "obs_current_terms");
+    requireContractRejects(config, validDr3Metadata(), "obs_current_terms");
+  }
+
+  SECTION("current cannot include foot support") {
+    auto config = validDr3Config();
+    config.obs_current_terms.push_back({"command_foot_support_state", 6, 118});
+
+    requireDeployRejects(config, "obs_current_terms");
+    requireContractRejects(config, validDr3Metadata(), "obs_current_terms");
+  }
+
+  SECTION("future term must be singular future_command") {
+    auto config = validDr3Config();
+    config.obs_history_terms = terms({{"future_commands", kDr3HistoryWidth}});
+
+    requireDeployRejects(config, "obs_history_terms[0].name");
+    requireContractRejects(config, validDr3Metadata(), "obs_history_terms[0].name");
+  }
+
+  SECTION("future width must omit velocity and footstate") {
+    auto config = validDr3Config();
+    config.obs_history_width = kClnHistoryWidth;
+    config.obs_history_terms = terms({{"future_command", kClnHistoryWidth}});
+
+    requireDeployRejects(config, "obs_history_width");
+    requireContractRejects(config, validDr3Metadata(), "obs_history_width");
   }
 }
 

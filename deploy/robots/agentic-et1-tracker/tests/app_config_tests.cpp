@@ -971,6 +971,16 @@ agentic_et1_tracker:
     REQUIRE(config.policy.profile == "GeneralTracker");
   }
 
+  SECTION("GeneralTrackerDR3") {
+    const auto config = loadYaml(R"yaml(
+agentic_et1_tracker:
+  motion_dirs: ["/tmp/motions"]
+  policy:
+    profile: "GeneralTrackerDR3"
+)yaml");
+    REQUIRE(config.policy.profile == "GeneralTrackerDR3");
+  }
+
   SECTION("arbitrary profile") {
     REQUIRE_THROWS_WITH(loadYaml(R"yaml(
 agentic_et1_tracker:
@@ -982,6 +992,30 @@ agentic_et1_tracker:
   }
 }
 
+TEST_CASE("AppConfig accepts GeneralTrackerDR3 suggested app-owned paths") {
+  const auto root = appRoot();
+  const auto dr3_policy_dir = root / "config/policy/general_tracker_dr3";
+  const auto dr3_deploy = dr3_policy_dir / "params/deploy_fut_obs.yaml";
+  const auto config = loadYaml("agentic_et1_tracker:\n"
+                               "  motion_dirs: [\"/tmp/motions\"]\n"
+                               "  policy:\n"
+                               "    profile: \"GeneralTrackerDR3\"\n"
+                               "    policy_dir: \"" +
+                               dr3_policy_dir.string() +
+                               "\"\n"
+                               "    policy_file: \"DR3-all.onnx\"\n"
+                               "    deploy: \"" +
+                               dr3_deploy.string() +
+                               "\"\n");
+
+  REQUIRE(config.policy.profile == "GeneralTrackerDR3");
+  REQUIRE(config.policy.policy_dir == dr3_policy_dir.lexically_normal().string());
+  REQUIRE(config.policy.policy_file == "DR3-all.onnx");
+  REQUIRE(config.policy.deploy == dr3_deploy.lexically_normal().string());
+  REQUIRE_FALSE(pathIsAtOrWithin(config.policy.policy_dir,
+                                 root / "../et1/config/policy/general_tracker_dr3"));
+}
+
 TEST_CASE("AppConfig rejects policy profile and deploy observation contract mismatches") {
   const auto root = appRoot();
   const auto legacy_policy_dir = root / "config/policy/general_tracker";
@@ -989,6 +1023,8 @@ TEST_CASE("AppConfig rejects policy profile and deploy observation contract mism
   const auto cln_policy_dir = root / "config/policy/general_tracker_cln";
   const auto cln_deploy = cln_policy_dir / "params/deploy.yaml";
   const auto footstate_deploy = cln_policy_dir / "params/deploy_fut_multi_footstate.yaml";
+  const auto dr3_policy_dir = root / "config/policy/general_tracker_dr3";
+  const auto dr3_deploy = dr3_policy_dir / "params/deploy_fut_obs.yaml";
 
   SECTION("legacy profile with CLN deploy") {
     REQUIRE_THROWS_WITH(loadYaml(policyYaml("GeneralTracker", cln_policy_dir, cln_deploy)),
@@ -1025,6 +1061,42 @@ TEST_CASE("AppConfig rejects policy profile and deploy observation contract mism
     REQUIRE_THROWS_WITH(loadYaml(policyYaml("GeneralTrackerCLNFootstate",
                                             cln_policy_dir,
                                             cln_deploy)),
+                        ContainsSubstring("policy.profile"));
+  }
+
+  SECTION("legacy profile with DR3 deploy") {
+    REQUIRE_THROWS_WITH(loadYaml(policyYaml("GeneralTracker", dr3_policy_dir, dr3_deploy)),
+                        ContainsSubstring("policy.profile"));
+  }
+
+  SECTION("CLN profile with DR3 deploy") {
+    REQUIRE_THROWS_WITH(loadYaml(policyYaml("GeneralTrackerCLN", dr3_policy_dir, dr3_deploy)),
+                        ContainsSubstring("policy.profile"));
+  }
+
+  SECTION("footstate profile with DR3 deploy") {
+    REQUIRE_THROWS_WITH(loadYaml(policyYaml("GeneralTrackerCLNFootstate",
+                                            dr3_policy_dir,
+                                            dr3_deploy)),
+                        ContainsSubstring("policy.profile"));
+  }
+
+  SECTION("DR3 profile with legacy deploy") {
+    REQUIRE_THROWS_WITH(loadYaml(policyYaml("GeneralTrackerDR3",
+                                            legacy_policy_dir,
+                                            legacy_deploy)),
+                        ContainsSubstring("policy.profile"));
+  }
+
+  SECTION("DR3 profile with CLN deploy") {
+    REQUIRE_THROWS_WITH(loadYaml(policyYaml("GeneralTrackerDR3", cln_policy_dir, cln_deploy)),
+                        ContainsSubstring("policy.profile"));
+  }
+
+  SECTION("DR3 profile with footstate deploy") {
+    REQUIRE_THROWS_WITH(loadYaml(policyYaml("GeneralTrackerDR3",
+                                            cln_policy_dir,
+                                            footstate_deploy)),
                         ContainsSubstring("policy.profile"));
   }
 }

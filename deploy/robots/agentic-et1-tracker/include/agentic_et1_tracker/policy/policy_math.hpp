@@ -24,6 +24,7 @@ struct PolicyObservationParts {
   Vec ref_com_rel_navi;
   Vec ref_com_vel_navi;
   Vec future_commands;
+  Vec future_command;
 };
 
 struct PolicyInputs {
