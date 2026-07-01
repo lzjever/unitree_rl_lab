@@ -221,8 +221,11 @@ void interpolateQuats(const TrkArrayView<float>& source,
 }
 
 bool sameContacts(const TrkFrameView& source, const TrkFrameView& target) {
-  return source.left_foot_contact_state.ptr[0] == target.left_foot_contact_state.ptr[0] &&
-         source.right_foot_contact_state.ptr[0] == target.right_foot_contact_state.ptr[0];
+  const std::int64_t source_left = source.left_foot_contact_state.ptr[0];
+  const std::int64_t source_right = source.right_foot_contact_state.ptr[0];
+  return source_left != 0 && source_right != 0 &&
+         source_left == target.left_foot_contact_state.ptr[0] &&
+         source_right == target.right_foot_contact_state.ptr[0];
 }
 
 void setContact(const TrkArrayView<std::int64_t>& source,

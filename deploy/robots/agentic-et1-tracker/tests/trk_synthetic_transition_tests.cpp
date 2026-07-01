@@ -365,6 +365,32 @@ TEST_CASE("Trk synthetic transition rejects contact mismatch and preserves same 
   }
 }
 
+TEST_CASE("Trk synthetic transition rejects unknown or single-support contact bridges") {
+  struct ContactCase {
+    const char* label;
+    std::int64_t left;
+    std::int64_t right;
+  };
+
+  for (const auto& item : std::vector<ContactCase>{
+           {"same unknown", 0, 0},
+           {"left unknown", 0, 2},
+           {"right unknown", 1, 0},
+       }) {
+    TrkTrack source_track = makeSingleFrameTrack();
+    TrkTrack target_track = makeTargetTrack();
+    source_track.left_foot_contact_state.values.at(0) = item.left;
+    source_track.right_foot_contact_state.values.at(0) = item.right;
+    target_track.left_foot_contact_state.values.at(0) = item.left;
+    target_track.right_foot_contact_state.values.at(0) = item.right;
+
+    CAPTURE(item.label);
+    REQUIRE_FALSE(
+        makeSyntheticTransitionTrk(*source_track.frame(0), *target_track.frame(0), 25.0, 0.20)
+            .has_value());
+  }
+}
+
 TEST_CASE("Trk synthetic transition uses shortest-path quaternion nlerp") {
   TrkTrack source_track = makeSingleFrameTrack();
   TrkTrack target_track = makeTargetTrack();

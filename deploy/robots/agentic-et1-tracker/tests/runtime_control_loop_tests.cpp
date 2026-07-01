@@ -183,10 +183,16 @@ void writePayload(std::ofstream& out, const ArrayFixture& array) {
 std::vector<ArrayFixture> requiredArrays(std::uint64_t frames) {
   std::vector<ArrayFixture> arrays;
   for (const auto& spec : TrkSchema::kRequiredArrays) {
-    arrays.push_back({std::string(spec.name),
-                      spec.dtype_family == TrkDtypeFamily::Contact ? TrkDtype::Int64
-                                                                    : TrkDtype::Float32,
-                      shapeFor(spec, frames)});
+    ArrayFixture fixture{std::string(spec.name),
+                         spec.dtype_family == TrkDtypeFamily::Contact ? TrkDtype::Int64
+                                                                       : TrkDtype::Float32,
+                         shapeFor(spec, frames)};
+    if (fixture.name == "left_foot_contact_state") {
+      fixture.contact_fill_value = 1;
+    } else if (fixture.name == "right_foot_contact_state") {
+      fixture.contact_fill_value = 2;
+    }
+    arrays.push_back(std::move(fixture));
   }
   return arrays;
 }
@@ -323,8 +329,6 @@ std::filesystem::path transitionReadyTrk(TempTree& tmp,
   arrayNamed(arrays, "body_quat_w").identity_quaternions = true;
   arrayNamed(arrays, "body_pos_w").root_body_positions =
       std::vector<std::array<float, 3>>(frames, {0.0F, 0.0F, 0.0F});
-  arrayNamed(arrays, "left_foot_contact_state").contact_fill_value = 0;
-  arrayNamed(arrays, "right_foot_contact_state").contact_fill_value = 0;
   auto& joint_pos = arrayNamed(arrays, "joint_pos");
   joint_pos.joint_pos_frames.reserve(frames);
   for (std::uint64_t frame = 0; frame < frames; ++frame) {
@@ -1112,6 +1116,44 @@ void requireStartupHoldInterpolatedFrame(const LowCmdFrame& frame,
   }
 }
 
+void requireCurrentUserFullStartupHold(RuntimeControlLoop& loop,
+                                       RuntimeStatusStore& store,
+                                       FakePolicy& policy,
+                                       const std::string& id,
+                                       float first_frame_joint,
+                                       float second_frame_joint) {
+  REQUIRE(store.snapshot().exec.has_value());
+  REQUIRE(store.snapshot().exec->id == id);
+  REQUIRE(store.snapshot().exec->frame == 0);
+  const int calls_at_target_start = policy.calls;
+
+  for (std::size_t tick = 0; tick < kStartupHoldPolicyStepsAt50Fps; ++tick) {
+    loop.tick();
+    const auto snapshot = store.snapshot();
+    REQUIRE(snapshot.active.kind == ActiveKind::User);
+    REQUIRE(snapshot.exec.has_value());
+    REQUIRE(snapshot.exec->id == id);
+    REQUIRE(snapshot.exec->state == MotionState::Running);
+    REQUIRE(snapshot.exec->frame == 0);
+    REQUIRE(policy.calls == calls_at_target_start + static_cast<int>(tick + 1));
+    REQUIRE(policy.inputs_seen.back()
+                .obs_current.at(kObsCurrentCommandJointOffset) ==
+            Catch::Approx(first_frame_joint).margin(1.0e-5F));
+  }
+
+  loop.tick();
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.active.kind == ActiveKind::User);
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->id == id);
+  REQUIRE(snapshot.exec->frame == 1);
+  REQUIRE(policy.calls ==
+          calls_at_target_start + static_cast<int>(kStartupHoldPolicyStepsAt50Fps) + 1);
+  REQUIRE(policy.inputs_seen.back()
+              .obs_current.at(kObsCurrentCommandJointOffset) ==
+          Catch::Approx(second_frame_joint).margin(1.0e-5F));
+}
+
 void requireMotorPreserved(const LowCmdFrame& frame,
                            const LowCmdFrame& base,
                            std::size_t sdk_slot) {
@@ -1228,7 +1270,7 @@ void startHoldingRun(RuntimeControlLoop& loop,
                      FakeReferenceSink* reference = nullptr,
                      StartQueuedRunMode mode =
                          StartQueuedRunMode::RequireDirectStart) {
-  const auto path = validTrk(tmp, id + ".trk", 1);
+  const auto path = transitionReadyTrk(tmp, id + ".trk", 1, 20.0F);
   REQUIRE(bridge.submitQueue(
               executeCommand(id, path, MotionMode::Queue, 1, true))
               .ok());
@@ -1358,7 +1400,7 @@ std::filesystem::path startCompletedUserToIdleTransition(
   REQUIRE(bridge.configureIdle({idleMotion(idle_path, 3)}).ok());
   loop.tick();
 
-  const auto user_path = validTrk(tmp, id_prefix + "_user.trk", 1);
+  const auto user_path = transitionReadyTrk(tmp, id_prefix + "_user.trk", 1, 20.0F);
   REQUIRE(bridge.submitQueue(
               executeCommand(id_prefix + "-source-user",
                              user_path,
@@ -1384,7 +1426,7 @@ void startCompletedUserToStandbyTransition(RuntimeControlLoop& loop,
                                            RuntimeBridge& bridge,
                                            TempTree& tmp,
                                            const std::string& id_prefix) {
-  const auto user_path = validTrk(tmp, id_prefix + "_user.trk", 1);
+  const auto user_path = transitionReadyTrk(tmp, id_prefix + "_user.trk", 1, 20.0F);
   REQUIRE(bridge.submitQueue(
               executeCommand(id_prefix + "-source-user",
                              user_path,
@@ -1642,7 +1684,7 @@ TEST_CASE("RuntimeControlLoop publishes active raw reference frames then clears"
   REQUIRE(reference.latest.frames == 3);
   REQUIRE(reference.latest.p.at(0) == std::array<float, 3>{{0.0F, 0.25F, 0.5F}});
   REQUIRE(reference.latest.q.at(0) == std::array<float, 4>{{0.0F, 0.25F, 0.5F, 0.75F}});
-  REQUIRE(reference.latest.c == std::array<std::int64_t, 2>{{0, 0}});
+  REQUIRE(reference.latest.c == std::array<std::int64_t, 2>{{1, 2}});
   REQUIRE(reference.latest.com == std::array<float, 3>{{0.0F, 0.25F, 0.5F}});
   REQUIRE(reference.latest.comv == std::array<float, 3>{{0.0F, 0.25F, 0.5F}});
 
@@ -1650,7 +1692,7 @@ TEST_CASE("RuntimeControlLoop publishes active raw reference frames then clears"
   loop.tick();
   REQUIRE(reference.latest.frame == 1);
   REQUIRE(reference.latest.p.at(0) == std::array<float, 3>{{20.25F, 20.5F, 20.75F}});
-  REQUIRE(reference.latest.c == std::array<std::int64_t, 2>{{1, 1}});
+  REQUIRE(reference.latest.c == std::array<std::int64_t, 2>{{1, 2}});
 
   loop.tick();
   REQUIRE_FALSE(reference.latest.active);
@@ -2749,6 +2791,149 @@ TEST_CASE("RuntimeControlLoop completed user unsafe bridge failure does not norm
 
   loop.tick();
   REQUIRE_FALSE(store.snapshot().exec.has_value());
+}
+
+TEST_CASE("RuntimeControlLoop completed user unsafe bridge failures record target failed") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.04;
+
+  struct Case {
+    const char* id;
+    std::filesystem::path (*make_target)(TempTree&, const std::string&);
+    ErrorCode expected_error;
+  };
+
+  const auto high_endpoint_velocity = [](TempTree& tmp, const std::string& name) {
+    return jointVelocityTrk(
+        tmp,
+        name,
+        2,
+        static_cast<float>(defaultSyntheticTransitionLimits().max_velocity + 1.0));
+  };
+  const auto invalid_root_quaternion = [](TempTree& tmp, const std::string& name) {
+    return zeroQuaternionTrk(tmp, name, 2);
+  };
+  const auto invalid_contact = [](TempTree& tmp, const std::string& name) {
+    return invalidContactTrk(tmp, name);
+  };
+
+  for (const auto& item : std::vector<Case>{
+           {"bridge-high-endpoint-velocity",
+            high_endpoint_velocity,
+            ErrorCode::InternalError},
+           {"bridge-invalid-root-quaternion",
+            invalid_root_quaternion,
+            ErrorCode::InternalError},
+           {"bridge-target-validation-failure",
+            invalid_contact,
+            ErrorCode::TrkValidationFailed},
+       }) {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeReferenceSink reference;
+    RuntimeControlLoop loop(config, bridge, store, TrkLoader(tmp.trkConfig()), &reference);
+
+    const auto source_path =
+        transitionReadyTrk(tmp, std::string(item.id) + "_source.trk", 2, 0.2F);
+    const auto target_path =
+        item.make_target(tmp, std::string(item.id) + "_target.trk");
+    REQUIRE(bridge.submitQueue(
+                executeCommand(std::string(item.id) + "-source",
+                               source_path,
+                               MotionMode::Queue,
+                               2))
+                .ok());
+    startQueuedRun(loop, store, std::string(item.id) + "-source");
+    loop.tick();
+    REQUIRE(store.snapshot().exec.has_value());
+    REQUIRE(store.snapshot().exec->frame == 0);
+
+    REQUIRE(bridge.submitQueue(
+                executeCommand(item.id, target_path, MotionMode::Queue, 2))
+                .ok());
+    loop.tick();
+
+    const auto snapshot = store.snapshot();
+    REQUIRE(snapshot.active.kind == ActiveKind::None);
+    REQUIRE_FALSE(snapshot.transition.active);
+    REQUIRE_FALSE(snapshot.exec.has_value());
+    REQUIRE(snapshot.queue.ids.empty());
+    REQUIRE(store.findRun(std::string(item.id) + "-source").run->state ==
+            MotionState::Done);
+    const auto failed = store.findRun(item.id);
+    REQUIRE(failed.ok());
+    REQUIRE(failed.run->state == MotionState::Failed);
+    REQUIRE(failed.run->err == item.expected_error);
+
+    loop.tick();
+    REQUIRE_FALSE(store.snapshot().exec.has_value());
+  }
+}
+
+TEST_CASE("RuntimeControlLoop robot unsafe before completed user bridge does not normal-start queued target") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.04;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeReferenceSink reference;
+  RuntimeControlLoop loop(config,
+                          bridge,
+                          store,
+                          TrkLoader(tmp.trkConfig()),
+                          robot,
+                          policy,
+                          deploy_config,
+                          passiveConfig(),
+                          kExpectedModeMachine,
+                          RuntimeMode::Real,
+                          &reference);
+
+  const auto source_path =
+      transitionReadyTrk(tmp, "bridge_robot_unsafe_a.trk", 2, 0.2F);
+  const auto target_path =
+      transitionReadyTrk(tmp, "bridge_robot_unsafe_b.trk", 2, 0.1F);
+  REQUIRE(bridge.submitQueue(
+              executeCommand("bridge-robot-unsafe-a",
+                             source_path,
+                             MotionMode::Queue,
+                             2))
+              .ok());
+  startQueuedRun(loop, store, "bridge-robot-unsafe-a");
+  for (std::size_t tick = 0; tick < kStartupHoldPolicyStepsAt50Fps; ++tick) {
+    loop.tick();
+  }
+  REQUIRE(store.snapshot().exec.has_value());
+  REQUIRE(store.snapshot().exec->frame == 0);
+
+  REQUIRE(bridge.submitQueue(
+              executeCommand("bridge-robot-unsafe-b",
+                             target_path,
+                             MotionMode::Queue,
+                             2))
+              .ok());
+  robot.low_state = badOrientationLowState(deploy_config, 91);
+  loop.tick();
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Passive);
+  REQUIRE(snapshot.active.kind == ActiveKind::None);
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.queue.ids ==
+          std::vector<std::string>{"bridge-robot-unsafe-b"});
+  REQUIRE(snapshot.err == ErrorCode::RobotBadOrientation);
+  REQUIRE(snapshot.block == "bad_orientation");
+  const auto source = store.findRun("bridge-robot-unsafe-a");
+  REQUIRE(source.ok());
+  REQUIRE(source.run->state == MotionState::Failed);
+  REQUIRE(source.run->err == ErrorCode::RobotBadOrientation);
+  REQUIRE(store.findRun("bridge-robot-unsafe-b").run->state ==
+          MotionState::Queued);
 }
 
 TEST_CASE("RuntimeControlLoop bridge only applies to GeneralTracker non-hold user to GeneralTracker") {
@@ -8936,9 +9121,13 @@ TEST_CASE("RuntimeControlLoop idle to user benign transition reject raw starts u
   REQUIRE_FALSE(snapshot.idle.active);
   REQUIRE(snapshot.queue.ids.empty());
   REQUIRE(store.findRun("idle-cap-bridge-user").run->state == MotionState::Running);
-  loop.tick();
-  REQUIRE(tracker_policy.calls >= 1);
-  REQUIRE(robot.write_attempts >= 1);
+  requireCurrentUserFullStartupHold(loop,
+                                    store,
+                                    tracker_policy,
+                                    "idle-cap-bridge-user",
+                                    20.0F,
+                                    20.1F);
+  REQUIRE(robot.write_attempts >= static_cast<int>(kStartupHoldPolicyStepsAt50Fps));
 }
 
 TEST_CASE("RuntimeControlLoop background transition benign reject raw starts user") {
@@ -8980,6 +9169,71 @@ TEST_CASE("RuntimeControlLoop background transition benign reject raw starts use
   REQUIRE(snapshot.queue.ids.empty());
   REQUIRE(store.findRun("background-contact-bridge-user").run->state ==
           MotionState::Running);
+}
+
+TEST_CASE("RuntimeControlLoop background transition benign reject uses full user startup hold") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.hz = 50.0;
+  config.transition_duration_s = 0.04;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  FakeReferenceSink reference;
+  auto loop = makeControlLoop(config,
+                              bridge,
+                              store,
+                              tmp.trkConfig(),
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              deploy_config,
+                              velocityDeployConfig(),
+                              fixStandConfig(),
+                              ControlMode::StandbyVelocity,
+                              passiveConfig(),
+                              &reference);
+
+  const auto idle_a = transitionReadyTrk(tmp, "background_hold_idle_a.trk", 2, 0.1F);
+  const auto idle_b = transitionReadyTrk(tmp, "background_hold_idle_b.trk", 2, 0.2F);
+  REQUIRE(bridge.configureIdle({idleMotion(idle_a, 2), idleMotion(idle_b, 2)}).ok());
+  loop.tick();
+  loop.tick();
+  loop.tick();
+  REQUIRE(store.snapshot().active.kind == ActiveKind::Idle);
+  advanceBackgroundTransition(loop, store, "idle");
+
+  const auto user_path =
+      transitionReadyTrk(tmp, "background_hold_user.trk", 3, 20.0F);
+  REQUIRE(bridge.submitQueue(
+              executeCommand("background-hold-user", user_path, MotionMode::Queue, 3))
+              .ok());
+
+  loop.tick();
+  for (int i = 0; i < 4; ++i) {
+    const auto running = store.snapshot();
+    if (running.exec.has_value() && running.exec->state == MotionState::Running) {
+      break;
+    }
+    loop.tick();
+  }
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.active.kind == ActiveKind::User);
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->id == "background-hold-user");
+  REQUIRE(snapshot.exec->state == MotionState::Running);
+  REQUIRE(snapshot.exec->frame == 0);
+  REQUIRE_FALSE(snapshot.transition.active);
+  requireCurrentUserFullStartupHold(loop,
+                                    store,
+                                    tracker_policy,
+                                    "background-hold-user",
+                                    20.0F,
+                                    20.1F);
 }
 
 TEST_CASE("RuntimeControlLoop background and idle yaw residual gate reject raw starts user") {
