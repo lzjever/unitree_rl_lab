@@ -6,6 +6,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 
 #include "agentic_et1_tracker/control/fixstand.hpp"
@@ -26,6 +27,12 @@ namespace {
 constexpr const char* kPolicyNotLoadedBlock = "policy_not_loaded";
 constexpr const char* kRobotDisconnectedBlock = "robot_disconnected";
 constexpr double kInternalStandbyMaxTrackDurationS = 5.0;
+constexpr const char* kLocoUpperDeployInvalidBlock = "loco_upper_deploy_invalid";
+constexpr const char* kLocoUpperComposerInvalidBlock = "loco_upper_composer_invalid";
+constexpr const char* kLocoUpperPolicyForbiddenBlock = "loco_upper_policy_forbidden";
+constexpr const char* kLocoUpperPolicyMissingBlock = "loco_upper_policy_missing";
+constexpr const char* kLocoUpperPolicyInvalidBlock = "loco_upper_policy_invalid";
+constexpr const char* kLocoUpperLoadFailedBlock = "loco_upper_load_failed";
 
 enum class FactoryPhase {
   Deploy,
@@ -55,9 +62,10 @@ AppRuntimeFactoryResult notReady(const AppConfig& config,
   return result;
 }
 
-AppRuntimeFactoryResult modelNotReady(const AppConfig& config) {
-  return notReady(config, ErrorCode::ModelNotReady, RobotState::NotReady,
-                  kPolicyNotLoadedBlock, runtimeMode(config));
+AppRuntimeFactoryResult modelNotReady(const AppConfig& config,
+                                      const std::string& block = kPolicyNotLoadedBlock) {
+  return notReady(config, ErrorCode::ModelNotReady, RobotState::NotReady, block,
+                  runtimeMode(config));
 }
 
 AppRuntimeFactoryResult robotDisconnected(const AppConfig& config) {
@@ -101,6 +109,21 @@ bool hasLocoUpperRuntimeDeps(const AppConfig& config, const AppRuntimeDeps& deps
 
 namespace app_internal {
 
+namespace {
+
+void setFailureBlock(std::string* failure_block, const char* block) {
+  if (failure_block != nullptr && failure_block->empty()) {
+    *failure_block = block;
+  }
+}
+
+bool isReadableRegularFile(const std::filesystem::path& path) {
+  std::error_code ec;
+  return std::filesystem::is_regular_file(path, ec) && !ec;
+}
+
+}  // namespace
+
 TrkValidationConfig internalStandbyTrkValidationConfig(
     const AppConfig& config,
     const std::filesystem::path& standby_reference) {
@@ -110,7 +133,9 @@ TrkValidationConfig internalStandbyTrkValidationConfig(
   return trk_config;
 }
 
-void tryAttachLocoUpperDeps(const AppConfig& config, AppRuntimeDeps& deps) {
+void tryAttachLocoUpperDeps(const AppConfig& config,
+                            AppRuntimeDeps& deps,
+                            std::string* failure_block) {
   if (!config.loco_upper.enabled) {
     return;
   }
@@ -128,6 +153,11 @@ void tryAttachLocoUpperDeps(const AppConfig& config, AppRuntimeDeps& deps) {
 
     const std::filesystem::path model_path = locoLowerModelPath(config.loco_upper);
     if (referencesEt1RuntimeDependency(model_path)) {
+      setFailureBlock(failure_block, kLocoUpperPolicyForbiddenBlock);
+      return;
+    }
+    if (!isReadableRegularFile(model_path)) {
+      setFailureBlock(failure_block, kLocoUpperPolicyMissingBlock);
       return;
     }
 
@@ -138,10 +168,18 @@ void tryAttachLocoUpperDeps(const AppConfig& config, AppRuntimeDeps& deps) {
     deps.loco_lower_deploy_config = std::move(loco_lower_deploy_config);
     deps.loco_upper_composer_config = std::move(composer_config);
   } catch (const LocoLowerDeployConfigError&) {
+    setFailureBlock(failure_block, kLocoUpperDeployInvalidBlock);
   } catch (const LocoUpperLowCmdComposerError&) {
+    setFailureBlock(failure_block, kLocoUpperComposerInvalidBlock);
   } catch (const PolicyRuntimeError&) {
+    setFailureBlock(failure_block, kLocoUpperPolicyInvalidBlock);
   } catch (const std::exception&) {
+    setFailureBlock(failure_block, kLocoUpperLoadFailedBlock);
   }
+}
+
+void tryAttachLocoUpperDeps(const AppConfig& config, AppRuntimeDeps& deps) {
+  tryAttachLocoUpperDeps(config, deps, nullptr);
 }
 
 }  // namespace app_internal
@@ -223,6 +261,25 @@ AppRuntimeFactoryResult createAppRuntimeDeps(const AppConfig& config) {
     auto velocity_policy = std::make_unique<OnnxVelocityPolicyRuntime>(
         OnnxVelocityPolicyRuntimeConfig{velocity_model_path, velocity_deploy_config});
 
+    AppRuntimeDeps deps;
+    deps.policy = std::move(policy);
+    deps.velocity_policy = std::move(velocity_policy);
+    deps.deploy_config = std::move(deploy_config);
+    deps.velocity_deploy_config = std::move(velocity_deploy_config);
+    deps.fixstand_config = std::move(fixstand_config);
+    deps.passive_config = std::move(passive_config);
+    deps.startup_control = startupControl(config.control);
+    deps.mode = runtimeMode(config);
+    deps.standby_track = std::move(standby_track);
+    std::string loco_upper_failure_block;
+    app_internal::tryAttachLocoUpperDeps(config, deps, &loco_upper_failure_block);
+    if (!hasLocoUpperRuntimeDeps(config, deps)) {
+      return modelNotReady(config,
+                           loco_upper_failure_block.empty()
+                               ? std::string(kPolicyNotLoadedBlock)
+                               : loco_upper_failure_block);
+    }
+
     phase = FactoryPhase::Robot;
     UnitreeSdkRobotIOConfig robot_config;
     robot_config.network = config.network;
@@ -236,22 +293,7 @@ AppRuntimeFactoryResult createAppRuntimeDeps(const AppConfig& config) {
     robot_config.release_motion_mode_retry_interval_ms =
         config.release_motion_mode_retry_interval_ms;
     auto robot_io = std::make_unique<UnitreeSdkRobotIO>(std::move(robot_config));
-
-    AppRuntimeDeps deps;
     deps.robot_io = std::move(robot_io);
-    deps.policy = std::move(policy);
-    deps.velocity_policy = std::move(velocity_policy);
-    deps.deploy_config = std::move(deploy_config);
-    deps.velocity_deploy_config = std::move(velocity_deploy_config);
-    deps.fixstand_config = std::move(fixstand_config);
-    deps.passive_config = std::move(passive_config);
-    deps.startup_control = startupControl(config.control);
-    deps.mode = runtimeMode(config);
-    deps.standby_track = std::move(standby_track);
-    app_internal::tryAttachLocoUpperDeps(config, deps);
-    if (!hasLocoUpperRuntimeDeps(config, deps)) {
-      return modelNotReady(config);
-    }
 
     AppRuntimeFactoryResult result;
     result.deps.emplace(std::move(deps));

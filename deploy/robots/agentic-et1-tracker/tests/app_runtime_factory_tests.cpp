@@ -24,6 +24,9 @@ TrkValidationConfig internalStandbyTrkValidationConfig(
     const std::filesystem::path& standby_reference);
 bool referencesEt1RuntimeDependency(const std::filesystem::path& path);
 void tryAttachLocoUpperDeps(const AppConfig& config, AppRuntimeDeps& deps);
+void tryAttachLocoUpperDeps(const AppConfig& config,
+                            AppRuntimeDeps& deps,
+                            std::string* failure_block);
 
 }  // namespace app_internal
 namespace {
@@ -302,16 +305,17 @@ AppRuntimeDeps baseDepsForLocoAttach() {
   return deps;
 }
 
-void requireModelNotReady(const AppRuntimeFactoryResult& result) {
+void requireModelNotReady(const AppRuntimeFactoryResult& result,
+                          const std::string& block = "policy_not_loaded") {
   REQUIRE_FALSE(result.deps.has_value());
   REQUIRE(result.snapshot.ready == false);
   REQUIRE(result.snapshot.robot == RobotState::NotReady);
   REQUIRE(result.snapshot.ctrl == ControllerState::Starting);
-  REQUIRE(result.snapshot.block == "policy_not_loaded");
+  REQUIRE(result.snapshot.block == block);
   REQUIRE(result.snapshot.err == ErrorCode::ModelNotReady);
   REQUIRE(result.health.state == ServiceHealth::Starting);
   REQUIRE(result.health.err == ErrorCode::ModelNotReady);
-  REQUIRE(result.health.block == "policy_not_loaded");
+  REQUIRE(result.health.block == block);
 }
 
 void requireMode(const AppRuntimeFactoryResult& result, RuntimeMode mode) {
@@ -613,6 +617,8 @@ TEST_CASE("AppRuntimeFactory loco attach keeps failures isolated from base deps"
   TempTree tmp;
   AppConfig config = realFactoryConfigWithRepoAssets();
   config.loco_upper.enabled = true;
+  config.control.standby_reference =
+      (appRoot() / "config/reference/standby/v0/standby_ref.trk").string();
   config.loco_upper.policy_dir = tmp.policy_dir.string();
   config.loco_upper.policy_file = "loco.onnx";
   config.loco_upper.deploy =
@@ -633,14 +639,31 @@ TEST_CASE("AppRuntimeFactory loco attach keeps failures isolated from base deps"
     REQUIRE(deps.loco_upper_composer_config.has_value());
   }
 
+  SECTION("valid repo loco_upper assets attach all loco deps") {
+    config.loco_upper.policy_dir =
+        (appRoot() / "config/policy/loco_lower/et1_low").string();
+    config.loco_upper.policy_file = "policy.onnx";
+    AppRuntimeDeps deps = baseDepsForLocoAttach();
+    std::string failure_block;
+
+    app_internal::tryAttachLocoUpperDeps(config, deps, &failure_block);
+
+    REQUIRE(failure_block.empty());
+    REQUIRE(deps.loco_lower_policy);
+    REQUIRE(deps.loco_lower_deploy_config.has_value());
+    REQUIRE(deps.loco_upper_composer_config.has_value());
+  }
+
   SECTION("bad model path keeps baseline deps untouched") {
     AppRuntimeDeps deps = baseDepsForLocoAttach();
     RobotIO* const robot = deps.robot_io.get();
     PolicyInference* const policy = deps.policy.get();
     VelocityPolicyInference* const velocity_policy = deps.velocity_policy.get();
+    std::string failure_block;
 
-    app_internal::tryAttachLocoUpperDeps(config, deps);
+    app_internal::tryAttachLocoUpperDeps(config, deps, &failure_block);
 
+    REQUIRE(failure_block == "loco_upper_policy_missing");
     REQUIRE_FALSE(deps.loco_lower_policy);
     REQUIRE_FALSE(deps.loco_lower_deploy_config.has_value());
     REQUIRE_FALSE(deps.loco_upper_composer_config.has_value());
@@ -655,9 +678,11 @@ TEST_CASE("AppRuntimeFactory loco attach keeps failures isolated from base deps"
     RobotIO* const robot = deps.robot_io.get();
     PolicyInference* const policy = deps.policy.get();
     VelocityPolicyInference* const velocity_policy = deps.velocity_policy.get();
+    std::string failure_block;
 
-    app_internal::tryAttachLocoUpperDeps(config, deps);
+    app_internal::tryAttachLocoUpperDeps(config, deps, &failure_block);
 
+    REQUIRE(failure_block == "loco_upper_policy_invalid");
     REQUIRE_FALSE(deps.loco_lower_policy);
     REQUIRE_FALSE(deps.loco_lower_deploy_config.has_value());
     REQUIRE_FALSE(deps.loco_upper_composer_config.has_value());
@@ -673,9 +698,11 @@ TEST_CASE("AppRuntimeFactory loco attach keeps failures isolated from base deps"
     RobotIO* const robot = deps.robot_io.get();
     PolicyInference* const policy = deps.policy.get();
     VelocityPolicyInference* const velocity_policy = deps.velocity_policy.get();
+    std::string failure_block;
 
-    app_internal::tryAttachLocoUpperDeps(config, deps);
+    app_internal::tryAttachLocoUpperDeps(config, deps, &failure_block);
 
+    REQUIRE(failure_block == "loco_upper_composer_invalid");
     REQUIRE_FALSE(deps.loco_lower_policy);
     REQUIRE_FALSE(deps.loco_lower_deploy_config.has_value());
     REQUIRE_FALSE(deps.loco_upper_composer_config.has_value());
@@ -693,6 +720,8 @@ TEST_CASE("AppRuntimeFactory enabled loco_upper asset failures surface as model-
   TempTree tmp;
   AppConfig config = realFactoryConfigWithRepoAssets();
   config.loco_upper.enabled = true;
+  config.control.standby_reference =
+      (appRoot() / "config/reference/standby/v0/standby_ref.trk").string();
   config.loco_upper.policy_dir = tmp.policy_dir.string();
   config.loco_upper.policy_file = "loco.onnx";
   config.loco_upper.deploy =
@@ -705,7 +734,7 @@ TEST_CASE("AppRuntimeFactory enabled loco_upper asset failures surface as model-
   SECTION("missing lower model fails startup") {
     const AppRuntimeFactoryResult result = createAppRuntimeDeps(config);
 
-    requireModelNotReady(result);
+    requireModelNotReady(result, "loco_upper_policy_missing");
     requireMode(result, RuntimeMode::Sim);
   }
 
@@ -714,7 +743,7 @@ TEST_CASE("AppRuntimeFactory enabled loco_upper asset failures surface as model-
 
     const AppRuntimeFactoryResult result = createAppRuntimeDeps(config);
 
-    requireModelNotReady(result);
+    requireModelNotReady(result, "loco_upper_policy_invalid");
     requireMode(result, RuntimeMode::Sim);
   }
 
@@ -724,7 +753,7 @@ TEST_CASE("AppRuntimeFactory enabled loco_upper asset failures surface as model-
 
     const AppRuntimeFactoryResult result = createAppRuntimeDeps(config);
 
-    requireModelNotReady(result);
+    requireModelNotReady(result, "loco_upper_composer_invalid");
     requireMode(result, RuntimeMode::Sim);
   }
 #else

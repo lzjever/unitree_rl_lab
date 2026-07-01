@@ -343,10 +343,6 @@ TEST_CASE("LocoLowerStepRunner injects command and writes lower lowcmd slots") {
   LocoLowerStepRunner runner(config, kExpectedModeMachine);
 
   const VelocityCommand command{0.4F, -0.2F, 0.1F};
-  for (std::size_t step_index = 1; step_index < config.policy_decimation; ++step_index) {
-    const LocoLowerStepResult held = runner.step(low_state, command, policy);
-    REQUIRE_FALSE(held.policy_evaluated);
-  }
   const LocoLowerStepResult step = runner.step(low_state, command, policy);
 
   REQUIRE(policy.calls == 1);
@@ -388,13 +384,6 @@ TEST_CASE("LocoLowerStepRunner honors null action clip contract") {
   policy.raw_actions = Vec(kLocoLowerPolicyJointDim, 2.0F);
   LocoLowerStepRunner runner(config, kExpectedModeMachine);
 
-  for (std::size_t step_index = 1; step_index < config.policy_decimation; ++step_index) {
-    const LocoLowerStepResult held = runner.step(low_state, VelocityCommand{}, policy);
-    REQUIRE_FALSE(held.policy_evaluated);
-    REQUIRE(held.raw_action == Vec(kLocoLowerPolicyJointDim, 0.0F));
-    REQUIRE_FALSE(held.raw_action_clamped);
-    REQUIRE_FALSE(held.action_clamped);
-  }
   const LocoLowerStepResult step = runner.step(low_state, VelocityCommand{}, policy);
 
   REQUIRE(policy.calls == 1);
@@ -423,9 +412,6 @@ TEST_CASE("LocoLowerStepRunner applies configured action clip when present") {
   CaptureLowerPolicy policy;
   policy.raw_actions = Vec(kLocoLowerPolicyJointDim, 2.0F);
   LocoLowerStepRunner runner(config, kExpectedModeMachine);
-  for (std::size_t step_index = 1; step_index < config.policy_decimation; ++step_index) {
-    (void)runner.step(low_state, VelocityCommand{}, policy);
-  }
   const LocoLowerStepResult step = runner.step(low_state, VelocityCommand{}, policy);
 
   REQUIRE(config.action_clip.has_value());
@@ -451,12 +437,6 @@ TEST_CASE("LocoLowerStepRunner clamps command ranges before policy inputs") {
     CaptureLowerPolicy policy;
     LocoLowerStepRunner runner(config, kExpectedModeMachine);
     const VelocityCommand command{0.4F, -0.2F, 0.1F};
-    for (std::size_t step_index = 1; step_index < config.policy_decimation; ++step_index) {
-      const LocoLowerStepResult held = runner.step(low_state, command, policy);
-      REQUIRE_FALSE(held.policy_evaluated);
-      REQUIRE_FALSE(held.command_clamped);
-    }
-
     const LocoLowerStepResult step = runner.step(low_state, command, policy);
 
     REQUIRE(step.command_clamped == false);
@@ -472,12 +452,6 @@ TEST_CASE("LocoLowerStepRunner clamps command ranges before policy inputs") {
     CaptureLowerPolicy policy;
     LocoLowerStepRunner runner(config, kExpectedModeMachine);
     const VelocityCommand command{0.75F, -0.25F, 0.6F};
-    for (std::size_t step_index = 1; step_index < config.policy_decimation; ++step_index) {
-      const LocoLowerStepResult held = runner.step(low_state, command, policy);
-      REQUIRE_FALSE(held.policy_evaluated);
-      REQUIRE(held.command_clamped);
-    }
-
     const LocoLowerStepResult step = runner.step(low_state, command, policy);
 
     REQUIRE(step.command_clamped == true);
@@ -507,49 +481,46 @@ TEST_CASE("LocoLowerLowCmdFrame rejects duplicate SDK slots before writing") {
   REQUIRE(base.motors.at(0).kp == 456.0F);
 }
 
-TEST_CASE("LocoLowerStepRunner reset aligns decimation phase with held zeros") {
+TEST_CASE("LocoLowerStepRunner explicitly holds last evaluated lower action") {
   const LocoLowerDeployConfig config = loadLocoLowerDeployConfig(repoFile(
       "config/policy/loco_lower/et1_low/params/deploy_lowobs10k.yaml"));
   const LowStateSample low_state = readyLowState(config);
   CaptureLowerPolicy policy;
   LocoLowerStepRunner runner(config, kExpectedModeMachine);
 
-  for (std::size_t step_index = 1; step_index < config.policy_decimation; ++step_index) {
-    const LocoLowerStepResult held = runner.step(low_state, VelocityCommand{}, policy);
-    CAPTURE(step_index);
-    REQUIRE(policy.calls == 0);
-    REQUIRE(held.raw_action == Vec(kLocoLowerPolicyJointDim, 0.0F));
-    REQUIRE_FALSE(held.policy_evaluated);
-    REQUIRE(policy.inputs_seen.empty());
-  }
+  const LocoLowerStepResult held_before_first =
+      runner.step(low_state, VelocityCommand{}, policy, nullptr, false);
+  REQUIRE(policy.calls == 0);
+  REQUIRE(held_before_first.raw_action == Vec(kLocoLowerPolicyJointDim, 0.0F));
+  REQUIRE_FALSE(held_before_first.policy_evaluated);
+
   const LocoLowerStepResult first = runner.step(low_state, VelocityCommand{}, policy);
   REQUIRE(first.policy_evaluated == true);
   REQUIRE(policy.calls == 1);
   for (std::size_t i = 0; i < kLocoLowerPolicyJointDim; ++i) {
     REQUIRE(policy.inputs_seen.back().obs.at(lastActionObsOffset() + i) == 0.0F);
   }
+
   policy.raw_actions = Vec(kLocoLowerPolicyJointDim, -0.5F);
-  for (std::size_t step_index = 1; step_index < config.policy_decimation; ++step_index) {
-    const LocoLowerStepResult held = runner.step(low_state, VelocityCommand{}, policy);
-    REQUIRE(policy.calls == 1);
-    REQUIRE(held.raw_action == first.raw_action);
-    REQUIRE(held.policy_evaluated == false);
-  }
-  const LocoLowerStepResult decimated = runner.step(low_state, VelocityCommand{}, policy);
+  const LocoLowerStepResult held =
+      runner.step(low_state, VelocityCommand{}, policy, nullptr, false);
+  REQUIRE(policy.calls == 1);
+  REQUIRE(held.raw_action == first.raw_action);
+  REQUIRE_FALSE(held.policy_evaluated);
+
+  const LocoLowerStepResult second = runner.step(low_state, VelocityCommand{}, policy);
   REQUIRE(policy.calls == 2);
-  REQUIRE(decimated.policy_evaluated == true);
-  REQUIRE(decimated.raw_action == Vec(kLocoLowerPolicyJointDim, -0.5F));
+  REQUIRE(second.policy_evaluated == true);
+  REQUIRE(second.raw_action == Vec(kLocoLowerPolicyJointDim, -0.5F));
 
   runner.reset();
-  for (std::size_t step_index = 1; step_index < config.policy_decimation; ++step_index) {
-    const LocoLowerStepResult held = runner.step(low_state, VelocityCommand{}, policy);
-    CAPTURE(step_index);
-    REQUIRE(policy.calls == 2);
-    REQUIRE(held.raw_action == Vec(kLocoLowerPolicyJointDim, 0.0F));
-    REQUIRE_FALSE(held.policy_evaluated);
-  }
-  const LocoLowerStepResult after_reset =
-      runner.step(low_state, VelocityCommand{}, policy);
+  const LocoLowerStepResult held_after_reset =
+      runner.step(low_state, VelocityCommand{}, policy, nullptr, false);
+  REQUIRE(policy.calls == 2);
+  REQUIRE(held_after_reset.raw_action == Vec(kLocoLowerPolicyJointDim, 0.0F));
+  REQUIRE_FALSE(held_after_reset.policy_evaluated);
+
+  const LocoLowerStepResult after_reset = runner.step(low_state, VelocityCommand{}, policy);
 
   REQUIRE(policy.calls == 3);
   REQUIRE(after_reset.policy_evaluated == true);

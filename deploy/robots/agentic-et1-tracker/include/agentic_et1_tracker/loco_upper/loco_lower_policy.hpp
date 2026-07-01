@@ -88,14 +88,14 @@ class LocoLowerStepRunner {
   LocoLowerStepResult step(const LowStateSample& low_state,
                            VelocityCommand command,
                            VelocityPolicyInference& policy,
-                           const LowCmdFrame* base_frame = nullptr);
+                           const LowCmdFrame* base_frame = nullptr,
+                           bool evaluate_policy = true);
 
  private:
   LocoLowerDeployConfig config_;
   std::uint8_t expected_mode_machine_{0};
   Vec last_action_;
   Vec held_raw_action_;
-  std::size_t tick_{0};
 };
 
 [[nodiscard]] LocoLowerDeployConfig loadLocoLowerDeployConfig(

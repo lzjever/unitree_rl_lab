@@ -1348,7 +1348,6 @@ void requireUserTransitionStatus(const RuntimeStatusStore& store,
 void requireNoActiveWorkOrBackground(const RuntimeStatusStore& store) {
   const auto snapshot = store.snapshot();
   REQUIRE(snapshot.active.kind == ActiveKind::None);
-  REQUIRE_FALSE(snapshot.idle.enabled);
   REQUIRE_FALSE(snapshot.idle.active);
   REQUIRE_FALSE(snapshot.transition.active);
   REQUIRE_FALSE(snapshot.exec.has_value());
@@ -6662,7 +6661,6 @@ TEST_CASE("RuntimeControlLoop loco_upper entry handoff starts lower target from 
   RuntimeBridge bridge(config, store);
   const DeployConfig deploy_config = deployConfig();
   LocoLowerDeployConfig loco_lower_config = locoLowerDeployConfig();
-  loco_lower_config.policy_decimation = 2;
   const LowStateSample entry_low_state = readyLowState(deploy_config);
   FakeRobotIO robot(entry_low_state);
   FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
@@ -6694,23 +6692,23 @@ TEST_CASE("RuntimeControlLoop loco_upper entry handoff starts lower target from 
   REQUIRE(robot.writes.empty());
 
   loop.tick();
-  REQUIRE(loco_lower_policy.calls == 0);
+  REQUIRE(loco_lower_policy.calls == 1);
   REQUIRE(robot.writes.size() == 1);
   requireLocoLowerEntryHandoffFrame(robot.writes.back(),
                                     loco_lower_config,
                                     entry_low_state,
-                                    Vec(kLocoLowerPolicyJointDim, 0.0F),
+                                    loco_lower_policy.next_raw,
                                     0.0F);
+  const Vec first_obs = loco_lower_policy.inputs_seen.back().obs;
 
   loop.tick();
-  REQUIRE(loco_lower_policy.calls == 1);
+  REQUIRE(loco_lower_policy.calls == 2);
   REQUIRE(robot.writes.size() == 2);
   requireLocoLowerEntryHandoffFrame(robot.writes.back(),
                                     loco_lower_config,
                                     entry_low_state,
                                     loco_lower_policy.next_raw,
                                     0.5F);
-  const Vec& first_obs = loco_lower_policy.inputs_seen.back().obs;
   REQUIRE(first_obs.at(6) == 0.0F);
   REQUIRE(first_obs.at(7) == 0.0F);
   REQUIRE(first_obs.at(8) == 0.0F);
@@ -6720,7 +6718,7 @@ TEST_CASE("RuntimeControlLoop loco_upper entry handoff starts lower target from 
   }
 }
 
-TEST_CASE("RuntimeControlLoop loco_upper lower controller runs at runtime tick through decimation") {
+TEST_CASE("RuntimeControlLoop loco_upper lower controller uses deploy step_dt cadence") {
   TempTree tmp;
   RuntimeConfig config = runtimeConfig();
   config.hz = 1000.0;
@@ -6759,14 +6757,95 @@ TEST_CASE("RuntimeControlLoop loco_upper lower controller runs at runtime tick t
   REQUIRE(store.snapshot().exec->loco.phase == LocoPhase::Entry);
   REQUIRE(robot.write_attempts == 0);
 
-  for (int i = 0; i < 20; ++i) {
+  for (int i = 0; i < 10; ++i) {
     loop.tick();
   }
 
   REQUIRE(store.snapshot().exec.has_value());
   REQUIRE(store.snapshot().exec->loco.phase == LocoPhase::Entry);
+  REQUIRE(robot.write_attempts == 10);
+  REQUIRE(loco_lower_policy.calls == 1);
+  requireLocoLowerEntryHandoffFrame(robot.writes.back(),
+                                    loco_lower_config,
+                                    *robot.low_state,
+                                    loco_lower_policy.next_raw,
+                                    9.0F / 39.0F);
+
+  for (int i = 0; i < 10; ++i) {
+    loop.tick();
+  }
+
   REQUIRE(robot.write_attempts == 20);
+  REQUIRE(loco_lower_policy.calls == 1);
+
+  loop.tick();
+  REQUIRE(robot.write_attempts == 21);
   REQUIRE(loco_lower_policy.calls == 2);
+}
+
+TEST_CASE("RuntimeControlLoop loco_upper lower controller preserves fractional step_dt cadence") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.hz = 60.0;
+  config.transition_duration_s = 2.0;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  LocoLowerDeployConfig loco_lower_config = locoLowerDeployConfig();
+  loco_lower_config.step_dt = 0.02;
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.5F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy,
+                                  deploy_config,
+                                  velocityDeployConfig(),
+                                  fixStandConfig(),
+                                  ControlMode::StandbyVelocity,
+                                  passiveConfig(),
+                                  loco_lower_config);
+
+  const auto path = identityQuaternionTrk(tmp, "loco_fractional_lower_step_dt.trk", 4);
+  REQUIRE(bridge.submitQueue(
+              locoUpperCommand("loco-fractional-lower-step-dt",
+                               path,
+                               MotionMode::Queue,
+                               4))
+              .ok());
+
+  loop.tick();
+  REQUIRE(store.snapshot().exec.has_value());
+  REQUIRE(store.snapshot().exec->loco.phase == LocoPhase::Entry);
+  REQUIRE(robot.write_attempts == 0);
+
+  loop.tick();
+  REQUIRE(robot.write_attempts == 1);
+  REQUIRE(loco_lower_policy.calls == 1);
+
+  loop.tick();
+  REQUIRE(robot.write_attempts == 2);
+  REQUIRE(loco_lower_policy.calls == 1);
+
+  for (int i = 0; i < 4; ++i) {
+    loop.tick();
+  }
+  REQUIRE(robot.write_attempts == 6);
+  REQUIRE(loco_lower_policy.calls == 5);
+
+  for (int i = 0; i < 54; ++i) {
+    loop.tick();
+  }
+  REQUIRE(store.snapshot().exec.has_value());
+  REQUIRE(store.snapshot().exec->loco.phase == LocoPhase::Entry);
+  REQUIRE(robot.write_attempts == 60);
+  REQUIRE(loco_lower_policy.calls == 50);
 }
 
 TEST_CASE("RuntimeControlLoop loco_upper motion writes every runtime tick while frame advances at track fps") {
@@ -8568,7 +8647,8 @@ TEST_CASE("RuntimeControlLoop idle to idle transition build failure does not sti
     REQUIRE(store.findRun(idle_a.string()).code == ErrorCode::RunNotFound);
     REQUIRE(store.findRun(idle_bad.string()).code == ErrorCode::RunNotFound);
     if (snapshot.active.kind == ActiveKind::None) {
-      REQUIRE_FALSE(snapshot.idle.enabled);
+      REQUIRE(snapshot.idle.enabled);
+      REQUIRE(snapshot.idle.n == 2);
       REQUIRE_FALSE(snapshot.idle.active);
       stopped_idle = true;
       break;
@@ -8578,9 +8658,10 @@ TEST_CASE("RuntimeControlLoop idle to idle transition build failure does not sti
 
   loop.tick();
   const auto next = store.snapshot();
-  REQUIRE(next.active.kind == ActiveKind::None);
-  REQUIRE_FALSE(next.idle.enabled);
-  REQUIRE_FALSE(next.idle.active);
+  REQUIRE(next.active.kind == ActiveKind::Idle);
+  REQUIRE(next.idle.enabled);
+  REQUIRE(next.idle.n == 2);
+  REQUIRE(next.idle.active);
   REQUIRE_FALSE(next.transition.active);
   REQUIRE_FALSE(next.exec.has_value());
 }
@@ -8642,6 +8723,52 @@ TEST_CASE("RuntimeControlLoop stop clears consumed inactive idle config") {
   REQUIRE(snapshot.active.kind == ActiveKind::None);
   REQUIRE(snapshot.queue.ids.empty());
   REQUIRE_FALSE(snapshot.exec.has_value());
+}
+
+TEST_CASE("RuntimeControlLoop idle empty config clears active idle") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  auto loop = makeControlLoop(config,
+                              bridge,
+                              store,
+                              tmp.trkConfig(),
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              deploy_config,
+                              velocity_config,
+                              fixstand_config,
+                              ControlMode::StandbyVelocity);
+
+  const auto idle_path = validTrk(tmp, "empty_config_clears_idle.trk", 3);
+  REQUIRE(bridge.configureIdle({idleMotion(idle_path, 3)}).ok());
+  loop.tick();
+  loop.tick();
+  loop.tick();
+  REQUIRE(store.snapshot().active.kind == ActiveKind::Idle);
+  REQUIRE(store.snapshot().idle.enabled);
+  REQUIRE(store.snapshot().idle.active);
+
+  REQUIRE(bridge.configureIdle({}).ok());
+  loop.tick();
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::StandbyVelocity);
+  REQUIRE(snapshot.active.kind == ActiveKind::None);
+  REQUIRE_FALSE(snapshot.idle.enabled);
+  REQUIRE(snapshot.idle.n == 0);
+  REQUIRE_FALSE(snapshot.idle.active);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.queue.ids.empty());
+  REQUIRE(store.findRun(idle_path.string()).code == ErrorCode::RunNotFound);
 }
 
 TEST_CASE("RuntimeControlLoop rereads safety before auto-starting idle") {
@@ -8936,7 +9063,7 @@ TEST_CASE("RuntimeControlLoop failed queue preempt of standby playback drops bac
   requireNoActiveWorkOrBackground(store);
 }
 
-TEST_CASE("RuntimeControlLoop failed queue preempt of idle transition drops background",
+TEST_CASE("RuntimeControlLoop failed queue preempt of idle transition preserves idle config",
           "[runtime-p1]") {
   TempTree tmp;
   const RuntimeConfig config = runtimeConfig();
@@ -8967,7 +9094,12 @@ TEST_CASE("RuntimeControlLoop failed queue preempt of idle transition drops back
   REQUIRE(failed.run->stop_reason == StopReason::None);
 
   loop.tick();
-  requireNoActiveWorkOrBackground(store);
+  const auto resumed = store.snapshot();
+  REQUIRE(resumed.active.kind == ActiveKind::Idle);
+  REQUIRE(resumed.idle.enabled);
+  REQUIRE(resumed.idle.active);
+  REQUIRE_FALSE(resumed.transition.active);
+  REQUIRE_FALSE(resumed.exec.has_value());
 }
 
 TEST_CASE("RuntimeControlLoop interrupt preempts background transition and playback from current reference",
@@ -9118,6 +9250,8 @@ TEST_CASE("RuntimeControlLoop idle to user benign transition reject raw starts u
   REQUIRE(snapshot.exec->state == MotionState::Running);
   REQUIRE(snapshot.exec->frame == 0);
   REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE(snapshot.idle.enabled);
+  REQUIRE(snapshot.idle.n == 1);
   REQUIRE_FALSE(snapshot.idle.active);
   REQUIRE(snapshot.queue.ids.empty());
   REQUIRE(store.findRun("idle-cap-bridge-user").run->state == MotionState::Running);
@@ -9276,6 +9410,8 @@ TEST_CASE("RuntimeControlLoop background and idle yaw residual gate reject raw s
     REQUIRE(snapshot.exec->id == "idle-yaw-residual-user");
     REQUIRE(snapshot.exec->state == MotionState::Running);
     REQUIRE_FALSE(snapshot.transition.active);
+    REQUIRE(snapshot.idle.enabled);
+    REQUIRE(snapshot.idle.n == 1);
     REQUIRE_FALSE(snapshot.idle.active);
     REQUIRE(store.findRun("idle-yaw-residual-user").run->state == MotionState::Running);
   }
@@ -9318,7 +9454,51 @@ TEST_CASE("RuntimeControlLoop background and idle yaw residual gate reject raw s
   }
 }
 
-TEST_CASE("RuntimeControlLoop idle to user transition target load failure publishes user failed") {
+TEST_CASE("RuntimeControlLoop idle interrupt raw start preserves idle config") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  RuntimeControlLoop loop(config, bridge, store, TrkLoader(tmp.trkConfig()), &reference);
+
+  const auto idle_path = transitionReadyTrk(tmp, "idle_interrupt_yaw_source.trk", 3);
+  REQUIRE(bridge.configureIdle({idleMotion(idle_path, 3)}).ok());
+  loop.tick();
+  loop.tick();
+  loop.tick();
+  REQUIRE(store.snapshot().active.kind == ActiveKind::Idle);
+
+  const auto user_path = transitionReadyTrk(tmp, "idle_interrupt_yaw_user.trk", 3);
+  REQUIRE(bridge.submitInterrupt(
+              executeCommand("idle-interrupt-yaw-user",
+                             user_path,
+                             MotionMode::Interrupt,
+                             3))
+              .ok());
+  loop.forceNextRootYawResidualForTest(0.06);
+  loop.tick();
+  for (int i = 0; i < 4; ++i) {
+    const auto running = store.snapshot();
+    if (running.exec.has_value() && running.exec->state == MotionState::Running) {
+      break;
+    }
+    loop.tick();
+  }
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.active.kind == ActiveKind::User);
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->id == "idle-interrupt-yaw-user");
+  REQUIRE(snapshot.exec->state == MotionState::Running);
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE(snapshot.idle.enabled);
+  REQUIRE(snapshot.idle.n == 1);
+  REQUIRE_FALSE(snapshot.idle.active);
+  REQUIRE(store.findRun("idle-interrupt-yaw-user").run->state == MotionState::Running);
+}
+
+TEST_CASE("RuntimeControlLoop idle to user transition target failure preserves idle config") {
   TempTree tmp;
   const RuntimeConfig config = runtimeConfig();
   const DeployConfig deploy_config = deployConfig();
@@ -9357,6 +9537,9 @@ TEST_CASE("RuntimeControlLoop idle to user transition target load failure publis
 
   const auto snapshot = store.snapshot();
   REQUIRE(snapshot.active.kind == ActiveKind::None);
+  REQUIRE(snapshot.idle.enabled);
+  REQUIRE(snapshot.idle.n == 1);
+  REQUIRE_FALSE(snapshot.idle.active);
   REQUIRE_FALSE(snapshot.transition.active);
   REQUIRE_FALSE(snapshot.exec.has_value());
   const auto failed = store.findRun("bad-user");
@@ -9368,14 +9551,15 @@ TEST_CASE("RuntimeControlLoop idle to user transition target load failure publis
 
   loop.tick();
   const auto next = store.snapshot();
-  REQUIRE(next.active.kind == ActiveKind::None);
-  REQUIRE_FALSE(next.idle.enabled);
-  REQUIRE_FALSE(next.idle.active);
+  REQUIRE(next.active.kind == ActiveKind::Idle);
+  REQUIRE(next.idle.enabled);
+  REQUIRE(next.idle.n == 1);
+  REQUIRE(next.idle.active);
   REQUIRE_FALSE(next.transition.active);
   REQUIRE_FALSE(next.exec.has_value());
 }
 
-TEST_CASE("RuntimeControlLoop idle to user transition interrupt failure does not resume idle") {
+TEST_CASE("RuntimeControlLoop idle to user transition interrupt failure preserves idle config") {
   TempTree tmp;
   const RuntimeConfig config = runtimeConfig();
   const DeployConfig deploy_config = deployConfig();
@@ -9418,9 +9602,10 @@ TEST_CASE("RuntimeControlLoop idle to user transition interrupt failure does not
   loop.tick();
 
   auto snapshot = store.snapshot();
-  REQUIRE(snapshot.active.kind == ActiveKind::None);
-  REQUIRE_FALSE(snapshot.idle.enabled);
-  REQUIRE_FALSE(snapshot.idle.active);
+  REQUIRE(snapshot.active.kind == ActiveKind::Idle);
+  REQUIRE(snapshot.idle.enabled);
+  REQUIRE(snapshot.idle.n == 1);
+  REQUIRE(snapshot.idle.active);
   REQUIRE_FALSE(snapshot.transition.active);
   REQUIRE_FALSE(snapshot.exec.has_value());
   const auto failed = store.findRun("bad-interrupt-user");
@@ -9432,9 +9617,10 @@ TEST_CASE("RuntimeControlLoop idle to user transition interrupt failure does not
 
   loop.tick();
   snapshot = store.snapshot();
-  REQUIRE(snapshot.active.kind == ActiveKind::None);
-  REQUIRE_FALSE(snapshot.idle.enabled);
-  REQUIRE_FALSE(snapshot.idle.active);
+  REQUIRE(snapshot.active.kind == ActiveKind::Idle);
+  REQUIRE(snapshot.idle.enabled);
+  REQUIRE(snapshot.idle.n == 1);
+  REQUIRE(snapshot.idle.active);
   REQUIRE_FALSE(snapshot.transition.active);
   REQUIRE_FALSE(snapshot.exec.has_value());
 }
@@ -9479,6 +9665,9 @@ TEST_CASE("RuntimeControlLoop invalid transition duration safely fails idle to u
 
   const auto snapshot = store.snapshot();
   REQUIRE(snapshot.active.kind == ActiveKind::None);
+  REQUIRE(snapshot.idle.enabled);
+  REQUIRE(snapshot.idle.n == 1);
+  REQUIRE_FALSE(snapshot.idle.active);
   REQUIRE_FALSE(snapshot.transition.active);
   REQUIRE_FALSE(snapshot.exec.has_value());
   const auto failed = store.findRun("duration-invalid-user");
@@ -9490,9 +9679,10 @@ TEST_CASE("RuntimeControlLoop invalid transition duration safely fails idle to u
 
   loop.tick();
   const auto next = store.snapshot();
-  REQUIRE(next.active.kind == ActiveKind::None);
-  REQUIRE_FALSE(next.idle.enabled);
-  REQUIRE_FALSE(next.idle.active);
+  REQUIRE(next.active.kind == ActiveKind::Idle);
+  REQUIRE(next.idle.enabled);
+  REQUIRE(next.idle.n == 1);
+  REQUIRE(next.idle.active);
   REQUIRE_FALSE(next.transition.active);
   REQUIRE_FALSE(next.exec.has_value());
 }
@@ -9746,14 +9936,13 @@ TEST_CASE("RuntimeControlLoop standby velocity with loco runtime still uses lega
                                     0.0F);
 }
 
-TEST_CASE("RuntimeControlLoop standby to loco_upper resets lower last_action before decimated first eval") {
+TEST_CASE("RuntimeControlLoop standby to loco_upper resets lower last_action before first eval") {
   TempTree tmp;
   RuntimeConfig config = runtimeConfig();
   config.transition_duration_s = 0.06;
   const DeployConfig deploy_config = deployConfig();
   const VelocityDeployConfig velocity_config = velocityDeployConfig();
   LocoLowerDeployConfig loco_lower_config = locoLowerDeployConfig();
-  loco_lower_config.policy_decimation = 10;
   const LocoUpperLowCmdComposerConfig composer_config = locoUpperComposerConfig();
   const FixStandConfig fixstand_config = fixStandConfig();
   RuntimeStatusStore store(config);
@@ -9785,9 +9974,9 @@ TEST_CASE("RuntimeControlLoop standby to loco_upper resets lower last_action bef
   applyLowCmdPositionToLowState(standby_frame, *robot.low_state);
   const LowStateSample standby_low_state = *robot.low_state;
 
-  const auto path = identityQuaternionTrk(tmp, "loco_after_standby_decimated_lower.trk", 4);
+  const auto path = identityQuaternionTrk(tmp, "loco_after_standby_first_lower.trk", 4);
   REQUIRE(bridge.submitQueue(
-              locoUpperCommand("loco-after-standby-decimated-lower", path, MotionMode::Queue, 4))
+              locoUpperCommand("loco-after-standby-first-lower", path, MotionMode::Queue, 4))
               .ok());
 
   loop.tick();
@@ -9796,16 +9985,18 @@ TEST_CASE("RuntimeControlLoop standby to loco_upper resets lower last_action bef
   REQUIRE(robot.write_attempts == 1);
 
   loop.tick();
-  REQUIRE(loco_lower_policy.calls == 0);
+  REQUIRE(loco_lower_policy.calls == 1);
   REQUIRE(robot.write_attempts == 2);
   requireLocoLowerEntryHandoffFrame(robot.writes.back(),
                                     loco_lower_config,
                                     standby_low_state,
-                                    Vec(kLocoLowerPolicyJointDim, 0.0F),
+                                    loco_lower_policy.next_raw,
                                     0.0F);
+  REQUIRE(loco_lower_policy.inputs_seen.back().obs.at(
+              kLocoLowerPolicyObsRowWidth - kLocoLowerPolicyJointDim) == 0.0F);
 
   loop.tick();
-  REQUIRE(loco_lower_policy.calls == 0);
+  REQUIRE(loco_lower_policy.calls == 2);
   REQUIRE(robot.write_attempts == 3);
 }
 

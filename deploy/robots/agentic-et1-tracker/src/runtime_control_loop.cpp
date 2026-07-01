@@ -776,12 +776,7 @@ bool RuntimeControlLoop::consumePendingCommands() {
             startTransitionFromCurrentReferenceToUser(std::move(command->request),
                                                       StopReason::None);
           } else {
-            const bool preempted_idle_background =
-                transition_ && transition_->target_kind == TransitionTargetKind::Idle;
             abortTransition(MotionState::Canceled, StopReason::None, ErrorCode::Ok);
-            if (preempted_idle_background) {
-              clearIdleConfig();
-            }
             enterGeneralTrackerIdleState();
             waiting_.push_back(std::move(command->request));
           }
@@ -830,8 +825,7 @@ void RuntimeControlLoop::consumeStoppingCommands() {
 
 void RuntimeControlLoop::handleStop(std::uint64_t sequence, bool requires_stopping) {
   cancelWaiting(StopReason::Stop, sequence);
-  idle_config_.clear();
-  idle_next_index_ = 0;
+  clearIdleConfig();
   if (fsm_state_ == RuntimeInternalState::Fault) {
     return;
   }
@@ -891,9 +885,7 @@ void RuntimeControlLoop::handleStop(std::uint64_t sequence, bool requires_stoppi
 void RuntimeControlLoop::handleControl(ControlMode mode) {
   if (mode == ControlMode::Passive) {
     cancelWaiting(StopReason::Stop);
-    idle_config_.clear();
-    idle_next_index_ = 0;
-    idle_current_index_.reset();
+    clearIdleConfig();
     if (active_kind_ == ActiveKind::Idle) {
       stopIdleActive();
     } else if (active_kind_ == ActiveKind::Transition) {
@@ -1003,7 +995,7 @@ void RuntimeControlLoop::handleIdleConfig(std::vector<IdleMotion> motions) {
   idle_config_ = std::move(motions);
   idle_next_index_ = 0;
   if (idle_config_.empty()) {
-    idle_current_index_.reset();
+    clearIdleConfig();
     return;
   }
   if (isMotionAcceptingState()) {
@@ -1025,12 +1017,7 @@ void RuntimeControlLoop::handleInterrupt(MotionRequest request) {
     if (isGeneralTrackerRequest(request)) {
       startTransitionFromCurrentReferenceToUser(std::move(request), replaced_reason);
     } else {
-      const bool preempted_idle_background =
-          transition_ && transition_->target_kind == TransitionTargetKind::Idle;
       abortTransition(MotionState::Canceled, replaced_reason, ErrorCode::Ok);
-      if (preempted_idle_background) {
-        clearIdleConfig();
-      }
       enterGeneralTrackerIdleState();
       waiting_.push_back(std::move(request));
     }
@@ -1558,6 +1545,7 @@ bool RuntimeControlLoop::prepareLocoUpperTrack(MotionRequest& request) {
   runtime.upper_clamped = compiled.flags.upper_clamped;
   runtime.upper_rate_limited = compiled.flags.upper_rate_limited;
   runtime.lower_runner.emplace(*loco_lower_deploy_config_, expected_mode_machine_);
+  resetLocoLowerPolicyTiming();
   if (compiled.plan.frame_count == 0 ||
       runtime.commands_body.size() != compiled.plan.frame_count ||
       runtime.upper_frames.size() != compiled.plan.frame_count) {
@@ -1653,13 +1641,11 @@ bool RuntimeControlLoop::startTransitionFromIdleToUser(MotionRequest target_requ
     if (active_kind_ == ActiveKind::Idle) {
       stopIdleActive();
     }
-    clearIdleConfig();
   };
   auto startWithoutTransition = [this](MotionRequest request) {
     if (active_kind_ == ActiveKind::Idle) {
       stopIdleActive();
     }
-    clearIdleConfig();
     active_ = std::move(request);
     active_kind_ = ActiveKind::User;
     idle_current_index_.reset();
@@ -1756,7 +1742,6 @@ bool RuntimeControlLoop::startTransitionFromIdleToUser(MotionRequest target_requ
     if (active_kind_ == ActiveKind::Idle) {
       stopIdleActive();
     }
-    clearIdleConfig();
   }
   return true;
 }
@@ -2432,10 +2417,12 @@ bool RuntimeControlLoop::writeLocoUpperStep(
   LocoLowerStepResult lower;
   LocoUpperLowCmdComposeResult composed;
   try {
+    const bool lower_policy_due = consumeLocoLowerPolicyDue();
     lower = loco_upper_->lower_runner->step(*low_state,
                                             command,
                                             *loco_lower_policy_,
-                                            lowCmdBaseFrame());
+                                            lowCmdBaseFrame(),
+                                            lower_policy_due);
     LowCmdFrame lower_frame = lower.low_cmd;
     if (lower_entry_alpha.has_value()) {
       applyLocoUpperLowerEntryInterpolation(*loco_lower_deploy_config_,
@@ -3168,13 +3155,8 @@ bool RuntimeControlLoop::startTransitionFromCurrentReferenceToUser(
     return false;
   }
 
-  const bool preempted_idle_background =
-      transition_ && transition_->target_kind == TransitionTargetKind::Idle;
-  auto abortPreemptedTransition = [this, replaced_reason, preempted_idle_background] {
+  auto abortPreemptedTransition = [this, replaced_reason] {
     abortTransition(MotionState::Canceled, replaced_reason, ErrorCode::Ok);
-    if (preempted_idle_background) {
-      clearIdleConfig();
-    }
     enterGeneralTrackerIdleState();
   };
 
@@ -3305,9 +3287,6 @@ bool RuntimeControlLoop::startTransitionFromCurrentReferenceToUser(
                                                std::move(entry_low_state));
   if (!started) {
     abortTransition(MotionState::Canceled, replaced_reason, ErrorCode::Ok);
-    if (preempted_idle_background) {
-      clearIdleConfig();
-    }
   }
   return true;
 }
@@ -3321,7 +3300,6 @@ bool RuntimeControlLoop::startTransitionFromCompletedIdleToIdle() {
   const std::optional<TrkFrameView> source_frame = active_track_->frame(active_->frame);
   if (!source_frame) {
     stopIdleActive();
-    clearIdleConfig();
     return true;
   }
 
@@ -3336,7 +3314,6 @@ bool RuntimeControlLoop::startTransitionFromCompletedIdleToIdle() {
     if (active_kind_ == ActiveKind::Idle) {
       stopIdleActive();
     }
-    clearIdleConfig();
   };
 
   TrkLoadResult loaded = loader_.load(motion.path);
@@ -3418,7 +3395,6 @@ bool RuntimeControlLoop::startTransitionFromCompletedIdleToIdle() {
     if (active_kind_ == ActiveKind::Idle) {
       stopIdleActive();
     }
-    clearIdleConfig();
   }
   return true;
 }
@@ -4758,6 +4734,38 @@ bool RuntimeControlLoop::consumeGeneralTrackerPolicyDue() {
     general_tracker_next_policy_time_s_ += step_dt;
   }
   general_tracker_policy_phase_s_ += runtime_dt;
+  return due;
+}
+
+double RuntimeControlLoop::locoLowerPolicyStepDt() const {
+  if (loco_lower_deploy_config_ &&
+      std::isfinite(loco_lower_deploy_config_->step_dt) &&
+      loco_lower_deploy_config_->step_dt > 0.0) {
+    return loco_lower_deploy_config_->step_dt;
+  }
+  if (std::isfinite(config_.hz) && config_.hz > 0.0) {
+    return 1.0 / config_.hz;
+  }
+  return 0.02;
+}
+
+void RuntimeControlLoop::resetLocoLowerPolicyTiming() {
+  loco_lower_policy_phase_s_ = 0.0;
+  loco_lower_next_policy_time_s_ = 0.0;
+}
+
+bool RuntimeControlLoop::consumeLocoLowerPolicyDue() {
+  const double step_dt = locoLowerPolicyStepDt();
+  const double runtime_dt =
+      std::isfinite(config_.hz) && config_.hz > 0.0 ? 1.0 / config_.hz : step_dt;
+  constexpr double kPhaseEpsilon = 1.0e-12;
+  const bool due =
+      loco_lower_policy_phase_s_ + kPhaseEpsilon >=
+      loco_lower_next_policy_time_s_;
+  if (due) {
+    loco_lower_next_policy_time_s_ += step_dt;
+  }
+  loco_lower_policy_phase_s_ += runtime_dt;
   return due;
 }
 

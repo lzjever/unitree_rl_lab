@@ -713,22 +713,19 @@ LocoLowerStepRunner::LocoLowerStepRunner(LocoLowerDeployConfig config,
 void LocoLowerStepRunner::reset() {
   last_action_ = Vec(kLocoLowerPolicyJointDim, 0.0F);
   held_raw_action_ = Vec(kLocoLowerPolicyJointDim, 0.0F);
-  tick_ = 0;
 }
 
 LocoLowerStepResult LocoLowerStepRunner::step(const LowStateSample& low_state,
                                               VelocityCommand command,
                                               VelocityPolicyInference& policy,
-                                              const LowCmdFrame* base_frame) {
+                                              const LowCmdFrame* base_frame,
+                                              bool evaluate_policy) {
   validateConfig(config_);
   LocoLowerStepResult result;
   command = clampCommand(config_.command_ranges, command, result.command_clamped);
   result.inputs = makeLocoLowerPolicyInputs(config_, low_state, last_action_, command);
 
-  ++tick_;
-  if ((tick_ % config_.policy_decimation) != 0) {
-    result.raw_action = held_raw_action_;
-  } else {
+  if (evaluate_policy) {
     Vec inferred_action = policy.infer(result.inputs);
     requireSize("raw_action", inferred_action.size(), kLocoLowerPolicyJointDim);
     requireFinite("raw_action", inferred_action);
@@ -736,6 +733,8 @@ LocoLowerStepResult LocoLowerStepRunner::step(const LowStateSample& low_state,
     result.action_clamped = result.raw_action_clamped;
     held_raw_action_ = result.raw_action;
     result.policy_evaluated = true;
+  } else {
+    result.raw_action = held_raw_action_;
   }
 
   result.processed_action = processedAction(config_, result.raw_action);

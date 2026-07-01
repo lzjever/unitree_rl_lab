@@ -302,6 +302,9 @@ class RuntimeControlLoop final {
   double generalTrackerPolicyStepDt() const;
   void resetGeneralTrackerPolicyTiming(double playback_time_s = 0.0);
   bool consumeGeneralTrackerPolicyDue();
+  double locoLowerPolicyStepDt() const;
+  void resetLocoLowerPolicyTiming();
+  bool consumeLocoLowerPolicyDue();
   std::size_t activePlaybackFrame() const;
   double activePlaybackEndTime() const;
   void advanceActivePlaybackTime();
@@ -385,6 +388,8 @@ class RuntimeControlLoop final {
   std::size_t active_policy_ticks_until_next_{0};
   double general_tracker_policy_phase_s_{0.0};
   double general_tracker_next_policy_time_s_{0.0};
+  double loco_lower_policy_phase_s_{0.0};
+  double loco_lower_next_policy_time_s_{0.0};
   double active_playback_time_s_{0.0};
   std::size_t policy_startup_hold_total_steps_{0};
   std::size_t policy_startup_hold_steps_remaining_{0};
