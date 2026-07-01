@@ -27,6 +27,7 @@
 #include "agentic_et1_tracker/policy/velocity_deploy_config.hpp"
 #include "agentic_et1_tracker/policy/velocity_policy_runner.hpp"
 #include "agentic_et1_tracker/trk/schema.hpp"
+#include "agentic_et1_tracker/trk/synthetic_transition.hpp"
 #include "agentic_et1_tracker/trk/validator.hpp"
 
 namespace agentic_et1_tracker {
@@ -75,6 +76,8 @@ struct ArrayFixture {
   std::optional<std::array<float, 4>> root_body_quat;
   std::vector<std::array<float, 4>> root_body_quats;
   std::vector<Vec> joint_pos_frames;
+  std::optional<float> fill_value;
+  std::optional<std::int64_t> contact_fill_value;
   bool identity_quaternions{false};
   bool invalid_contact{false};
   std::size_t invalid_contact_index{0};
@@ -108,9 +111,10 @@ void writePayload(std::ofstream& out, const ArrayFixture& array) {
   const auto elements = elementCount(array.shape);
   if (array.dtype == TrkDtype::Int64) {
     for (std::size_t i = 0; i < elements; ++i) {
-      const auto value = array.invalid_contact && i == array.invalid_contact_index
-                             ? array.invalid_contact_value
-                             : static_cast<std::int64_t>(i % 3);
+      auto value = array.contact_fill_value.value_or(static_cast<std::int64_t>(i % 3));
+      if (array.invalid_contact && i == array.invalid_contact_index) {
+        value = array.invalid_contact_value;
+      }
       writeScalar(out, value);
     }
     return;
@@ -120,6 +124,9 @@ void writePayload(std::ofstream& out, const ArrayFixture& array) {
     float value = array.zero_first_quaternion && i < 4
                       ? 0.0F
                       : static_cast<float>(i) * 0.25F;
+    if (array.fill_value) {
+      value = *array.fill_value;
+    }
     if (array.identity_quaternions && array.name == "body_quat_w") {
       value = i % 4 == 0 ? 1.0F : 0.0F;
     }
@@ -308,6 +315,50 @@ std::filesystem::path identityQuaternionTrk(TempTree& tmp,
   return path;
 }
 
+std::filesystem::path transitionReadyTrk(TempTree& tmp,
+                                         const std::string& name,
+                                         std::uint64_t frames,
+                                         float start_offset = 0.1F) {
+  auto arrays = requiredArrays(frames);
+  arrayNamed(arrays, "body_quat_w").identity_quaternions = true;
+  arrayNamed(arrays, "body_pos_w").root_body_positions =
+      std::vector<std::array<float, 3>>(frames, {0.0F, 0.0F, 0.0F});
+  arrayNamed(arrays, "left_foot_contact_state").contact_fill_value = 0;
+  arrayNamed(arrays, "right_foot_contact_state").contact_fill_value = 0;
+  auto& joint_pos = arrayNamed(arrays, "joint_pos");
+  joint_pos.joint_pos_frames.reserve(frames);
+  for (std::uint64_t frame = 0; frame < frames; ++frame) {
+    joint_pos.joint_pos_frames.push_back(
+        Vec(kPolicyJointDim, start_offset + 0.1F * static_cast<float>(frame)));
+  }
+  const auto path = tmp.allowed / name;
+  writeTrk(path, arrays);
+  return path;
+}
+
+std::filesystem::path transitionReadyContactTrk(TempTree& tmp,
+                                                const std::string& name,
+                                                std::uint64_t frames,
+                                                std::int64_t left_contact,
+                                                std::int64_t right_contact,
+                                                float start_offset = 0.1F) {
+  auto arrays = requiredArrays(frames);
+  arrayNamed(arrays, "body_quat_w").identity_quaternions = true;
+  arrayNamed(arrays, "body_pos_w").root_body_positions =
+      std::vector<std::array<float, 3>>(frames, {0.0F, 0.0F, 0.0F});
+  arrayNamed(arrays, "left_foot_contact_state").contact_fill_value = left_contact;
+  arrayNamed(arrays, "right_foot_contact_state").contact_fill_value = right_contact;
+  auto& joint_pos = arrayNamed(arrays, "joint_pos");
+  joint_pos.joint_pos_frames.reserve(frames);
+  for (std::uint64_t frame = 0; frame < frames; ++frame) {
+    joint_pos.joint_pos_frames.push_back(
+        Vec(kPolicyJointDim, start_offset + 0.1F * static_cast<float>(frame)));
+  }
+  const auto path = tmp.allowed / name;
+  writeTrk(path, arrays);
+  return path;
+}
+
 std::filesystem::path rootPositionsTrk(
     TempTree& tmp,
     const std::string& name,
@@ -342,6 +393,30 @@ std::filesystem::path jointPosTrk(TempTree& tmp,
   auto arrays = requiredArrays(joint_pos_frames.size());
   arrayNamed(arrays, "body_quat_w").identity_quaternions = true;
   arrayNamed(arrays, "joint_pos").joint_pos_frames = joint_pos_frames;
+  const auto path = tmp.allowed / name;
+  writeTrk(path, arrays);
+  return path;
+}
+
+std::filesystem::path jointVelocityTrk(TempTree& tmp,
+                                       const std::string& name,
+                                       std::uint64_t frames,
+                                       float joint_velocity) {
+  auto arrays = requiredArrays(frames);
+  arrayNamed(arrays, "body_quat_w").identity_quaternions = true;
+  arrayNamed(arrays, "joint_vel").fill_value = joint_velocity;
+  const auto path = tmp.allowed / name;
+  writeTrk(path, arrays);
+  return path;
+}
+
+std::filesystem::path bodyAngularVelocityTrk(TempTree& tmp,
+                                             const std::string& name,
+                                             std::uint64_t frames,
+                                             float body_angular_velocity) {
+  auto arrays = requiredArrays(frames);
+  arrayNamed(arrays, "body_quat_w").identity_quaternions = true;
+  arrayNamed(arrays, "body_ang_vel_w").fill_value = body_angular_velocity;
   const auto path = tmp.allowed / name;
   writeTrk(path, arrays);
   return path;
@@ -1197,7 +1272,7 @@ void startHoldingToUserTransition(RuntimeControlLoop& loop,
                                   StartQueuedRunMode held_start_mode =
                                       StartQueuedRunMode::RequireDirectStart) {
   startHoldingRun(loop, store, bridge, tmp, held_id, reference, held_start_mode);
-  const auto target_path = validTrk(tmp, target_id + ".trk", 2);
+  const auto target_path = transitionReadyTrk(tmp, target_id + ".trk", 2);
   REQUIRE(bridge.submitQueue(
               executeCommand(target_id, target_path, MotionMode::Queue, 2))
               .ok());
@@ -1254,6 +1329,24 @@ void requireReferenceStartsFrom(const FakeReferenceSink& reference,
   REQUIRE(reference.latest.com == source.com);
 }
 
+StatusSnapshot requireActiveUserAfterTransition(RuntimeControlLoop& loop,
+                                                RuntimeStatusStore& store,
+                                                const std::string& id) {
+  for (int i = 0; i < 160; ++i) {
+    loop.tick();
+    const auto snapshot = store.snapshot();
+    if (snapshot.active.kind == ActiveKind::User) {
+      REQUIRE(snapshot.exec.has_value());
+      REQUIRE(snapshot.exec->id == id);
+      REQUIRE(snapshot.exec->state == MotionState::Running);
+      REQUIRE_FALSE(snapshot.transition.active);
+      return snapshot;
+    }
+  }
+  FAIL("target user did not start after synthetic transition");
+  return store.snapshot();
+}
+
 std::filesystem::path startCompletedUserToIdleTransition(
     RuntimeControlLoop& loop,
     RuntimeStatusStore& store,
@@ -1261,7 +1354,7 @@ std::filesystem::path startCompletedUserToIdleTransition(
     TempTree& tmp,
     const std::string& id_prefix,
     StartQueuedRunMode start_mode = StartQueuedRunMode::RequireDirectStart) {
-  const auto idle_path = validTrk(tmp, id_prefix + "_idle.trk", 3);
+  const auto idle_path = transitionReadyTrk(tmp, id_prefix + "_idle.trk", 3);
   REQUIRE(bridge.configureIdle({idleMotion(idle_path, 3)}).ok());
   loop.tick();
 
@@ -2431,6 +2524,334 @@ TEST_CASE("RuntimeControlLoop transition completion starts target user at frame 
   FAIL("target user did not start after synthetic transition");
 }
 
+TEST_CASE("RuntimeControlLoop completed user bridges queued user through synthetic transition") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  RuntimeControlLoop loop(config, bridge, store, TrkLoader(tmp.trkConfig()), &reference);
+
+  const auto source_path =
+      transitionReadyTrk(tmp, "completed_bridge_source.trk", 2, 0.2F);
+  const auto target_path =
+      transitionReadyTrk(tmp, "completed_bridge_target.trk", 2, 0.1F);
+  REQUIRE(bridge.submitQueue(
+              executeCommand("completed-bridge-a",
+                             source_path,
+                             MotionMode::Queue,
+                             2))
+              .ok());
+  startQueuedRun(loop, store, "completed-bridge-a");
+  loop.tick();
+  REQUIRE(store.snapshot().exec.has_value());
+  REQUIRE(store.snapshot().exec->frame == 0);
+
+  const auto source_track = loadTrack(tmp.trkConfig(), source_path);
+  const auto source_reference =
+      makeReferenceFrameSnapshot("completed-bridge-a", *source_track, 1);
+  REQUIRE(source_reference.has_value());
+  REQUIRE(bridge.submitQueue(
+              executeCommand("completed-bridge-b",
+                             target_path,
+                             MotionMode::Queue,
+                             2))
+              .ok());
+  REQUIRE(store.snapshot().queue.ids ==
+          std::vector<std::string>{"completed-bridge-b"});
+
+  loop.tick();
+
+  auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Running);
+  REQUIRE(snapshot.active.kind == ActiveKind::Transition);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.transition.active);
+  REQUIRE(snapshot.transition.target == "user");
+  REQUIRE(snapshot.transition.target_id == "completed-bridge-b");
+  REQUIRE(snapshot.transition.target_state == MotionState::Queued);
+  REQUIRE(snapshot.transition.frame == 0);
+  REQUIRE(snapshot.queue.ids.empty());
+  REQUIRE(store.findRun("completed-bridge-a").run->state == MotionState::Done);
+  REQUIRE(store.findRun("completed-bridge-b").run->state == MotionState::Queued);
+  REQUIRE(store.findRun("transition").code == ErrorCode::RunNotFound);
+  requireReferenceStartsFrom(reference, *source_reference);
+
+  snapshot = requireActiveUserAfterTransition(loop, store, "completed-bridge-b");
+  REQUIRE(snapshot.queue.ids.empty());
+  REQUIRE(snapshot.exec->frame == 0);
+  REQUIRE(snapshot.exec->frames == 2);
+}
+
+TEST_CASE("RuntimeControlLoop completed user bridge benign gate reject keeps queued target for FIFO start") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.04;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeReferenceSink reference;
+  RuntimeControlLoop loop(config,
+                          bridge,
+                          store,
+                          TrkLoader(tmp.trkConfig()),
+                          robot,
+                          policy,
+                          deploy_config,
+                          passiveConfig(),
+                          kExpectedModeMachine,
+                          RuntimeMode::Real,
+                          &reference);
+
+  const auto source_path = identityQuaternionTrk(tmp, "bridge_benign_gate_a.trk", 2);
+  const auto target_path = identityQuaternionTrk(tmp, "bridge_benign_gate_b.trk", 2);
+  REQUIRE(bridge.submitQueue(
+              executeCommand("bridge-benign-gate-a",
+                             source_path,
+                             MotionMode::Queue,
+                             2))
+              .ok());
+  startQueuedRun(loop, store, "bridge-benign-gate-a");
+  for (std::size_t tick = 0; tick < kStartupHoldPolicyStepsAt50Fps; ++tick) {
+    loop.tick();
+  }
+  REQUIRE(store.snapshot().exec.has_value());
+  REQUIRE(store.snapshot().exec->frame == 0);
+
+  REQUIRE(bridge.submitQueue(
+              executeCommand("bridge-benign-gate-b",
+                             target_path,
+                             MotionMode::Queue,
+                             2))
+              .ok());
+  loop.tick();
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.active.kind == ActiveKind::None);
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.queue.ids == std::vector<std::string>{"bridge-benign-gate-b"});
+  REQUIRE(store.findRun("bridge-benign-gate-a").run->state == MotionState::Done);
+  REQUIRE(store.findRun("bridge-benign-gate-b").run->state == MotionState::Queued);
+
+  startQueuedRun(loop, store, "bridge-benign-gate-b");
+  REQUIRE(store.snapshot().exec.has_value());
+  REQUIRE(store.snapshot().exec->id == "bridge-benign-gate-b");
+  REQUIRE(store.snapshot().exec->state == MotionState::Running);
+  REQUIRE(store.snapshot().exec->frame == 0);
+}
+
+TEST_CASE("RuntimeControlLoop completed user yaw residual gate reject keeps queued target") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  RuntimeControlLoop loop(config, bridge, store, TrkLoader(tmp.trkConfig()), &reference);
+
+  const auto source_path =
+      transitionReadyTrk(tmp, "bridge_yaw_residual_a.trk", 2, 0.2F);
+  const auto target_path =
+      transitionReadyTrk(tmp, "bridge_yaw_residual_b.trk", 2, 0.1F);
+  REQUIRE(bridge.submitQueue(
+              executeCommand("bridge-yaw-residual-a",
+                             source_path,
+                             MotionMode::Queue,
+                             2))
+              .ok());
+  startQueuedRun(loop, store, "bridge-yaw-residual-a");
+  loop.tick();
+  REQUIRE(store.snapshot().exec.has_value());
+  REQUIRE(store.snapshot().exec->frame == 0);
+
+  REQUIRE(bridge.submitQueue(
+              executeCommand("bridge-yaw-residual-b",
+                             target_path,
+                             MotionMode::Queue,
+                             2))
+              .ok());
+  loop.forceNextRootYawResidualForTest(0.06);
+  loop.tick();
+
+  auto snapshot = store.snapshot();
+  REQUIRE(snapshot.active.kind == ActiveKind::None);
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.queue.ids == std::vector<std::string>{"bridge-yaw-residual-b"});
+  REQUIRE(store.findRun("bridge-yaw-residual-a").run->state == MotionState::Done);
+  REQUIRE(store.findRun("bridge-yaw-residual-b").run->state == MotionState::Queued);
+
+  startQueuedRun(loop, store, "bridge-yaw-residual-b");
+  REQUIRE(store.snapshot().exec.has_value());
+  REQUIRE(store.snapshot().exec->id == "bridge-yaw-residual-b");
+  REQUIRE(store.snapshot().exec->state == MotionState::Running);
+}
+
+TEST_CASE("RuntimeControlLoop completed user unsafe bridge failure does not normal-start queued target") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.04;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeReferenceSink reference;
+  RuntimeControlLoop loop(config,
+                          bridge,
+                          store,
+                          TrkLoader(tmp.trkConfig()),
+                          robot,
+                          policy,
+                          deploy_config,
+                          passiveConfig(),
+                          kExpectedModeMachine,
+                          RuntimeMode::Real,
+                          &reference);
+
+  const auto source_path = identityQuaternionTrk(tmp, "bridge_unsafe_a.trk", 2);
+  const Vec large_gap(kPolicyJointDim, 1000.0F);
+  const auto target_path =
+      jointPosTrk(tmp, "bridge_unsafe_b.trk", {large_gap, large_gap});
+  REQUIRE(bridge.submitQueue(
+              executeCommand("bridge-unsafe-a",
+                             source_path,
+                             MotionMode::Queue,
+                             2))
+              .ok());
+  startQueuedRun(loop, store, "bridge-unsafe-a");
+  for (std::size_t tick = 0; tick < kStartupHoldPolicyStepsAt50Fps; ++tick) {
+    loop.tick();
+  }
+  REQUIRE(store.snapshot().exec.has_value());
+  REQUIRE(store.snapshot().exec->frame == 0);
+
+  REQUIRE(bridge.submitQueue(
+              executeCommand("bridge-unsafe-b",
+                             target_path,
+                             MotionMode::Queue,
+                             2))
+              .ok());
+  loop.tick();
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.active.kind == ActiveKind::None);
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.queue.ids.empty());
+  REQUIRE(store.findRun("bridge-unsafe-a").run->state == MotionState::Done);
+  const auto failed = store.findRun("bridge-unsafe-b");
+  REQUIRE(failed.ok());
+  REQUIRE(failed.run->state == MotionState::Failed);
+  REQUIRE(failed.run->err == ErrorCode::InternalError);
+
+  loop.tick();
+  REQUIRE_FALSE(store.snapshot().exec.has_value());
+}
+
+TEST_CASE("RuntimeControlLoop bridge only applies to GeneralTracker non-hold user to GeneralTracker") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+
+  SECTION("held source does not complete into the user-to-user bridge") {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeReferenceSink reference;
+    RuntimeControlLoop loop(config,
+                            bridge,
+                            store,
+                            TrkLoader(tmp.trkConfig()),
+                            &reference);
+    const auto source_path = validTrk(tmp, "bridge_scope_hold_a.trk", 1);
+    const auto target_path = validTrk(tmp, "bridge_scope_hold_b.trk", 2);
+    REQUIRE(bridge.submitQueue(
+                executeCommand("bridge-scope-hold-a",
+                               source_path,
+                               MotionMode::Queue,
+                               1,
+                               true))
+                .ok());
+    startQueuedRun(loop, store, "bridge-scope-hold-a");
+    REQUIRE(bridge.submitQueue(
+                executeCommand("bridge-scope-hold-b",
+                               target_path,
+                               MotionMode::Queue,
+                               2))
+                .ok());
+
+    loop.tick();
+
+    const auto snapshot = store.snapshot();
+    REQUIRE(snapshot.active.kind == ActiveKind::User);
+    REQUIRE(snapshot.exec.has_value());
+    REQUIRE(snapshot.exec->id == "bridge-scope-hold-a");
+    REQUIRE(snapshot.exec->state == MotionState::Holding);
+    REQUIRE_FALSE(snapshot.transition.active);
+    REQUIRE(snapshot.queue.ids ==
+            std::vector<std::string>{"bridge-scope-hold-b"});
+  }
+
+  SECTION("LocoUpper target remains queued for ordinary FIFO handling") {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeReferenceSink reference;
+    RuntimeControlLoop loop(config,
+                            bridge,
+                            store,
+                            TrkLoader(tmp.trkConfig()),
+                            &reference);
+    const auto source_path = validTrk(tmp, "bridge_scope_loco_a.trk", 1);
+    const auto target_path = validTrk(tmp, "bridge_scope_loco_b.trk", 2);
+    REQUIRE(bridge.submitQueue(
+                executeCommand("bridge-scope-loco-a",
+                               source_path,
+                               MotionMode::Queue,
+                               1))
+                .ok());
+    startQueuedRun(loop, store, "bridge-scope-loco-a");
+    REQUIRE(bridge.submitQueue(
+                locoUpperCommand("bridge-scope-loco-b",
+                                 target_path,
+                                 MotionMode::Queue,
+                                 2))
+                .ok());
+
+    loop.tick();
+
+    const auto snapshot = store.snapshot();
+    REQUIRE(snapshot.active.kind == ActiveKind::None);
+    REQUIRE_FALSE(snapshot.transition.active);
+    REQUIRE(snapshot.queue.ids ==
+            std::vector<std::string>{"bridge-scope-loco-b"});
+    REQUIRE(store.findRun("bridge-scope-loco-a").run->state == MotionState::Done);
+    REQUIRE(store.findRun("bridge-scope-loco-b").run->state == MotionState::Queued);
+  }
+
+  SECTION("completed user still prefers background idle transition when no user is queued") {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeReferenceSink reference;
+    RuntimeControlLoop loop(config,
+                            bridge,
+                            store,
+                            TrkLoader(tmp.trkConfig()),
+                            &reference);
+    startCompletedUserToIdleTransition(loop,
+                                       store,
+                                       bridge,
+                                       tmp,
+                                       "bridge-scope-idle");
+
+    const auto snapshot = store.snapshot();
+    REQUIRE(snapshot.active.kind == ActiveKind::Transition);
+    REQUIRE(snapshot.transition.active);
+    REQUIRE(snapshot.transition.target == "idle");
+    REQUIRE(snapshot.transition.target_id.empty());
+  }
+}
+
 TEST_CASE("RuntimeControlLoop aligns synthetic transition target root pose in memory") {
   constexpr float kHalfPi = 1.57079632679F;
   TempTree tmp;
@@ -2773,7 +3194,12 @@ TEST_CASE("RuntimeControlLoop interrupt transition restarts from current transit
   REQUIRE(reference.latest.active);
   REQUIRE(reference.latest.frame == 0);
   REQUIRE(reference.latest.p == interrupted_frame.p);
-  REQUIRE(reference.latest.q == interrupted_frame.q);
+  for (std::size_t body = 0; body < reference.latest.q.size(); ++body) {
+    for (std::size_t axis = 0; axis < reference.latest.q.at(body).size(); ++axis) {
+      REQUIRE(reference.latest.q.at(body).at(axis) ==
+              Catch::Approx(interrupted_frame.q.at(body).at(axis)).margin(1.0e-6F));
+    }
+  }
   REQUIRE(reference.latest.c == interrupted_frame.c);
   REQUIRE(reference.latest.com == interrupted_frame.com);
   REQUIRE(reference.latest.comv == interrupted_frame.comv);
@@ -2798,7 +3224,68 @@ TEST_CASE("RuntimeControlLoop transition duration config controls synthetic fram
 
   const auto snapshot = store.snapshot();
   REQUIRE(snapshot.active.kind == ActiveKind::Transition);
-  REQUIRE(snapshot.transition.frames == 51);
+  REQUIRE(snapshot.transition.frames >= 2);
+}
+
+TEST_CASE("RuntimeControlLoop policy synthetic transition uses deploy step dt when target fps differs") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 1.0;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeReferenceSink reference;
+  RuntimeControlLoop loop(config,
+                          bridge,
+                          store,
+                          TrkLoader(tmp.trkConfig(25.0)),
+                          robot,
+                          policy,
+                          deploy_config,
+                          passiveConfig(),
+                          kExpectedModeMachine,
+                          RuntimeMode::Real,
+                          &reference);
+
+  startHoldingToUserTransition(loop,
+                               store,
+                               bridge,
+                               tmp,
+                               "held-policy-fps",
+                               "target-policy-fps",
+                               &reference);
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.active.kind == ActiveKind::Transition);
+  REQUIRE(snapshot.transition.frames >= 2);
+  REQUIRE(reference.latest.active);
+  REQUIRE(reference.latest.fps == 50.0);
+}
+
+TEST_CASE("RuntimeControlLoop non-policy synthetic transition keeps target track fps") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 1.0;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  RuntimeControlLoop loop(config, bridge, store, TrkLoader(tmp.trkConfig(25.0)), &reference);
+
+  startHoldingToUserTransition(loop,
+                               store,
+                               bridge,
+                               tmp,
+                               "held-non-policy-fps",
+                               "target-non-policy-fps",
+                               &reference);
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.active.kind == ActiveKind::Transition);
+  REQUIRE(snapshot.transition.frames >= 2);
+  REQUIRE(reference.latest.active);
+  REQUIRE(reference.latest.fps == 25.0);
 }
 
 TEST_CASE("RuntimeControlLoop completed user enters idle through internal transition") {
@@ -3579,6 +4066,127 @@ TEST_CASE("RuntimeControlLoop synthetic transition is not held but target user s
           calls_at_target_start + static_cast<int>(kStartupHoldPolicyStepsAt50Fps) + 1);
   REQUIRE(policy.inputs_seen.back().obs_current.at(kObsCurrentCommandJointOffset) ==
           6.5F);
+}
+
+TEST_CASE("RuntimeControlLoop arrived via user bridge uses reduced startup hold only for target") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.hz = 50.0;
+  config.user_bridge_reduced_startup_hold_s = 0.10;
+
+  SECTION("completed user bridge target uses reduced startup hold") {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    const DeployConfig deploy_config = deployConfig();
+    FakeRobotIO robot(readyLowState(deploy_config));
+    FakePolicy policy(floatSeq(0.0F, kPolicyJointDim));
+    FakeReferenceSink reference;
+    RuntimeControlLoop loop(config,
+                            bridge,
+                            store,
+                            TrkLoader(tmp.trkConfig()),
+                            robot,
+                            policy,
+                            deploy_config,
+                            passiveConfig(),
+                            kExpectedModeMachine,
+                            RuntimeMode::Real,
+                            &reference);
+
+    const auto source_path =
+        transitionReadyTrk(tmp, "bridge_reduced_hold_a.trk", 2, 0.2F);
+    const auto target_path =
+        transitionReadyTrk(tmp, "bridge_reduced_hold_b.trk", 3, 0.1F);
+    REQUIRE(bridge.submitQueue(
+                executeCommand("bridge-reduced-hold-a",
+                               source_path,
+                               MotionMode::Queue,
+                               2))
+                .ok());
+    startQueuedRun(loop, store, "bridge-reduced-hold-a");
+    for (std::size_t tick = 0; tick < kStartupHoldPolicyStepsAt50Fps; ++tick) {
+      loop.tick();
+    }
+    REQUIRE(store.snapshot().exec.has_value());
+    REQUIRE(store.snapshot().exec->frame == 0);
+
+    REQUIRE(bridge.submitQueue(
+                executeCommand("bridge-reduced-hold-b",
+                               target_path,
+                               MotionMode::Queue,
+                               3))
+                .ok());
+    loop.tick();
+    REQUIRE(store.snapshot().active.kind == ActiveKind::Transition);
+
+    const auto started =
+        requireActiveUserAfterTransition(loop, store, "bridge-reduced-hold-b");
+    REQUIRE(started.exec.has_value());
+    REQUIRE(started.exec->frame == 0);
+    const int calls_at_target_start = policy.calls;
+
+    const std::size_t reduced_steps = 5;
+    for (std::size_t tick = 0; tick < reduced_steps; ++tick) {
+      loop.tick();
+      REQUIRE(store.snapshot().exec.has_value());
+      REQUIRE(store.snapshot().exec->frame == 0);
+      REQUIRE(policy.calls == calls_at_target_start + static_cast<int>(tick + 1));
+    }
+
+    loop.tick();
+    REQUIRE(store.snapshot().exec.has_value());
+    REQUIRE(store.snapshot().exec->frame == 1);
+    REQUIRE(policy.calls == calls_at_target_start + static_cast<int>(reduced_steps) + 1);
+  }
+
+  SECTION("standby to user still runs startup hold") {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    const DeployConfig deploy_config = deployConfig();
+    FakeRobotIO robot(readyLowState(deploy_config));
+    FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+    FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+    FakeReferenceSink reference;
+    const auto standby_track = validStandbyTrack(tmp, "standby_startup_hold_ref.trk");
+    auto loop = makeControlLoop(config,
+                                bridge,
+                                store,
+                                tmp.trkConfig(),
+                                robot,
+                                tracker_policy,
+                                velocity_policy,
+                                deploy_config,
+                                velocityDeployConfig(),
+                                fixStandConfig(),
+                                ControlMode::StandbyVelocity,
+                                passiveConfig(),
+                                &reference,
+                                standby_track);
+
+    const auto target_path = identityQuaternionTrk(tmp, "standby_startup_hold_user.trk", 3);
+    REQUIRE(bridge.submitQueue(
+                executeCommand("standby-startup-hold-user",
+                               target_path,
+                               MotionMode::Queue,
+                               3))
+                .ok());
+    startQueuedRun(loop,
+                   store,
+                   "standby-startup-hold-user",
+                   StartQueuedRunMode::AllowStandbyTransition);
+    const int calls_at_target_start = tracker_policy.calls;
+
+    for (std::size_t tick = 0; tick < 3; ++tick) {
+      loop.tick();
+      REQUIRE(store.snapshot().exec.has_value());
+      REQUIRE(store.snapshot().exec->id == "standby-startup-hold-user");
+      REQUIRE(store.snapshot().exec->frame == 0);
+      REQUIRE(tracker_policy.calls == calls_at_target_start +
+                                      static_cast<int>(tick + 1));
+      REQUIRE(tracker_policy.inputs_seen.back()
+                  .obs_current.at(kObsCurrentCommandJointOffset) == 0.0F);
+    }
+  }
 }
 
 TEST_CASE("RuntimeControlLoop policy integration writes final frame before done") {
@@ -7151,10 +7759,11 @@ TEST_CASE("RuntimeControlLoop standby no-active user gates through standby refer
     FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
     const auto standby_track =
         loadTrack(tmp.trkConfig(),
-                  identityQuaternionTrk(
+                  transitionReadyTrk(
                       tmp,
                       std::string("standby_source_") + toString(mode) + ".trk",
-                      3));
+                      3,
+                      0.3F));
     const auto expected_source =
         makeReferenceFrameSnapshot("",
                                    *standby_track,
@@ -7177,7 +7786,10 @@ TEST_CASE("RuntimeControlLoop standby no-active user gates through standby refer
 
     const std::string id = std::string("standby-first-user-") + toString(mode);
     const auto user_path =
-        validTrk(tmp, std::string("standby_first_user_") + toString(mode) + ".trk", 2);
+        transitionReadyTrk(tmp,
+                           std::string("standby_first_user_") + toString(mode) + ".trk",
+                           2,
+                           0.1F);
     if (mode == MotionMode::Interrupt) {
       REQUIRE(bridge.submitInterrupt(executeCommand(id, user_path, mode, 2)).ok());
     } else {
@@ -7228,6 +7840,108 @@ TEST_CASE("RuntimeControlLoop standby no-active user gates through standby refer
     }
     REQUIRE(saw_user);
   }
+}
+
+TEST_CASE("RuntimeControlLoop standby no-active short benign transition failure raw starts user") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.04;
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+
+  for (const MotionMode mode : {MotionMode::Queue, MotionMode::Interrupt}) {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeReferenceSink reference;
+    FakeRobotIO robot(readyLowState(deploy_config));
+    FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+    FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+    const auto standby_track =
+        validStandbyTrack(tmp, std::string("short_raw_standby_") + toString(mode) + ".trk");
+    auto loop = makeControlLoop(config,
+                                bridge,
+                                store,
+                                tmp.trkConfig(),
+                                robot,
+                                tracker_policy,
+                                velocity_policy,
+                                deploy_config,
+                                velocity_config,
+                                fixstand_config,
+                                ControlMode::StandbyVelocity,
+                                passiveConfig(),
+                                &reference,
+                                standby_track);
+
+    const std::string id = std::string("short-raw-") + toString(mode);
+    const auto user_path =
+        validTrk(tmp, std::string("short_raw_user_") + toString(mode) + ".trk", 2);
+    if (mode == MotionMode::Interrupt) {
+      REQUIRE(bridge.submitInterrupt(executeCommand(id, user_path, mode, 2)).ok());
+    } else {
+      REQUIRE(bridge.submitQueue(executeCommand(id, user_path, mode, 2)).ok());
+    }
+
+    loop.tick();
+
+    const auto snapshot = store.snapshot();
+    REQUIRE(snapshot.active.kind == ActiveKind::User);
+    REQUIRE(snapshot.active.id == id);
+    REQUIRE_FALSE(snapshot.transition.active);
+    REQUIRE(snapshot.exec.has_value());
+    REQUIRE(snapshot.exec->id == id);
+    REQUIRE(store.findRun(id).run->state != MotionState::Failed);
+  }
+}
+
+TEST_CASE("RuntimeControlLoop standby no-active yaw residual gate blocks raw start fallback") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.04;
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  const auto standby_track = validStandbyTrack(tmp, "standby_yaw_residual_ref.trk");
+  auto loop = makeControlLoop(config,
+                              bridge,
+                              store,
+                              tmp.trkConfig(),
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              deploy_config,
+                              velocity_config,
+                              fixstand_config,
+                              ControlMode::StandbyVelocity,
+                              passiveConfig(),
+                              &reference,
+                              standby_track);
+
+  const auto user_path = validTrk(tmp, "standby_yaw_residual_user.trk", 2);
+  REQUIRE(bridge.submitQueue(
+              executeCommand("standby-yaw-residual-user",
+                             user_path,
+                             MotionMode::Queue,
+                             2))
+              .ok());
+  loop.forceNextRootYawResidualForTest(0.06);
+  loop.tick();
+
+  requireStandbyGateFailure(loop,
+                            store,
+                            reference,
+                            robot,
+                            tracker_policy,
+                            velocity_policy,
+                            "standby-yaw-residual-user",
+                            ErrorCode::InternalError);
 }
 
 TEST_CASE("RuntimeControlLoop standby no-active missing standby track fails user gate") {
@@ -7335,6 +8049,86 @@ TEST_CASE("RuntimeControlLoop standby no-active user gate failures do not raw st
                               velocity_policy,
                               item.id,
                               item.expected_error);
+  }
+}
+
+TEST_CASE("RuntimeControlLoop standby no-active unsafe transition failure does not raw start") {
+  TempTree tmp;
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+
+  struct Case {
+    const char* id;
+    std::filesystem::path (*make_path)(TempTree&, const std::string&);
+  };
+
+  const auto high_endpoint_velocity = [](TempTree& tmp,
+                                         const std::string& name) {
+    return jointVelocityTrk(
+        tmp,
+        name,
+        2,
+        static_cast<float>(defaultSyntheticTransitionLimits().max_velocity + 1.0));
+  };
+  const auto high_body_angular_velocity = [](TempTree& tmp,
+                                             const std::string& name) {
+    return bodyAngularVelocityTrk(
+        tmp,
+        name,
+        2,
+        static_cast<float>(defaultSyntheticTransitionLimits().max_velocity + 1.0));
+  };
+  const auto large_joint_gap = [](TempTree& tmp, const std::string& name) {
+    const Vec large_gap(kPolicyJointDim, 1000.0F);
+    return jointPosTrk(tmp, name, {large_gap, large_gap});
+  };
+
+  for (const auto& item : std::vector<Case>{
+           {"standby-high-endpoint-velocity", high_endpoint_velocity},
+           {"standby-high-body-angular-velocity", high_body_angular_velocity},
+           {"standby-large-gap", large_joint_gap},
+       }) {
+    RuntimeConfig config = runtimeConfig();
+    config.transition_duration_s = 0.04;
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeReferenceSink reference;
+    FakeRobotIO robot(readyLowState(deploy_config));
+    FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+    FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+    const auto standby_track =
+        validStandbyTrack(tmp, std::string(item.id) + "_standby_ref.trk");
+    auto loop = makeControlLoop(config,
+                                bridge,
+                                store,
+                                tmp.trkConfig(),
+                                robot,
+                                tracker_policy,
+                                velocity_policy,
+                                deploy_config,
+                                velocity_config,
+                                fixstand_config,
+                                ControlMode::StandbyVelocity,
+                                passiveConfig(),
+                                &reference,
+                                standby_track);
+
+    const auto user_path = item.make_path(tmp, std::string(item.id) + ".trk");
+    REQUIRE(bridge.submitQueue(
+                executeCommand(item.id, user_path, MotionMode::Queue, 2))
+                .ok());
+
+    loop.tick();
+
+    requireStandbyGateFailure(loop,
+                              store,
+                              reference,
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              item.id,
+                              ErrorCode::InternalError);
   }
 }
 
@@ -7515,8 +8309,8 @@ TEST_CASE("RuntimeControlLoop completed idle enters next idle through internal t
                               passiveConfig(),
                               &reference);
 
-  const auto idle_a = validTrk(tmp, "idle_to_idle_a.trk", 2);
-  const auto idle_b = validTrk(tmp, "idle_to_idle_b.trk", 2);
+  const auto idle_a = transitionReadyTrk(tmp, "idle_to_idle_a.trk", 2, 0.1F);
+  const auto idle_b = transitionReadyTrk(tmp, "idle_to_idle_b.trk", 2, 0.3F);
   REQUIRE(bridge.configureIdle({idleMotion(idle_a, 2), idleMotion(idle_b, 2)}).ok());
   loop.tick();
   loop.tick();
@@ -7817,7 +8611,9 @@ TEST_CASE("RuntimeControlLoop queue preempts background transition and playback 
     RuntimeStatusStore store(config);
     RuntimeBridge bridge(config, store);
     FakeReferenceSink reference;
-    const auto standby_track = validStandbyTrack(tmp, "queue_standby_ref.trk");
+    const auto standby_track =
+        loadTrack(tmp.trkConfig(),
+                  transitionReadyTrk(tmp, "queue_standby_ref.trk", 2, 0.1F));
     RuntimeControlLoop loop(config,
                             bridge,
                             store,
@@ -8022,7 +8818,9 @@ TEST_CASE("RuntimeControlLoop interrupt preempts background transition and playb
     RuntimeStatusStore store(config);
     RuntimeBridge bridge(config, store);
     FakeReferenceSink reference;
-    const auto standby_track = validStandbyTrack(tmp, "interrupt_standby_ref.trk");
+    const auto standby_track =
+        loadTrack(tmp.trkConfig(),
+                  transitionReadyTrk(tmp, "interrupt_standby_ref.trk", 2, 0.1F));
     RuntimeControlLoop loop(config,
                             bridge,
                             store,
@@ -8078,6 +8876,191 @@ TEST_CASE("RuntimeControlLoop interrupt preempts background transition and playb
 
     requireUserTransitionStatus(store, "interrupt-playback-user");
     requireReferenceStartsFrom(reference, source);
+  }
+}
+
+TEST_CASE("RuntimeControlLoop idle to user benign transition reject raw starts user") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.hz = 50.0;
+  config.transition_duration_s = 0.04;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  FakeReferenceSink reference;
+  auto loop = makeControlLoop(config,
+                              bridge,
+                              store,
+                              tmp.trkConfig(),
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              deploy_config,
+                              velocityDeployConfig(),
+                              fixStandConfig(),
+                              ControlMode::StandbyVelocity,
+                              passiveConfig(),
+                              &reference);
+
+  const auto idle_path = transitionReadyTrk(tmp, "idle_contact_bridge_source.trk", 3);
+  REQUIRE(bridge.configureIdle({idleMotion(idle_path, 3)}).ok());
+  loop.tick();
+  loop.tick();
+  loop.tick();
+  REQUIRE(store.snapshot().active.kind == ActiveKind::Idle);
+
+  const auto user_path =
+      transitionReadyTrk(tmp, "idle_cap_bridge_user.trk", 3, 20.0F);
+  REQUIRE(bridge.submitQueue(
+              executeCommand("idle-cap-bridge-user", user_path, MotionMode::Queue, 3))
+              .ok());
+
+  loop.tick();
+  for (int i = 0; i < 4; ++i) {
+    auto snapshot = store.snapshot();
+    if (snapshot.exec.has_value() && snapshot.exec->state == MotionState::Running) {
+      break;
+    }
+    loop.tick();
+  }
+  auto snapshot = store.snapshot();
+  REQUIRE(snapshot.active.kind == ActiveKind::User);
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->id == "idle-cap-bridge-user");
+  REQUIRE(snapshot.exec->state == MotionState::Running);
+  REQUIRE(snapshot.exec->frame == 0);
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE_FALSE(snapshot.idle.active);
+  REQUIRE(snapshot.queue.ids.empty());
+  REQUIRE(store.findRun("idle-cap-bridge-user").run->state == MotionState::Running);
+  loop.tick();
+  REQUIRE(tracker_policy.calls >= 1);
+  REQUIRE(robot.write_attempts >= 1);
+}
+
+TEST_CASE("RuntimeControlLoop background transition benign reject raw starts user") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  RuntimeControlLoop loop(config, bridge, store, TrkLoader(tmp.trkConfig()), &reference);
+
+  startCompletedUserToIdleTransition(loop, store, bridge, tmp, "background-contact-bridge");
+  advanceBackgroundTransition(loop, store, "idle");
+  REQUIRE(store.snapshot().active.kind == ActiveKind::Transition);
+
+  const auto user_path =
+      transitionReadyContactTrk(tmp, "background_contact_bridge_user.trk", 3, 1, 0);
+  REQUIRE(bridge.submitQueue(
+              executeCommand("background-contact-bridge-user",
+                             user_path,
+                             MotionMode::Queue,
+                             3))
+              .ok());
+
+  loop.tick();
+  for (int i = 0; i < 4; ++i) {
+    auto running = store.snapshot();
+    if (running.exec.has_value() && running.exec->state == MotionState::Running) {
+      break;
+    }
+    loop.tick();
+  }
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.active.kind == ActiveKind::User);
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->id == "background-contact-bridge-user");
+  REQUIRE(snapshot.exec->state == MotionState::Running);
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE(snapshot.queue.ids.empty());
+  REQUIRE(store.findRun("background-contact-bridge-user").run->state ==
+          MotionState::Running);
+}
+
+TEST_CASE("RuntimeControlLoop background and idle yaw residual gate reject raw starts user") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+
+  SECTION("idle active") {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeReferenceSink reference;
+    RuntimeControlLoop loop(config, bridge, store, TrkLoader(tmp.trkConfig()), &reference);
+
+    const auto idle_path = transitionReadyTrk(tmp, "idle_yaw_residual_source.trk", 3);
+    REQUIRE(bridge.configureIdle({idleMotion(idle_path, 3)}).ok());
+    loop.tick();
+    loop.tick();
+    loop.tick();
+    REQUIRE(store.snapshot().active.kind == ActiveKind::Idle);
+
+    const auto user_path = transitionReadyTrk(tmp, "idle_yaw_residual_user.trk", 3);
+    REQUIRE(bridge.submitQueue(
+                executeCommand("idle-yaw-residual-user",
+                               user_path,
+                               MotionMode::Queue,
+                               3))
+                .ok());
+    loop.forceNextRootYawResidualForTest(0.06);
+    loop.tick();
+    for (int i = 0; i < 4; ++i) {
+      auto running = store.snapshot();
+      if (running.exec.has_value() && running.exec->state == MotionState::Running) {
+        break;
+      }
+      loop.tick();
+    }
+
+    const auto snapshot = store.snapshot();
+    REQUIRE(snapshot.active.kind == ActiveKind::User);
+    REQUIRE(snapshot.exec.has_value());
+    REQUIRE(snapshot.exec->id == "idle-yaw-residual-user");
+    REQUIRE(snapshot.exec->state == MotionState::Running);
+    REQUIRE_FALSE(snapshot.transition.active);
+    REQUIRE_FALSE(snapshot.idle.active);
+    REQUIRE(store.findRun("idle-yaw-residual-user").run->state == MotionState::Running);
+  }
+
+  SECTION("background transition") {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    FakeReferenceSink reference;
+    RuntimeControlLoop loop(config, bridge, store, TrkLoader(tmp.trkConfig()), &reference);
+
+    startCompletedUserToIdleTransition(loop, store, bridge, tmp, "background-yaw-residual");
+    advanceBackgroundTransition(loop, store, "idle");
+
+    const auto user_path =
+        transitionReadyTrk(tmp, "background_yaw_residual_user.trk", 3);
+    REQUIRE(bridge.submitQueue(
+                executeCommand("background-yaw-residual-user",
+                               user_path,
+                               MotionMode::Queue,
+                               3))
+                .ok());
+    loop.forceNextRootYawResidualForTest(0.06);
+    loop.tick();
+    for (int i = 0; i < 4; ++i) {
+      auto running = store.snapshot();
+      if (running.exec.has_value() && running.exec->state == MotionState::Running) {
+        break;
+      }
+      loop.tick();
+    }
+
+    const auto snapshot = store.snapshot();
+    REQUIRE(snapshot.active.kind == ActiveKind::User);
+    REQUIRE(snapshot.exec.has_value());
+    REQUIRE(snapshot.exec->id == "background-yaw-residual-user");
+    REQUIRE(snapshot.exec->state == MotionState::Running);
+    REQUIRE_FALSE(snapshot.transition.active);
+    REQUIRE(store.findRun("background-yaw-residual-user").run->state ==
+            MotionState::Running);
   }
 }
 

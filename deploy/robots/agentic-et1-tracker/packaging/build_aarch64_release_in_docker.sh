@@ -141,6 +141,20 @@ else
   printf 'keeping release workspace %s\n' "$release_workspace"
 fi
 
+workspace_tracker_dir="$release_workspace/unitree_rl_lab/deploy/robots/agentic-et1-tracker"
+[[ -d "$workspace_tracker_dir" ]] || {
+  printf 'error: prepared workspace is missing tracker dir: %s\n' "$workspace_tracker_dir" >&2
+  exit 1
+}
+rm -rf "$workspace_tracker_dir/third_party/ruckig"
+mkdir -p "$workspace_tracker_dir/third_party" "$workspace_tracker_dir/packaging/scripts"
+cp -a "$TRACKER_DIR/third_party/ruckig" "$workspace_tracker_dir/third_party/ruckig"
+cp -a "$TRACKER_DIR/third_party/THIRD_PARTY_MANIFEST.yaml" "$workspace_tracker_dir/third_party/THIRD_PARTY_MANIFEST.yaml"
+cp -a "$TRACKER_DIR/CMakeLists.txt" "$workspace_tracker_dir/CMakeLists.txt"
+cp -a "$SCRIPT_DIR/build_release.sh" "$workspace_tracker_dir/packaging/build_release.sh"
+cp -a "$SCRIPT_DIR/README.release.md" "$workspace_tracker_dir/packaging/README.release.md"
+cp -a "$SCRIPT_DIR/scripts/selftest.sh" "$workspace_tracker_dir/packaging/scripts/selftest.sh"
+
 if [[ "$out_dir" == /work/unitree_rl_lab/* ]]; then
   out_dir="$REPO_ROOT/${out_dir#/work/unitree_rl_lab/}"
 fi
@@ -193,6 +207,7 @@ chown -R "$HOST_UID:$HOST_GID" /release-out
 EOS
 
 "${docker_cmd[@]}" run --rm \
+  --network none \
   -e HOST_UID="$(id -u)" \
   -e HOST_GID="$(id -g)" \
   -e ET1_VERSION="$version" \

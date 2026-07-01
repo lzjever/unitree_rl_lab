@@ -1,0 +1,8 @@
+schema_version: 1
+package: agentic-et1-tracker
+vendored_dependencies:
+  - name: ruckig
+    path: ruckig
+    manifest: ruckig/VENDOR_MANIFEST.yaml
+    license: MIT
+    release_required: true

@@ -13,6 +13,9 @@ agentic_et1_tracker:
   max_track_duration_s: 120
   stop_hold_s: 0.0
   transition_duration_s: 0.7
+  transition_min_frames: 2
+  transition_duration_dt_tolerance_s: 1.0e-9
+  user_bridge_reduced_startup_hold_s: 0.10
   idle_mode: "hold_current"
   reference:
     enabled: true

@@ -142,6 +142,9 @@ agentic_et1_tracker:
   REQUIRE(config.runtime.hz == 1000.0);
   REQUIRE(config.runtime.stop_hold_s == 0.0);
   REQUIRE(config.runtime.transition_duration_s == 0.30);
+  REQUIRE(config.runtime.transition_min_frames == 2);
+  REQUIRE(config.runtime.transition_duration_dt_tolerance_s == 1.0e-9);
+  REQUIRE(config.runtime.user_bridge_reduced_startup_hold_s == 0.10);
   REQUIRE(config.trk.fps == 50.0);
   REQUIRE(config.trk.max_duration_s == 120.0);
   REQUIRE(config.trk.allowlist_dirs == std::vector<std::filesystem::path>{"/home/galbot/motions"});
@@ -375,6 +378,9 @@ agentic_et1_tracker:
   recent_limit: 9
   max_track_duration_s: 42.5
   transition_duration_s: 1.0
+  transition_min_frames: 3
+  transition_duration_dt_tolerance_s: 0.02
+  user_bridge_reduced_startup_hold_s: 0.08
   stop_hold_s: 0.0
   idle_mode: "hold_current"
   passive_password: "secret"
@@ -423,6 +429,9 @@ agentic_et1_tracker:
   REQUIRE(config.runtime.hz == 1000.0);
   REQUIRE(config.runtime.stop_hold_s == 0.0);
   REQUIRE(config.runtime.transition_duration_s == 1.0);
+  REQUIRE(config.runtime.transition_min_frames == 3);
+  REQUIRE(config.runtime.transition_duration_dt_tolerance_s == 0.02);
+  REQUIRE(config.runtime.user_bridge_reduced_startup_hold_s == 0.08);
   REQUIRE(config.trk.allowlist_dirs ==
           std::vector<std::filesystem::path>{"/srv/motions/a", "/srv/motions/b"});
   REQUIRE(config.trk.max_duration_s == 42.5);
@@ -765,6 +774,37 @@ agentic_et1_tracker:
                                               "  transition_duration_s: ") +
                                    value + "\n"),
                           ContainsSubstring("transition_duration_s"));
+    }
+  }
+
+  SECTION("transition min frames must be positive") {
+    REQUIRE_THROWS_WITH(loadYaml(R"yaml(
+agentic_et1_tracker:
+  motion_dirs: ["/tmp/motions"]
+  transition_min_frames: 0
+)yaml"),
+                        ContainsSubstring("transition_min_frames"));
+  }
+
+  SECTION("transition duration dt tolerance must be finite non-negative") {
+    for (const char* value : {"-0.1", ".nan"}) {
+      CAPTURE(value);
+      REQUIRE_THROWS_WITH(loadYaml(std::string("agentic_et1_tracker:\n"
+                                              "  motion_dirs: [\"/tmp/motions\"]\n"
+                                              "  transition_duration_dt_tolerance_s: ") +
+                                   value + "\n"),
+                          ContainsSubstring("transition_duration_dt_tolerance_s"));
+    }
+  }
+
+  SECTION("reduced startup hold must be finite non-negative and not exceed full hold") {
+    for (const char* value : {"-0.1", ".nan", "0.5001"}) {
+      CAPTURE(value);
+      REQUIRE_THROWS_WITH(loadYaml(std::string("agentic_et1_tracker:\n"
+                                              "  motion_dirs: [\"/tmp/motions\"]\n"
+                                              "  user_bridge_reduced_startup_hold_s: ") +
+                                   value + "\n"),
+                          ContainsSubstring("user_bridge_reduced_startup_hold_s"));
     }
   }
 

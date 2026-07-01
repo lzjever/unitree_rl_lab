@@ -10,6 +10,9 @@ struct RuntimeConfig {
   double hz{1000.0};
   double stop_hold_s{0.0};
   double transition_duration_s{0.30};
+  std::size_t transition_min_frames{2};
+  double transition_duration_dt_tolerance_s{1.0e-9};
+  double user_bridge_reduced_startup_hold_s{0.10};
   double loco_upper_max_hold_s{10.0};
   double radius_tolerance_m{0.05};
   bool loco_upper_strict_pose{false};

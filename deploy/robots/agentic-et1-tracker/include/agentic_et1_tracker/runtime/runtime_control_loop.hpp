@@ -23,6 +23,7 @@
 #include "agentic_et1_tracker/runtime/runtime_config.hpp"
 #include "agentic_et1_tracker/runtime/runtime_status_store.hpp"
 #include "agentic_et1_tracker/trk/loader.hpp"
+#include "agentic_et1_tracker/trk/synthetic_transition.hpp"
 
 namespace agentic_et1_tracker {
 
@@ -106,6 +107,7 @@ class RuntimeControlLoop final {
   RuntimeInternalState internalStateForTest() const;
   void failNextTransitionStartForTest();
   void faultNextTransitionStartForTest();
+  void forceNextRootYawResidualForTest(double residual_rad);
 
  private:
   struct SnapshotRuntimeState {
@@ -128,6 +130,11 @@ class RuntimeControlLoop final {
     SafetyTerminal,
   };
 
+  enum class StartupHoldMode {
+    Run,
+    Reduced,
+  };
+
   struct PendingTransition {
     TransitionTargetKind target_kind{TransitionTargetKind::User};
     std::string target_id;
@@ -138,6 +145,7 @@ class RuntimeControlLoop final {
     MotionState source_completion_state{MotionState::Done};
     StopReason source_completion_reason{StopReason::None};
     ErrorCode source_completion_error{ErrorCode::Ok};
+    bool reduced_target_startup_hold{false};
   };
 
   struct LocoUpperRuntimeState {
@@ -188,9 +196,12 @@ class RuntimeControlLoop final {
   void enterVelocityState();
   void enterGeneralTrackerIdleState();
   void enterTrackPreparingState();
-  void enterTrackActiveState(const std::optional<LowStateSample>& entry_low_state);
+  void enterTrackActiveState(
+      const std::optional<LowStateSample>& entry_low_state,
+      StartupHoldMode startup_hold_mode = StartupHoldMode::Run);
   void resetPolicyStartupHoldForActiveUser(
-      const std::optional<LowStateSample>& entry_low_state);
+      const std::optional<LowStateSample>& entry_low_state,
+      StartupHoldMode startup_hold_mode = StartupHoldMode::Run);
   void clearPolicyStartupHold();
   void applyPolicyStartupUpperBodyInterpolation(LowCmdFrame& frame) const;
   bool isMotionAcceptingState() const;
@@ -247,13 +258,15 @@ class RuntimeControlLoop final {
   bool startTransitionFromCurrentReferenceToUser(MotionRequest target_request,
                                                 StopReason replaced_reason);
   bool startTransitionFromCompletedIdleToIdle();
+  bool startTransitionFromCompletedUserToNextUser();
   bool startTransitionFromCompletedUserToIdle();
   bool startTransitionFromCompletedUserToStandby();
   StandbyTransitionResult startTransitionFromActiveToStandbyCancellation();
   bool startSyntheticTransitionFromActiveFrame(PendingTransition target);
   bool startInternalTransition(std::shared_ptr<const TrkTrack> track,
                                PendingTransition target,
-                               std::optional<LowStateSample> entry_low_state);
+                               std::optional<LowStateSample> entry_low_state,
+                               bool publish_target_failure = true);
   bool startStandbyPlayback(PendingTransition target);
   void advanceTransition();
   void advanceTransitionWithPolicy();
@@ -294,9 +307,13 @@ class RuntimeControlLoop final {
   void advanceActivePlaybackTime();
   std::size_t velocityPolicyIntervalTicks() const;
   std::size_t activePolicyIntervalTicks() const;
-  std::size_t policyStartupHoldPolicySteps() const;
+  std::size_t policyStartupHoldPolicySteps(double duration_s) const;
   std::size_t stopHoldTicks() const;
   std::optional<double> transitionDurationForUse() const;
+  double transitionSampleFpsForTarget(const TrkTrack& target) const;
+  SyntheticTransitionOptions transitionOptionsForTarget(const TrkTrack& target) const;
+  std::optional<bool> rootYawResidualAllowsBridge(const TrkFrameView& source,
+                                                  const TrkFrameView& target);
   void publishActive();
   void publishReferenceActive();
   void publishReferenceTransition();
@@ -375,6 +392,7 @@ class RuntimeControlLoop final {
   std::size_t velocity_policy_ticks_until_next_{0};
   bool fail_next_transition_start_for_test_{false};
   bool fault_next_transition_start_for_test_{false};
+  std::optional<double> forced_next_root_yaw_residual_for_test_;
   std::optional<LowCmdFrame> lowcmd_buffer_;
   std::optional<LowStateSample> latest_low_state_;
   std::optional<HighStateSample> latest_high_state_;

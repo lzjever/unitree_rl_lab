@@ -6,6 +6,58 @@ option(AGENTIC_ET1_BUILD_TESTS "Build pure core unit tests" ON)
 option(AGENTIC_ET1_BUILD_ROBOT "Build robot integration target" ON)
 option(AGENTIC_ET1_BUILD_ONNX "Build ONNX policy runtime target" ON)
 option(AGENTIC_ET1_BUILD_PERF_SMOKE "Build opt-in performance smoke tests" OFF)
+option(AGENTIC_ET1_ENABLE_RUCKIG "Require and add the vendored Ruckig dependency" ON)
+option(AGENTIC_ET1_RELEASE_BUILD "Enable deterministic release dependency gates" OFF)
+set(AGENTIC_ET1_RUCKIG_SOURCE_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ruckig"
+  CACHE PATH "Vendored Ruckig source directory")
+
+if(NOT AGENTIC_ET1_ENABLE_RUCKIG)
+  message(FATAL_ERROR
+    "AGENTIC_ET1_ENABLE_RUCKIG=OFF is unsupported; "
+    "agentic_et1_tracker_trk requires vendored ruckig::ruckig")
+endif()
+if(AGENTIC_ET1_RELEASE_BUILD
+    AND DEFINED FETCHCONTENT_FULLY_DISCONNECTED
+    AND NOT FETCHCONTENT_FULLY_DISCONNECTED)
+  message(FATAL_ERROR
+    "AGENTIC_ET1_RELEASE_BUILD requires FETCHCONTENT_FULLY_DISCONNECTED=ON when set")
+endif()
+
+if(AGENTIC_ET1_ENABLE_RUCKIG)
+  foreach(AGENTIC_ET1_RUCKIG_REQUIRED_FILE IN ITEMS
+      CMakeLists.txt
+      LICENSE
+      VENDOR_MANIFEST.yaml
+      cmake/ruckig-config.cmake.in
+      include/ruckig/ruckig.hpp
+      src/ruckig/brake.cpp)
+    if(NOT EXISTS "${AGENTIC_ET1_RUCKIG_SOURCE_DIR}/${AGENTIC_ET1_RUCKIG_REQUIRED_FILE}")
+      message(FATAL_ERROR
+        "Vendored Ruckig is required but missing "
+        "${AGENTIC_ET1_RUCKIG_SOURCE_DIR}/${AGENTIC_ET1_RUCKIG_REQUIRED_FILE}")
+    endif()
+  endforeach()
+
+  function(agentic_et1_add_vendored_ruckig source_dir binary_dir)
+    set(BUILD_EXAMPLES OFF)
+    set(BUILD_TESTS OFF)
+    set(BUILD_PYTHON_MODULE OFF)
+    set(BUILD_CLOUD_CLIENT OFF)
+    set(BUILD_BENCHMARK OFF)
+    set(BUILD_SHARED_LIBS OFF)
+
+    add_subdirectory("${source_dir}" "${binary_dir}")
+  endfunction()
+
+  agentic_et1_add_vendored_ruckig(
+    "${AGENTIC_ET1_RUCKIG_SOURCE_DIR}"
+    "${CMAKE_CURRENT_BINARY_DIR}/ruckig")
+
+  if(NOT TARGET ruckig::ruckig)
+    message(FATAL_ERROR "Vendored Ruckig did not provide target ruckig::ruckig")
+  endif()
+endif()
 
 add_library(agentic_et1_tracker_core
   src/command_mailbox.cpp
@@ -53,6 +105,8 @@ target_include_directories(agentic_et1_tracker_trk
 target_link_libraries(agentic_et1_tracker_trk
   PUBLIC
     agentic_et1_tracker_core
+  PRIVATE
+    ruckig::ruckig
 )
 
 add_library(agentic_et1_tracker_loco_upper

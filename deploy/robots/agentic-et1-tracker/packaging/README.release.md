@@ -42,6 +42,27 @@ The default build is the real integration binary:
 - `AGENTIC_ET1_BUILD_ONNX=ON`
 - `AGENTIC_ET1_BUILD_ROBOT=ON`
 - `AGENTIC_ET1_BUILD_TESTS=OFF`
+- `AGENTIC_ET1_RELEASE_BUILD=ON`
+- `FETCHCONTENT_FULLY_DISCONNECTED=ON`
+
+Ruckig is a required vendored dependency for release builds. The packager uses
+the local source snapshot under
+`deploy/robots/agentic-et1-tracker/third_party/ruckig`, configures CMake with
+`AGENTIC_ET1_RUCKIG_SOURCE_DIR`, and fails before configure if the Ruckig
+`LICENSE`, `VENDOR_MANIFEST.yaml`, or package-level third party manifest is
+missing. Ruckig tests, examples, Python bindings, benchmark, and cloud client
+are disabled for release builds. These release-gate CMake values are fixed by
+`build_release.sh` and cannot be overridden with `--cmake-arg`.
+
+This gate verifies that the vendored Ruckig source snapshot is present,
+configurable for the release build, and linked by `agentic_et1_tracker_trk`
+through `ruckig::ruckig`.
+
+The vendored Ruckig snapshot is the official public MIT Community tag `v0.17.3`
+from `pantor/ruckig`. The public docs currently show `0.19.3`, but no public
+GitHub release/tag or PyPI source distribution for `v0.19.3` was available when
+this release gate was added, so the manifest records the exact `v0.17.3` commit
+instead of claiming a nonexistent `v0.19.3` tag.
 
 The script uses repo-local ONNX Runtime packages under `deploy/thirdparty` when
 available. Unitree SDK2 is discovered by the existing CMake logic; pass an
@@ -111,7 +132,9 @@ deploy/robots/agentic-et1-tracker/packaging/build_aarch64_release_in_docker.sh \
 
 The aarch64 release entry still calls `build_release.sh` as the bottom-level
 packager. The container only runs the release build; it does not `apt install`
-or rebuild yaml-cpp. Outputs keep the existing names:
+or rebuild yaml-cpp, and the release-build container runs with Docker
+`--network none` so configure/build cannot fetch dependencies from the network.
+Outputs keep the existing names:
 
 ```text
 agentic-et1-tracker-<version>-aarch64.tar.gz
@@ -128,9 +151,12 @@ Runtime stays repo-local under `deploy/thirdparty` inside the clone. This avoids
 `git worktree` metadata and host absolute symlinks that can point outside the
 container mount.
 
-The clone is prepared from the current git commit (`HEAD`). Uncommitted tracked
-changes, untracked files, and dirty local config edits are not included in the
-release workspace; commit changes first before using this release path.
+The clone is prepared from the current git commit (`HEAD`). The aarch64 wrapper
+then overlays the release-gate files and vendored Ruckig snapshot from the
+current checkout so this dependency gate can be validated before commit.
+Other uncommitted tracked changes, untracked files, and dirty local config edits
+are not included in the release workspace; commit those changes first before
+using this release path.
 
 The aarch64 toolchain file keeps default `/work/...` paths for compatibility,
 but the Docker release also exports:

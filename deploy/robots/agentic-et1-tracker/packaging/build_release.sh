@@ -166,6 +166,36 @@ fi
 [[ -d "$onnxruntime_root" ]] || { printf 'error: missing ONNX Runtime root: %s\n' "$onnxruntime_root" >&2; exit 1; }
 [[ -d "$skill_dir" ]] || { printf 'error: missing skill dir: %s\n' "$skill_dir" >&2; exit 1; }
 
+for extra_cmake_arg in "${extra_cmake_args[@]}"; do
+  for release_gate_var in \
+    AGENTIC_ET1_RUCKIG_SOURCE_DIR \
+    AGENTIC_ET1_ENABLE_RUCKIG \
+    AGENTIC_ET1_RELEASE_BUILD \
+    FETCHCONTENT_FULLY_DISCONNECTED
+  do
+    case "$extra_cmake_arg" in
+      "-D${release_gate_var}"|"-D${release_gate_var}="*|"-D${release_gate_var}:"*"="*|"-U${release_gate_var}"*)
+        printf 'error: --cmake-arg may not override release gate variable %s\n' "$release_gate_var" >&2
+        exit 1
+        ;;
+    esac
+  done
+done
+
+ruckig_source_dir="$TRACKER_DIR/third_party/ruckig"
+third_party_manifest="$TRACKER_DIR/third_party/THIRD_PARTY_MANIFEST.yaml"
+for required_vendor_artifact in \
+  "$ruckig_source_dir/CMakeLists.txt" \
+  "$ruckig_source_dir/LICENSE" \
+  "$ruckig_source_dir/VENDOR_MANIFEST.yaml" \
+  "$third_party_manifest"
+do
+  [[ -f "$required_vendor_artifact" ]] || {
+    printf 'error: missing vendored release artifact: %s\n' "$required_vendor_artifact" >&2
+    exit 1
+  }
+done
+
 cmake_build="$build_dir/cmake"
 stage_dir="$build_dir/stage"
 package_name="agentic-et1-tracker-$version-$target_arch"
@@ -182,6 +212,10 @@ cmake_args=(
   -DAGENTIC_ET1_BUILD_TESTS=OFF
   -DAGENTIC_ET1_BUILD_ONNX=ON
   -DAGENTIC_ET1_BUILD_ROBOT=ON
+  -DAGENTIC_ET1_ENABLE_RUCKIG=ON
+  -DAGENTIC_ET1_RELEASE_BUILD=ON
+  -DFETCHCONTENT_FULLY_DISCONNECTED=ON
+  -DAGENTIC_ET1_RUCKIG_SOURCE_DIR="$ruckig_source_dir"
   -DONNXRUNTIME_ROOT="$onnxruntime_root"
   -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
   "-DCMAKE_INSTALL_RPATH=\$ORIGIN/../lib"
@@ -214,6 +248,7 @@ install -d \
   "$package_root/config" \
   "$package_root/scripts" \
   "$package_root/share/agentic-et1-tracker" \
+  "$package_root/share/agentic-et1-tracker/third_party" \
   "$package_root/skills"
 
 install -m 0755 "$binary" "$package_root/bin/agentic-et1-tracker"
@@ -223,6 +258,9 @@ printf '%s\n' "$version" > "$package_root/VERSION"
 
 cp -a "$TRACKER_DIR/config" "$package_root/share/agentic-et1-tracker/"
 rm -rf "$package_root/share/agentic-et1-tracker/config/policy/general_tracker"
+cp -a "$ruckig_source_dir" "$package_root/share/agentic-et1-tracker/third_party/ruckig"
+install -m 0644 "$third_party_manifest" "$package_root/share/agentic-et1-tracker/third_party/THIRD_PARTY_MANIFEST.yaml"
+install -m 0644 "$third_party_manifest" "$package_root/THIRD_PARTY_MANIFEST.yaml"
 cp -a "$SCRIPT_DIR/scripts/." "$package_root/scripts/"
 cp -a "$skill_dir" "$package_root/skills/et1-action"
 chmod +x "$package_root"/scripts/*.sh

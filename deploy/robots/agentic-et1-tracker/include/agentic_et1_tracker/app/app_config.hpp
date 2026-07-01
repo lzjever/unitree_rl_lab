@@ -66,6 +66,9 @@ struct AppConfig {
   int mode_machine{1};
   double stop_hold_s{0.0};
   double transition_duration_s{0.30};
+  std::size_t transition_min_frames{2};
+  double transition_duration_dt_tolerance_s{1.0e-9};
+  double user_bridge_reduced_startup_hold_s{0.10};
   std::string idle_mode{"hold_current"};
   std::string passive_password{"galaxy"};
   std::string lock_path;

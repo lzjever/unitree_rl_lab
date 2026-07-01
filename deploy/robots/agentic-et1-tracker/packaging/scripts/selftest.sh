@@ -72,6 +72,11 @@ check_contains() {
   printf 'ok contains %s %s\n' "$path" "$needle"
 }
 
+check_manifest_entry() {
+  local entry="$1"
+  check_contains "$ET1_RELEASE_DIR/manifest.sha256" "$entry"
+}
+
 check_exec "$ET1_BIN"
 check_exec "$ET1_CLI"
 check_file "$ET1_RELEASE_DIR/config/config.robot.yaml.template"
@@ -131,6 +136,26 @@ check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/reference/standby/
 check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/reference/standby/v0/README.md"
 check_sha256 "$ET1_RELEASE_DIR/share/agentic-et1-tracker/config/reference/standby/v0/standby_ref.trk" \
   "6ca49404e1ee1008f6226a2f7c00e990f0447ae6c826657246b7a29fbb525741"
+check_file "$ET1_RELEASE_DIR/THIRD_PARTY_MANIFEST.yaml"
+check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/third_party/THIRD_PARTY_MANIFEST.yaml"
+check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/third_party/ruckig/CMakeLists.txt"
+check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/third_party/ruckig/LICENSE"
+check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/third_party/ruckig/VENDOR_MANIFEST.yaml"
+check_file "$ET1_RELEASE_DIR/share/agentic-et1-tracker/third_party/ruckig/include/ruckig/ruckig.hpp"
+check_contains "$ET1_RELEASE_DIR/share/agentic-et1-tracker/third_party/ruckig/LICENSE" \
+  "MIT License"
+check_contains "$ET1_RELEASE_DIR/share/agentic-et1-tracker/third_party/ruckig/VENDOR_MANIFEST.yaml" \
+  "version: 0.17.3"
+check_contains "$ET1_RELEASE_DIR/share/agentic-et1-tracker/third_party/ruckig/VENDOR_MANIFEST.yaml" \
+  "upstream_tag: v0.17.3"
+check_contains "$ET1_RELEASE_DIR/share/agentic-et1-tracker/third_party/ruckig/VENDOR_MANIFEST.yaml" \
+  "license: MIT"
+check_contains "$ET1_RELEASE_DIR/share/agentic-et1-tracker/third_party/THIRD_PARTY_MANIFEST.yaml" \
+  "name: ruckig"
+check_manifest_entry "THIRD_PARTY_MANIFEST.yaml"
+check_manifest_entry "share/agentic-et1-tracker/third_party/THIRD_PARTY_MANIFEST.yaml"
+check_manifest_entry "share/agentic-et1-tracker/third_party/ruckig/LICENSE"
+check_manifest_entry "share/agentic-et1-tracker/third_party/ruckig/VENDOR_MANIFEST.yaml"
 
 prepend_release_lib_path
 "$ET1_BIN" --help >/dev/null 2>&1

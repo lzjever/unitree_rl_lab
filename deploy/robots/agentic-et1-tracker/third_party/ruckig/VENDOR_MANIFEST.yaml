@@ -1,0 +1,16 @@
+name: ruckig
+version: 0.17.3
+upstream_url: https://github.com/pantor/ruckig
+upstream_tag: v0.17.3
+upstream_commit: cb99a04ce488f83701aaee6efd9c9f0d36a3d43b
+source_archive_url: https://github.com/pantor/ruckig/archive/refs/tags/v0.17.3.tar.gz
+license: MIT
+license_file: LICENSE
+build_mode: vendored CMake add_subdirectory with tests/examples/python/cloud client disabled
+cmake_target: ruckig::ruckig
+release_required: true
+local_patches: []
+source_note: >-
+  Source snapshot copied from the official public Community repository tag.
+  Public GitHub release/tag and PyPI source distribution for v0.19.3 were not
+  available when this dependency was vendored, so no v0.19.3 commit is claimed.

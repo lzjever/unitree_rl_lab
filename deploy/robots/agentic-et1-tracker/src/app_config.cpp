@@ -31,6 +31,7 @@ constexpr int kMaxDomainId = 232;
 constexpr double kMinRuntimeRate = 1.0;
 constexpr double kMaxRuntimeRate = 1000.0;
 constexpr double kMaxTransitionDurationS = 5.0;
+constexpr double kPolicyStartupHoldDurationS = 0.5;
 constexpr const char* kInternalStandbyReference = "reference/standby/v0/standby_ref.trk";
 
 ConfigError error(const std::string& message) { return ConfigError("config error: " + message); }
@@ -621,6 +622,24 @@ AppConfig loadAppConfig(const std::filesystem::path& path) {
                                       config.transition_duration_s,
                                       kMaxTransitionDurationS);
     config.runtime.transition_duration_s = config.transition_duration_s;
+    config.transition_min_frames =
+        optionalPositiveSize(section, "transition_min_frames", config.transition_min_frames);
+    config.runtime.transition_min_frames = config.transition_min_frames;
+    config.transition_duration_dt_tolerance_s =
+        optionalNonNegativeDouble(section,
+                                  "transition_duration_dt_tolerance_s",
+                                  config.transition_duration_dt_tolerance_s);
+    config.runtime.transition_duration_dt_tolerance_s =
+        config.transition_duration_dt_tolerance_s;
+    config.user_bridge_reduced_startup_hold_s =
+        optionalNonNegativeDouble(section,
+                                  "user_bridge_reduced_startup_hold_s",
+                                  config.user_bridge_reduced_startup_hold_s);
+    if (config.user_bridge_reduced_startup_hold_s > kPolicyStartupHoldDurationS) {
+      throw error("user_bridge_reduced_startup_hold_s must be <= 0.5");
+    }
+    config.runtime.user_bridge_reduced_startup_hold_s =
+        config.user_bridge_reduced_startup_hold_s;
     config.idle_mode = optionalString(section, "idle_mode", config.idle_mode);
     if (config.idle_mode != kIdleModeHoldCurrent) {
       throw error("idle_mode must be hold_current");

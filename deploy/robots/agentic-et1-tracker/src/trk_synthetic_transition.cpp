@@ -10,6 +10,8 @@
 #include <utility>
 #include <vector>
 
+#include <ruckig/ruckig.hpp>
+
 #include "agentic_et1_tracker/trk/schema.hpp"
 
 namespace agentic_et1_tracker {
@@ -23,6 +25,7 @@ constexpr std::size_t kFloatElementsPerFrame =
     kJointDim + kJointDim + kBodyPosFrameSize + kBodyQuatFrameSize + kBodyPosFrameSize +
     kBodyPosFrameSize + 3 + 3;
 constexpr std::size_t kContactElementsPerFrame = 2;
+constexpr double kRuckigDurationEpsilon = 1.0e-9;
 
 bool finite(double value) {
   return std::isfinite(value);
@@ -85,21 +88,37 @@ bool validFrame(const TrkFrameView& frame) {
          validFloatView(frame.ref_com_vel_navi, 3);
 }
 
-std::optional<std::size_t> frameCount(double target_fps, double duration_s) {
+constexpr std::uint64_t bytesPerFrame() {
+  return static_cast<std::uint64_t>(kFloatElementsPerFrame) * sizeof(float) +
+         static_cast<std::uint64_t>(kContactElementsPerFrame) * sizeof(std::int64_t);
+}
+
+constexpr std::uint64_t maxPayloadFrames() {
+  return TrkSchema::kDefaultLimits.max_total_payload_bytes / bytesPerFrame();
+}
+
+bool validTimingCap(double target_fps, double duration_s) {
   if (!finite(target_fps) || !finite(duration_s) || target_fps <= 0.0 || duration_s <= 0.0) {
-    return std::nullopt;
+    return false;
   }
   const double intervals_d = duration_s * target_fps;
-  constexpr std::uint64_t bytes_per_frame =
-      static_cast<std::uint64_t>(kFloatElementsPerFrame) * sizeof(float) +
-      static_cast<std::uint64_t>(kContactElementsPerFrame) * sizeof(std::int64_t);
-  constexpr std::uint64_t max_frames =
-      TrkSchema::kDefaultLimits.max_total_payload_bytes / bytes_per_frame;
+  constexpr std::uint64_t max_frames = maxPayloadFrames();
   if (!finite(intervals_d) || intervals_d > static_cast<double>(max_frames - 1)) {
-    return std::nullopt;
+    return false;
   }
+  return true;
+}
+
+std::optional<std::size_t> quantizedFrameCount(double target_fps,
+                                               double duration_s,
+                                               std::size_t min_frames) {
+  const double intervals_d = duration_s * target_fps;
+  constexpr std::uint64_t max_frames = maxPayloadFrames();
+  const std::size_t min_intervals =
+      min_frames > 0 ? std::max<std::size_t>(1, min_frames - 1) : 1;
   const std::size_t intervals =
-      std::max<std::size_t>(1, static_cast<std::size_t>(std::ceil(intervals_d - 1.0e-12)));
+      std::max<std::size_t>(min_intervals,
+                            static_cast<std::size_t>(std::ceil(intervals_d - 1.0e-12)));
   const std::size_t frames = intervals + 1;
   if (static_cast<std::uint64_t>(frames) > max_frames) {
     return std::nullopt;
@@ -148,22 +167,6 @@ TrkTrack makeEmptyTrack(std::size_t frames, double target_fps) {
   resizeFloatArray(track.ref_com_rel_navi, frames, {frames, 3}, 3);
   resizeFloatArray(track.ref_com_vel_navi, frames, {frames, 3}, 3);
   return track;
-}
-
-float lerp(float source, float target, double t) {
-  return static_cast<float>(static_cast<double>(source) +
-                            (static_cast<double>(target) - static_cast<double>(source)) * t);
-}
-
-void interpolateLinear(const TrkArrayView<float>& source,
-                       const TrkArrayView<float>& target,
-                       std::size_t frame,
-                       double t,
-                       TrkFloatArray& out) {
-  const std::size_t offset = frame * out.frame_size;
-  for (std::size_t i = 0; i < out.frame_size; ++i) {
-    out.values[offset + i] = lerp(source.ptr[i], target.ptr[i], t);
-  }
 }
 
 std::array<float, 4> normalizedQuat(const float* q) {
@@ -217,27 +220,103 @@ void interpolateQuats(const TrkArrayView<float>& source,
   }
 }
 
-void setContact(const TrkArrayView<std::int64_t>& source,
-                const TrkArrayView<std::int64_t>& target,
-                std::size_t frame,
-                double t,
-                TrkContactArray& out) {
-  out.values[frame] = t < 0.5 ? source.ptr[0] : target.ptr[0];
+bool sameContacts(const TrkFrameView& source, const TrkFrameView& target) {
+  return source.left_foot_contact_state.ptr[0] == target.left_foot_contact_state.ptr[0] &&
+         source.right_foot_contact_state.ptr[0] == target.right_foot_contact_state.ptr[0];
 }
 
-void finiteDifference(const TrkFloatArray& positions, double fps, TrkFloatArray& velocities) {
-  const std::size_t frames = static_cast<std::size_t>(positions.shape.front());
+void setContact(const TrkArrayView<std::int64_t>& source,
+                std::size_t frame,
+                TrkContactArray& out) {
+  out.values[frame] = source.ptr[0];
+}
+
+void interpolateFloatViewEndpointPreserving(const TrkArrayView<float>& source,
+                                            const TrkArrayView<float>& target,
+                                            std::size_t frame,
+                                            double t,
+                                            TrkFloatArray& out) {
+  const std::size_t offset = frame * out.frame_size;
+  for (std::size_t i = 0; i < out.frame_size; ++i) {
+    const double value = static_cast<double>(source.ptr[i]) * (1.0 - t) +
+                         static_cast<double>(target.ptr[i]) * t;
+    out.values[offset + i] = static_cast<float>(value);
+  }
+}
+
+std::optional<ruckig::Trajectory<ruckig::DynamicDOFs>> makeJointTrajectory(
+    const TrkArrayView<float>& source_position,
+    const TrkArrayView<float>& source_velocity,
+    const TrkArrayView<float>& target_position,
+    const TrkArrayView<float>& target_velocity,
+    double dt) {
+  const std::size_t dofs = source_position.size;
+  if (dofs != kJointDim || source_velocity.size != dofs || target_position.size != dofs ||
+      target_velocity.size != dofs) {
+    return std::nullopt;
+  }
+
+  ruckig::Ruckig<ruckig::DynamicDOFs> ruckig(dofs, dt);
+  ruckig::InputParameter<ruckig::DynamicDOFs> input(dofs);
+  ruckig::Trajectory<ruckig::DynamicDOFs> trajectory(dofs);
+  const SyntheticTransitionLimits limits = defaultSyntheticTransitionLimits();
+
+  for (std::size_t i = 0; i < dofs; ++i) {
+    input.current_position[i] = static_cast<double>(source_position.ptr[i]);
+    input.current_velocity[i] = static_cast<double>(source_velocity.ptr[i]);
+    input.current_acceleration[i] = 0.0;
+    input.target_position[i] = static_cast<double>(target_position.ptr[i]);
+    input.target_velocity[i] = static_cast<double>(target_velocity.ptr[i]);
+    input.target_acceleration[i] = 0.0;
+    input.max_velocity[i] = limits.max_velocity;
+    input.max_acceleration[i] = limits.max_acceleration;
+    input.max_jerk[i] = limits.max_jerk;
+  }
+
+  if (!ruckig.validate_input<false>(input, true, true)) {
+    return std::nullopt;
+  }
+
+  const ruckig::Result result = ruckig.calculate(input, trajectory);
+  if (result != ruckig::Result::Working) {
+    return std::nullopt;
+  }
+
+  const double trajectory_duration = trajectory.get_duration();
+  if (!finite(trajectory_duration) || trajectory_duration <= 0.0) {
+    return std::nullopt;
+  }
+  return trajectory;
+}
+
+bool sampleRuckigTrajectory(const ruckig::Trajectory<ruckig::DynamicDOFs>& trajectory,
+                            std::size_t frames,
+                            double dt,
+                            TrkFloatArray& out_position,
+                            TrkFloatArray& out_velocity) {
+  const std::size_t dofs = out_position.frame_size;
+  if (dofs == 0 || out_velocity.frame_size != dofs ||
+      out_position.values.size() != frames * dofs || out_velocity.values.size() != frames * dofs) {
+    return false;
+  }
+
+  const double trajectory_duration = trajectory.get_duration();
+  std::vector<double> position(dofs, 0.0);
+  std::vector<double> velocity(dofs, 0.0);
+  std::vector<double> acceleration(dofs, 0.0);
   for (std::size_t frame = 0; frame < frames; ++frame) {
-    const std::size_t prev = frame == 0 ? frame : frame - 1;
-    const std::size_t next = frame + 1 < frames ? frame + 1 : frame;
-    const double scale = frame > 0 && frame + 1 < frames ? 0.5 * fps : fps;
-    for (std::size_t i = 0; i < positions.frame_size; ++i) {
-      const float before = positions.values[prev * positions.frame_size + i];
-      const float after = positions.values[next * positions.frame_size + i];
-      velocities.values[frame * velocities.frame_size + i] =
-          static_cast<float>((static_cast<double>(after) - static_cast<double>(before)) * scale);
+    const double sample_time = std::min(static_cast<double>(frame) * dt, trajectory_duration);
+    trajectory.at_time(sample_time, position, velocity, acceleration);
+    for (std::size_t i = 0; i < dofs; ++i) {
+      if (!finite(position[i]) || !finite(velocity[i])) {
+        return false;
+      }
+      out_position.values[frame * dofs + i] = static_cast<float>(position[i]);
+      out_velocity.values[frame * dofs + i] = static_cast<float>(velocity[i]);
     }
   }
+
+  return true;
 }
 
 bool allFinite(const TrkFloatArray& array) {
@@ -261,40 +340,95 @@ bool allFinite(const TrkTrack& track) {
 std::optional<TrkTrack> makeSyntheticTransitionTrk(const TrkFrameView& source,
                                                    const TrkFrameView& target,
                                                    double target_fps,
-                                                   double duration_s) {
+                                                   SyntheticTransitionOptions options) {
   if (!validFrame(source) || !validFrame(target)) {
     return std::nullopt;
   }
 
-  const std::optional<std::size_t> maybe_frames = frameCount(target_fps, duration_s);
+  if (options.root_yaw_mode != SyntheticTransitionRootYawMode::kDisabled ||
+      options.min_frames == 0 ||
+      !finite(options.duration_dt_tolerance_s) ||
+      options.duration_dt_tolerance_s < 0.0 ||
+      !validTimingCap(target_fps, options.max_duration_s) || !sameContacts(source, target)) {
+    return std::nullopt;
+  }
+
+  const double dt = 1.0 / target_fps;
+  const std::optional<ruckig::Trajectory<ruckig::DynamicDOFs>> joint_trajectory =
+      makeJointTrajectory(source.joint_pos, source.joint_vel, target.joint_pos, target.joint_vel,
+                          dt);
+  if (!joint_trajectory.has_value()) {
+    return std::nullopt;
+  }
+
+  const double feasible_duration = joint_trajectory->get_duration();
+  const std::optional<std::size_t> maybe_frames =
+      quantizedFrameCount(target_fps, feasible_duration, options.min_frames);
   if (!maybe_frames.has_value()) {
+    return std::nullopt;
+  }
+  const double actual_duration = static_cast<double>(*maybe_frames - 1) * dt;
+  if (!finite(actual_duration) ||
+      actual_duration > options.max_duration_s + options.duration_dt_tolerance_s ||
+      actual_duration + kRuckigDurationEpsilon < feasible_duration) {
     return std::nullopt;
   }
 
   TrkTrack track = makeEmptyTrack(*maybe_frames, target_fps);
+  if (!sampleRuckigTrajectory(*joint_trajectory, track.metadata.frames, dt, track.joint_pos,
+                              track.joint_vel)) {
+    return std::nullopt;
+  }
+
   const double intervals = static_cast<double>(track.metadata.frames - 1);
   for (std::size_t frame = 0; frame < track.metadata.frames; ++frame) {
     const double t = static_cast<double>(frame) / intervals;
-    interpolateLinear(source.joint_pos, target.joint_pos, frame, t, track.joint_pos);
-    interpolateLinear(source.body_pos_w, target.body_pos_w, frame, t, track.body_pos_w);
-    interpolateLinear(source.ref_com_rel_navi, target.ref_com_rel_navi, frame, t,
-                      track.ref_com_rel_navi);
+    interpolateFloatViewEndpointPreserving(source.body_pos_w,
+                                           target.body_pos_w,
+                                           frame,
+                                           t,
+                                           track.body_pos_w);
+    interpolateFloatViewEndpointPreserving(source.body_lin_vel_w,
+                                           target.body_lin_vel_w,
+                                           frame,
+                                           t,
+                                           track.body_lin_vel_w);
+    interpolateFloatViewEndpointPreserving(source.ref_com_rel_navi,
+                                           target.ref_com_rel_navi,
+                                           frame,
+                                           t,
+                                           track.ref_com_rel_navi);
+    interpolateFloatViewEndpointPreserving(source.ref_com_vel_navi,
+                                           target.ref_com_vel_navi,
+                                           frame,
+                                           t,
+                                           track.ref_com_vel_navi);
     interpolateQuats(source.body_quat_w, target.body_quat_w, frame, t, track.body_quat_w);
-    setContact(source.left_foot_contact_state, target.left_foot_contact_state, frame, t,
-               track.left_foot_contact_state);
-    setContact(source.right_foot_contact_state, target.right_foot_contact_state, frame, t,
-               track.right_foot_contact_state);
+    // This preserves angular velocity endpoints only; it does not enforce consistency
+    // with the interpolated quaternion derivative.
+    interpolateFloatViewEndpointPreserving(source.body_ang_vel_w,
+                                           target.body_ang_vel_w,
+                                           frame,
+                                           t,
+                                           track.body_ang_vel_w);
+    setContact(source.left_foot_contact_state, frame, track.left_foot_contact_state);
+    setContact(source.right_foot_contact_state, frame, track.right_foot_contact_state);
   }
-
-  finiteDifference(track.joint_pos, target_fps, track.joint_vel);
-  finiteDifference(track.body_pos_w, target_fps, track.body_lin_vel_w);
-  finiteDifference(track.ref_com_rel_navi, target_fps, track.ref_com_vel_navi);
-  std::fill(track.body_ang_vel_w.values.begin(), track.body_ang_vel_w.values.end(), 0.0F);
 
   if (!allFinite(track)) {
     return std::nullopt;
   }
   return track;
+}
+
+std::optional<TrkTrack> makeSyntheticTransitionTrk(const TrkFrameView& source,
+                                                   const TrkFrameView& target,
+                                                   double target_fps,
+                                                   double duration_s) {
+  return makeSyntheticTransitionTrk(source,
+                                    target,
+                                    target_fps,
+                                    SyntheticTransitionOptions{duration_s});
 }
 
 }  // namespace agentic_et1_tracker
