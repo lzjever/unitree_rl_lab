@@ -4,6 +4,28 @@ Date: 2026-05-29
 Latest targeted update: 2026-06-17
 Environment: local workspace `/home/galbot/works/et1`
 
+## Manual E2E and visual gates
+
+`tools/manual_gate.py` is the manual product-mind E2E and MuJoCo visual
+screenshot gate. It is deliberately not wired into default `ctest`, release
+selftest, or packaging gates.
+
+- `tools/manual_gate.py e2e` covers the P0 black-box HTTP/status scenarios:
+  startup FixStand to StandbyVelocity recovery, standby/stop/passive idle
+  retention and clearing semantics, idle set/preempt/resume/clear,
+  queue/interrupt A-B-C run status contract, transition-to-stopping execute
+  conflict, and opt-in loco-upper bounded execution when enabled.
+- `tools/manual_gate.py visual` requires a running or explicitly started MuJoCo
+  session, runs a short action unless disabled, writes a screenshot artifact,
+  and emits a minimal checklist/result JSON for operator review.
+- Defaults connect to already running services. Process startup is explicit via
+  `--start-tracker` and `--start-mujoco-cmd`; the script stops only processes
+  it started.
+- Full local simulation acceptance should pass `--start-tracker
+  --enable-loco-temp --require-loco`. The script's generated config may lower
+  temporary runtime `hz` to make transition/stopping HTTP windows observable;
+  this does not change release config or default gates.
+
 ## Loco-upper simulation handoff status
 
 Status as of 2026-06-17:

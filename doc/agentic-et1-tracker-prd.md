@@ -26,8 +26,10 @@ GA 范围，KISS 收口版。
 - `.trk` 必须是 `agentic-et1-tracker` GeneralTracker GA schema 下的 ET1TRK1 v1 runtime cache 内容，不是 NPZ 或通用轨迹格式。
 - 异步返回短 `id`。
 - 动作顺序排队执行。
-- 立即接受抢断请求，取消等待队列，并触发受控 stop-to-idle；新动作只能在 stop-to-idle 后开始。
-- `/stop` 取消控制线程消费 stop 命令时已经存在的 active，以及 sequence 不大于该 stop command 且仍 queued/pending 的动作；健康可控路径回到 `ctrl:"idle"`。
+- 立即接受抢断请求，取消等待队列，并触发受控 stop-to-standby_velocity；新动作只能在 stop-to-standby_velocity 后开始。
+- 普通“停下/静止/待命”入口是 `/standby_velocity`，保留 idle 配置；`/stop` 是 urgent/immediate 软件停止，取消控制线程消费 stop 命令时已经存在的 active，以及 sequence 不大于该 stop command 且仍 queued/pending 的动作，并清空 idle 配置。健康可控路径回到 `ctrl:"standby_velocity"`。
+- `/passive` 是 password-gated safety sink，停止 active work、清 queue、清 idle 配置，不自动恢复。
+- `/fixstand` 是固定构型/姿态恢复入口，不等于普通静止站立；要回到正常可执行待命链路需显式 `/standby_velocity`。
 - 查询当前动作、队列、机器人和控制器状态。
 - 真机和仿真使用同一套 HTTP 接口。
 
@@ -46,7 +48,7 @@ GA 范围，KISS 收口版。
 - 复杂业务状态判断。
 - 默认返回完整诊断大包。
 
-KISS 的关键不是删掉队列和抢断，而是把它们限制成最小确定语义：一个当前动作、一个有界 FIFO 队列、一个抢断模式、一个 stop-to-idle；不增加上传、资产管理、profile 切换或通用 policy 平台。
+KISS 的关键不是删掉队列和抢断，而是把它们限制成最小确定语义：一个当前动作、一个有界 FIFO 队列、一个抢断模式、一个 stop-to-standby_velocity；不增加上传、资产管理、profile 切换或通用 policy 平台。
 
 ## 3. 产品边界
 
@@ -66,14 +68,15 @@ KISS 的关键不是删掉队列和抢断，而是把它们限制成最小确定
 
 ### 3.2 核心使用流
 
-核心接口是 4 个 route path：`/health`、`/status`、`/execute`、`/stop`。其中 `/status?id=ID` 是 `/status` 的查询形态，不是额外 route。agent 高频核心动作是 `/status`、`/status?id=ID`、`/execute`、`/stop`；`/health` 仅用于 readiness 探活。
+原始 GA 核心接口是 4 个 route path：`/health`、`/status`、`/execute`、`/stop`。当前公开控制合同还包括 `/idle`、`/passive`、`/fixstand`、`/standby_velocity`，以及可选的 `/execute_loco_upper`。其中 `/status?id=ID` 是 `/status` 的查询形态，不是额外 route。agent 高频核心动作是 `/status`、`/status?id=ID`、`/execute`、`/standby_velocity`；`/stop` 只用于 urgent/immediate 停止；`/health` 仅用于 readiness 探活。
 
 ```text
 GET  /health
 GET  /status
 POST /execute       # queue 或 interrupt
 GET  /status?id=ID  # 查询指定动作
-POST /stop          # 接受停止命令
+POST /standby_velocity # 普通停止/待命，保留 idle 配置
+POST /stop          # urgent/immediate 停止，清 queue 和 idle 配置
 ```
 
 顺序执行：
@@ -92,7 +95,13 @@ curl -s -X POST http://127.0.0.1:8080/execute \
   -d '{"path":"/home/galbot/motions/b.trk","mode":"interrupt"}'
 ```
 
-终止并回 idle：
+普通停止并进入待命：
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/standby_velocity
+```
+
+urgent/immediate 停止：
 
 ```bash
 curl -s -X POST http://127.0.0.1:8080/stop
@@ -252,7 +261,7 @@ unitree_rl_lab/deploy/robots/agentic-et1-tracker/
 
 - 新 app 自己的控制状态机。
 - 单活动执行。
-- 在生产路径中负责 queue、interrupt、stop-to-idle。
+- 在生产路径中负责 queue、interrupt、stop-to-standby_velocity。
 - 生产路径中唯一能推进 reference、运行 policy、写 `LowCmd` 的模块。
 - 消费 `CommandMailbox` 和 `MotionQueue`，并更新 `StatusSnapshot`。
 
@@ -344,12 +353,13 @@ HTTP 线程只做：
 - `/stop` 是幂等的；无 active 时也返回成功。
 - `RuntimeBridge` 为每个 accepted command 分配单调递增 sequence；stop 命令携带自己的 stop sequence，作为本次 stop watermark。
 - `/stop` 只取消控制线程消费该 stop 命令时已经存在的 active，以及 sequence `<= stop_sequence` 且仍 queued/pending 的动作。
-- sequence `> stop_sequence` 的新 `queue` 或 `interrupt` 是 stop 之后 accepted 的新工作，不属于本次 stop 的取消集合，也不应被本次 stop 再取消。
-- `/stop` 处理中收到新的 `queue` 请求时，新请求可以入队，但不能在 stop-to-idle 完成前启动。
-- `/stop` 处理中收到新的 `interrupt` 请求时，新动作成为 stop-to-idle 后的待执行动作；当前 stopping 继续完成。
+- sequence `> stop_sequence` 的已接受内部 post-stop work 不属于本次 stop 的取消集合，也不应被本次 stop 再取消。
+- 外部 HTTP `/execute queue|interrupt` 在 public `ctrl:"stopping"` 时必须返回 `CONTROL_STATE_CONFLICT`，不分配 run id、不调用 validator、不写 command sink、不改 queue。
+- 低层 bridge/internal 已经保留的 post-stop `queue` work 只能在 stop-to-standby_velocity 完成后启动；不能在 `stopping` 中启动。
+- 低层 bridge/internal 已经保留的 post-stop `interrupt` work 可成为 stop-to-standby_velocity 后的待执行动作；当前 stopping 继续完成。
 - `stop` 触发 `ctrl:"stopping"` 时，顶层 `stop_reason:"stop"`。
 - `interrupt` 触发新的 `ctrl:"stopping"` 时，顶层 `stop_reason:"interrupt"`。
-- 如果已经处于 `ctrl:"stopping"`，后续 `interrupt` 不改写当前 stopping 的顶层 `stop_reason`；它只替换等待队列队首并清空旧等待。
+- 如果低层/internal 已经处于 `ctrl:"stopping"` 且保留了 post-stop interrupt work，后续处理不得改写当前 stopping 的顶层 `stop_reason`；它只影响 stop-to-standby_velocity 后的待执行工作。
 - 被 `/stop`、`interrupt` 或替换清空的已接受 queued 动作进入 `canceled`，保留在 recent ring buffer 中供 `/status?id` 查询。
 - `interrupt` 不取消已经完成的 recent 记录。
 - 控制线程消费不是严格到达顺序，而是全局优先级 `stop > interrupt > queue`；同一优先级内再按进入 `CommandMailbox`/`MotionQueue` 的 sequence 排序。
@@ -362,15 +372,15 @@ HTTP 线程只做：
 | 状态 | 含义 | 允许进入条件 | 退出条件 |
 | --- | --- | --- | --- |
 | `starting` | 初始化 DDS、policy、配置 | 进程启动 | 初始化成功或失败 |
-| `idle` | 可执行 tracker idle | ready 且无 active | 有 queued/interrupt |
+| `standby_velocity` | Velocity0 待命；可执行用户 `.trk`，且可在 idle config 存在时启动 background idle | ready 且无 active | 有 queued/interrupt 或 idle auto-play |
 | `preparing` | 加载 `.trk`、reset policy history | 取到下一个动作 | 加载成功或失败 |
 | `running` | 正在执行 active | `preparing` 成功 | done/stop/interrupt/fault |
-| `stopping` | 受控停止并回 idle | stop 或 interrupt | idle 或 fault |
+| `stopping` | 受控停止并回 standby_velocity 或 safety/fault | stop、interrupt 或 standby_velocity/fixstand/passive 控制命令 | standby_velocity、fixstand、passive 或 fault |
 | `fault` | 安全阻塞 | safety/model/robot 错误 | 人工或重启恢复 |
 
 HTTP 状态里的 `ctrl` 只能来自这个状态机，不暴露 ET1 参考 app 的 FSM 名称。
 
-`stopping` 同时覆盖用户 stop 和 interrupt 两种停止来源。HTTP 不暴露单独的抢断状态；来源只通过 `stop_reason:"stop"|"interrupt"` 表示。`ctrl` 离开 `stopping` 后，顶层 `stop_reason` 恢复为 `null`，recent 动作可以保留自己的停止或取消原因。若 stopping 期间接受新的 interrupt 作为待执行动作，当前顶层 `stop_reason` 保持进入 stopping 时的原因，不被后来的待执行请求改写。
+`stopping` 同时覆盖用户 stop 和 interrupt 两种停止来源。HTTP 不暴露单独的抢断状态；来源只通过 `stop_reason:"stop"|"interrupt"` 表示。`ctrl` 离开 `stopping` 后，顶层 `stop_reason` 恢复为 `null`，recent 动作可以保留自己的停止或取消原因。外部 HTTP `/execute` 在 `stopping` 中拒绝；若低层/internal 已保留 post-stop work，当前顶层 `stop_reason` 保持进入 stopping 时的原因，不被待执行工作改写。
 
 ### 5.6 构建隔离
 
@@ -442,10 +452,10 @@ GA 使用有界内存 FIFO 队列：
 1. 请求被立即接受；等待队列中已接受但未执行的旧动作进入 `canceled`。
 2. 如果当前 active 正在 `running`，控制器进入 `ctrl:"stopping"`，顶层 `stop_reason:"interrupt"`。
 3. 新动作进入 `queued`，排在队首。
-4. 控制器完成受控 stop-to-idle。
-5. stop-to-idle 完成且 start gate 满足后，新动作才可开始 `running`。
+4. 控制器完成受控 stop-to-standby_velocity。
+5. stop-to-standby_velocity 完成且 start gate 满足后，新动作才可开始 `running`。
 
-如果请求发生在 `ctrl:"stopping"` 期间，当前 stopping 原因保持不变；新 interrupt 只替换 stop-to-idle 后的待执行队首，并把被替换或清空的 queued 动作标记为 `canceled`。`interrupt` 不能在真机中直接硬切 reference。
+外部 HTTP `/execute` 请求发生在 `ctrl:"stopping"` 期间时必须拒绝，不分配 id、不改 queue。若低层/internal 已保留 post-stop interrupt work，当前 stopping 原因保持不变，待执行工作只能在 stop-to-standby_velocity 完成后按自身语义继续。`interrupt` 不能在真机中直接硬切 reference。
 
 `/execute` 分成 accept gate 和 start gate，避免队列接收与真正启动混在一起。
 
@@ -456,47 +466,50 @@ accept gate 在 HTTP 线程中执行，只决定请求能否进入执行系统�
 - `mode_machine` 检查通过。
 - policy model 和 deploy 配置已加载。
 - 当前不处于 `fault`。
+- 当前 public `ctrl` 不处于 `stopping`、`passive`、`fixstand`、`fault` 或 legacy/internal Idle；这些 ready controller states 由 controller gate 拒绝。
 - `path` 是 absolute local path，canonical 后通过 allowlist，存在、可读、扩展名为 `.trk`。
 - `.trk` 通过 `TrkValidator` 的 app-local ET1TRK1 v1 GeneralTracker GA schema 校验。
 - `TrkValidator`/HTTP accept gate 只做 metadata、schema 和 bounds 轻量校验，不读取 contact payload；metadata 合法但 contact 值域错误的 `.trk` 可被 accepted。
 - 对 `mode:"queue"`，队列未满。
 
-`ctrl:"running"` 和 `ctrl:"stopping"` 本身不是 accept gate 的拒绝理由。`stopping` 期间允许接受合法 `queue` 或 `interrupt` 请求；它们只能排队或更新待执行头部，不能直接启动。
+`ctrl:"running"` 本身不是外部 HTTP `/execute` 的拒绝理由；`queue` 和 `interrupt` 可在 running/preparing 中被接受。`ctrl:"stopping"` 是外部 HTTP controller gate 的拒绝理由：返回 `CONTROL_STATE_CONFLICT`，不分配 id、不改 queue。低层 bridge/internal 已存在的 post-stop work 是内部 watermark 语义，不等价于外部 HTTP 在 stopping 中继续 accepted。
 
 accept gate 不满足时返回 `SERVICE_NOT_READY`、`ROBOT_DISCONNECTED`、`ROBOT_NOT_READY`、`MODEL_NOT_READY`、`TRK_*` 或 `QUEUE_FULL`，且不入队。`fault` 或 `ready=false` 的 not-ready 场景不入队，agent 应先轮询 `/status` 并处理 `block`。
 
 start gate 在控制线程中执行，只决定队列头动作何时真正开始。必须满足：
 
-- stop-to-idle 已完成。
-- `ctrl:"idle"`。
+- stop-to-standby_velocity 已完成。
+- `ctrl:"standby_velocity"`。
 - robot、`mode_machine`、policy 仍 ready。
 - 当前不处于 `fault`。
 
 start gate 不满足时不得推进 reference、不得加载新 `.trk`、不得发布新动作的 LowCmd。已接受请求保持 `queued`，直到 start gate 满足，或被后续 `/stop`、`interrupt`、`fault` 语义处理。
 
-### 6.3 Stop-to-idle
+### 6.3 Stop and standby
 
-`POST /stop` 是基础能力，语义固定：
+`POST /standby_velocity` 是普通“停下/静止/待命”入口，保留 idle 配置；如果 idle pool 非空且无 user work，回到可播放 idle 的待命链路后 background idle manager 可按规则重新播放 idle。
+
+`POST /stop` 是 urgent/immediate 软件停止，语义固定：
 
 1. HTTP adapter 通过 `RuntimeBridge` 写入带 sequence 的 stop 命令并立即返回 accepted，不等待控制线程消费 ack。
 2. stop 命令由控制线程消费时，以 stop command sequence 作为 watermark 建立本次 stop 的取消集合。
 3. 停止控制线程消费 stop 时已经存在的 active。
 4. 清空 sequence `<= stop_sequence` 且仍 queued/pending 的动作，并标记为 `canceled`。
 5. 进入 `ctrl:"stopping"`，`stop_reason:"stop"`。
-6. 健康可控路径下，控制器回到 tracker idle 控制态。
+6. 清空 idle 配置；健康可控路径下，控制器回到 `ctrl:"standby_velocity"`。
 7. agent 通过后续 `/status` 和 `/status?id=ID` 查询停止、取消和失败结果。
 
-`/stop` 是软件控制停止，不等价于硬件急停。
+`/stop` 是 urgent/immediate 软件停止，不等价于硬件急停，也不作为普通停下/静止/待命入口。
 
-`/stop` 与 `/execute` 不同：即使 `ready=false`、机器人断连或已经处于 `fault`，也必须尽可能返回成功的可理解状态。无法发布 LowCmd 时，不做硬件承诺；`/status` 必须返回明确 `block`/`err`，不承诺回到 `ctrl:"idle"`。
+`/stop` 与 `/execute` 不同：即使 `ready=false`、机器人断连或已经处于 `fault`，也必须尽可能返回成功的可理解状态。无法发布 LowCmd 时，不做硬件承诺；`/status` 必须返回明确 `block`/`err`，不承诺回到 `ctrl:"standby_velocity"`。
 
-`POST /stop` 响应不返回精确取消数量，也不承诺控制线程已经消费 stop。取消集合、active 最终 `stopped/failed`、queued 最终 `canceled` 等结果只通过后续 `/status` 和 `/status?id=ID` 体现。stop 后 accepted 的新 `queue/interrupt` sequence 大于该 stop watermark，不属于本次取消集合；若调用方在 stop 后继续提交新工作，`queue.n > 0` 不表示本次 stop 未收敛。
+`POST /stop` 响应不返回精确取消数量，也不承诺控制线程已经消费 stop。取消集合、active 最终 `stopped/failed`、queued 最终 `canceled` 等结果只通过后续 `/status` 和 `/status?id=ID` 体现。低层 bridge/internal 已接受且 sequence 大于该 stop watermark 的 post-stop work 不属于本次 stop 取消集合；外部 HTTP `/execute` 在 public `ctrl:"stopping"` 时仍必须拒绝。若内部 post-stop work 存在，`queue.n > 0` 不表示本次 stop 未收敛。
 
-这里的 `idle` 是新 app 自己实现的 tracker idle 控制态，不承诺物理已静止或执行质量。GA 采用保守实现：
+这里的 `standby_velocity` 是 Velocity0 待命控制态，不承诺物理已静止或执行质量。GA 采用保守实现：
 
 - 停止推进 reference。
 - 若 `RobotIO` 仍可控，控制循环在每个 tick 发布当前安全关节目标的 hold `LowCmd`，持续时间由 `stop_hold_s` 配置。
-- 之后进入配置的 tracker idle。
+- 之后进入 `standby_velocity`；如果 idle 配置仍存在，只有 `/standby_velocity` 这类保留 idle 的普通待命路径才允许 background idle manager 后续按规则自动播放 idle。`/stop` 和 `/passive` 已清空 idle 配置，不自动恢复。
 - 不进入硬件断力。
 - 不承诺从 `Passive` 自动站起。
 - 若机器人断连、DDS 不可写或进入 fault，`stop_hold_s` 不构成物理保持承诺；状态必须暴露明确 `block`/`err`。
@@ -619,7 +632,7 @@ ready 响应必须是 `ok:true,state:"ready"`。starting 或 error/not-ready 响
   "mode": "real",
   "ready": true,
   "robot": "idle",
-  "ctrl": "idle",
+  "ctrl": "standby_velocity",
   "stop_reason": null,
   "hz": 50,
   "exec": null,
@@ -639,12 +652,12 @@ ready 响应必须是 `ok:true,state:"ready"`。starting 或 error/not-ready 响
 - `holding`
 - `fault`
 
-`robot` 表示连接、健康和本 app 的控制输出意图，不表示硬件确认状态、物理已静止或动作执行质量。`robot:"idle"` 只表示 app 当前意图是 idle 输出；agent 判断 `/stop` 收敛不应依赖它。`robot:"holding"` 只表示 app 正在 stop hold 阶段输出 hold 控制意图，不表示硬件确认进入保持状态。
+`robot` 表示连接、健康和本 app 的控制输出意图，不表示硬件确认状态、物理已静止或动作执行质量。`robot:"idle"` 只表示 app 当前没有用户动作输出；agent 判断普通待命应看 `ctrl:"standby_velocity"`，判断 urgent `/stop` 收敛还要结合 active/queue/err。`robot:"holding"` 只表示 app 正在 stop hold 阶段输出 hold 控制意图，不表示硬件确认进入保持状态。
 
 `ctrl`：
 
 - `starting`
-- `idle`
+- `standby_velocity`
 - `preparing`
 - `running`
 - `stopping`
@@ -757,17 +770,18 @@ ready 响应必须是 `ok:true,state:"ready"`。starting 或 error/not-ready 响
 `mode:"queue"`：
 
 - 若 controller 空闲且 start gate 满足，动作进入队列头，很快开始执行。
-- 若已有 active 或 `ctrl:"stopping"`，动作排在队尾。
+- 若已有 active 且 public `ctrl` 为 `preparing`/`running`，动作排在队尾。
+- 若 public `ctrl:"stopping"`，外部 HTTP 请求返回 `CONTROL_STATE_CONFLICT`，不分配 id、不入队。
 - 若队列满，返回 `QUEUE_FULL`。
 - 若 accept gate 不满足，返回错误，不入队。
 
 `mode:"interrupt"`：
 
-- 立即接受抢断请求，取消旧等待，并触发受控 stop-to-idle。
+- 立即接受抢断请求，取消旧等待，并触发受控 stop-to-standby_velocity。
 - 如果当前 active 正在 `running`，状态表现为 `ctrl:"stopping"`、`stop_reason:"interrupt"`。
 - 清空等待队列。
 - 新动作排到队首。
-- 若请求发生在 `ctrl:"stopping"` 期间，新动作替换等待中的旧队首，清空其他等待动作，当前顶层 `stop_reason` 不变，且仍必须等待 stop-to-idle 完成。
+- 若外部 HTTP 请求发生在 `ctrl:"stopping"` 期间，返回 `CONTROL_STATE_CONFLICT`，不分配 id、不改等待队列。只有低层/internal 已保留的 post-stop work 可在 stop-to-standby_velocity 完成后继续。
 - 返回新动作 `id`。
 
 ### 7.5 `POST /stop`
@@ -792,22 +806,22 @@ ready 响应必须是 `ok:true,state:"ready"`。starting 或 error/not-ready 响
 - stop 命令被控制线程消费时，停止当时存在的 active。
 - 清空 sequence `<= stop_sequence` 且仍 queued/pending 的 queue 项。
 - 被清空的 queued/pending 动作标记为 `canceled`，动作自己的 `stop_reason:"stop"`。
-- sequence `> stop_sequence` 的新 `queue/interrupt` 不属于该 stop；它们只能在 stop-to-idle 完成后按自身语义继续。
+- sequence `> stop_sequence` 的已接受内部 post-stop `queue/interrupt` 不属于该 stop；它们只能在 stop-to-standby_velocity 完成后按自身语义继续。外部 HTTP `/execute` 在 public `ctrl:"stopping"` 时拒绝，不产生这类新 sequence。
 
 ```text
 stop accepted: sequence=10
 本次 stop 只取消 sequence <= 10 且仍 queued/pending 的动作
-stop 期间新 queue accepted: sequence=11，不属于本次 stop 取消集合
+低层/internal post-stop work: sequence=11，不属于本次 stop 取消集合
 ```
 
 - 被停止的 active 动作最终变为 `stopped`；若停止期间发生 fault，则变为 `failed` 并返回明确 `err`。
-- 健康可控路径下控制器目标状态为 `ctrl:"idle"`。
+- 健康可控路径下控制器目标状态为 `ctrl:"standby_velocity"`。
 - 如果没有 active，HTTP 也返回成功；控制线程消费 stop 时仍按 watermark 清空旧 queued/pending。
 - 取消和停止结果通过后续 `/status` 和 `/status?id=ID` 查询体现。
 
 agent 调用 `/stop` 后应轮询 `/status`，直到：
 
-- 健康可控路径：`ctrl:"idle"`，且本次 stop 涉及的 active 不再是 `running/stopping`。
+- 健康可控路径：`ctrl:"standby_velocity"`，且本次 stop 涉及的 active 不再是 `running/stopping`。
 - 若调用方 stop 后没有提交新工作，通常还应看到 `exec:null`、`queue.n == 0`。
 - 若 stop 后又有新 `queue/interrupt` 被接受，`queue.n > 0` 或后续新 `exec` 不表示本次 stop 失败。
 
@@ -870,9 +884,10 @@ GA 错误码：
 | --- | --- | --- | --- | --- |
 | `queue` | accept gate 通过、队列未满 | `ok:true,state:"queued"` | 新动作 queued | `err:null` |
 | `queue` | 队列满 | `ok:false` | 不入队 | `QUEUE_FULL,next:"status"` |
-| `interrupt` | accept gate 通过 | `ok:true,state:"queued"` | 旧 queued `canceled`；running 则 `ctrl:"stopping"` | 顶层 `stop_reason:"interrupt"`，已在 stopping 则保持原原因 |
-| `stop` | 任意非崩溃状态 | `ok:true,state:"accepted"` | 消费时已有 active/queued 停止或取消；健康路径进入/保持 `stopping` 后回 `idle` | 无法控制时给 `block/err`，不承诺 `idle` |
-| loader fail | 控制线程加载失败 | 请求已 accepted | 当前动作 `failed`，进入 `idle` 或 `fault` | `TRK_PARSE_FAILED` 或 `TRK_VALIDATION_FAILED` |
+| `queue` / `interrupt` | public `ctrl:"stopping"` | `ok:false` | 不分配 id、不入队、不改 queue | `CONTROL_STATE_CONFLICT,next:"status"` 或等价 controller conflict |
+| `interrupt` | accept gate 通过且不在 `stopping` | `ok:true,state:"queued"` | 旧 queued `canceled`；running 则 `ctrl:"stopping"` | 顶层 `stop_reason:"interrupt"` |
+| `stop` | 任意非崩溃状态 | `ok:true,state:"accepted"` | 消费时已有 active/queued 停止或取消；健康路径进入/保持 `stopping` 后回 `standby_velocity` | 无法控制时给 `block/err`，不承诺 `standby_velocity` |
+| loader fail | 控制线程加载失败 | 请求已 accepted | 当前动作 `failed`，进入 `standby_velocity` 或 `fault` | `TRK_PARSE_FAILED` 或 `TRK_VALIDATION_FAILED` |
 | invalid contact payload | metadata/schema/bounds 合法，contact payload 值域非法 | 请求可 accepted | `TrkLoader` 加载失败，当前动作 `failed` | `TRK_VALIDATION_FAILED` 或 loader validation failure |
 | inference fail | ONNX 推理失败 | 请求已 accepted | 当前动作 `failed`，`ctrl:"fault"` | `MODEL_INFERENCE_FAILED,next:"manual"` |
 | robot disconnect | lowstate 超时/断连 | `/execute` 拒绝 | `ready:false`；active failed 或 stopping blocked | `ROBOT_DISCONNECTED,block:"lowstate_timeout"` |
@@ -1010,7 +1025,7 @@ TOCTOU 处理：
 
 `ready=false` 时，`GET /status` 和 `GET /health` 仍可用，但 `/execute` 不入队。agent 应先等待或处理 `block`。
 
-`ready=true` 不表示 `ctrl` 一定是 `idle`。例如 stop-to-idle 期间，robot/model 仍健康时可以保持 `ready=true`、`ctrl:"stopping"`；此时 `/execute` 可通过 accept gate，但 start gate 必须等待 `ctrl:"idle"`。`ctrl:"idle"` 表示 app 停止推进 reference 并回到 tracker idle 控制态；不承诺物理机器人已经静止。
+`ready=true` 不表示 `ctrl` 一定是 `standby_velocity`。例如 stop-to-standby_velocity 期间，robot/model 仍健康时可以保持 `ready:true`、`ctrl:"stopping"`；此时外部 HTTP `/execute` 必须被 controller gate 拒绝并返回 `CONTROL_STATE_CONFLICT`，不分配 id、不改 queue。低层/internal 已存在的 post-stop work 也必须等待 `ctrl:"standby_velocity"` 后才能启动。`ctrl:"standby_velocity"` 表示 app 进入 Velocity0 待命链路；不承诺物理机器人已经静止。
 
 ### 10.2 `block`
 
@@ -1121,8 +1136,8 @@ agentic_et1_tracker:
 - best-effort 检测发现疑似已有控制进程占用时应拒绝启动或进入 `error`，但 PRD 不把它描述成硬互斥保证。
 - `.trk` 路径必须受 allowlist 限制。
 - 执行中允许 queue 和 interrupt，但语义必须确定。
-- `/stop` 必须取消 stop 被控制线程消费时已有的 active/queued；健康可控路径回到 `ctrl:"idle"`，fault/disconnected 只承诺明确 `block/err`。
-- `interrupt` 必须先进入受控 stop-to-idle 过渡，再加载新 `.trk`，不能在真机中直接硬切 reference。
+- `/stop` 必须取消 stop 被控制线程消费时已有的 active/queued，并清 idle 配置；健康可控路径回到 `ctrl:"standby_velocity"`，fault/disconnected 只承诺明确 `block/err`。
+- `interrupt` 必须先进入受控 stop-to-standby_velocity 过渡，再加载新 `.trk`，不能在真机中直接硬切 reference。
 - tracker 执行态必须由新 app 自己实现 bad-orientation safety fallback；检测到坏姿态时应进入 `fault` 或拒绝继续执行。
 - 出现 safety/fault 时拒绝新执行。
 - HTTP 不直接写 `LowCmd`。
@@ -1155,14 +1170,14 @@ agentic_et1_tracker:
 - `POST /execute mode=queue` 一个合法 `.trk`，立即返回 `id`。
 - 轮询 `/status?id=ID` 能看到 `frame` 增长。
 - 连续提交多个 queue 动作，按 FIFO 顺序执行。
-- 执行中提交 `mode=interrupt`，请求立即接受，当前动作受控 stop-to-idle，等待队列取消，新动作在 stop-to-idle 后执行。
+- 执行中提交 `mode=interrupt`，请求立即接受，当前动作受控 stop-to-standby_velocity，等待队列取消，新动作在 stop-to-standby_velocity 后执行。
 - 由 interrupt 触发的 stopping 期间，`/status` 只出现 `ctrl:"stopping"` 和 `stop_reason:"interrupt"`，不出现单独的抢断 ctrl 状态。
-- `ctrl:"stopping"` 且 robot/model ready 时，新的合法 `queue` 或 `interrupt` 可以被接受，但必须等 stop-to-idle 完成后才开始。
-- stop 已在进行时提交 `mode=interrupt`，当前顶层 `stop_reason` 仍为 `stop`，新动作成为 stop-to-idle 后的待执行队首，旧等待动作可通过 `/status?id` 查到 `state:"canceled"`。
+- `ctrl:"stopping"` 且 robot/model ready 时，外部 HTTP `/execute queue|interrupt` 返回 `CONTROL_STATE_CONFLICT`，不分配 id、不改 queue。
+- 若低层/internal 已存在 post-stop work，当前顶层 `stop_reason` 仍为进入 stopping 时的原因；该 work 只能在 stop-to-standby_velocity 后继续。
 - 执行中 `POST /stop` 后，HTTP 响应只表示 accepted；本次 stop 被控制线程消费时已有 active 最终 `stopped` 或明确 `failed`，已有 queued 变为 `canceled`。
-- 健康可控且 stop 后无新请求时，控制器回到 `ctrl:"idle"`，`exec:null`，`queue.n==0`。
-- stop 后接受新 queue/interrupt 时，新工作不属于本次 stop 的取消集合；`queue.n>0` 或新 `exec` 不使本次 stop 验收失败。
-- robot disconnect 或 fault 期间 `/stop` 不承诺 `ctrl:"idle"`，但 `/status` 必须返回明确 `block` 或 `err`。
+- 健康可控且 stop 后无新请求时，控制器回到 `ctrl:"standby_velocity"`，`exec:null`，`queue.n==0`，idle 配置已清空。
+- 低层/internal post-stop work 不属于本次 stop 的取消集合；`queue.n>0` 或后续新 `exec` 不使本次 stop 验收失败。外部 HTTP 在 `stopping` 中不得通过这种路径新增 work。
+- robot disconnect 或 fault 期间 `/stop` 不承诺 `ctrl:"standby_velocity"`，但 `/status` 必须返回明确 `block` 或 `err`。
 - 提交 metadata/schema 损坏或缺少关键数组的 `.trk`，请求被拒绝，控制进程不崩溃；payload 语义错误（如 contact 值域非法）若 metadata 合法可被 accepted，但控制线程加载失败并将动作标记为 `failed`。
 - oversized metadata、frame_count 不一致、非法 dtype 或畸形 byte_count 的 `.trk` 被拒绝。
 - 包含未知但合法数组的 `.trk` 可被 validator/loader 跳过未知 payload，不分配 unknown payload。
@@ -1173,7 +1188,7 @@ agentic_et1_tracker:
 - 真机 lowstate 连接后，`GET /status` 返回 `mode:"real"`。
 - `mode_machine` 不匹配时 `ready=false`，并给出 `block`。
 - 合法 `.trk` 可执行。
-- queue、interrupt、stop-to-idle 的语义与仿真一致。
+- queue、interrupt、stop-to-standby_velocity 的语义与仿真一致。
 - LowCmd 占用检测按 best-effort 验证；部署层仍需单控制进程约束。
 
 ### 14.4 Core Tests
@@ -1183,7 +1198,7 @@ agentic_et1_tracker:
 - 默认 core tests 不依赖 Unitree SDK2 或 ONNX Runtime。
 - 默认不打开 `AGENTIC_ET1_BUILD_ONNX`、`AGENTIC_ET1_BUILD_ROBOT`、`AGENTIC_ET1_BUILD_PERF_SMOKE` 时，core tests 不依赖 MuJoCo、Unitree SDK2 或 ONNX Runtime。
 - queue、interrupt/stop 状态机、accept gate/start gate、progress、`TrkSchema`、`TrkValidator` 都有核心单测。
-- `/stop` 单测覆盖响应只表示 accepted、stopping 期间新 queue/interrupt 不属于本次 stop 取消集合，且不要求无条件 `queue.n==0`。
+- `/stop` 单测覆盖响应只表示 accepted、低层/internal post-stop work 不属于本次 stop 取消集合，且不要求无条件 `queue.n==0`；HTTP/API 测试必须覆盖 public `ctrl:"stopping"` 中 `/execute queue|interrupt` 返回 conflict 且无 id/queue side effect。
 - 路径安全单测覆盖 URL/相对路径拒绝、canonical allowlist、symlink escape、控制线程重校验失败。
 - loader 单测覆盖同一打开文件句柄 scan+payload read 的 TOCTOU 约束。
 
@@ -1195,12 +1210,13 @@ agentic_et1_tracker:
 
 ### 14.6 Agent 体验
 
-agent 高频使用的是 4 个核心动作，另有 `GET /health` 用于 readiness 探活；route path 仍只有 4 个：`/health`、`/status`、`/execute`、`/stop`。
+agent 高频使用的是状态、执行和普通待命动作，另有 `GET /health` 用于 readiness 探活；当前公开 route path 包括 `/health`、`/status`、`/execute`、`/idle`、`/standby_velocity`、`/stop`、`/passive`、`/fixstand`，以及可选 `/execute_loco_upper`。
 
 - `GET /status`
 - `GET /status?id=ID`
 - `POST /execute`
-- `POST /stop`
+- `POST /standby_velocity`
+- `POST /stop`（urgent/immediate）
 
 `GET /health` 仅用于探活。
 
@@ -1231,7 +1247,7 @@ agent 高频使用的是 4 个核心动作，另有 `GET /health` 用于 readine
 
 - 现有 ET1 app 只能参考，不能作为运行时依赖。
 - `.trk` 是 API 合同；底层真实内容必须是 app-local ET1TRK1 v1 GeneralTracker GA schema runtime cache。
-- 新 app 必须自己实现 queue、interrupt、stop-to-idle。
+- 新 app 必须自己实现 queue、interrupt、stop-to-standby_velocity。
 - 生产 HTTP 必须通过 `RuntimeBridge`、`CommandMailbox`、`MotionQueue` 和 `RuntimeControlLoop`；`TrackerController` 只能作为 core/test façade，不能作为生产同步控制入口。
 - 新 app 必须自己实现 app-local `TrkSchema`，并让 validator/loader 共用它。
 - 新 app 必须自己实现轻量 `.trk` 预校验、payload skip 和异常隔离。
@@ -1242,7 +1258,7 @@ agent 高频使用的是 4 个核心动作，另有 `GET /health` 用于 readine
 
 最终结论：
 
-本 PRD 以“独立 app、只支持 `.trk` 路径、短接口、有界队列、确定抢断、stop-to-idle、真机/仿真一致、零影响现有 ET1 app”为 GA 范围。任何会引入资产管理、复杂调度、业务判断、多格式兼容或依赖现有 ET1 app 内部实现的能力都不进入当前版本。
+本 PRD 以“独立 app、只支持 `.trk` 路径、短接口、有界队列、确定抢断、stop-to-standby_velocity、真机/仿真一致、零影响现有 ET1 app”为 GA 范围。任何会引入资产管理、复杂调度、业务判断、多格式兼容或依赖现有 ET1 app 内部实现的能力都不进入当前版本。
 
 ## 17. 开发交付定义
 
@@ -1250,10 +1266,10 @@ agent 高频使用的是 4 个核心动作，另有 `GET /health` 用于 readine
 
 ### 17.1 产品/文档闭合
 
-- 产品范围闭合：只做 `.trk` 执行、queue、interrupt、stop、status。
-- 接口闭合：只需要 `/health`、`/status`、`/execute`、`/stop`。
+- 产品范围闭合：只做 `.trk` 执行、queue、interrupt、urgent stop、status 和当前控制合同。
+- 接口闭合：核心执行/状态需要 `/health`、`/status`、`/execute`；当前控制合同还包括 `/idle`、`/standby_velocity`、urgent `/stop`、passworded `/passive` 和 recovery `/fixstand`。
 - 工程边界闭合：独立 app，不改、不包、不链 ET1 app，CMake 只用 target-level include/link。
-- 状态机闭合：`starting/idle/preparing/running/stopping/fault`。
+- 状态机闭合：`starting/standby_velocity/preparing/running/stopping/fault`，并包含 current control states `passive`/`fixstand`。
 - 停止语义闭合：不暴露单独抢断状态，统一用 `ctrl:"stopping"` 和 `stop_reason`；stop 取消集合由 command sequence/watermark 定义。
 - Policy/Observation 边界闭合：只支持固定 GeneralTrackerCLN frozen profile 和 `config/policy/general_tracker_cln/params/deploy.yaml` 的最小合同。
 - 安全边界闭合：LowCmd best-effort 占用检测、本 app 进程锁、部署层单控制进程约束、allowlist、bad orientation、fault 拒绝执行。
@@ -1268,9 +1284,9 @@ GA 代码交付必须保留已有 runtime/integration 实现，并满足以下�
 
 - 默认 app-owned frozen profile 交付时必须存在于新 app 目录或外部部署资产目录，默认配置指向真实存在的 agentic-owned ONNX/deploy 资产；当前资产证据应包括 manifest、hash 校验和 non-symlink 检查记录。
 - `AGENTIC_ET1_BUILD_ONNX=ON` 且 `AGENTIC_ET1_BUILD_ROBOT=ON` 的 non-stub runtime factory 可构建、链接并运行真实 ONNX Runtime 与 Unitree SDK2 RobotIO。
-- MuJoCo 仿真验收按第 14 节完成，覆盖 generated `.trk`、HTTP `/health`、`/status`、`/execute`、frame progress、`/stop`、queue/interrupt/stop-to-idle 和 fault/disconnect 基本路径。
+- MuJoCo 仿真验收按第 14 节完成，覆盖 generated `.trk`、HTTP `/health`、`/status`、`/execute`、frame progress、`/standby_velocity`、urgent `/stop`、queue/interrupt/stop-to-standby_velocity 和 fault/disconnect 基本路径。
 - 真机验收按第 14 节完成，覆盖 LowCmd 通道占用 best-effort、`mode_machine`、readiness/safety gates、stop_hold、fault fallback 和部署层单控制进程约束。真机验收为 external pending，需要 ET1 硬件和操作者窗口；这不阻止 MuJoCo、`ONNX+ROBOT` build、fake tests 和证据记录继续推进。
-- 真实 integration perf 记录按第 11 节和第 14 节完成，至少覆盖 50 Hz 控制循环、HTTP p95、queue/interrupt/stop-to-idle、fault/disconnect 和资产隔离。
+- 真实 integration perf 记录按第 11 节和第 14 节完成，至少覆盖 50 Hz 控制循环、HTTP p95、queue/interrupt/stop-to-standby_velocity、fault/disconnect 和资产隔离。
 
 ### 17.3 成熟度结论
 

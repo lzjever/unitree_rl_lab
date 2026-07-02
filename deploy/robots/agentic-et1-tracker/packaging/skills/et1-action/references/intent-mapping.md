@@ -5,9 +5,10 @@ Map user interruptions to one workflow command:
 - Switch to base/chassis/loco-upper mode: `motion-mode base`, then later motion commands use `/execute_loco_upper`.
 - Switch back to normal whole-body tracking: `motion-mode fullbody`.
 - Ordinary walking, turning, or motion prompts do not imply base mode; use the current `motion-mode`.
+- If base/chassis/loco-upper mode returns `MODEL_NOT_READY`, report the error; do not retry through full-body `/execute`.
 - Add after current work: `sequence-append`.
 - Replace later work while current motion continues: `sequence-replace-tail`.
-- New user motion request while anything is running: use `run-text` or a new `sequence-start`; these cancel old local sequences and submit the first motion with tracker interrupt.
+- New user motion request while anything is running: use `run-text` or a new `sequence-start`; these cancel old local sequences and submit the first motion with tracker interrupt. Direct `run-text` and `run-trk` also default to interrupt; use `--mode queue` only for explicit append-after-current tracker work. Raw HTTP `/execute` and `/execute_loco_upper` still default to queue when `mode` is omitted.
 - Immediately change a known active sequence to a ready `.trk`: `sequence-interrupt --trk`.
 - Immediately change a known active sequence to new text: `sequence-interrupt --text`; it cancels old tail work, generates, then submits with tracker interrupt.
 - Ordinary stop, pause, or "do not move": `sequence-cancel` or `standby`.

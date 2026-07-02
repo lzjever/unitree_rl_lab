@@ -83,6 +83,16 @@ std::string readTextFile(const std::filesystem::path& path) {
                      std::istreambuf_iterator<char>());
 }
 
+void replaceOnce(std::string& text,
+                 const std::string& needle,
+                 const std::string& replacement) {
+  const std::size_t pos = text.find(needle);
+  if (pos == std::string::npos) {
+    throw std::runtime_error("missing yaml text " + needle);
+  }
+  text.replace(pos, needle.size(), replacement);
+}
+
 std::string yamlList(const std::vector<int>& values, const std::string& indent) {
   std::ostringstream out;
   for (const int value : values) {
@@ -256,6 +266,25 @@ TEST_CASE("LocoLowerDeployConfig accepts app-owned ET1 lowobs10k deploy") {
   REQUIRE(config.observation_terms.at(0).offset == 0);
   REQUIRE(config.observation_terms.at(5).name == "last_action");
   REQUIRE(config.observation_terms.at(5).offset == 33);
+}
+
+TEST_CASE("LocoLowerDeployConfig rejects non-frozen lower asset cadence") {
+  std::string text = readTextFile(repoFile(
+      "config/policy/loco_lower/et1_low/params/deploy_lowobs10k.yaml"));
+
+  SECTION("step_dt must stay at the current 20ms lower asset contract") {
+    replaceOnce(text, "step_dt: 0.02\n", "step_dt: 0.01\n");
+
+    requireLocoLowerError(writeTempDeployConfig("loco_lower_step_dt_001", text),
+                          "step_dt must equal 0.02");
+  }
+
+  SECTION("policy_decimation must stay at the current lower asset contract") {
+    replaceOnce(text, "policy_decimation: 10\n", "policy_decimation: 5\n");
+
+    requireLocoLowerError(writeTempDeployConfig("loco_lower_decimation_5", text),
+                          "policy_decimation must equal 10");
+  }
 }
 
 TEST_CASE("LocoLowerDeployConfig defaults missing SDK joint map to identity") {

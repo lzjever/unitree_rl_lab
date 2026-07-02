@@ -13,18 +13,20 @@ scripts/et1-action ...
 
 Do not depend on typed tools, plugins, curl, or multi-tool parallel calls.
 
-Prefer natural-language commands through `run-text`; it checks bundled presets first, falls back to text-to-TRK generation, then runs the resulting `.trk`. Use `run-trk` only when the `.trk` path is already known. Direct `run-text`, `run-trk`, `sequence-start`, and `standby` cancel any active local sequence before continuing; new user intent must not leave old background generation running.
+Prefer natural-language commands through `run-text`; it checks bundled presets first, falls back to text-to-TRK generation, then runs the resulting `.trk`. Use `run-trk` only when the `.trk` path is already known. Direct `run-text`, `run-trk`, `sequence-start`, and `standby` cancel any active local sequence before continuing; new user intent must not leave old background generation running. `run-text` and `run-trk` submit with tracker `interrupt` mode by default because a new user instruction should replace the current foreground action; use `--mode queue` only when the user explicitly asks to add after current tracker work. This is a skill-level product default: raw HTTP `/execute` and `/execute_loco_upper` still default to `mode:"queue"` when `mode` is omitted.
 For generated motions, translate user intent to a concise English Kimodo-style prompt and choose a short physical duration. Use `--seed` when the user asks to retry/compare variants or reproduce a result; use `--diffusion-steps` only when explicitly needed.
 For precise left/right limb actions or final-pose requests, use `run-text ... --hold --no-preset`. The command also auto-detects common "hold the pose" phrasing and bypasses risky presets for precise left/right limb prompts.
 
-Motion submission has two persistent skill modes. The default is `fullbody`, which submits TRK through the normal whole-body tracker (`/execute`). Only switch to `base` when the user explicitly asks to use base/chassis/loco-upper mode; then later `run-text`, `run-trk`, and sequence submissions use `/execute_loco_upper` until the user explicitly switches back to `fullbody`. Do not infer base mode from ordinary walking requests.
+Motion submission has two persistent skill modes. The default is `fullbody`, which submits TRK through the normal whole-body tracker (`/execute`). Only switch to `base` when the user explicitly asks to use base/chassis/loco-upper mode; then later `run-text`, `run-trk`, and sequence submissions use `/execute_loco_upper` until the user explicitly switches back to `fullbody`. Do not infer base mode from ordinary walking requests. If base/loco-upper execution returns `MODEL_NOT_READY`, report that compact error and do not fall back to `/execute`.
 
 Common commands:
 
 ```bash
 scripts/et1-action run-text "<concise English motion prompt>" --duration 3
+scripts/et1-action run-text "<concise English motion prompt>" --duration 3 --mode queue  # explicit append after current tracker work
 scripts/et1-action run-text "<concise English final-pose prompt>" --duration 4 --hold --no-preset
 scripts/et1-action run-trk /abs/path/motion.trk
+scripts/et1-action run-trk /abs/path/motion.trk --mode queue  # explicit append after current tracker work
 scripts/et1-action run-trk relative/name-under-user-motion
 scripts/et1-action motion-mode              # query current fullbody/base mode
 scripts/et1-action motion-mode base         # explicit base/chassis/loco-upper mode
@@ -40,8 +42,9 @@ scripts/et1-action sequence-start --plan-json '{"segments":[{"text":"<segment pr
 scripts/et1-action sequence-status SEQ_ID
 ```
 
-Normal stop requests map to `standby` or `sequence-cancel`; do not use `urgent-stop` unless the user clearly asks for emergency stop, abort, or kill. Use `fixstand` only when the user explicitly asks to enter the stand configuration. Use `passive --password ...` only when the user explicitly authorizes passive mode and provides the password; passive mode does not automatically recover, and the next normal recovery step is `fixstand`.
+Normal stop requests map to `standby` or `sequence-cancel`; do not use `urgent-stop` unless the user clearly asks for emergency stop, abort, or kill. Use `fixstand` only when the user explicitly asks to enter the stand configuration. Use `passive --password ...` only when the user explicitly authorizes passive mode and provides the password; there is no default password lookup. Passive mode does not automatically recover, and the next normal recovery step is `fixstand`.
 `standby` cancels active local sequences and tracker queued motions, but does not clear idle configuration. If idle motions are loaded, the tracker may enter idle background motion; if no idle is loaded, it stays in velocity0 standby. Trust the command JSON `state/ctrl/active/idle` fields instead of assuming pure velocity0.
+`fixstand` and `passive` keep the compatibility `state:"fixstand"` or `state:"passive"`, but successful output also has `accepted:true` and `confirmed:false`; do not treat `state` alone as confirmation that `/status` has already reached the target state. `urgent-stop --urgent` keeps compatibility `state:"stopped"`, adds `urgent:true`, and is the only skill command that calls `/stop`.
 Only clear generation cache when the user explicitly asks to clear/reset cache. Run `scripts/et1-action cache-clear`; add `--root PATH` only when clearing a non-default text-to-TRK root. Do not clear cache as a normal retry or motion-control step.
 
 `run-trk` accepts absolute `.trk` file paths and relative user-motion names. Absolute paths must already exist, be files, and end in `.trk`; `.et1trk` is not supported. Relative paths are resolved under `Path.cwd()/generated/user-motion`, may include subdirectories, and may omit the `.trk` suffix. Relative paths must not contain `..`, and symlinks must resolve inside the user-motion root. If the exact relative file is not found, `scripts/find-user-motion` searches that root for a best `.trk` match: first a unique stem-exact match, then a unique basename/stem contains match. If no filename match exists, it scans `generated/user-motion/**/*.json` metadata and fuzzy-matches the JSON `name` field; a single best match with score `>= 0.80` plays the sibling/declared `.trk`. No match or ambiguous same-priority matches returns `REQUEST_INVALID`.

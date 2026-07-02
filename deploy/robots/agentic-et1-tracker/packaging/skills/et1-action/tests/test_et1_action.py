@@ -45,6 +45,9 @@ DEFAULT_FIELDS = {
     "active",
     "idle",
     "segments",
+    "accepted",
+    "confirmed",
+    "urgent",
     "hold",
     "matched",
     "motion_mode",
@@ -59,6 +62,7 @@ class TrackerState:
         self.records = []
         self.next_id = 1
         self.run_state = "running"
+        self.loco_upper_enabled = True
         self.status = {
             "ok": True,
             "state": "running",
@@ -118,7 +122,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/execute":
             self.send_json({"ok": True, "id": state.run_id()})
         elif self.path == "/execute_loco_upper":
-            self.send_json({"ok": True, "id": state.run_id()})
+            if state.loco_upper_enabled:
+                self.send_json({"ok": True, "id": state.run_id()})
+            else:
+                self.send_json({"ok": False, "error": {"code": "MODEL_NOT_READY", "message": "loco_upper disabled"}})
         elif self.path == "/standby_velocity":
             self.send_json({"ok": True, "ctrl": "standby_velocity"})
         elif self.path == "/fixstand":
@@ -339,6 +346,23 @@ print(json.dumps({"ok": True}))
         self.assertEqual(out["idle"], {"enabled": True, "active": True, "n": 2})
         self.assertEqual([record[1] for record in self.tracker.records], ["/standby_velocity", "/status"])
 
+    def test_standby_uses_standby_velocity_not_stop_and_preserves_idle_config(self):
+        self.tracker.status = {
+            "ok": True,
+            "ctrl": "standby_velocity",
+            "active": {"kind": "none", "id": None},
+            "idle": {"enabled": True, "active": False, "n": 2},
+        }
+        out, _ = self.cli("standby")
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["cmd"], "standby")
+        self.assertEqual(out["intent"], "cancel_to_standby")
+        self.assertEqual(out["state"], "standby")
+        self.assertEqual(out["idle"], {"enabled": True, "active": False, "n": 2})
+        post_paths = [record[1] for record in self.tracker.records if record[0] == "POST"]
+        self.assertEqual(post_paths, ["/standby_velocity"])
+        self.assertNotIn("/stop", post_paths)
+
     def test_standby_waits_until_user_motion_leaves_active_state(self):
         self.tracker.status_sequence = [
             {
@@ -431,6 +455,21 @@ print(json.dumps({"ok": True}))
         self.assertEqual(out["motion_mode"], "fullbody")
         self.assertEqual(out["executor"], "fullbody")
         self.assertEqual(self.tracker.records[-1][1], "/execute")
+
+    def test_loco_upper_disabled_returns_model_not_ready_without_fullbody_fallback(self):
+        self.tracker.loco_upper_enabled = False
+        out, _ = self.cli("motion-mode", "base")
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["motion_mode"], "base")
+
+        out, proc = self.cli("run-trk", str(self.ready_trk), check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["cmd"], "run-trk")
+        self.assertEqual(out["error"]["code"], "MODEL_NOT_READY")
+        post_paths = [record[1] for record in self.tracker.records if record[0] == "POST"]
+        self.assertEqual(post_paths, ["/execute_loco_upper"])
+        self.assertNotIn("/execute", post_paths)
 
     def test_run_text_cancels_existing_sequence_before_interrupt_execute(self):
         state_path = self.write_active_sequence()
@@ -700,13 +739,27 @@ print(json.dumps({"ok": True}))
         self.assertEqual(self.calls(), [])
         self.assertEqual(self.tracker.records[-1][2]["mode"], "interrupt")
 
+    def test_run_trk_default_interrupt_and_explicit_queue_mode(self):
+        out, _ = self.cli("run-trk", str(self.ready_trk))
+        self.assertTrue(out["ok"])
+        self.assertEqual(self.tracker.records[-1][2]["mode"], "interrupt")
+
+        out, _ = self.cli("run-trk", str(self.ready_trk), "--mode", "queue")
+        self.assertTrue(out["ok"])
+        self.assertEqual(self.tracker.records[-1][2]["mode"], "queue")
+
     def test_standby_and_urgent_stop_guard(self):
         self.cli("standby")
         bad, proc = self.cli("urgent-stop", check=False)
         self.assertNotEqual(proc.returncode, 0)
         self.assertFalse(bad["ok"])
         self.assertEqual(bad["error"]["code"], "REQUEST_INVALID")
-        self.cli("urgent-stop", "--urgent")
+        out, _ = self.cli("urgent-stop", "--urgent")
+        self.assertEqual(out["intent"], "urgent_stop")
+        self.assertEqual(out["state"], "stopped")
+        self.assertTrue(out["urgent"])
+        self.assertTrue(out["accepted"])
+        self.assertFalse(out["confirmed"])
         paths = [record[1] for record in self.tracker.records if record[0] == "POST"]
         self.assertEqual(paths, ["/standby_velocity", "/stop"])
 
@@ -715,10 +768,14 @@ print(json.dumps({"ok": True}))
         self.assertTrue(out["ok"])
         self.assertEqual(out["cmd"], "fixstand")
         self.assertEqual(out["intent"], "explicit_stand_configuration")
+        self.assertEqual(out["state"], "fixstand")
+        self.assertEqual(out["ctrl"], "fixstand")
+        self.assertTrue(out["accepted"])
+        self.assertFalse(out["confirmed"])
         self.assertEqual(self.tracker.records[-1][1], "/fixstand")
 
     def test_passive_requires_password(self):
-        out, proc = self.cli("passive", check=False)
+        out, proc = self.cli("passive", env_extra={"ET1_PASSIVE_PASSWORD": "secret"}, check=False)
         self.assertNotEqual(proc.returncode, 0)
         self.assertFalse(out["ok"])
         self.assertEqual(out["cmd"], "passive")
@@ -733,6 +790,9 @@ print(json.dumps({"ok": True}))
         self.assertEqual(out["cmd"], "passive")
         self.assertEqual(out["intent"], "explicit_passive")
         self.assertEqual(out["state"], "passive")
+        self.assertEqual(out["ctrl"], "passive")
+        self.assertTrue(out["accepted"])
+        self.assertFalse(out["confirmed"])
         self.assertEqual(out["next"], "fixstand")
         state = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(state["state"], "canceled")

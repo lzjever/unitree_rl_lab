@@ -105,12 +105,14 @@ P0 一等命令只包括：`run-text`、`run-trk`、`sequence-start`、`sequence
 - 先查 preset；命中则 stage preset；未命中则调用 nl2trk。
 - 默认提交给 trk2motion 执行。
 - 短动作可选 `--wait`，但默认不 wait。
+- skill 产品默认用 tracker `mode:"interrupt"` 提交新用户意图；如果用户明确要求“排在当前动作后面”，才显式 `--mode queue`。raw HTTP `/execute` / `/execute_loco_upper` 省略 `mode` 时仍默认 `queue`，这是服务端合同，不因 skill 默认而改变。
 
 `run-trk`：
 
 - 输入本地绝对 `.trk`。
 - 直接调用 trk2motion `run`。
 - 用于兼容现有工作流和调试。
+- 默认同样使用 tracker `mode:"interrupt"`；需要保留当前 tracker work 时显式 `--mode queue`。
 
 ### 序列控制
 

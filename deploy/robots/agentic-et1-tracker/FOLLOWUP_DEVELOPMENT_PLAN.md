@@ -46,10 +46,10 @@ unit/runtime/release selftest 覆盖。不要据此宣称整体 GA。
 - `GET /status?id=<id>`：只查询用户 run id。
 - `POST /execute`：只接受 `{"path":"/absolute/file.trk","mode":"queue|interrupt","hold":true|false}`；`mode` 可省略，默认 `queue`；`hold` 可省略，等价 false；`hold` 必须是 boolean；拒绝 `paths` 和任何额外字段。
 - `POST /idle`：`{"paths":["/abs/a.trk"]}` 原子覆盖 idle pool；`{"paths":[]}` 清空；这是配置接口，不产生用户 run id。
-- `POST /stop`：空 body；abort user / idle / holding / transition；清 idle config；不播放 `standby_ref.trk`。
-- `POST /passive`：空 body；进入 Passive safety sink；停止 active work，清 user queue，清 idle pool/config；不播放 `standby_ref.trk`；不得自动恢复 `lowcmd_occupied`。
-- `POST /fixstand`：空 body；进入 FixStand，是 LowCmd 未被占用时的姿态恢复入口；不播放 `standby_ref.trk`。
-- `POST /standby_velocity`：空 body；进入 StandbyVelocity/Velocity0，是正常可执行 `.trk` 和 idle auto-play 的待命状态；不播放 `standby_ref.trk`。
+- `POST /standby_velocity`：空 body；普通“停下/静止/待命”入口，进入 StandbyVelocity/Velocity0，保留 idle config，是正常可执行 `.trk` 和 idle auto-play 的待命状态；不播放 `standby_ref.trk`。
+- `POST /stop`：空 body；urgent/immediate 软件停止，abort user / idle / holding / transition；清 idle config；不播放 `standby_ref.trk`；不作为普通待命入口。
+- `POST /passive`：password-gated；进入 Passive safety sink；停止 active work，清 user queue，清 idle pool/config；不播放 `standby_ref.trk`；不得自动恢复 `lowcmd_occupied`。
+- `POST /fixstand`：空 body；进入 FixStand，是 LowCmd 未被占用时的固定构型/姿态恢复入口，不等于普通静止站立；不播放 `standby_ref.trk`。
 
 skill CLI 必须保持 one-line compact JSON；`holding` 对 `run --hold --wait` 和 `wait` 是成功状态。
 
@@ -128,7 +128,7 @@ Passive safety sink 时发送，且需提前准备 MuJoCo reset/upright/operator
 
 - real config 使用 app-owned assets，`mode_machine:1` 下 startup MotionSwitcher release 行为符合预期。
 - LowCmd owner preflight 能阻止外部占用下的 writing runtime。
-- `/fixstand`、`/standby_velocity`、普通 `.trk`、`hold:true`、`/stop` 人工可控。
+- `/fixstand`、`/standby_velocity`、普通 `.trk`、`hold:true`、urgent `/stop` 人工可控。
 - holding/transition 中 operator 可随时停止。
 - `bad_orientation` 和 `lowcmd_occupied` 不被 `/stop`、idle 或 transition 绕过。
 

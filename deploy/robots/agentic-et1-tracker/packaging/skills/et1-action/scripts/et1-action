@@ -910,7 +910,15 @@ def fixstand_cmd(base, timeout):
     if not out.get("ok"):
         error = out.get("error", {})
         return err_doc("fixstand", error.get("code", "TRACKER_STATE_CONFLICT"), error.get("message", "fixstand failed"), "fixstand")
-    return ok_doc("fixstand", "standby", intent="explicit_stand_configuration", state="fixstand")
+    return ok_doc(
+        "fixstand",
+        "standby",
+        intent="explicit_stand_configuration",
+        state="fixstand",
+        ctrl="fixstand",
+        accepted=True,
+        confirmed=False,
+    )
 
 
 def passive_cmd(args, base, timeout):
@@ -921,7 +929,15 @@ def passive_cmd(args, base, timeout):
     if not out.get("ok"):
         error = out.get("error", {})
         return err_doc("passive", error.get("code", "TRACKER_STATE_CONFLICT"), error.get("message", "passive failed"), "fixstand")
-    return ok_doc("passive", "fixstand", intent="explicit_passive", state="passive")
+    return ok_doc(
+        "passive",
+        "fixstand",
+        intent="explicit_passive",
+        state="passive",
+        ctrl="passive",
+        accepted=True,
+        confirmed=False,
+    )
 
 
 def urgent_stop_cmd(args, base, timeout):
@@ -931,7 +947,15 @@ def urgent_stop_cmd(args, base, timeout):
     if not out.get("ok"):
         error = out.get("error", {})
         return err_doc("urgent-stop", error.get("code", "TRACKER_STATE_CONFLICT"), error.get("message", "urgent stop failed"), "urgent-stop")
-    return ok_doc("urgent-stop", "standby", intent="urgent_stop", state="stopped")
+    return ok_doc(
+        "urgent-stop",
+        "standby",
+        intent="urgent_stop",
+        state="stopped",
+        urgent=True,
+        accepted=True,
+        confirmed=False,
+    )
 
 
 def default_idle_roots():

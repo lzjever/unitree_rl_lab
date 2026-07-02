@@ -39,6 +39,27 @@ ctest --test-dir build-agentic-et1-tracker-perf-smoke -L perf --output-on-failur
 Hermetic core tests must use the explicit stub/test runtime flags shown above;
 that build does not require MuJoCo, Unitree SDK2, or ONNX Runtime.
 
+Manual product gates are opt-in development/acceptance checks and are not part
+of default `ctest`, release selftest, or packaging gates:
+
+```sh
+tools/manual_gate.py e2e --url http://127.0.0.1:8083 \
+  --motion-dir /absolute/dir/listed/in/motion_dirs
+tools/manual_gate.py visual --url http://127.0.0.1:8083 \
+  --motion-dir /absolute/dir/listed/in/motion_dirs
+```
+
+By default the script only connects to an already running tracker and MuJoCo
+session. Use `--start-tracker` or `--start-mujoco-cmd` only for explicit manual
+sessions; the script stops only processes it started. `visual` writes a MuJoCo
+screenshot and a JSON checklist report under `/tmp/agentic-et1-manual-gate` by
+default.
+
+For full local simulation acceptance, use an explicit temporary tracker config
+with `--start-tracker --enable-loco-temp --require-loco`. The generated config
+keeps release defaults untouched and lowers only the temporary runtime `hz` to
+make short transition/stopping HTTP windows observable.
+
 ## HTTP Contract
 
 `agentic-et1-tracker` is a local HTTP API for LLM agents. Keep calls short.
@@ -51,6 +72,9 @@ Commands:
 - `POST /execute`: `{"path":"/absolute/file.trk","mode":"queue|interrupt","hold":true}`.
   Only `path`, optional `mode`, and optional boolean `hold` are allowed;
   `mode` defaults to `queue`, and omitted `hold` behaves as `false`.
+  The packaged `et1-action` skill intentionally defaults `run-text` and
+  `run-trk` to `mode:"interrupt"` for new user intent; that is a skill
+  product decision, not the raw HTTP default.
 - `POST /execute_loco_upper`:
   `{"path":"/absolute/file.trk","mode":"queue|interrupt","hold":true,"max_radius_m":0.8}`.
   Same local `.trk` allowlist contract as `/execute`, but routes the motion
@@ -71,12 +95,16 @@ Commands:
   the same client-facing default as `cap.loco_upper.default_radius_m`.
 - `POST /idle`: `{"paths":["/absolute/idle-a.trk","/absolute/idle-b.trk"]}`.
 - `POST /idle`: `{"paths":[]}` clears the idle pool.
-- `POST /stop`: empty body; stops active work and cancels queued work.
+- `POST /stop`: empty body; urgent/immediate software stop. It stops active
+  work, cancels queued work, and clears idle config. Use `/standby_velocity`
+  for ordinary stop/standby when idle config should be preserved.
 - `POST /passive`: `{"password":"galaxy"}` by default; enter Passive safety
   sink when LowCmd is free; stops active work, clears queued work, and clears
   the idle pool. Configure the password with top-level `passive_password`.
-- `POST /fixstand`: empty body; enter FixStand.
-- `POST /standby_velocity`: empty body; enter StandbyVelocity.
+- `POST /fixstand`: empty body; enter fixed stand configuration/recovery. This
+  is not ordinary quiet standing.
+- `POST /standby_velocity`: empty body; enter ordinary StandbyVelocity/Velocity0
+  standby while preserving idle config.
 
 `/execute` accepts local `.trk` paths allowed by `motion_dirs` only. It rejects
 uploads, non-`.trk` files, embedded motion payloads, `paths`, and any JSON
@@ -95,8 +123,13 @@ controller state. Non-empty `/idle` is accepted only after the control chain has
 reached StandbyVelocity, or while a user motion is preparing/running. Idle does
 not use `queue.limit`, `queue.ids`, `exec`, or `GET /status?id=...`.
 
-`/stop` is highest priority for active work, stops idle playback, immediately
-aborts holding runs and internal transitions, and clears the idle config. It
+`/standby_velocity` is the ordinary stop/standby command. It does not create a
+user run and does not clear idle config; with idle motions loaded, background
+idle may restart after the runtime returns to the standby chain.
+
+`/stop` is highest priority for active work and is reserved for urgent/immediate
+software stop semantics. It stops idle playback, immediately aborts holding runs
+and internal transitions, cancels queued work, and clears the idle config. It
 does not play `standby_ref.trk`. It preserves the stop watermark: user
 queue/interrupt requests accepted after a pending stop are not canceled by that
 older stop. For loco-upper this is an immediate cancellation path: runtime
@@ -161,10 +194,10 @@ Status schemas:
 {"ok":true,"ready":true,"mode":"sim","robot":"running","ctrl":"running","stop_reason":null,"hz":1000,"active":{"kind":"idle","id":null},"exec":null,"queue":{"n":0,"limit":8,"ids":[]},"transition":{"active":false,"target":null,"target_id":null,"target_state":null,"frame":0,"frames":0,"progress":0},"idle":{"enabled":true,"n":2,"active":true,"current":0,"frame":12,"frames":120,"time_s":0.24,"duration_s":2.4,"progress":0.1},"low_ms":0,"block":null,"err":null,"pose":{"q":[1,0,0,0],"g":[0,0,0],"p":null,"v":null},"cap":{"loco_upper":{"enabled":true,"ready":true,"default_radius_m":0.8,"max_radius_m":2.0,"strict_pose":false}}}
 
 // GET /status while a held user run owns the reference
-{"ok":true,"ready":true,"mode":"sim","robot":"running","ctrl":"running","stop_reason":null,"hz":1000,"active":{"kind":"user","id":"a7K3p9Qx"},"exec":{"id":"a7K3p9Qx","state":"holding","frame":119,"frames":120,"time_s":2.38,"duration_s":2.4,"progress":1,"hold":true,"stop_reason":null,"err":null},"queue":{"n":0,"limit":8,"ids":[]},"transition":{"active":false,"target":null,"target_id":null,"target_state":null,"frame":0,"frames":0,"progress":0},"idle":{"enabled":false,"n":0,"active":false,"current":null,"frame":0,"frames":0,"time_s":0,"duration_s":0,"progress":0},"low_ms":0,"block":null,"err":null,"pose":{"q":[1,0,0,0],"g":[0,0,0],"p":null,"v":null},"cap":{"loco_upper":{"enabled":true,"ready":true,"default_radius_m":0.8,"max_radius_m":2.0,"strict_pose":false}}}
+{"ok":true,"ready":true,"mode":"sim","robot":"running","ctrl":"running","stop_reason":null,"hz":1000,"active":{"kind":"user","id":"a7K3p9Qx"},"exec":{"id":"a7K3p9Qx","state":"holding","frame":119,"frames":120,"time_s":2.38,"duration_s":2.4,"progress":1,"hold":true,"stop_reason":null,"err":null},"queue":{"n":0,"limit":8,"ids":[]},"transition":{"active":false,"target":null,"target_id":null,"target_state":null,"frame":0,"frames":0,"progress":0},"idle":{"enabled":true,"n":2,"active":false,"current":null,"frame":0,"frames":0,"time_s":0,"duration_s":0,"progress":0},"low_ms":0,"block":null,"err":null,"pose":{"q":[1,0,0,0],"g":[0,0,0],"p":null,"v":null},"cap":{"loco_upper":{"enabled":true,"ready":true,"default_radius_m":0.8,"max_radius_m":2.0,"strict_pose":false}}}
 
 // GET /status during an internal transition to a user run
-{"ok":true,"ready":true,"mode":"sim","robot":"running","ctrl":"running","stop_reason":null,"hz":1000,"active":{"kind":"transition","id":null},"exec":null,"queue":{"n":0,"limit":8,"ids":[]},"transition":{"active":true,"target":"user","target_id":"b8L4s0Ry","target_state":"queued","frame":8,"frames":25,"progress":0.32},"idle":{"enabled":false,"n":0,"active":false,"current":null,"frame":0,"frames":0,"time_s":0,"duration_s":0,"progress":0},"low_ms":0,"block":null,"err":null,"pose":{"q":[1,0,0,0],"g":[0,0,0],"p":null,"v":null},"cap":{"loco_upper":{"enabled":true,"ready":true,"default_radius_m":0.8,"max_radius_m":2.0,"strict_pose":false}}}
+{"ok":true,"ready":true,"mode":"sim","robot":"running","ctrl":"running","stop_reason":null,"hz":1000,"active":{"kind":"transition","id":null},"exec":null,"queue":{"n":0,"limit":8,"ids":[]},"transition":{"active":true,"target":"user","target_id":"b8L4s0Ry","target_state":"queued","frame":8,"frames":25,"progress":0.32},"idle":{"enabled":true,"n":2,"active":false,"current":null,"frame":0,"frames":0,"time_s":0,"duration_s":0,"progress":0},"low_ms":0,"block":null,"err":null,"pose":{"q":[1,0,0,0],"g":[0,0,0],"p":null,"v":null},"cap":{"loco_upper":{"enabled":true,"ready":true,"default_radius_m":0.8,"max_radius_m":2.0,"strict_pose":false}}}
 
 // GET /status?id=<id>
 {"ok":true,"id":"a7K3p9Qx","state":"holding","frame":119,"frames":120,"time_s":2.38,"duration_s":2.4,"progress":1,"hold":true,"stop_reason":null,"err":null,"path":"/absolute/file.trk","robot":"running","ctrl":"running","ready":true,"block":null,"queue_pos":null,"top_err":null}
@@ -234,7 +267,7 @@ Controller states:
 | `passive` | Safety sink; publishes passive damping command; idle pool is cleared. | `/fixstand`, passworded `/passive`, `/stop`, `/idle {"paths":[]}` | `/execute`, `/standby_velocity`, and non-empty `/idle` return `CONTROL_STATE_CONFLICT`. If `block:"lowcmd_occupied"`, next action is `manual`. |
 | `fixstand` | Holds configured stand posture. | `/standby_velocity`, passworded `/passive`, `/stop`, `/fixstand`, `/idle {"paths":[]}` | `/execute` and non-empty `/idle` return conflict; call `/standby_velocity` first. Passworded `/passive` and `/fixstand` are the `bad_orientation` software recovery exceptions. |
 | `standby_velocity` | Velocity policy with zero command; robot stands idle. | `/execute`, `/idle`, passworded `/passive`, `/fixstand`, `/stop` | Normal state for starting user `.trk`; idle auto-play may start only when ready/safe and no user active/queue exists. |
-| idle active (`active.kind:"idle"`) | GeneralTracker plays an idle pool motion without a user id. | `/execute`, `/stop`, `/idle`, passworded `/passive`, `/fixstand`, `/standby_velocity` | `exec:null`, user `queue` unchanged. User `/execute` preempts idle. |
+| idle active (`active.kind:"idle"`) | GeneralTracker plays an idle pool motion without a user id. | `/execute`, `/stop`, `/idle`, passworded `/passive`, `/fixstand`, `/standby_velocity` | `exec:null`, user `queue` unchanged. User `/execute` preempts idle playback but keeps idle config. |
 | `preparing`/`running` with `active.kind:"user"` | Preparing or executing a user `.trk`. | `/stop`, passworded `/passive`, `/execute` queue/interrupt, `/idle` config/clear | `queue` waits; `interrupt` preempts current user run. Poll `/status?id=<id>`. |
 | holding (`active.kind:"user"`, `exec.state:"holding"`) | Holds the last reference frame of a user `.trk` submitted with `hold:true`. | `/execute` queue/interrupt, `/stop`, passworded `/passive`, `/fixstand`, `/standby_velocity`, `/idle` config/clear | Same user id remains queryable. `/stop`, passworded `/passive`, and `/fixstand` end it immediately; no `standby_ref.trk` playback. |
 | transition active (`active.kind:"transition"`) | Internal synthetic reference transition toward `transition.target`. | `/execute` queue/interrupt, `/stop`, passworded `/passive`, `/fixstand`, `/standby_velocity`, `/idle` config/clear | Not a user run; no id, queue entry, queue limit use, or user history entry. `/stop` aborts immediately. |

@@ -92,6 +92,23 @@ AppConfig realFactoryConfigWithRepoAssets() {
   return config;
 }
 
+void enableLocoUpperWithTempModel(AppConfig& config,
+                                  const TempTree& tmp,
+                                  const std::string& policy_file = "loco.onnx") {
+  config.loco_upper.enabled = true;
+  config.control.standby_reference =
+      (appRoot() / "config/reference/standby/v0/standby_ref.trk").string();
+  config.loco_upper.policy_dir = tmp.policy_dir.string();
+  config.loco_upper.policy_file = policy_file;
+  config.loco_upper.deploy =
+      (appRoot() / "config/policy/loco_lower/et1_low/params/deploy_lowobs10k.yaml")
+          .string();
+  config.loco_upper.limits =
+      (appRoot() / "config/limits/et1_upper_body/v0/limits.yaml").string();
+  config.loco_upper.joint_map =
+      (appRoot() / "config/limits/et1_upper_body/v0/joint_map.yaml").string();
+}
+
 std::string repeatValues(const std::string& value, int count) {
   std::ostringstream out;
   out << '[';
@@ -616,17 +633,7 @@ TEST_CASE("AppRuntimeFactory loco attach keeps failures isolated from base deps"
 #if AGENTIC_ET1_TRACKER_REAL_FACTORY
   TempTree tmp;
   AppConfig config = realFactoryConfigWithRepoAssets();
-  config.loco_upper.enabled = true;
-  config.control.standby_reference =
-      (appRoot() / "config/reference/standby/v0/standby_ref.trk").string();
-  config.loco_upper.policy_dir = tmp.policy_dir.string();
-  config.loco_upper.policy_file = "loco.onnx";
-  config.loco_upper.deploy =
-      (appRoot() / "config/policy/loco_lower/et1_low/params/deploy_lowobs10k.yaml").string();
-  config.loco_upper.limits =
-      (appRoot() / "config/limits/et1_upper_body/v0/limits.yaml").string();
-  config.loco_upper.joint_map =
-      (appRoot() / "config/limits/et1_upper_body/v0/joint_map.yaml").string();
+  enableLocoUpperWithTempModel(config, tmp);
 
   SECTION("valid app-owned assets attach all loco deps") {
     writeMinimalLocoLowerOnnx(tmp.exported_dir / config.loco_upper.policy_file);
@@ -664,6 +671,60 @@ TEST_CASE("AppRuntimeFactory loco attach keeps failures isolated from base deps"
     app_internal::tryAttachLocoUpperDeps(config, deps, &failure_block);
 
     REQUIRE(failure_block == "loco_upper_policy_missing");
+    REQUIRE_FALSE(deps.loco_lower_policy);
+    REQUIRE_FALSE(deps.loco_lower_deploy_config.has_value());
+    REQUIRE_FALSE(deps.loco_upper_composer_config.has_value());
+    REQUIRE(deps.robot_io.get() == robot);
+    REQUIRE(deps.policy.get() == policy);
+    REQUIRE(deps.velocity_policy.get() == velocity_policy);
+  }
+
+  SECTION("forbidden final model symlink keeps baseline deps untouched") {
+    const auto et1_exported =
+        tmp.root / "deploy/robots/et1/config/policy/loco_lower/exported";
+    std::filesystem::create_directories(et1_exported);
+    const auto et1_model = et1_exported / config.loco_upper.policy_file;
+    writeMinimalLocoLowerOnnx(et1_model);
+
+    std::error_code ec;
+    std::filesystem::create_symlink(et1_model,
+                                    tmp.exported_dir / config.loco_upper.policy_file,
+                                    ec);
+    if (ec) {
+      SUCCEED("file symlinks are not supported on this platform");
+      return;
+    }
+
+    AppRuntimeDeps deps = baseDepsForLocoAttach();
+    RobotIO* const robot = deps.robot_io.get();
+    PolicyInference* const policy = deps.policy.get();
+    VelocityPolicyInference* const velocity_policy = deps.velocity_policy.get();
+    std::string failure_block;
+
+    app_internal::tryAttachLocoUpperDeps(config, deps, &failure_block);
+
+    REQUIRE(failure_block == "loco_upper_policy_forbidden");
+    REQUIRE_FALSE(deps.loco_lower_policy);
+    REQUIRE_FALSE(deps.loco_lower_deploy_config.has_value());
+    REQUIRE_FALSE(deps.loco_upper_composer_config.has_value());
+    REQUIRE(deps.robot_io.get() == robot);
+    REQUIRE(deps.policy.get() == policy);
+    REQUIRE(deps.velocity_policy.get() == velocity_policy);
+  }
+
+  SECTION("invalid lower deploy keeps baseline deps untouched") {
+    writeMinimalLocoLowerOnnx(tmp.exported_dir / config.loco_upper.policy_file);
+    config.loco_upper.deploy = (tmp.params_dir / "bad-lower-deploy.yaml").string();
+    writeText(config.loco_upper.deploy, "not_loco_lower: true\n");
+    AppRuntimeDeps deps = baseDepsForLocoAttach();
+    RobotIO* const robot = deps.robot_io.get();
+    PolicyInference* const policy = deps.policy.get();
+    VelocityPolicyInference* const velocity_policy = deps.velocity_policy.get();
+    std::string failure_block;
+
+    app_internal::tryAttachLocoUpperDeps(config, deps, &failure_block);
+
+    REQUIRE(failure_block == "loco_upper_deploy_invalid");
     REQUIRE_FALSE(deps.loco_lower_policy);
     REQUIRE_FALSE(deps.loco_lower_deploy_config.has_value());
     REQUIRE_FALSE(deps.loco_upper_composer_config.has_value());
@@ -719,17 +780,7 @@ TEST_CASE("AppRuntimeFactory enabled loco_upper asset failures surface as model-
 #if AGENTIC_ET1_TRACKER_REAL_FACTORY
   TempTree tmp;
   AppConfig config = realFactoryConfigWithRepoAssets();
-  config.loco_upper.enabled = true;
-  config.control.standby_reference =
-      (appRoot() / "config/reference/standby/v0/standby_ref.trk").string();
-  config.loco_upper.policy_dir = tmp.policy_dir.string();
-  config.loco_upper.policy_file = "loco.onnx";
-  config.loco_upper.deploy =
-      (appRoot() / "config/policy/loco_lower/et1_low/params/deploy_lowobs10k.yaml").string();
-  config.loco_upper.limits =
-      (appRoot() / "config/limits/et1_upper_body/v0/limits.yaml").string();
-  config.loco_upper.joint_map =
-      (appRoot() / "config/limits/et1_upper_body/v0/joint_map.yaml").string();
+  enableLocoUpperWithTempModel(config, tmp);
 
   SECTION("missing lower model fails startup") {
     const AppRuntimeFactoryResult result = createAppRuntimeDeps(config);
@@ -747,6 +798,39 @@ TEST_CASE("AppRuntimeFactory enabled loco_upper asset failures surface as model-
     requireMode(result, RuntimeMode::Sim);
   }
 
+  SECTION("forbidden lower model symlink fails startup") {
+    const auto et1_exported =
+        tmp.root / "deploy/robots/et1/config/policy/loco_lower/exported";
+    std::filesystem::create_directories(et1_exported);
+    const auto et1_model = et1_exported / config.loco_upper.policy_file;
+    writeMinimalLocoLowerOnnx(et1_model);
+
+    std::error_code ec;
+    std::filesystem::create_symlink(et1_model,
+                                    tmp.exported_dir / config.loco_upper.policy_file,
+                                    ec);
+    if (ec) {
+      SUCCEED("file symlinks are not supported on this platform");
+      return;
+    }
+
+    const AppRuntimeFactoryResult result = createAppRuntimeDeps(config);
+
+    requireModelNotReady(result, "loco_upper_policy_forbidden");
+    requireMode(result, RuntimeMode::Sim);
+  }
+
+  SECTION("invalid lower deploy fails startup") {
+    writeMinimalLocoLowerOnnx(tmp.exported_dir / config.loco_upper.policy_file);
+    config.loco_upper.deploy = (tmp.params_dir / "bad-lower-deploy.yaml").string();
+    writeText(config.loco_upper.deploy, "not_loco_lower: true\n");
+
+    const AppRuntimeFactoryResult result = createAppRuntimeDeps(config);
+
+    requireModelNotReady(result, "loco_upper_deploy_invalid");
+    requireMode(result, RuntimeMode::Sim);
+  }
+
   SECTION("missing upper limits fail startup") {
     writeMinimalLocoLowerOnnx(tmp.exported_dir / config.loco_upper.policy_file);
     config.loco_upper.limits = (tmp.root / "missing_limits.yaml").string();
@@ -756,6 +840,22 @@ TEST_CASE("AppRuntimeFactory enabled loco_upper asset failures surface as model-
     requireModelNotReady(result, "loco_upper_composer_invalid");
     requireMode(result, RuntimeMode::Sim);
   }
+#else
+  SUCCEED("real factory is not compiled in this build");
+#endif
+}
+
+TEST_CASE("AppRuntimeFactory real mode keeps loco_upper asset fail-fast before robot init") {
+#if AGENTIC_ET1_TRACKER_REAL_FACTORY
+  TempTree tmp;
+  AppConfig config = realFactoryConfigWithRepoAssets();
+  config.mode_machine = 1;
+  enableLocoUpperWithTempModel(config, tmp);
+
+  const AppRuntimeFactoryResult result = createAppRuntimeDeps(config);
+
+  requireModelNotReady(result, "loco_upper_policy_missing");
+  requireMode(result, RuntimeMode::Real);
 #else
   SUCCEED("real factory is not compiled in this build");
 #endif
