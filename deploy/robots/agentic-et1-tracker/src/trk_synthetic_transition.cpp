@@ -220,12 +220,22 @@ void interpolateQuats(const TrkArrayView<float>& source,
   }
 }
 
-bool sameContacts(const TrkFrameView& source, const TrkFrameView& target) {
+bool sameContacts(const TrkFrameView& source,
+                  const TrkFrameView& target,
+                  SyntheticTransitionContactMode mode) {
   const std::int64_t source_left = source.left_foot_contact_state.ptr[0];
   const std::int64_t source_right = source.right_foot_contact_state.ptr[0];
-  return source_left != 0 && source_right != 0 &&
-         source_left == target.left_foot_contact_state.ptr[0] &&
-         source_right == target.right_foot_contact_state.ptr[0];
+  if (source_left != target.left_foot_contact_state.ptr[0] ||
+      source_right != target.right_foot_contact_state.ptr[0]) {
+    return false;
+  }
+  switch (mode) {
+    case SyntheticTransitionContactMode::kSameNonzero:
+      return source_left != 0 && source_right != 0;
+    case SyntheticTransitionContactMode::kSameValid:
+      return true;
+  }
+  return false;
 }
 
 void setContact(const TrkArrayView<std::int64_t>& source,
@@ -359,7 +369,8 @@ std::optional<TrkTrack> makeSyntheticTransitionTrk(const TrkFrameView& source,
       !finite(options.duration_dt_tolerance_s) ||
       options.duration_dt_tolerance_s < 0.0 ||
       !validLimits(options.limits) ||
-      !validTimingCap(target_fps, options.max_duration_s) || !sameContacts(source, target)) {
+      !validTimingCap(target_fps, options.max_duration_s) ||
+      !sameContacts(source, target, options.contact_mode)) {
     return std::nullopt;
   }
 

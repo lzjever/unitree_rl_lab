@@ -16,6 +16,7 @@
 #include "agentic_et1_tracker/policy/observation_builder.hpp"
 #include "agentic_et1_tracker/loco_upper/validator.hpp"
 #include "agentic_et1_tracker/trk/reference_alignment.hpp"
+#include "agentic_et1_tracker/trk/schema.hpp"
 #include "agentic_et1_tracker/trk/synthetic_transition.hpp"
 #include "agentic_et1_tracker/trk/validator.hpp"
 
@@ -27,10 +28,14 @@ constexpr double kPolicyStartupHoldDurationS = 0.5;
 constexpr std::size_t kStartupUpperBodyFirstPolicyJoint = 14;
 constexpr std::size_t kStartupUpperBodyLastPolicyJointExclusive = 26;
 constexpr double kLocoUpperRadiusSuppressMarginM = 0.02;
-constexpr double kStandbyRawStartFallbackMaxGap = 25.0;
-constexpr double kStandbyRawStartFallbackEpsilon = 1.0e-9;
+constexpr double kRawStartFallbackZeroEpsilon = 1.0e-4;
+constexpr double kTransitionFrameCountEpsilon = 1.0e-9;
 constexpr std::size_t kRootBodyIndex = 0;
 constexpr std::size_t kBodyQuatDimensions = 4;
+constexpr std::size_t kBodyPositionDimensions = 3;
+constexpr std::size_t kBodyCount = TrkSchema::kBodyCount;
+constexpr std::size_t kBodyPosFrameSize = kBodyCount * kBodyPositionDimensions;
+constexpr std::size_t kBodyQuatFrameSize = kBodyCount * kBodyQuatDimensions;
 
 bool isStartupOrWaitingError(ErrorCode error) {
   switch (error) {
@@ -62,19 +67,21 @@ bool isFinitePlanarPosition(const std::array<float, 3>& position) {
   return std::isfinite(position[0]) && std::isfinite(position[1]);
 }
 
-std::optional<double> maxAbsFinite(const TrkArrayView<float>& view) {
-  if (view.ptr == nullptr || view.size == 0) {
-    return std::nullopt;
-  }
-  double max_abs = 0.0;
-  for (std::size_t i = 0; i < view.size; ++i) {
-    const double value = static_cast<double>(view.ptr[i]);
+bool isFiniteVec3(const std::array<float, 3>& values) {
+  return std::isfinite(values[0]) && std::isfinite(values[1]) &&
+         std::isfinite(values[2]);
+}
+
+bool isFiniteQuat(const std::array<float, 4>& values) {
+  double norm_sq = 0.0;
+  for (const float value : values) {
     if (!std::isfinite(value)) {
-      return std::nullopt;
+      return false;
     }
-    max_abs = std::max(max_abs, std::abs(value));
+    norm_sq += static_cast<double>(value) * static_cast<double>(value);
   }
-  return max_abs;
+  return norm_sq > static_cast<double>(std::numeric_limits<float>::epsilon()) *
+                       static_cast<double>(std::numeric_limits<float>::epsilon());
 }
 
 std::optional<double> maxAbsDeltaFinite(const TrkArrayView<float>& source,
@@ -112,11 +119,6 @@ std::optional<double> maxAbsDeltaPrefixFinite(const TrkArrayView<float>& source,
     max_abs_delta = std::max(max_abs_delta, std::abs(target_value - source_value));
   }
   return max_abs_delta;
-}
-
-bool viewMaxAtMost(const TrkArrayView<float>& view, double limit) {
-  const std::optional<double> max_abs = maxAbsFinite(view);
-  return max_abs.has_value() && *max_abs <= limit;
 }
 
 std::optional<double> rootYawFromFrame(const TrkFrameView& frame) {
@@ -169,54 +171,45 @@ std::optional<bool> rootYawResidualWithinLimit(const TrkFrameView& source,
   return shortestAngleAbs(*source_yaw, *target_yaw) <= limit_rad;
 }
 
-bool endpointVelocitiesAllowStandbyRawStartFallback(const TrkFrameView& source,
-                                                    const TrkFrameView& target,
-                                                    const SyntheticTransitionLimits& limits) {
-  return viewMaxAtMost(source.joint_vel, limits.max_velocity) &&
-         viewMaxAtMost(target.joint_vel, limits.max_velocity) &&
-         viewMaxAtMost(source.body_lin_vel_w, limits.max_velocity) &&
-         viewMaxAtMost(target.body_lin_vel_w, limits.max_velocity) &&
-         viewMaxAtMost(source.body_ang_vel_w, limits.max_velocity) &&
-         viewMaxAtMost(target.body_ang_vel_w, limits.max_velocity) &&
-         viewMaxAtMost(source.ref_com_vel_navi, limits.max_velocity) &&
-         viewMaxAtMost(target.ref_com_vel_navi, limits.max_velocity);
+bool sameContactValue(const TrkArrayView<std::int64_t>& source,
+                      const TrkArrayView<std::int64_t>& target) {
+  return source.ptr != nullptr && target.ptr != nullptr && source.size == 1 &&
+         target.size == 1 && source.ptr[0] == target.ptr[0];
 }
 
-bool transitionGapAllowsStandbyRawStartFallback(const TrkFrameView& source,
-                                                const TrkFrameView& target,
-                                                double transition_duration_s,
-                                                double target_fps,
-                                                const SyntheticTransitionLimits& limits) {
-  if (!std::isfinite(transition_duration_s) || !std::isfinite(target_fps) ||
-      transition_duration_s <= 0.0 || target_fps <= 0.0) {
-    return false;
-  }
-
-  const double intervals =
-      std::ceil(transition_duration_s * target_fps - kStandbyRawStartFallbackEpsilon);
-  if (!std::isfinite(intervals) || intervals < 1.0) {
-    return false;
-  }
-
-  const double effective_duration_s = intervals / target_fps;
-  const double dynamic_gap_limit =
-      limits.max_velocity * effective_duration_s +
-      0.5 * limits.max_acceleration * effective_duration_s *
-          effective_duration_s +
-      limits.max_jerk * effective_duration_s *
-          effective_duration_s * effective_duration_s / 6.0;
-  const double allowed_gap =
-      std::min(kStandbyRawStartFallbackMaxGap, dynamic_gap_limit);
-
+bool rawStartGapNearZero(const TrkFrameView& source,
+                         const TrkFrameView& target) {
+  const std::optional<bool> yaw_zero =
+      rootYawResidualWithinLimit(source, target, kRawStartFallbackZeroEpsilon);
   const std::optional<double> joint_gap =
       maxAbsDeltaFinite(source.joint_pos, target.joint_pos);
+  const std::optional<double> joint_vel_gap =
+      maxAbsDeltaFinite(source.joint_vel, target.joint_vel);
   const std::optional<double> root_gap =
       maxAbsDeltaPrefixFinite(source.body_pos_w, target.body_pos_w, 3);
+  const std::optional<double> root_lin_vel_gap =
+      maxAbsDeltaPrefixFinite(source.body_lin_vel_w, target.body_lin_vel_w, 3);
+  const std::optional<double> root_ang_vel_gap =
+      maxAbsDeltaPrefixFinite(source.body_ang_vel_w, target.body_ang_vel_w, 3);
   const std::optional<double> com_gap =
       maxAbsDeltaFinite(source.ref_com_rel_navi, target.ref_com_rel_navi);
-  return joint_gap.has_value() && root_gap.has_value() && com_gap.has_value() &&
-         *joint_gap <= allowed_gap && *root_gap <= allowed_gap &&
-         *com_gap <= allowed_gap;
+  const std::optional<double> com_vel_gap =
+      maxAbsDeltaFinite(source.ref_com_vel_navi, target.ref_com_vel_navi);
+  return yaw_zero.has_value() && *yaw_zero &&
+         joint_gap.has_value() && *joint_gap <= kRawStartFallbackZeroEpsilon &&
+         joint_vel_gap.has_value() &&
+         *joint_vel_gap <= kRawStartFallbackZeroEpsilon &&
+         root_gap.has_value() && *root_gap <= kRawStartFallbackZeroEpsilon &&
+         root_lin_vel_gap.has_value() &&
+         *root_lin_vel_gap <= kRawStartFallbackZeroEpsilon &&
+         root_ang_vel_gap.has_value() &&
+         *root_ang_vel_gap <= kRawStartFallbackZeroEpsilon &&
+         com_gap.has_value() && *com_gap <= kRawStartFallbackZeroEpsilon &&
+         com_vel_gap.has_value() && *com_vel_gap <= kRawStartFallbackZeroEpsilon &&
+         sameContactValue(source.left_foot_contact_state,
+                          target.left_foot_contact_state) &&
+         sameContactValue(source.right_foot_contact_state,
+                          target.right_foot_contact_state);
 }
 
 bool allowStandbyRawStartAfterTransitionBuildFailure(const TrkFrameView& source,
@@ -225,15 +218,96 @@ bool allowStandbyRawStartAfterTransitionBuildFailure(const TrkFrameView& source,
                                                      double target_fps,
                                                      double root_yaw_residual_limit_rad,
                                                      const SyntheticTransitionLimits& limits) {
-  const std::optional<bool> yaw_residual_ok =
-      rootYawResidualWithinLimit(source, target, root_yaw_residual_limit_rad);
-  return yaw_residual_ok.has_value() && *yaw_residual_ok &&
-         endpointVelocitiesAllowStandbyRawStartFallback(source, target, limits) &&
-         transitionGapAllowsStandbyRawStartFallback(source,
-                                                   target,
-                                                   transition_duration_s,
-                                                   target_fps,
-                                                   limits);
+  (void)transition_duration_s;
+  (void)target_fps;
+  (void)root_yaw_residual_limit_rad;
+  (void)limits;
+  return rawStartGapNearZero(source, target);
+}
+
+bool copyFloatFrame(TrkFloatArray& out,
+                    const TrkArrayView<float>& view,
+                    std::vector<std::uint64_t> shape,
+                    std::size_t frame_size) {
+  if (view.ptr == nullptr || view.size != frame_size) {
+    return false;
+  }
+  out.shape = std::move(shape);
+  out.frame_size = frame_size;
+  out.values.assign(view.ptr, view.ptr + frame_size);
+  return true;
+}
+
+bool copyContactFrame(TrkContactArray& out,
+                      const TrkArrayView<std::int64_t>& view,
+                      std::vector<std::uint64_t> shape,
+                      std::size_t frame_size) {
+  if (view.ptr == nullptr || view.size != frame_size) {
+    return false;
+  }
+  out.shape = std::move(shape);
+  out.frame_size = frame_size;
+  out.values.assign(view.ptr, view.ptr + frame_size);
+  return true;
+}
+
+std::optional<TrkTrack> singleFrameTrackFromFrame(const TrkFrameView& frame,
+                                                  double fps) {
+  if (!std::isfinite(fps) || fps <= 0.0) {
+    return std::nullopt;
+  }
+
+  TrkTrack track;
+  track.metadata.frames = 1;
+  track.metadata.duration_s = 0.0;
+  track.metadata.fps = fps;
+  track.metadata.version = TrkSchema::kVersion;
+  track.metadata.array_count = TrkSchema::kRequiredArrays.size();
+
+  if (!copyFloatFrame(track.joint_pos,
+                      frame.joint_pos,
+                      {1, TrkSchema::kJointDim},
+                      TrkSchema::kJointDim) ||
+      !copyFloatFrame(track.joint_vel,
+                      frame.joint_vel,
+                      {1, TrkSchema::kJointDim},
+                      TrkSchema::kJointDim) ||
+      !copyFloatFrame(track.body_pos_w,
+                      frame.body_pos_w,
+                      {1, TrkSchema::kBodyCount, 3},
+                      kBodyPosFrameSize) ||
+      !copyFloatFrame(track.body_quat_w,
+                      frame.body_quat_w,
+                      {1, TrkSchema::kBodyCount, 4},
+                      kBodyQuatFrameSize) ||
+      !copyFloatFrame(track.body_lin_vel_w,
+                      frame.body_lin_vel_w,
+                      {1, TrkSchema::kBodyCount, 3},
+                      kBodyPosFrameSize) ||
+      !copyFloatFrame(track.body_ang_vel_w,
+                      frame.body_ang_vel_w,
+                      {1, TrkSchema::kBodyCount, 3},
+                      kBodyPosFrameSize) ||
+      !copyContactFrame(track.left_foot_contact_state,
+                        frame.left_foot_contact_state,
+                        {1},
+                        1) ||
+      !copyContactFrame(track.right_foot_contact_state,
+                        frame.right_foot_contact_state,
+                        {1},
+                        1) ||
+      !copyFloatFrame(track.ref_com_rel_navi,
+                      frame.ref_com_rel_navi,
+                      {1, 3},
+                      3) ||
+      !copyFloatFrame(track.ref_com_vel_navi,
+                      frame.ref_com_vel_navi,
+                      {1, 3},
+                      3)) {
+    return std::nullopt;
+  }
+
+  return track;
 }
 
 std::optional<std::array<double, 2>> highstatePlanarPosition(
@@ -657,6 +731,84 @@ std::optional<bool> RuntimeControlLoop::rootYawResidualAllowsBridge(
                                     config_.transition_root_yaw_residual_limit_rad);
 }
 
+std::optional<TrkTrack> RuntimeControlLoop::controllableSourceTrack(
+    const TrkFrameView& reference_frame,
+    double fps,
+    const LowStateSample& low_state,
+    const std::optional<HighStateSample>& high_state,
+    const TrkFrameView* contact_frame) const {
+  if (!deploy_config_ ||
+      deploy_config_->sdk_joint_ids_map.size() < kPolicyJointCount ||
+      !isFiniteQuat(low_state.quat_wxyz) || !isFiniteVec3(low_state.gyro)) {
+    return std::nullopt;
+  }
+
+  std::optional<TrkTrack> track = singleFrameTrackFromFrame(reference_frame, fps);
+  if (!track || track->joint_pos.values.size() < kPolicyJointCount ||
+      track->joint_vel.values.size() < kPolicyJointCount ||
+      track->body_quat_w.values.size() < kBodyQuatDimensions ||
+      track->body_ang_vel_w.values.size() < kBodyPositionDimensions) {
+    return std::nullopt;
+  }
+
+  for (std::size_t policy_index = 0; policy_index < kPolicyJointCount;
+       ++policy_index) {
+    const int sdk_slot_raw = deploy_config_->sdk_joint_ids_map.at(policy_index);
+    if (sdk_slot_raw < 0 ||
+        sdk_slot_raw >= static_cast<int>(low_state.motors.size())) {
+      return std::nullopt;
+    }
+    const MotorStateSample& motor =
+        low_state.motors.at(static_cast<std::size_t>(sdk_slot_raw));
+    if (!std::isfinite(motor.q) || !std::isfinite(motor.dq)) {
+      return std::nullopt;
+    }
+    track->joint_pos.values.at(policy_index) = motor.q;
+    track->joint_vel.values.at(policy_index) = motor.dq;
+  }
+
+  for (std::size_t i = 0; i < low_state.quat_wxyz.size(); ++i) {
+    track->body_quat_w.values.at(kRootBodyIndex * kBodyQuatDimensions + i) =
+        low_state.quat_wxyz.at(i);
+  }
+  for (std::size_t i = 0; i < low_state.gyro.size(); ++i) {
+    track->body_ang_vel_w.values.at(kRootBodyIndex * kBodyPositionDimensions + i) =
+        low_state.gyro.at(i);
+  }
+
+  if (high_state && high_state->fresh &&
+      isFiniteVec3(high_state->position) &&
+      isFiniteVec3(high_state->linear_velocity) &&
+      isFiniteVec3(high_state->angular_velocity)) {
+    if (track->body_pos_w.values.size() < kBodyPositionDimensions ||
+        track->body_lin_vel_w.values.size() < kBodyPositionDimensions) {
+      return std::nullopt;
+    }
+    for (std::size_t i = 0; i < high_state->position.size(); ++i) {
+      track->body_pos_w.values.at(kRootBodyIndex * kBodyPositionDimensions + i) =
+          high_state->position.at(i);
+      track->body_lin_vel_w.values.at(kRootBodyIndex * kBodyPositionDimensions + i) =
+          high_state->linear_velocity.at(i);
+      track->body_ang_vel_w.values.at(kRootBodyIndex * kBodyPositionDimensions + i) =
+          high_state->angular_velocity.at(i);
+    }
+  }
+
+  if (contact_frame != nullptr &&
+      (!copyContactFrame(track->left_foot_contact_state,
+                         contact_frame->left_foot_contact_state,
+                         {1},
+                         1) ||
+       !copyContactFrame(track->right_foot_contact_state,
+                         contact_frame->right_foot_contact_state,
+                         {1},
+                         1))) {
+    return std::nullopt;
+  }
+
+  return track;
+}
+
 void RuntimeControlLoop::tick() {
   if (fsm_state_ == RuntimeInternalState::Stopping) {
     consumeStoppingCommands();
@@ -839,9 +991,19 @@ void RuntimeControlLoop::handleStop(std::uint64_t sequence, bool requires_stoppi
     }
     return;
   }
+  post_stop_control_ = ControlMode::StandbyVelocity;
+  if (active_kind_ == ActiveKind::Transition ||
+      (active_kind_ == ActiveKind::User && active_ &&
+       active_->executor == MotionExecutor::GeneralTracker)) {
+    const StandbyTransitionResult transition_result =
+        startTransitionFromActiveToStandbyCancellation();
+    if (transition_result == StandbyTransitionResult::Started ||
+        transition_result == StandbyTransitionResult::SafetyTerminal) {
+      return;
+    }
+  }
   if (active_kind_ == ActiveKind::Transition) {
     abortTransition();
-    post_stop_control_ = ControlMode::StandbyVelocity;
     stop_reason_ = StopReason::Stop;
     enterStopping(StopReason::Stop);
     return;
@@ -860,7 +1022,6 @@ void RuntimeControlLoop::handleStop(std::uint64_t sequence, bool requires_stoppi
     enterStopping(StopReason::Stop);
     return;
   }
-  post_stop_control_ = ControlMode::StandbyVelocity;
   if (active_) {
     markActiveStopping(StopReason::Stop);
   } else if (fsm_state_ == RuntimeInternalState::FixStand && waiting_.empty()) {
@@ -1069,6 +1230,17 @@ void RuntimeControlLoop::cancelWaiting(StopReason reason, std::uint64_t sequence
   waiting_ = std::move(remaining);
 }
 
+void RuntimeControlLoop::failWaiting(ErrorCode error) {
+  for (auto& request : waiting_) {
+    request.state = MotionState::Failed;
+    request.stop_reason = StopReason::None;
+    request.err = error;
+    request.ended_at = std::chrono::steady_clock::now();
+    status_.publishRunStatus(toStatus(request));
+  }
+  waiting_.clear();
+}
+
 ControllerState RuntimeControlLoop::controllerStateForInternal(
     RuntimeInternalState state) const {
   switch (state) {
@@ -1171,6 +1343,22 @@ void RuntimeControlLoop::handleInternalEvent(RuntimeInternalEvent event) {
 }
 
 void RuntimeControlLoop::enterPassiveState(const RobotReadinessStatus& readiness) {
+  if (readiness.err == ErrorCode::RobotBadOrientation) {
+    failWaiting(readiness.err);
+    clearIdleConfig();
+    if (active_kind_ == ActiveKind::Idle) {
+      stopIdleActive();
+    } else if (active_kind_ == ActiveKind::Transition) {
+      abortTransition(MotionState::Failed, StopReason::None, readiness.err);
+    } else if (active_) {
+      finishActive(MotionState::Failed, StopReason::None, readiness.err);
+    }
+    active_.reset();
+    active_track_.reset();
+    loco_upper_.reset();
+    policy_runner_.reset();
+    clearReference();
+  }
   handleInternalEvent(RuntimeInternalEvent::SafetyPassive);
   applyReadiness(readiness);
 }
@@ -1642,17 +1830,6 @@ bool RuntimeControlLoop::startTransitionFromIdleToUser(MotionRequest target_requ
       stopIdleActive();
     }
   };
-  auto startWithoutTransition = [this](MotionRequest request) {
-    if (active_kind_ == ActiveKind::Idle) {
-      stopIdleActive();
-    }
-    active_ = std::move(request);
-    active_kind_ = ActiveKind::User;
-    idle_current_index_.reset();
-    active_track_.reset();
-    handleInternalEvent(RuntimeInternalEvent::MotionRequest);
-    publishActive();
-  };
 
   target_request.state = MotionState::Queued;
   target_request.frame = 0;
@@ -1668,65 +1845,16 @@ bool RuntimeControlLoop::startTransitionFromIdleToUser(MotionRequest target_requ
   target_request.frames = loaded.track->metadata.frames;
   target_request.fps = loaded.track->metadata.fps;
   target_request.duration_s = loaded.track->metadata.duration_s;
-  auto target_track = std::make_shared<TrkTrack>(std::move(*loaded.track));
-  std::optional<TrkTrack> aligned_target_track =
-      alignTrackRootPlanarPose(*target_track, *source_frame);
-  if (!aligned_target_track) {
-    failTarget(std::move(target_request), ErrorCode::InternalError);
-    return true;
-  }
-  target_track = std::make_shared<TrkTrack>(std::move(*aligned_target_track));
-  const std::optional<TrkFrameView> target_frame = target_track->frame(0);
-  if (!target_frame) {
-    failTarget(std::move(target_request), ErrorCode::InternalError);
-    return true;
-  }
-  const std::optional<bool> yaw_residual_ok =
-      rootYawResidualAllowsBridge(*source_frame, *target_frame);
-  if (!yaw_residual_ok) {
-    failTarget(std::move(target_request), ErrorCode::InternalError);
-    return true;
-  }
-  if (!*yaw_residual_ok) {
-    startWithoutTransition(std::move(target_request));
-    return true;
-  }
+  auto target_track = std::make_shared<const TrkTrack>(std::move(*loaded.track));
 
-  const std::optional<double> transition_duration_s = transitionDurationForUse();
-  if (!transition_duration_s) {
-    failTarget(std::move(target_request), ErrorCode::InternalError);
-    return true;
-  }
+  ErrorCode transition_error = ErrorCode::InternalError;
+  bool transition_build_rejected = false;
+  std::optional<UserTransitionTracks> tracks =
+      makeUserTransitionTracks(*source_frame,
+                               target_track,
+                               transition_error,
+                               transition_build_rejected);
 
-  const double transition_fps = transitionSampleFpsForTarget(*target_track);
-  std::optional<TrkTrack> transition_track =
-      makeSyntheticTransitionTrk(*source_frame,
-                                 *target_frame,
-                                 transition_fps,
-                                 transitionOptionsForTarget(*target_track));
-  if (!transition_track) {
-    if (!allowStandbyRawStartAfterTransitionBuildFailure(*source_frame,
-                                                         *target_frame,
-                                                         *transition_duration_s,
-                                                         transition_fps,
-                                                         config_.transition_root_yaw_residual_limit_rad,
-                                                         transitionLimitsForUse())) {
-      failTarget(std::move(target_request), ErrorCode::InternalError);
-      return true;
-    }
-    startWithoutTransition(std::move(target_request));
-    return true;
-  }
-
-  PendingTransition target;
-  target.target_kind = TransitionTargetKind::User;
-  target.target_id = target_request.id;
-  target.target_state = MotionState::Queued;
-  target.target_track = std::move(target_track);
-  target.target_request = std::move(target_request);
-
-  auto transition_track_ptr =
-      std::make_shared<TrkTrack>(std::move(*transition_track));
   std::optional<LowStateSample> entry_low_state;
   if (hasPolicyRuntime()) {
     entry_low_state = latest_low_state_;
@@ -1735,7 +1863,27 @@ bool RuntimeControlLoop::startTransitionFromIdleToUser(MotionRequest target_requ
     }
   }
 
-  const bool started = startInternalTransition(std::move(transition_track_ptr),
+  if (!tracks) {
+    tracks = makeUserTransitionTracksFromControllableSource(*source_frame,
+                                                            target_track,
+                                                            entry_low_state,
+                                                            transition_error,
+                                                            transition_build_rejected);
+  }
+
+  if (!tracks) {
+    failTarget(std::move(target_request), transition_error);
+    return true;
+  }
+
+  PendingTransition target;
+  target.target_kind = TransitionTargetKind::User;
+  target.target_id = target_request.id;
+  target.target_state = MotionState::Queued;
+  target.target_track = std::move(tracks->target_track);
+  target.target_request = std::move(target_request);
+
+  const bool started = startInternalTransition(std::move(tracks->transition_track),
                                                std::move(target),
                                                std::move(entry_low_state));
   if (!started) {
@@ -1805,29 +1953,79 @@ void RuntimeControlLoop::startTransitionFromStandbyToUser(
   target_request.fps = loaded.track->metadata.fps;
   target_request.duration_s = loaded.track->metadata.duration_s;
   auto target_track = std::make_shared<TrkTrack>(std::move(*loaded.track));
+  auto original_target_track =
+      std::make_shared<const TrkTrack>(*target_track);
+  ErrorCode controllable_fallback_error = ErrorCode::InternalError;
+  auto tryControllableFallback = [this,
+                                  &source_frame,
+                                  &original_target_track,
+                                  &entry_low_state,
+                                  &target_request,
+                                  &controllable_fallback_error]() -> bool {
+    controllable_fallback_error = ErrorCode::InternalError;
+    bool fallback_transition_build_rejected = false;
+    std::optional<UserTransitionTracks> fallback_tracks =
+        makeUserTransitionTracksFromControllableSource(
+            *source_frame,
+            original_target_track,
+            entry_low_state,
+            controllable_fallback_error,
+            fallback_transition_build_rejected);
+    if (!fallback_tracks) {
+      return false;
+    }
+
+    PendingTransition target;
+    target.target_kind = TransitionTargetKind::User;
+    target.target_id = target_request.id;
+    target.target_state = MotionState::Queued;
+    target.target_track = std::move(fallback_tracks->target_track);
+    target.target_request = std::move(target_request);
+
+    const bool started =
+        startInternalTransition(std::move(fallback_tracks->transition_track),
+                                std::move(target),
+                                std::move(entry_low_state));
+    if (!started) {
+      clearReference();
+    }
+    return true;
+  };
   std::optional<TrkTrack> aligned_target_track =
       alignTrackRootPlanarPose(*target_track, *source_frame);
   if (!aligned_target_track) {
-    failTarget(std::move(target_request), ErrorCode::InternalError);
+    if (tryControllableFallback()) {
+      return;
+    }
+    failTarget(std::move(target_request), controllable_fallback_error);
     return;
   }
   target_track = std::make_shared<TrkTrack>(std::move(*aligned_target_track));
 
   const std::optional<TrkFrameView> target_frame = target_track->frame(0);
   if (!target_frame) {
-    failTarget(std::move(target_request), ErrorCode::InternalError);
+    if (tryControllableFallback()) {
+      return;
+    }
+    failTarget(std::move(target_request), controllable_fallback_error);
     return;
   }
   const std::optional<bool> yaw_residual_ok =
       rootYawResidualAllowsBridge(*source_frame, *target_frame);
   if (!yaw_residual_ok || !*yaw_residual_ok) {
-    failTarget(std::move(target_request), ErrorCode::InternalError);
+    if (tryControllableFallback()) {
+      return;
+    }
+    failTarget(std::move(target_request), controllable_fallback_error);
     return;
   }
 
   const std::optional<double> transition_duration_s = transitionDurationForUse();
   if (!transition_duration_s) {
-    failTarget(std::move(target_request), ErrorCode::InternalError);
+    if (tryControllableFallback()) {
+      return;
+    }
+    failTarget(std::move(target_request), controllable_fallback_error);
     return;
   }
 
@@ -1838,16 +2036,20 @@ void RuntimeControlLoop::startTransitionFromStandbyToUser(
                                  transition_fps,
                                  transitionOptionsForTarget(*target_track));
   if (!transition_track) {
-    if (!allowStandbyRawStartAfterTransitionBuildFailure(*source_frame,
-                                                         *target_frame,
-                                                         *transition_duration_s,
-                                                         transition_fps,
-                                                         config_.transition_root_yaw_residual_limit_rad,
-                                                         transitionLimitsForUse())) {
-      failTarget(std::move(target_request), ErrorCode::InternalError);
+    if (allowStandbyRawStartAfterTransitionBuildFailure(*source_frame,
+                                                        *target_frame,
+                                                        *transition_duration_s,
+                                                        transition_fps,
+                                                        config_.transition_root_yaw_residual_limit_rad,
+                                                        transitionLimitsForUse())) {
+      startWithoutTransition(std::move(target_request));
       return;
     }
-    startWithoutTransition(std::move(target_request));
+
+    if (!tryControllableFallback()) {
+      failTarget(std::move(target_request), controllable_fallback_error);
+      return;
+    }
     return;
   }
 
@@ -1866,6 +2068,127 @@ void RuntimeControlLoop::startTransitionFromStandbyToUser(
   if (!started) {
     clearReference();
   }
+}
+
+std::optional<RuntimeControlLoop::UserTransitionTracks>
+RuntimeControlLoop::makeUserTransitionTracks(
+    const TrkFrameView& source_frame,
+    std::shared_ptr<const TrkTrack> target_track,
+    ErrorCode& error,
+    bool& transition_build_rejected,
+    bool allow_same_valid_contact) {
+  transition_build_rejected = false;
+  error = ErrorCode::InternalError;
+  if (!target_track) {
+    return std::nullopt;
+  }
+
+  std::optional<TrkTrack> aligned_target_track =
+      alignTrackRootPlanarPose(*target_track, source_frame);
+  if (!aligned_target_track) {
+    return std::nullopt;
+  }
+  auto aligned_target_track_ptr =
+      std::make_shared<const TrkTrack>(std::move(*aligned_target_track));
+  const std::optional<TrkFrameView> target_frame =
+      aligned_target_track_ptr->frame(0);
+  if (!target_frame) {
+    return std::nullopt;
+  }
+
+  const std::optional<bool> yaw_residual_ok =
+      rootYawResidualAllowsBridge(source_frame, *target_frame);
+  if (!yaw_residual_ok || !*yaw_residual_ok) {
+    return std::nullopt;
+  }
+
+  const std::optional<double> transition_duration_s = transitionDurationForUse();
+  if (!transition_duration_s) {
+    return std::nullopt;
+  }
+
+  const double transition_fps =
+      transitionSampleFpsForTarget(*aligned_target_track_ptr);
+  SyntheticTransitionOptions options =
+      allow_same_valid_contact
+          ? controlledTransitionOptionsForTarget(*aligned_target_track_ptr)
+          : transitionOptionsForTarget(*aligned_target_track_ptr);
+  std::optional<TrkTrack> transition_track =
+      makeSyntheticTransitionTrk(source_frame,
+                                 *target_frame,
+                                 transition_fps,
+                                 options);
+  if (!transition_track) {
+    transition_build_rejected = true;
+    return std::nullopt;
+  }
+
+  UserTransitionTracks tracks;
+  tracks.transition_track =
+      std::make_shared<const TrkTrack>(std::move(*transition_track));
+  tracks.target_track = std::move(aligned_target_track_ptr);
+  error = ErrorCode::Ok;
+  return tracks;
+}
+
+std::optional<RuntimeControlLoop::UserTransitionTracks>
+RuntimeControlLoop::makeUserTransitionTracksFromControllableSource(
+    const TrkFrameView& reference_frame,
+    std::shared_ptr<const TrkTrack> target_track,
+    std::optional<LowStateSample>& entry_low_state,
+    ErrorCode& error,
+    bool& transition_build_rejected) {
+  transition_build_rejected = false;
+  if (!hasPolicyRuntime() || !target_track) {
+    return std::nullopt;
+  }
+
+  std::optional<LowStateSample> low_state = readLowStateForStatus();
+  const RobotReadinessStatus readiness =
+      mapRobotReadiness(low_state,
+                        robot_io_->lowCmdOccupancy(),
+                        expected_mode_machine_);
+  applyReadiness(readiness);
+  if (readiness.err != ErrorCode::Ok || !low_state) {
+    error = readiness.err == ErrorCode::Ok ? ErrorCode::RobotNotReady
+                                           : readiness.err;
+    return std::nullopt;
+  }
+
+  const std::optional<TrkFrameView> target_contact_frame = target_track->frame(0);
+  if (!target_contact_frame) {
+    error = ErrorCode::InternalError;
+    return std::nullopt;
+  }
+
+  const std::optional<HighStateSample> high_state = readHighStateForStatus();
+  std::optional<TrkTrack> source_track =
+      controllableSourceTrack(reference_frame,
+                              transitionSampleFpsForTarget(*target_track),
+                              *low_state,
+                              high_state,
+                              &*target_contact_frame);
+  if (!source_track) {
+    error = ErrorCode::InternalError;
+    return std::nullopt;
+  }
+
+  const std::optional<TrkFrameView> source_frame = source_track->frame(0);
+  if (!source_frame) {
+    error = ErrorCode::InternalError;
+    return std::nullopt;
+  }
+
+  std::optional<UserTransitionTracks> tracks =
+      makeUserTransitionTracks(*source_frame,
+                               std::move(target_track),
+                               error,
+                               transition_build_rejected,
+                               true);
+  if (tracks) {
+    entry_low_state = std::move(low_state);
+  }
+  return tracks;
 }
 
 void RuntimeControlLoop::completePreparing() {
@@ -3190,90 +3513,16 @@ bool RuntimeControlLoop::startTransitionFromCurrentReferenceToUser(
   target_request.frames = loaded.track->metadata.frames;
   target_request.fps = loaded.track->metadata.fps;
   target_request.duration_s = loaded.track->metadata.duration_s;
-  auto target_track = std::make_shared<TrkTrack>(std::move(*loaded.track));
-  std::optional<TrkTrack> aligned_target_track =
-      alignTrackRootPlanarPose(*target_track, *source_frame);
-  if (!aligned_target_track) {
-    target_request.state = MotionState::Failed;
-    target_request.err = ErrorCode::InternalError;
-    target_request.ended_at = std::chrono::steady_clock::now();
-    status_.publishRunStatus(toStatus(target_request));
-    abortPreemptedTransition();
-    return true;
-  }
-  target_track = std::make_shared<TrkTrack>(std::move(*aligned_target_track));
-  const std::optional<TrkFrameView> target_frame = target_track->frame(0);
-  if (!target_frame) {
-    target_request.state = MotionState::Failed;
-    target_request.err = ErrorCode::InternalError;
-    target_request.ended_at = std::chrono::steady_clock::now();
-    status_.publishRunStatus(toStatus(target_request));
-    abortPreemptedTransition();
-    return true;
-  }
-  const std::optional<bool> yaw_residual_ok =
-      rootYawResidualAllowsBridge(*source_frame, *target_frame);
-  if (!yaw_residual_ok) {
-    target_request.state = MotionState::Failed;
-    target_request.err = ErrorCode::InternalError;
-    target_request.ended_at = std::chrono::steady_clock::now();
-    status_.publishRunStatus(toStatus(target_request));
-    abortPreemptedTransition();
-    return true;
-  }
-  if (!*yaw_residual_ok) {
-    abortPreemptedTransition();
-    active_ = std::move(target_request);
-    active_kind_ = ActiveKind::User;
-    idle_current_index_.reset();
-    active_track_.reset();
-    handleInternalEvent(RuntimeInternalEvent::MotionRequest);
-    publishActive();
-    return true;
-  }
+  auto target_track = std::make_shared<const TrkTrack>(std::move(*loaded.track));
 
-  const std::optional<double> transition_duration_s = transitionDurationForUse();
-  const double transition_fps = transitionSampleFpsForTarget(*target_track);
-  std::optional<TrkTrack> transition_track =
-      transition_duration_s
-          ? makeSyntheticTransitionTrk(*source_frame,
-                                       *target_frame,
-                                       transition_fps,
-                                       transitionOptionsForTarget(*target_track))
-          : std::nullopt;
-  if (!transition_track) {
-    if (transition_duration_s &&
-        allowStandbyRawStartAfterTransitionBuildFailure(*source_frame,
-                                                        *target_frame,
-                                                        *transition_duration_s,
-                                                        transition_fps,
-                                                        config_.transition_root_yaw_residual_limit_rad,
-                                                        transitionLimitsForUse())) {
-      abortPreemptedTransition();
-      active_ = std::move(target_request);
-      active_kind_ = ActiveKind::User;
-      idle_current_index_.reset();
-      handleInternalEvent(RuntimeInternalEvent::MotionRequest);
-      publishActive();
-    } else {
-      target_request.state = MotionState::Failed;
-      target_request.err = ErrorCode::InternalError;
-      target_request.ended_at = std::chrono::steady_clock::now();
-      status_.publishRunStatus(toStatus(target_request));
-      abortPreemptedTransition();
-    }
-    return true;
-  }
+  ErrorCode transition_error = ErrorCode::InternalError;
+  bool transition_build_rejected = false;
+  std::optional<UserTransitionTracks> tracks =
+      makeUserTransitionTracks(*source_frame,
+                               target_track,
+                               transition_error,
+                               transition_build_rejected);
 
-  PendingTransition target;
-  target.target_kind = TransitionTargetKind::User;
-  target.target_id = target_request.id;
-  target.target_state = MotionState::Queued;
-  target.target_track = std::move(target_track);
-  target.target_request = std::move(target_request);
-
-  auto transition_track_ptr =
-      std::make_shared<TrkTrack>(std::move(*transition_track));
   std::optional<LowStateSample> entry_low_state;
   if (hasPolicyRuntime()) {
     entry_low_state = latest_low_state_;
@@ -3281,8 +3530,33 @@ bool RuntimeControlLoop::startTransitionFromCurrentReferenceToUser(
       entry_low_state = readLowStateForStatus();
     }
   }
+
+  if (!tracks) {
+    tracks = makeUserTransitionTracksFromControllableSource(*source_frame,
+                                                            target_track,
+                                                            entry_low_state,
+                                                            transition_error,
+                                                            transition_build_rejected);
+  }
+
+  if (!tracks) {
+    target_request.state = MotionState::Failed;
+    target_request.err = transition_error;
+    target_request.ended_at = std::chrono::steady_clock::now();
+    status_.publishRunStatus(toStatus(target_request));
+    abortPreemptedTransition();
+    return true;
+  }
+
+  PendingTransition target;
+  target.target_kind = TransitionTargetKind::User;
+  target.target_id = target_request.id;
+  target.target_state = MotionState::Queued;
+  target.target_track = std::move(tracks->target_track);
+  target.target_request = std::move(target_request);
+
   finishTransitionTarget(MotionState::Canceled, replaced_reason, ErrorCode::Ok);
-  const bool started = startInternalTransition(std::move(transition_track_ptr),
+  const bool started = startInternalTransition(std::move(tracks->transition_track),
                                                std::move(target),
                                                std::move(entry_low_state));
   if (!started) {
@@ -3452,6 +3726,16 @@ bool RuntimeControlLoop::startTransitionFromCompletedUserToNextUser() {
     return false;
   }
 
+  const MotionRequest source_to_complete = *active_;
+  auto publishSourceDone = [this, source_to_complete] {
+    MotionRequest completed = source_to_complete;
+    completed.state = MotionState::Done;
+    completed.err = ErrorCode::Ok;
+    completed.stop_reason = StopReason::None;
+    completed.ended_at = std::chrono::steady_clock::now();
+    status_.publishRunStatus(toStatus(completed));
+  };
+
   MotionRequest target_request = waiting_.front();
   target_request.state = MotionState::Queued;
   target_request.frame = 0;
@@ -3468,6 +3752,8 @@ bool RuntimeControlLoop::startTransitionFromCompletedUserToNextUser() {
   target_request.fps = loaded.track->metadata.fps;
   target_request.duration_s = loaded.track->metadata.duration_s;
   auto target_track = std::make_shared<TrkTrack>(std::move(*loaded.track));
+  auto original_target_track =
+      std::make_shared<const TrkTrack>(*target_track);
   std::optional<TrkTrack> aligned_target_track =
       alignTrackRootPlanarPose(*target_track, *source_frame);
   if (!aligned_target_track) {
@@ -3501,6 +3787,36 @@ bool RuntimeControlLoop::startTransitionFromCompletedUserToNextUser() {
                                        transitionOptionsForTarget(*target_track))
           : std::nullopt;
   if (!transition_track) {
+    ErrorCode fallback_error = ErrorCode::InternalError;
+    bool fallback_transition_build_rejected = false;
+    std::optional<LowStateSample> fallback_entry_low_state = entry_low_state;
+    std::optional<UserTransitionTracks> fallback_tracks =
+        makeUserTransitionTracksFromControllableSource(
+            *source_frame,
+            original_target_track,
+            fallback_entry_low_state,
+            fallback_error,
+            fallback_transition_build_rejected);
+    if (fallback_tracks) {
+      PendingTransition target;
+      target.target_kind = TransitionTargetKind::User;
+      target.target_id = target_request.id;
+      target.target_state = MotionState::Queued;
+      target.target_track = std::move(fallback_tracks->target_track);
+      target.target_request = target_request;
+      target.reduced_target_startup_hold = true;
+
+      const bool started =
+          startInternalTransition(std::move(fallback_tracks->transition_track),
+                                  std::move(target),
+                                  std::move(fallback_entry_low_state),
+                                  false);
+      if (started) {
+        waiting_.pop_front();
+        publishSourceDone();
+        return true;
+      }
+    }
     if (transition_duration_s &&
         allowStandbyRawStartAfterTransitionBuildFailure(*source_frame,
                                                         *target_frame,
@@ -3522,7 +3838,6 @@ bool RuntimeControlLoop::startTransitionFromCompletedUserToNextUser() {
   target.target_request = std::move(target_request);
   target.reduced_target_startup_hold = true;
 
-  const MotionRequest source_to_complete = *active_;
   auto transition_track_ptr =
       std::make_shared<TrkTrack>(std::move(*transition_track));
   const bool started = startInternalTransition(std::move(transition_track_ptr),
@@ -3535,13 +3850,7 @@ bool RuntimeControlLoop::startTransitionFromCompletedUserToNextUser() {
   }
 
   waiting_.pop_front();
-
-  MotionRequest completed = source_to_complete;
-  completed.state = MotionState::Done;
-  completed.err = ErrorCode::Ok;
-  completed.stop_reason = StopReason::None;
-  completed.ended_at = std::chrono::steady_clock::now();
-  status_.publishRunStatus(toStatus(completed));
+  publishSourceDone();
   return true;
 }
 
@@ -3694,18 +4003,21 @@ RuntimeControlLoop::startTransitionFromActiveToStandbyCancellation() {
     return StandbyTransitionResult::Fallback;
   }
   if (active_kind_ == ActiveKind::User &&
-      active_->state == MotionState::Holding) {
+      active_->executor != MotionExecutor::GeneralTracker) {
     return StandbyTransitionResult::Fallback;
   }
   if (active_kind_ == ActiveKind::Transition && !transition_) {
     return StandbyTransitionResult::Fallback;
   }
 
-  const std::optional<TrkFrameView> source_frame = active_track_->frame(active_->frame);
-  if (!source_frame || !standby_track_->frame(0)) {
+  const std::optional<TrkFrameView> reference_source_frame =
+      active_track_->frame(active_->frame);
+  if (!reference_source_frame || !standby_track_->frame(0)) {
     return StandbyTransitionResult::Fallback;
   }
 
+  std::optional<TrkTrack> source_track;
+  std::optional<TrkFrameView> source_frame = reference_source_frame;
   if (hasPolicyRuntime()) {
     const std::optional<LowStateSample> entry_low_state = readLowStateForStatus();
     const RobotReadinessStatus readiness =
@@ -3716,6 +4028,18 @@ RuntimeControlLoop::startTransitionFromActiveToStandbyCancellation() {
       return StandbyTransitionResult::Fallback;
     }
     applyReadiness(readiness);
+    const std::optional<HighStateSample> high_state = readHighStateForStatus();
+    source_track = controllableSourceTrack(*reference_source_frame,
+                                           active_track_->metadata.fps,
+                                           *entry_low_state,
+                                           high_state);
+    if (!source_track) {
+      return StandbyTransitionResult::Fallback;
+    }
+    source_frame = source_track->frame(0);
+    if (!source_frame) {
+      return StandbyTransitionResult::Fallback;
+    }
   }
 
   if (active_kind_ == ActiveKind::Transition &&
@@ -3734,7 +4058,7 @@ RuntimeControlLoop::startTransitionFromActiveToStandbyCancellation() {
     target.source_completion_error = ErrorCode::Ok;
   }
 
-  if (startSyntheticTransitionFromActiveFrame(std::move(target))) {
+  if (startSyntheticTransitionFromFrame(std::move(target), *source_frame)) {
     return StandbyTransitionResult::Started;
   }
   return isSafetyTerminalState() ? StandbyTransitionResult::SafetyTerminal
@@ -3751,11 +4075,20 @@ bool RuntimeControlLoop::startSyntheticTransitionFromActiveFrame(
   if (!source_frame) {
     return false;
   }
+  return startSyntheticTransitionFromFrame(std::move(target), *source_frame);
+}
+
+bool RuntimeControlLoop::startSyntheticTransitionFromFrame(
+    PendingTransition target,
+    const TrkFrameView& source_frame) {
+  if (!active_ || !active_track_) {
+    return false;
+  }
   if (!target.target_track) {
     return false;
   }
   std::optional<TrkTrack> aligned_target_track =
-      alignTrackRootPlanarPose(*target.target_track, *source_frame);
+      alignTrackRootPlanarPose(*target.target_track, source_frame);
   if (!aligned_target_track) {
     if (target.target_request && !target.target_request->id.empty()) {
       target.target_request->state = MotionState::Failed;
@@ -3778,7 +4111,7 @@ bool RuntimeControlLoop::startSyntheticTransitionFromActiveFrame(
     return false;
   }
   const std::optional<bool> yaw_residual_ok =
-      rootYawResidualAllowsBridge(*source_frame, *target_frame);
+      rootYawResidualAllowsBridge(source_frame, *target_frame);
   if (!yaw_residual_ok || !*yaw_residual_ok) {
     if (target.target_request && !target.target_request->id.empty()) {
       target.target_request->state = MotionState::Failed;
@@ -3800,7 +4133,7 @@ bool RuntimeControlLoop::startSyntheticTransitionFromActiveFrame(
   const double transition_fps = transitionSampleFpsForTarget(*target.target_track);
   std::optional<TrkTrack> transition_track =
       transition_duration_s
-          ? makeSyntheticTransitionTrk(*source_frame,
+          ? makeSyntheticTransitionTrk(source_frame,
                                        *target_frame,
                                        transition_fps,
                                        transitionOptionsForTarget(*target.target_track))
@@ -4835,7 +5168,10 @@ std::size_t RuntimeControlLoop::policyStartupHoldPolicySteps(double duration_s) 
 }
 
 std::size_t RuntimeControlLoop::stopHoldTicks() const {
-  return 0;
+  if (!std::isfinite(config_.stop_hold_s) || config_.stop_hold_s <= 0.0) {
+    return 0;
+  }
+  return ticksForPeriod(config_.stop_hold_s);
 }
 
 std::optional<double> RuntimeControlLoop::transitionDurationForUse() const {
@@ -4865,14 +5201,52 @@ double RuntimeControlLoop::transitionSampleFpsForTarget(const TrkTrack& target) 
   return target.metadata.fps;
 }
 
+std::optional<std::size_t> RuntimeControlLoop::transitionFrameCountForTarget(
+    const TrkTrack& target) const {
+  const std::optional<double> duration_s = transitionDurationForUse();
+  const double fps = transitionSampleFpsForTarget(target);
+  if (!duration_s || !std::isfinite(fps) || fps <= 0.0) {
+    return std::nullopt;
+  }
+
+  const double intervals_d =
+      std::ceil(*duration_s * fps - kTransitionFrameCountEpsilon);
+  const double max_size =
+      static_cast<double>(std::numeric_limits<std::size_t>::max() - 1);
+  if (!std::isfinite(intervals_d) || intervals_d < 1.0 ||
+      intervals_d > max_size) {
+    return std::nullopt;
+  }
+
+  const std::size_t duration_intervals =
+      static_cast<std::size_t>(intervals_d);
+  const std::size_t min_intervals =
+      config_.transition_min_frames > 0
+          ? std::max<std::size_t>(1, config_.transition_min_frames - 1)
+          : 1;
+  return std::max(duration_intervals, min_intervals) + 1;
+}
+
 SyntheticTransitionOptions RuntimeControlLoop::transitionOptionsForTarget(
     const TrkTrack& target) const {
-  (void)target;
   SyntheticTransitionOptions options;
   options.max_duration_s = config_.transition_duration_s;
   options.min_frames = config_.transition_min_frames;
+  if (const std::optional<std::size_t> frames =
+          transitionFrameCountForTarget(target)) {
+    const double fps = transitionSampleFpsForTarget(target);
+    options.min_frames = *frames;
+    options.max_duration_s = static_cast<double>(*frames - 1) / fps;
+  }
   options.duration_dt_tolerance_s = config_.transition_duration_dt_tolerance_s;
   options.limits = transitionLimitsForUse();
+  return options;
+}
+
+SyntheticTransitionOptions RuntimeControlLoop::controlledTransitionOptionsForTarget(
+    const TrkTrack& target) const {
+  SyntheticTransitionOptions options = transitionOptionsForTarget(target);
+  options.contact_mode = SyntheticTransitionContactMode::kSameValid;
   return options;
 }
 
@@ -5123,6 +5497,8 @@ void RuntimeControlLoop::enterFault(ErrorCode error,
                                     RobotState robot,
                                     std::string block,
                                     std::optional<std::size_t> low_ms) {
+  failWaiting(error);
+  clearIdleConfig();
   enterInternalState(RuntimeInternalState::Fault);
   runtime_state_.ready = false;
   runtime_state_.robot = robot;

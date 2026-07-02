@@ -171,6 +171,9 @@ bool sameIdleConfig(const IdleStatus& lhs, const IdleStatus& rhs) {
 }
 
 void normalizeActive(StatusSnapshot& snapshot) {
+  if (snapshot.active.kind == ActiveKind::Idle && !snapshot.idle.active) {
+    snapshot.active = {ActiveKind::None, ""};
+  }
   if (snapshot.active.kind == ActiveKind::None && snapshot.exec) {
     snapshot.active = {ActiveKind::User, snapshot.exec->id};
   }

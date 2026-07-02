@@ -411,6 +411,37 @@ TEST_CASE("Trk synthetic transition rejects unknown or single-support contact br
   }
 }
 
+TEST_CASE("Trk synthetic transition can explicitly allow same valid zero contact") {
+  TrkTrack source_track = makeSingleFrameTrack();
+  TrkTrack target_track = makeTargetTrack();
+  source_track.left_foot_contact_state.values.at(0) = 0;
+  source_track.right_foot_contact_state.values.at(0) = 0;
+  target_track.left_foot_contact_state.values.at(0) = 0;
+  target_track.right_foot_contact_state.values.at(0) = 0;
+
+  SyntheticTransitionOptions options;
+  options.max_duration_s = 0.20;
+  options.contact_mode = SyntheticTransitionContactMode::kSameValid;
+
+  const std::optional<TrkTrack> transition =
+      makeSyntheticTransitionTrk(*source_track.frame(0),
+                                 *target_track.frame(0),
+                                 25.0,
+                                 options);
+  REQUIRE(transition.has_value());
+  for (std::size_t frame = 0; frame < transition->metadata.frames; ++frame) {
+    REQUIRE(contactAt(transition->left_foot_contact_state, frame) == 0);
+    REQUIRE(contactAt(transition->right_foot_contact_state, frame) == 0);
+  }
+
+  target_track.right_foot_contact_state.values.at(0) = 2;
+  REQUIRE_FALSE(makeSyntheticTransitionTrk(*source_track.frame(0),
+                                           *target_track.frame(0),
+                                           25.0,
+                                           options)
+                    .has_value());
+}
+
 TEST_CASE("Trk synthetic transition uses shortest-path quaternion nlerp") {
   TrkTrack source_track = makeSingleFrameTrack();
   TrkTrack target_track = makeTargetTrack();

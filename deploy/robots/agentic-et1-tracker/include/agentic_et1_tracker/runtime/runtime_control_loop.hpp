@@ -148,6 +148,11 @@ class RuntimeControlLoop final {
     bool reduced_target_startup_hold{false};
   };
 
+  struct UserTransitionTracks {
+    std::shared_ptr<const TrkTrack> transition_track;
+    std::shared_ptr<const TrkTrack> target_track;
+  };
+
   struct LocoUpperRuntimeState {
     LocoUpperRootPlan root_plan;
     std::vector<LocoUpperVelocityCommand> commands_body;
@@ -188,6 +193,7 @@ class RuntimeControlLoop final {
   void handleInterrupt(MotionRequest request);
   void cancelWaiting(StopReason reason);
   void cancelWaiting(StopReason reason, std::uint64_t sequence);
+  void failWaiting(ErrorCode error);
   ControllerState controllerStateForInternal(RuntimeInternalState state) const;
   void enterInternalState(RuntimeInternalState state);
   void handleInternalEvent(RuntimeInternalEvent event);
@@ -263,6 +269,21 @@ class RuntimeControlLoop final {
   bool startTransitionFromCompletedUserToStandby();
   StandbyTransitionResult startTransitionFromActiveToStandbyCancellation();
   bool startSyntheticTransitionFromActiveFrame(PendingTransition target);
+  bool startSyntheticTransitionFromFrame(PendingTransition target,
+                                         const TrkFrameView& source_frame);
+  std::optional<UserTransitionTracks> makeUserTransitionTracks(
+      const TrkFrameView& source_frame,
+      std::shared_ptr<const TrkTrack> target_track,
+      ErrorCode& error,
+      bool& transition_build_rejected,
+      bool allow_same_valid_contact = false);
+  std::optional<UserTransitionTracks>
+  makeUserTransitionTracksFromControllableSource(
+      const TrkFrameView& reference_frame,
+      std::shared_ptr<const TrkTrack> target_track,
+      std::optional<LowStateSample>& entry_low_state,
+      ErrorCode& error,
+      bool& transition_build_rejected);
   bool startInternalTransition(std::shared_ptr<const TrkTrack> track,
                                PendingTransition target,
                                std::optional<LowStateSample> entry_low_state,
@@ -315,9 +336,19 @@ class RuntimeControlLoop final {
   std::optional<double> transitionDurationForUse() const;
   SyntheticTransitionLimits transitionLimitsForUse() const;
   double transitionSampleFpsForTarget(const TrkTrack& target) const;
+  std::optional<std::size_t> transitionFrameCountForTarget(
+      const TrkTrack& target) const;
   SyntheticTransitionOptions transitionOptionsForTarget(const TrkTrack& target) const;
+  SyntheticTransitionOptions controlledTransitionOptionsForTarget(
+      const TrkTrack& target) const;
   std::optional<bool> rootYawResidualAllowsBridge(const TrkFrameView& source,
                                                   const TrkFrameView& target);
+  std::optional<TrkTrack> controllableSourceTrack(
+      const TrkFrameView& reference_frame,
+      double fps,
+      const LowStateSample& low_state,
+      const std::optional<HighStateSample>& high_state,
+      const TrkFrameView* contact_frame = nullptr) const;
   void publishActive();
   void publishReferenceActive();
   void publishReferenceTransition();
