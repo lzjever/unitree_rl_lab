@@ -1,7 +1,7 @@
 # Agentic ET1 Tracker Acceptance Evidence
 
 Date: 2026-05-29
-Latest targeted update: 2026-06-17
+Latest targeted update: 2026-07-03
 Environment: local workspace `/home/galbot/works/et1`
 
 ## Manual E2E and visual gates
@@ -22,10 +22,31 @@ pipelines automatically cover those gates.
 - `tools/manual_gate.py visual` requires a running or explicitly started MuJoCo
   session, runs a short action unless disabled, writes a screenshot artifact,
   and emits a minimal checklist/result JSON for operator review.
-- `--fixture-source auto` and `existing` prefer stable named manual gate
-  fixtures such as `manual_gate_long_c.trk` and
-  `manual_gate_transition_a.trk` when they exist and pass `trk_summary`; recent
-  generated actions are fallback fixtures only.
+- `tools/manual_gate.py` visual/e2e runs are manual product gates only. They
+  are not default release gates, and the shorter visual/e2e checks are not
+  evidence of long MuJoCo/tracker standby stability unless the explicit soak
+  options below were run and archived.
+- MuJoCo sling landing/settle is opt-in via `--mujoco-land-settle`. When
+  enabled, the script follows the ET1 manual landing sequence: request tracker
+  `fixstand`, optionally send sim-control `hold`, repeatedly issue `lower`
+  until `both=true` is stable for the configured samples/duration, request
+  tracker `standby`, confirm standby/velocity0 can stand, then `release` and
+  allow short transient contact loss only if the post-release window recovers
+  continuous `both=true` contact with no passive/fault/block/err or low `root_z`.
+- Long standby soak is opt-in via `--standby-soak-s <seconds>`. It drives
+  `standby`, samples `/status` for the requested duration, fails on
+  passive/fault/block/err or low `root_z`, and requires `both=true` when
+  sim-control is available. The intended full MuJoCo landing/standby flow is
+  `fixstand` -> landing/lower contact -> `standby` -> `release` -> soak.
+  Failures include the latest sample summary.
+- `--fixture-source auto` writes reference-derived
+  `manual_gate_e2e_safe_*.trk` fixtures into the selected `motion_dirs`
+  directory for E2E/visual semantic checks. `--fixture-source existing`
+  requires that complete e2e-safe named set to already exist. Recent arbitrary
+  generated actions and legacy `manual_gate_long_*.trk` files are not product
+  gate fixtures. When sim-control is available, final settle accepts only
+  physical-safe fixture sources: `existing` and `e2e_safe`; synthetic fixtures
+  remain HTTP/status contract-only.
 - Defaults connect to already running services. Process startup is explicit via
   `--start-tracker` and `--start-mujoco-cmd`; the script stops only processes
   it started.

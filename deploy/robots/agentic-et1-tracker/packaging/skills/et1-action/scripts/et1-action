@@ -37,6 +37,7 @@ P0_NEXT = {
     "status",
     "urgent-stop",
     "idle-load",
+    "idle-clear",
     "cache-clear",
 }
 MOTION_MODES = {"fullbody", "base"}
@@ -882,13 +883,12 @@ def standby_confirmed(status):
     return active.get("kind") not in {"user", "transition"}
 
 
-def standby_cmd(base, timeout, poll):
-    cancel_active_sequences("standby")
+def standby_after_control_cmd(cmd, intent, base, timeout, poll):
     out = tracker_standby(base, timeout)
     if not out.get("ok"):
         error = out.get("error", {})
-        return err_doc("standby", error.get("code", "TRACKER_STATE_CONFLICT"), error.get("message", "standby failed"), "standby")
-    fields = {"intent": "cancel_to_standby", "state": "standby"}
+        return err_doc(cmd, error.get("code", "TRACKER_STATE_CONFLICT"), error.get("message", "standby failed"), cmd)
+    fields = {"intent": intent, "state": "standby"}
     deadline = time.monotonic() + standby_confirm_seconds(timeout)
     status = None
     while True:
@@ -896,19 +896,33 @@ def standby_cmd(base, timeout, poll):
         if status.get("ok"):
             fields.update(compact_tracker_state(status))
             if standby_confirmed(status):
-                return ok_doc("standby", "run-text", **fields)
+                return ok_doc(cmd, "run-text", **fields)
         if time.monotonic() >= deadline:
             if status and status.get("ok"):
                 fields.update(compact_tracker_state(status))
             fields["state"] = "standby_pending"
             return err_doc(
-                "standby",
+                cmd,
                 "STANDBY_NOT_CONFIRMED",
                 "standby sent; motion still active",
                 "status",
                 **fields,
             )
         time.sleep(poll)
+
+
+def standby_cmd(base, timeout, poll):
+    cancel_active_sequences("standby")
+    return standby_after_control_cmd("standby", "cancel_to_standby", base, timeout, poll)
+
+
+def idle_clear_cmd(base, timeout, poll):
+    cancel_active_sequences("idle-clear")
+    out = tracker_idle_set(base, [], timeout)
+    if not out.get("ok"):
+        error = out.get("error", {})
+        return err_doc("idle-clear", error.get("code", "TRACKER_STATE_CONFLICT"), error.get("message", "idle clear failed"), "idle-clear")
+    return standby_after_control_cmd("idle-clear", "cancel_to_still", base, timeout, poll)
 
 
 def fixstand_cmd(base, timeout):
@@ -1840,6 +1854,8 @@ def parse(argv):
     idle.add_argument("--preset-dir")
     idle.add_argument("--stage-dir")
 
+    sub.add_parser("idle-clear")
+
     cc = sub.add_parser("cache-clear")
     cc.add_argument("--root")
 
@@ -1908,6 +1924,8 @@ def main(argv):
             out = urgent_stop_cmd(args, base, args.timeout)
         elif args.cmd == "idle-load":
             out = idle_load_cmd(args, base, args.timeout)
+        elif args.cmd == "idle-clear":
+            out = idle_clear_cmd(base, args.timeout, args.poll)
         elif args.cmd == "cache-clear":
             out = cache_clear_cmd(args)
         elif args.cmd == "sequence-start":

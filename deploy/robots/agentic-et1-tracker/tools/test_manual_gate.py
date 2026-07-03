@@ -379,6 +379,16 @@ class ManualGateFinalSettleTests(unittest.TestCase):
         self.assertEqual(parsed["camera_track_body"], "pelvis_link")
         self.assertEqual(parsed["camera_trackbodyid"], 4)
 
+    def test_parse_sim_control_status_accepts_boolean_contact_words(self):
+        parsed = manual_gate.parse_sim_control_status(
+            "ok left_contact=true right_contact=false both=true root_z=0.740"
+        )
+
+        self.assertTrue(parsed["left_contact"])
+        self.assertFalse(parsed["right_contact"])
+        self.assertTrue(parsed["both"])
+        self.assertEqual(parsed["root_z"], 0.74)
+
     def test_visual_camera_accepts_tracking_pelvis(self):
         reason = manual_gate.visual_camera_reason(sim_status())
 
@@ -493,10 +503,40 @@ class ManualGateFinalSettleTests(unittest.TestCase):
             manual_gate.get = old_get
             manual_gate.sim_control_status = old_sim_control_status
 
-        self.assertIn("did not use existing generated TRK", str(raised.exception))
+        self.assertIn("non-physical-safe fixture source", str(raised.exception))
+        self.assertIn("synthetic", str(raised.exception))
         self.assertEqual(raised.exception.report["final_settle"]["fixture_source"],
                          "synthetic")
         self.assertNotEqual(raised.exception.report["final_settle"].get("result"), "SKIP")
+
+    def test_final_settle_check_allows_e2e_safe_when_sim_control_available(self):
+        old_get = manual_gate.get
+        old_sim_control_status = manual_gate.sim_control_status
+        args = SimpleNamespace(
+            final_settle_s=0.0,
+            min_root_z=0.2,
+            sim_control_port=8090,
+            sim_control_timeout_ms=200,
+            fixture_source_resolved="e2e_safe",
+        )
+
+        try:
+            manual_gate.get = lambda _url, _path: status()
+            manual_gate.sim_control_status = (
+                lambda _port, _timeout_ms: {
+                    "available": True,
+                    "ok": True,
+                    "root_z": 0.74,
+                    "both": True,
+                }
+            )
+            result = manual_gate.final_settle_check(args, "http://tracker")
+        finally:
+            manual_gate.get = old_get
+            manual_gate.sim_control_status = old_sim_control_status
+
+        self.assertEqual(result["result"], "PASS")
+        self.assertEqual(result["fixture_source"], "e2e_safe")
 
     def test_visual_action_terminal_check_rejects_failed_terminal(self):
         old_run_status = manual_gate.run_status
@@ -621,6 +661,558 @@ class ManualGateFinalSettleTests(unittest.TestCase):
         self.assertIn("terminal state is failed", str(raised.exception))
 
 
+class ManualGateMujocoLandingSettleTests(unittest.TestCase):
+    def args(self, **overrides):
+        base = {
+            "sim_control_port": 8090,
+            "sim_control_timeout_ms": 200,
+            "min_root_z": 0.2,
+            "mujoco_land_hold": True,
+            "mujoco_land_timeout_s": 1.0,
+            "mujoco_land_contact_samples": 2,
+            "mujoco_land_contact_s": 0.0,
+            "mujoco_land_interval_s": 0.0,
+            "mujoco_land_release_check_s": 0.0,
+            "standby_timeout": 1.0,
+        }
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    def test_landing_settle_fixstand_lowers_standby_then_releases(self):
+        old_command = manual_gate.sim_control_command
+        old_get = manual_gate.get
+        old_post = manual_gate.post
+        events = []
+        lower_samples = [
+            {"available": True, "ok": True, "root_z": 0.90, "both": False},
+            {"available": True, "ok": True, "root_z": 0.78, "both": True},
+            {"available": True, "ok": True, "root_z": 0.74, "both": True},
+        ]
+        statuses = [
+            status(ctrl="fixstand"),
+            status(ctrl="standby"),
+            status(ctrl="standby"),
+        ]
+
+        def fake_command(_port, _timeout_ms, command):
+            events.append(f"sim:{command}")
+            if command == "hold":
+                return {"available": True, "ok": True, "root_z": 0.95, "both": False}
+            if command == "lower":
+                return lower_samples.pop(0)
+            if command == "release":
+                return {"available": True, "ok": True, "root_z": 0.74, "both": True}
+            if command == "status":
+                return {"available": True, "ok": True, "root_z": 0.74, "both": True}
+            self.fail(f"unexpected command {command}")
+
+        def fake_get(_url, path):
+            events.append(f"get:{path}")
+            return statuses.pop(0) if statuses else status(ctrl="standby")
+
+        def fake_post(_url, path, body=None):
+            events.append(f"post:{path}")
+            return {"ok": True}
+
+        try:
+            manual_gate.sim_control_command = fake_command
+            manual_gate.get = fake_get
+            manual_gate.post = fake_post
+            result = manual_gate.mujoco_landing_settle_check(self.args(), "http://tracker")
+        finally:
+            manual_gate.sim_control_command = old_command
+            manual_gate.get = old_get
+            manual_gate.post = old_post
+
+        self.assertEqual(
+            events,
+            [
+                "post:/fixstand",
+                "get:/status",
+                "sim:hold",
+                "sim:lower",
+                "sim:lower",
+                "sim:lower",
+                "post:/standby",
+                "get:/status",
+                "sim:release",
+                "sim:status",
+                "get:/status",
+            ],
+        )
+        self.assertEqual(result["result"], "PASS")
+        self.assertEqual(result["lower_count"], 3)
+        self.assertEqual(result["standby_status"]["ctrl"], "standby")
+        self.assertEqual(result["release_check"]["sim_control"]["both"], True)
+        self.assertEqual(result["release_check"]["status"]["ctrl"], "standby")
+
+    def test_landing_settle_can_skip_initial_hold(self):
+        old_command = manual_gate.sim_control_command
+        old_get = manual_gate.get
+        old_post = manual_gate.post
+        events = []
+        statuses = [
+            status(ctrl="fixstand"),
+            status(ctrl="standby"),
+            status(ctrl="standby"),
+        ]
+
+        def fake_command(_port, _timeout_ms, command):
+            events.append(f"sim:{command}")
+            return {"available": True, "ok": True, "root_z": 0.74, "both": True}
+
+        def fake_get(_url, path):
+            events.append(f"get:{path}")
+            return statuses.pop(0) if statuses else status(ctrl="standby")
+
+        def fake_post(_url, path, body=None):
+            events.append(f"post:{path}")
+            return {"ok": True}
+
+        try:
+            manual_gate.sim_control_command = fake_command
+            manual_gate.get = fake_get
+            manual_gate.post = fake_post
+            result = manual_gate.mujoco_landing_settle_check(
+                self.args(mujoco_land_hold=False, mujoco_land_contact_samples=1),
+                "http://tracker",
+            )
+        finally:
+            manual_gate.sim_control_command = old_command
+            manual_gate.get = old_get
+            manual_gate.post = old_post
+
+        self.assertEqual(
+            events,
+            [
+                "post:/fixstand",
+                "get:/status",
+                "sim:lower",
+                "post:/standby",
+                "get:/status",
+                "sim:release",
+                "sim:status",
+                "get:/status",
+            ],
+        )
+        self.assertEqual(result["result"], "PASS")
+
+    def test_landing_settle_fails_when_contact_is_lost_after_release(self):
+        old_command = manual_gate.sim_control_command
+        old_get = manual_gate.get
+        old_post = manual_gate.post
+        responses = {
+            "hold": [{"available": True, "ok": True, "root_z": 0.95, "both": False}],
+            "lower": [{"available": True, "ok": True, "root_z": 0.74, "both": True}],
+            "release": [{"available": True, "ok": True, "root_z": 0.74, "both": True}],
+            "status": [{"available": True, "ok": True, "root_z": 0.74, "both": False}],
+        }
+        statuses = [
+            status(ctrl="fixstand"),
+            status(ctrl="standby"),
+            status(ctrl="standby"),
+        ]
+
+        def fake_command(_port, _timeout_ms, command):
+            return responses[command].pop(0)
+
+        try:
+            manual_gate.sim_control_command = fake_command
+            manual_gate.get = (
+                lambda _url, _path: statuses.pop(0) if statuses else status(ctrl="standby")
+            )
+            manual_gate.post = lambda _url, _path, body=None: {"ok": True}
+            with self.assertRaises(manual_gate.GateError) as raised:
+                manual_gate.mujoco_landing_settle_check(
+                    self.args(mujoco_land_contact_samples=1),
+                    "http://tracker",
+                )
+        finally:
+            manual_gate.sim_control_command = old_command
+            manual_gate.get = old_get
+            manual_gate.post = old_post
+
+        self.assertIn("post-release both contact did not recover", str(raised.exception))
+        self.assertIn("mujoco_landing_settle", raised.exception.report)
+        self.assertIn("samples", raised.exception.report["mujoco_landing_settle"])
+
+    def test_landing_settle_accepts_transient_post_release_contact_loss(self):
+        old_command = manual_gate.sim_control_command
+        old_get = manual_gate.get
+        old_post = manual_gate.post
+        old_monotonic = manual_gate.time.monotonic
+        old_sleep = manual_gate.time.sleep
+        clock = {"t": 0.0}
+        release_samples = [
+            {"available": True, "ok": True, "root_z": 0.74, "both": False},
+            {"available": True, "ok": True, "root_z": 0.74, "both": True},
+            {"available": True, "ok": True, "root_z": 0.74, "both": True},
+        ]
+        seen_release_both = []
+        statuses = [
+            status(ctrl="fixstand"),
+            status(ctrl="standby"),
+        ]
+
+        def fake_monotonic():
+            clock["t"] += 0.05
+            return clock["t"]
+
+        def fake_command(_port, _timeout_ms, command):
+            if command == "hold":
+                return {"available": True, "ok": True, "root_z": 0.95, "both": False}
+            if command == "lower":
+                return {"available": True, "ok": True, "root_z": 0.74, "both": True}
+            if command == "release":
+                return {"available": True, "ok": True, "root_z": 0.74, "both": True}
+            if command == "status":
+                sample = release_samples.pop(0) if release_samples else {
+                    "available": True,
+                    "ok": True,
+                    "root_z": 0.74,
+                    "both": True,
+                }
+                seen_release_both.append(sample["both"])
+                return sample
+            self.fail(f"unexpected command {command}")
+
+        try:
+            manual_gate.sim_control_command = fake_command
+            manual_gate.get = (
+                lambda _url, _path: statuses.pop(0) if statuses else status(ctrl="standby")
+            )
+            manual_gate.post = lambda _url, _path, body=None: {"ok": True}
+            manual_gate.time.monotonic = fake_monotonic
+            manual_gate.time.sleep = lambda seconds: clock.__setitem__("t", clock["t"] + seconds)
+            result = manual_gate.mujoco_landing_settle_check(
+                self.args(
+                    mujoco_land_contact_samples=2,
+                    mujoco_land_release_check_s=0.50,
+                ),
+                "http://tracker",
+            )
+        finally:
+            manual_gate.sim_control_command = old_command
+            manual_gate.get = old_get
+            manual_gate.post = old_post
+            manual_gate.time.monotonic = old_monotonic
+            manual_gate.time.sleep = old_sleep
+
+        self.assertEqual(result["result"], "PASS")
+        self.assertIn(False, seen_release_both)
+        self.assertEqual(seen_release_both[-2:], [True, True])
+        self.assertEqual(result["release_check"]["sim_control"]["both"], True)
+
+    def test_landing_settle_fails_when_post_release_contact_never_recovers(self):
+        old_command = manual_gate.sim_control_command
+        old_get = manual_gate.get
+        old_post = manual_gate.post
+        old_monotonic = manual_gate.time.monotonic
+        old_sleep = manual_gate.time.sleep
+        clock = {"t": 0.0}
+        statuses = [
+            status(ctrl="fixstand"),
+            status(ctrl="standby"),
+        ]
+
+        def fake_monotonic():
+            clock["t"] += 0.05
+            return clock["t"]
+
+        def fake_command(_port, _timeout_ms, command):
+            if command == "hold":
+                return {"available": True, "ok": True, "root_z": 0.95, "both": False}
+            if command == "lower":
+                return {"available": True, "ok": True, "root_z": 0.74, "both": True}
+            if command in ("release", "status"):
+                return {"available": True, "ok": True, "root_z": 0.74, "both": False}
+            self.fail(f"unexpected command {command}")
+
+        try:
+            manual_gate.sim_control_command = fake_command
+            manual_gate.get = (
+                lambda _url, _path: statuses.pop(0) if statuses else status(ctrl="standby")
+            )
+            manual_gate.post = lambda _url, _path, body=None: {"ok": True}
+            manual_gate.time.monotonic = fake_monotonic
+            manual_gate.time.sleep = lambda seconds: clock.__setitem__("t", clock["t"] + seconds)
+            with self.assertRaises(manual_gate.GateError) as raised:
+                manual_gate.mujoco_landing_settle_check(
+                    self.args(
+                        mujoco_land_contact_samples=2,
+                        mujoco_land_release_check_s=0.25,
+                    ),
+                    "http://tracker",
+                )
+        finally:
+            manual_gate.sim_control_command = old_command
+            manual_gate.get = old_get
+            manual_gate.post = old_post
+            manual_gate.time.monotonic = old_monotonic
+            manual_gate.time.sleep = old_sleep
+
+        self.assertIn("post-release both contact did not recover", str(raised.exception))
+        report = raised.exception.report["mujoco_landing_settle"]
+        self.assertIn("samples", report)
+        self.assertTrue(any(
+            sample.get("sim_control", {}).get("both") is False
+            for sample in report["samples"]
+        ))
+
+    def test_landing_settle_fails_immediately_on_post_release_low_root_z(self):
+        old_command = manual_gate.sim_control_command
+        old_get = manual_gate.get
+        old_post = manual_gate.post
+        statuses = [
+            status(ctrl="fixstand"),
+            status(ctrl="standby"),
+            status(ctrl="standby"),
+        ]
+
+        def fake_command(_port, _timeout_ms, command):
+            if command == "hold":
+                return {"available": True, "ok": True, "root_z": 0.95, "both": False}
+            if command == "lower":
+                return {"available": True, "ok": True, "root_z": 0.74, "both": True}
+            if command == "release":
+                return {"available": True, "ok": True, "root_z": 0.74, "both": True}
+            if command == "status":
+                return {"available": True, "ok": True, "root_z": 0.10, "both": True}
+            self.fail(f"unexpected command {command}")
+
+        try:
+            manual_gate.sim_control_command = fake_command
+            manual_gate.get = (
+                lambda _url, _path: statuses.pop(0) if statuses else status(ctrl="standby")
+            )
+            manual_gate.post = lambda _url, _path, body=None: {"ok": True}
+            with self.assertRaises(manual_gate.GateError) as raised:
+                manual_gate.mujoco_landing_settle_check(
+                    self.args(mujoco_land_contact_samples=1),
+                    "http://tracker",
+                )
+        finally:
+            manual_gate.sim_control_command = old_command
+            manual_gate.get = old_get
+            manual_gate.post = old_post
+
+        self.assertIn("sim-control root_z 0.100 < 0.200", str(raised.exception))
+        self.assertIn("samples", raised.exception.report["mujoco_landing_settle"])
+
+    def test_landing_settle_fails_immediately_on_post_release_passive(self):
+        old_command = manual_gate.sim_control_command
+        old_get = manual_gate.get
+        old_post = manual_gate.post
+        statuses = [
+            status(ctrl="fixstand"),
+            status(ctrl="standby"),
+            status(
+                ready=False,
+                ctrl="passive",
+                robot="fault",
+                block="bad_orientation",
+                err={"code": "ROBOT_BAD_ORIENTATION"},
+                pose={"p": [0.0, 0.0, 0.74]},
+            ),
+        ]
+
+        def fake_command(_port, _timeout_ms, command):
+            if command == "hold":
+                return {"available": True, "ok": True, "root_z": 0.95, "both": False}
+            if command == "lower":
+                return {"available": True, "ok": True, "root_z": 0.74, "both": True}
+            if command in ("release", "status"):
+                return {"available": True, "ok": True, "root_z": 0.74, "both": True}
+            self.fail(f"unexpected command {command}")
+
+        try:
+            manual_gate.sim_control_command = fake_command
+            manual_gate.get = (
+                lambda _url, _path: statuses.pop(0) if statuses else status(ctrl="standby")
+            )
+            manual_gate.post = lambda _url, _path, body=None: {"ok": True}
+            with self.assertRaises(manual_gate.GateError) as raised:
+                manual_gate.mujoco_landing_settle_check(
+                    self.args(mujoco_land_contact_samples=1),
+                    "http://tracker",
+                )
+        finally:
+            manual_gate.sim_control_command = old_command
+            manual_gate.get = old_get
+            manual_gate.post = old_post
+
+        self.assertIn("bad_orientation", str(raised.exception))
+        self.assertIn("samples", raised.exception.report["mujoco_landing_settle"])
+
+
+class ManualGateStandbySoakTests(unittest.TestCase):
+    def args(self, **overrides):
+        base = {
+            "sim_control_port": 8090,
+            "sim_control_timeout_ms": 200,
+            "standby_timeout": 1.0,
+            "standby_soak_s": 0.0,
+            "standby_soak_interval_s": 0.0,
+            "min_root_z": 0.2,
+        }
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    def test_standby_soak_requests_standby_and_samples_stability(self):
+        old_get = manual_gate.get
+        old_post = manual_gate.post
+        old_sim_control_status = manual_gate.sim_control_status
+        posts = []
+        statuses = [
+            status(ctrl="standby"),
+            status(ctrl="standby"),
+        ]
+
+        try:
+            manual_gate.post = lambda _url, path, body=None: posts.append(path) or {"ok": True}
+            manual_gate.get = lambda _url, _path: statuses.pop(0) if statuses else status(ctrl="standby")
+            manual_gate.sim_control_status = (
+                lambda _port, _timeout_ms: {
+                    "available": True,
+                    "ok": True,
+                    "root_z": 0.74,
+                    "both": True,
+                }
+            )
+            result = manual_gate.standby_soak_check(self.args(), "http://tracker")
+        finally:
+            manual_gate.get = old_get
+            manual_gate.post = old_post
+            manual_gate.sim_control_status = old_sim_control_status
+
+        self.assertEqual(posts, ["/standby"])
+        self.assertEqual(result["result"], "PASS")
+        self.assertGreaterEqual(result["sample_count"], 1)
+        self.assertEqual(result["samples"][-1]["sim_control"]["both"], True)
+
+    def test_standby_soak_fails_with_recent_sample_summary(self):
+        old_get = manual_gate.get
+        old_post = manual_gate.post
+        old_sim_control_status = manual_gate.sim_control_status
+        statuses = [
+            status(ctrl="standby"),
+            status(
+                ready=False,
+                ctrl="passive",
+                robot="fault",
+                block="bad_orientation",
+                err={"code": "ROBOT_BAD_ORIENTATION"},
+                pose={"p": [-2.2, -0.18, -0.709]},
+            ),
+        ]
+        sim_samples = [
+            {"available": True, "ok": True, "root_z": 0.74, "both": True},
+            {"available": True, "ok": True, "root_z": -0.709, "both": True},
+        ]
+
+        try:
+            manual_gate.post = lambda _url, _path, body=None: {"ok": True}
+            manual_gate.get = lambda _url, _path: statuses.pop(0) if statuses else status(
+                ready=False,
+                ctrl="passive",
+                robot="fault",
+                block="bad_orientation",
+                err={"code": "ROBOT_BAD_ORIENTATION"},
+                pose={"p": [-2.2, -0.18, -0.709]},
+            )
+            manual_gate.sim_control_status = (
+                lambda _port, _timeout_ms: sim_samples.pop(0) if sim_samples else {
+                    "available": True,
+                    "ok": True,
+                    "root_z": -0.709,
+                    "both": True,
+                }
+            )
+            with self.assertRaises(manual_gate.GateError) as raised:
+                manual_gate.standby_soak_check(
+                    self.args(standby_soak_s=1.0), "http://tracker"
+                )
+        finally:
+            manual_gate.get = old_get
+            manual_gate.post = old_post
+            manual_gate.sim_control_status = old_sim_control_status
+
+        self.assertIn("bad_orientation", str(raised.exception))
+        self.assertIn("standby_soak", raised.exception.report)
+        self.assertIn("samples", raised.exception.report["standby_soak"])
+        self.assertLessEqual(len(raised.exception.report["standby_soak"]["samples"]), 8)
+
+
+class ManualGateQueueInterruptContractTests(unittest.TestCase):
+    def test_queue_interrupt_contract_holds_active_safe_fixtures(self):
+        old_execute = manual_gate.execute
+        old_run_status = manual_gate.run_status
+        old_post = manual_gate.post
+        old_wait_standby = manual_gate.wait_standby
+        old_checkpoint = manual_gate.check_status_checkpoint
+        execute_calls = []
+        posts = []
+        runs = {
+            "A": [
+                {"id": "A", "state": "running"},
+                {"id": "A", "state": "stopped", "stop_reason": "interrupt"},
+            ],
+            "B": [
+                {"id": "B", "state": "queued", "queue_pos": 1},
+                {"id": "B", "state": "canceled", "stop_reason": "interrupt"},
+            ],
+            "C": [
+                {"id": "C", "state": "holding"},
+            ],
+        }
+
+        def fake_execute(_url, path, mode="queue", hold=False):
+            run_id = ("A", "B", "C")[len(execute_calls)]
+            execute_calls.append({
+                "id": run_id,
+                "path": path,
+                "mode": mode,
+                "hold": hold,
+            })
+            return run_id
+
+        def fake_run_status(_url, run_id):
+            states = runs[run_id]
+            return states.pop(0) if len(states) > 1 else states[0]
+
+        try:
+            manual_gate.execute = fake_execute
+            manual_gate.run_status = fake_run_status
+            manual_gate.post = lambda _url, path, body=None: posts.append(path) or {"ok": True}
+            manual_gate.wait_standby = lambda _url: status(ctrl="standby")
+            manual_gate.check_status_checkpoint = (
+                lambda *_args, **_kwargs: {"result": "PASS"}
+            )
+            fixtures = {
+                key: Path(f"/motions/manual_gate_e2e_safe_{key}.trk")
+                for key in manual_gate.FIXTURE_KEYS
+            }
+
+            result = manual_gate.queue_interrupt_status_contract_check(
+                SimpleNamespace(), "http://tracker", fixtures
+            )
+        finally:
+            manual_gate.execute = old_execute
+            manual_gate.run_status = old_run_status
+            manual_gate.post = old_post
+            manual_gate.wait_standby = old_wait_standby
+            manual_gate.check_status_checkpoint = old_checkpoint
+
+        self.assertEqual(result["result"], "PASS")
+        self.assertEqual(posts, ["/standby"])
+        self.assertEqual(
+            [(call["id"], call["mode"], call["hold"]) for call in execute_calls],
+            [("A", "queue", True), ("B", "queue", False), ("C", "interrupt", True)],
+        )
+        self.assertEqual(execute_calls[0]["path"], fixtures["long_a"])
+        self.assertEqual(execute_calls[2]["path"], fixtures["long_c"])
+
+
 class ManualGateFixtureSelectionTests(unittest.TestCase):
     def args(self, source="auto", gate="e2e"):
         return SimpleNamespace(
@@ -633,28 +1225,25 @@ class ManualGateFixtureSelectionTests(unittest.TestCase):
 
     def write_named_fixtures(self, root):
         return {
-            "idle_a": manual_gate.write_trk(root / "manual_gate_idle_a.trk", 80, 0.1),
-            "idle_b": manual_gate.write_trk(root / "manual_gate_idle_b.trk", 90, 0.2),
-            "short": manual_gate.write_trk(root / "manual_gate_short.trk", 35, 0.3),
-            "long_a": manual_gate.write_trk(root / "manual_gate_long_a.trk", 260, 0.4),
-            "long_b": manual_gate.write_trk(root / "manual_gate_long_b.trk", 220, 0.5),
-            "long_c": manual_gate.write_trk(root / "manual_gate_long_c.trk", 220, 0.6),
-            "transition_a": manual_gate.write_trk(
-                root / "manual_gate_transition_a.trk", 12, 0.7
-            ),
-            "transition_b": manual_gate.write_trk(
-                root / "manual_gate_transition_b.trk", 500, 0.8
-            ),
-            "transition_c": manual_gate.write_trk(
-                root / "manual_gate_transition_c.trk", 500, 0.9
-            ),
-            "loco": manual_gate.write_trk(root / "manual_gate_loco.trk", 60, 1.0),
+            key: manual_gate.write_trk(
+                root / f"manual_gate_e2e_safe_{key}.trk",
+                manual_gate.E2E_SAFE_FIXTURE_FRAMES[key],
+                0.1,
+            )
+            for key in manual_gate.FIXTURE_KEYS
         }
 
-    def test_auto_prefers_stable_named_manual_gate_fixtures(self):
+    def test_e2e_safe_frame_extension_holds_last_reference_frame(self):
+        data = b"aabbcc"
+
+        self.assertEqual(manual_gate.repeat_frame_data(data, 3, 5), b"aabbcccccc")
+        self.assertEqual(manual_gate.repeat_frame_data(data, 3, 2), b"aabb")
+
+    def test_auto_prefers_existing_e2e_safe_named_fixtures(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             named = self.write_named_fixtures(root)
+            manual_gate.write_trk(root / "manual_gate_long_c.trk", 220, 0.6)
             manual_gate.write_trk(
                 root / "et1-generated-turn_around_180_degrees-newer.trk", 20, 0.2
             )
@@ -665,10 +1254,31 @@ class ManualGateFixtureSelectionTests(unittest.TestCase):
         self.assertGreaterEqual(report["candidate_count"], len(named))
         self.assertEqual(fixtures, {key: path.resolve() for key, path in named.items()})
 
+    def test_auto_generates_reference_derived_e2e_safe_fixtures_not_recent_generated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy_long = manual_gate.write_trk(root / "manual_gate_long_c.trk", 220, 0.6)
+            generated = manual_gate.write_trk(
+                root / "et1-generated-turn_around_180_degrees-newer.trk", 260, 0.2
+            )
+
+            fixtures, report = manual_gate.resolve_fixtures(self.args("auto"), root)
+
+            self.assertEqual(report["source"], "e2e_safe")
+            self.assertEqual(set(fixtures.keys()), set(manual_gate.FIXTURE_KEYS))
+            self.assertNotIn(legacy_long.resolve(), set(fixtures.values()))
+            self.assertNotIn(generated.resolve(), set(fixtures.values()))
+            for key, path in fixtures.items():
+                self.assertEqual(path.name, f"manual_gate_e2e_safe_{key}.trk")
+                self.assertLessEqual(
+                    manual_gate.trk_summary(path).frames,
+                    manual_gate.E2E_SAFE_FIXTURE_MAX_FRAMES,
+                )
+
     def test_obvious_tmp_and_synthetic_files_remain_filtered(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            stable = manual_gate.write_trk(root / "manual_gate_short.trk", 35, 0.3)
+            stable = manual_gate.write_trk(root / "manual_gate_e2e_safe_short.trk", 35, 0.3)
             real = manual_gate.write_trk(root / "et1-generated-real.trk", 20, 0.2)
             tmp_dir = root / "tmp"
             tmp_dir.mkdir()
@@ -681,16 +1291,17 @@ class ManualGateFixtureSelectionTests(unittest.TestCase):
         paths = {candidate.path for candidate in candidates}
         self.assertEqual(paths, {stable.resolve(), real.resolve()})
 
-    def test_existing_selection_falls_back_to_recent_generated_trk(self):
+    def test_existing_source_requires_e2e_safe_named_fixtures(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            existing = manual_gate.write_trk(root / "et1-generated-real.trk", 20, 0.2)
+            manual_gate.write_trk(root / "manual_gate_long_c.trk", 220, 0.6)
+            manual_gate.write_trk(root / "et1-generated-real.trk", 20, 0.2)
 
-            fixtures, report = manual_gate.resolve_fixtures(self.args("existing"), root)
+            with self.assertRaises(manual_gate.GateError) as raised:
+                manual_gate.resolve_fixtures(self.args("existing"), root)
 
-        self.assertEqual(report["source"], "existing")
-        self.assertEqual(report["candidate_count"], 1)
-        self.assertEqual(set(fixtures.values()), {existing.resolve()})
+        self.assertIn("no complete e2e-safe fixture set", str(raised.exception))
+        self.assertIn("manual_gate_e2e_safe_", str(raised.exception))
 
     def test_existing_source_fails_when_only_synthetic_files_exist(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -702,20 +1313,19 @@ class ManualGateFixtureSelectionTests(unittest.TestCase):
 
         self.assertIn("found no usable generated TRK", str(raised.exception))
 
-    def test_auto_refuses_synthetic_when_sim_control_is_available(self):
+    def test_auto_uses_e2e_safe_fixtures_when_sim_control_is_available(self):
         old_sim_control_status = manual_gate.sim_control_status
         try:
             manual_gate.sim_control_status = (
                 lambda _port, _timeout_ms: {"available": True, "ok": True, "root_z": 0.74}
             )
             with tempfile.TemporaryDirectory() as tmp:
-                with self.assertRaises(manual_gate.GateError) as raised:
-                    manual_gate.resolve_fixtures(self.args("auto"), Path(tmp))
+                fixtures, report = manual_gate.resolve_fixtures(self.args("auto"), Path(tmp))
         finally:
             manual_gate.sim_control_status = old_sim_control_status
 
-        self.assertIn("refusing to synthesize", str(raised.exception))
-        self.assertEqual(raised.exception.report["fixture_selection"]["candidate_count"], 0)
+        self.assertEqual(report["source"], "e2e_safe")
+        self.assertEqual(set(fixtures.keys()), set(manual_gate.FIXTURE_KEYS))
 
     def test_synthetic_source_refuses_before_writing_when_sim_control_is_available(self):
         old_sim_control_status = manual_gate.sim_control_status
@@ -820,6 +1430,28 @@ class ManualGateTempConfigTests(unittest.TestCase):
             timeout_s = manual_gate.trk_terminal_timeout_s(args, track, min_timeout_s=12.0)
 
         self.assertGreaterEqual(timeout_s, 26.0)
+
+    def test_manual_soak_and_landing_options_default_to_off(self):
+        args = self.parse("visual")
+
+        self.assertFalse(args.mujoco_land_settle)
+        self.assertEqual(args.standby_soak_s, 0.0)
+
+    def test_manual_soak_and_landing_options_are_opt_in(self):
+        args = self.parse(
+            "all",
+            "--mujoco-land-settle",
+            "--no-mujoco-land-hold",
+            "--mujoco-land-contact-samples",
+            "3",
+            "--standby-soak-s",
+            "30",
+        )
+
+        self.assertTrue(args.mujoco_land_settle)
+        self.assertFalse(args.mujoco_land_hold)
+        self.assertEqual(args.mujoco_land_contact_samples, 3)
+        self.assertEqual(args.standby_soak_s, 30.0)
 
 
 if __name__ == "__main__":

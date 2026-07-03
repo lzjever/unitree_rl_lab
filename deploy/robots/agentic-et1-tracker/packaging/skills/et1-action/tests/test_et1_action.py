@@ -33,6 +33,7 @@ P0_NEXT = {
     "status",
     "urgent-stop",
     "idle-load",
+    "idle-clear",
     "cache-clear",
 }
 DEFAULT_FIELDS = {
@@ -135,7 +136,11 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/urgent_stop":
             self.send_json({"ok": True, "urgent_stop": True})
         elif self.path == "/idle":
-            self.send_json({"ok": True, "idle": {"enabled": True, "n": len((payload or {}).get("paths", []))}})
+            paths = (payload or {}).get("paths", [])
+            state.status["idle"] = {"enabled": bool(paths), "active": False, "n": len(paths)}
+            if not paths and state.status.get("active", {}).get("kind") == "idle":
+                state.status["active"] = {"kind": "none", "id": None}
+            self.send_json({"ok": True, "idle": {"enabled": bool(paths), "n": len(paths)}})
         else:
             self.send_json({"ok": False, "error": {"code": "not_found", "message": self.path}}, 404)
 
@@ -362,6 +367,27 @@ print(json.dumps({"ok": True}))
         post_paths = [record[1] for record in self.tracker.records if record[0] == "POST"]
         self.assertEqual(post_paths, ["/standby"])
         self.assertNotIn("/urgent_stop", post_paths)
+
+    def test_idle_clear_clears_idle_then_enters_standby_without_urgent_stop(self):
+        state_path = self.write_active_sequence()
+        self.tracker.status = {
+            "ok": True,
+            "ctrl": "standby",
+            "active": {"kind": "none", "id": None},
+            "idle": {"enabled": True, "active": False, "n": 2},
+        }
+        out, _ = self.cli("idle-clear")
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["cmd"], "idle-clear")
+        self.assertEqual(out["intent"], "cancel_to_still")
+        self.assertEqual(out["state"], "standby")
+        self.assertEqual(out["idle"], {"enabled": False, "active": False, "n": 0})
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["state"], "canceled")
+        self.assertIsNone(state["active"])
+        post_records = [record for record in self.tracker.records if record[0] == "POST"]
+        self.assertEqual([(record[1], record[2]) for record in post_records], [("/idle", {"paths": []}), ("/standby", None)])
+        self.assertNotIn("/urgent_stop", [record[1] for record in post_records])
 
     def test_standby_waits_until_user_motion_leaves_active_state(self):
         self.tracker.status_sequence = [
@@ -1193,6 +1219,7 @@ print(json.dumps({"ok": True}))
                 (ROOT / "SKILL.md").read_text(encoding="utf-8"),
                 (ROOT / "references" / "intent-mapping.md").read_text(encoding="utf-8"),
                 (ROOT / "references" / "sequence-workflow.md").read_text(encoding="utf-8"),
+                (ROOT / "references" / "output-contract.md").read_text(encoding="utf-8"),
                 (ROOT / "agents" / "openai.yaml").read_text(encoding="utf-8"),
             ]
         )
@@ -1209,6 +1236,11 @@ print(json.dumps({"ok": True}))
         self.assertIn("Do not depend on typed tools, plugins, curl, or multi-tool parallel calls.", docs)
         self.assertIn("Ordinary stop, pause", docs)
         self.assertIn("`standby` maps to tracker `POST /standby`", docs)
+        self.assertIn("scripts/et1-action idle-clear", docs)
+        self.assertIn("`idle-clear` maps to tracker `POST /idle {\"paths\":[]}` then `POST /standby`", docs)
+        self.assertIn("\"不要动\", \"站着别动\", \"do not move\", \"completely still\", \"no idle\", or \"别播放 idle\": `idle-clear`", docs)
+        self.assertIn("`idle-load`, `idle-clear`, or `cache-clear`", docs)
+        self.assertNotIn("Treat ordinary stop, do-not-move, standing still", docs)
         self.assertIn("Direct `run-text` and `run-trk` default to tracker interrupt", docs)
         self.assertIn("Do not block the turn with `sleep && sequence-status`", docs)
 

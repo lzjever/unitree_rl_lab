@@ -28,6 +28,7 @@ from typing import Any, Callable, NamedTuple
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_EXISTING_MOTION_DIR = Path("/home/galbot/works/agent-test/generated")
+E2E_SAFE_SOURCE_TRK = ROOT / "config/reference/standby/v0/standby_ref.trk"
 MAGIC = b"ET1TRK1\0"
 FLOAT32 = 1
 FLOAT64 = 2
@@ -73,9 +74,26 @@ FIXTURE_KEYS = (
     "transition_c",
     "loco",
 )
+E2E_SAFE_FIXTURE_FRAMES = {
+    "idle_a": 50,
+    "idle_b": 50,
+    "short": 35,
+    "long_a": 80,
+    "long_b": 80,
+    "long_c": 80,
+    "transition_a": 80,
+    "transition_b": 80,
+    "transition_c": 80,
+    "loco": 35,
+}
+E2E_SAFE_FIXTURE_MAX_FRAMES = max(E2E_SAFE_FIXTURE_FRAMES.values())
 NAMED_MANUAL_GATE_FIXTURES = {
+    f"manual_gate_e2e_safe_{key}.trk": key for key in FIXTURE_KEYS
+}
+LEGACY_MANUAL_GATE_FIXTURES = {
     f"manual_gate_{key}.trk": key for key in FIXTURE_KEYS
 }
+PHYSICAL_SAFE_FIXTURE_SOURCES = ("existing", "e2e_safe")
 STANDBY_CTRLS = ("standby", "standby_velocity")
 UNSTABLE_CTRL_STATES = ("passive", "fault", "stopping", "urgent_stopping")
 USER_PREEMPTED_IDLE_RUN_STATES = ("running", "done", "holding")
@@ -89,6 +107,13 @@ class TrkCandidate(NamedTuple):
     path: Path
     frames: int
     mtime_ns: int
+
+
+class TrkArray(NamedTuple):
+    name: str
+    dtype: int
+    shape: tuple[int, ...]
+    data: bytes
 
 
 class GateError(RuntimeError):
@@ -186,9 +211,14 @@ def parse_sim_control_status(raw: str) -> dict[str, Any]:
         if "=" not in token:
             continue
         key, value = token.split("=", 1)
-        if value in ("0", "1") and key in ("left_contact", "right_contact", "both"):
-            parsed[key] = value == "1"
-            continue
+        if key in ("left_contact", "right_contact", "both"):
+            normalized = value.lower()
+            if normalized in ("0", "1"):
+                parsed[key] = normalized == "1"
+                continue
+            if normalized in ("true", "false"):
+                parsed[key] = normalized == "true"
+                continue
         if key == "camera_trackbodyid":
             try:
                 parsed[key] = int(value)
@@ -221,6 +251,20 @@ def sim_control_status(port: int, timeout_ms: int) -> dict[str, Any]:
 
 def sim_control_camera_align(port: int, timeout_ms: int) -> dict[str, Any]:
     return sim_control_command(port, timeout_ms, "camera_align")
+
+
+def sim_control_compact(sim_status: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "available",
+        "ok",
+        "left_contact",
+        "right_contact",
+        "both",
+        "root_z",
+        "raw",
+        "error",
+    )
+    return {key: sim_status.get(key) for key in keys if key in sim_status}
 
 
 def compact_status(status: Any) -> Any:
@@ -376,6 +420,77 @@ def sim_control_required_reason(label: str, sim_status: dict[str, Any]) -> str |
     return None
 
 
+def sim_both_contact_reason(label: str,
+                            sim_status: dict[str, Any],
+                            *,
+                            require_available: bool = False) -> str | None:
+    if not sim_status.get("available"):
+        if require_available:
+            return sim_control_required_reason(label, sim_status)
+        return None
+    reason = sim_control_required_reason(label, sim_status)
+    if reason is not None:
+        return reason
+    if sim_status.get("both") is not True:
+        return f"{label}: both contact is not true; sim_control={sim_control_compact(sim_status)}"
+    return None
+
+
+def contact_recovery_update(sim_status: dict[str, Any],
+                            now: float,
+                            consecutive_contact: int,
+                            contact_started_at: float | None) -> tuple[int, float | None]:
+    if sim_status.get("both") is True:
+        consecutive_contact += 1
+        if contact_started_at is None:
+            contact_started_at = now
+        return consecutive_contact, contact_started_at
+    return 0, None
+
+
+def contact_recovery_s(now: float, contact_started_at: float | None) -> float:
+    return (now - contact_started_at) if contact_started_at is not None else 0.0
+
+
+def contact_recovered(now: float,
+                      contact_started_at: float | None,
+                      consecutive_contact: int,
+                      samples_required: int,
+                      s_required: float) -> bool:
+    return (consecutive_contact >= samples_required and
+            contact_recovery_s(now, contact_started_at) >= s_required)
+
+
+def status_pose_root_z(status: dict[str, Any]) -> Any:
+    pose = status.get("pose")
+    if not isinstance(pose, dict):
+        return None
+    p = pose.get("p")
+    if not isinstance(p, list) or len(p) < 3:
+        return None
+    return p[2]
+
+
+def status_root_z_reason(label: str,
+                         status: dict[str, Any],
+                         min_root_z: float) -> str | None:
+    root_z = status_pose_root_z(status)
+    if isinstance(root_z, bool) or not isinstance(root_z, (int, float)):
+        return f"{label}: status pose root_z is not numeric ({root_z})"
+    if root_z < min_root_z:
+        return f"{label}: status pose root_z {root_z:.3f} < {min_root_z:.3f}"
+    return None
+
+
+def physical_root_z_reason(label: str,
+                           status: dict[str, Any],
+                           sim_status: dict[str, Any],
+                           min_root_z: float) -> str | None:
+    if sim_status.get("available"):
+        return sim_root_z_reason(label, sim_status, min_root_z)
+    return status_root_z_reason(label, status, min_root_z)
+
+
 def visual_camera_reason(sim_status: dict[str, Any],
                          expected_body: str = VISUAL_CAMERA_TRACK_BODY) -> str | None:
     reason = sim_control_required_reason("visual camera", sim_status)
@@ -490,9 +605,11 @@ def final_settle_check(args: argparse.Namespace, url: str) -> dict[str, Any]:
         evidence["result"] = "SKIP"
         evidence["reason"] = "sim-control unavailable; physical root_z was not checked"
         return evidence
-    if fixture_source != "existing":
+    if fixture_source not in PHYSICAL_SAFE_FIXTURE_SOURCES:
         fail(
-            "sim-control is available but final settle did not use existing generated TRK fixtures",
+            "sim-control is available but final settle used a non-physical-safe "
+            f"fixture source ({fixture_source}); refusing synthetic/non-physical-safe "
+            "TRK fixtures",
             {"final_settle": evidence},
         )
     evidence["result"] = "PASS"
@@ -523,6 +640,310 @@ def visual_camera_align_check(args: argparse.Namespace) -> dict[str, Any]:
         fail(reason, {"visual_camera_align": evidence})
     evidence["result"] = "PASS"
     return evidence
+
+
+def fail_recent(label: str,
+                reason: str,
+                samples: list[dict[str, Any]],
+                **extra: Any) -> None:
+    report = {
+        "result": "FAIL",
+        "samples": samples[-8:],
+    }
+    report.update(extra)
+    fail(reason, {label: report})
+
+
+def sim_control_checked_command(args: argparse.Namespace,
+                                command: str,
+                                label: str,
+                                samples: list[dict[str, Any]]) -> dict[str, Any]:
+    sim_status = sim_control_command(
+        args.sim_control_port,
+        args.sim_control_timeout_ms,
+        command,
+    )
+    samples.append({
+        "command": command,
+        "sim_control": sim_status,
+    })
+    reason = sim_control_required_reason(label, sim_status)
+    if reason is not None:
+        fail_recent(label, reason, samples)
+    return sim_status
+
+
+def standby_stability_reason(label: str,
+                             status: dict[str, Any],
+                             sim_status: dict[str, Any],
+                             min_root_z: float,
+                             *,
+                             require_sim_contact: bool) -> str | None:
+    reason = standby_safety_reason(label, status, sim_status, min_root_z)
+    if reason is not None:
+        return reason
+    return sim_both_contact_reason(
+        label,
+        sim_status,
+        require_available=require_sim_contact,
+    )
+
+
+def standby_safety_reason(label: str,
+                          status: dict[str, Any],
+                          sim_status: dict[str, Any],
+                          min_root_z: float) -> str | None:
+    reason = status_clear_reason(
+        status,
+        label=label,
+        require_ready=True,
+        require_ctrls=STANDBY_CTRLS,
+        require_active_none=True,
+        require_queue_empty=True,
+        forbid_ctrls=UNSTABLE_CTRL_STATES,
+    )
+    if reason is not None:
+        return reason
+    reason = generic_stopping_reason(status, label)
+    if reason is not None:
+        return reason
+    reason = physical_root_z_reason(label, status, sim_status, min_root_z)
+    if reason is not None:
+        return reason
+    return None
+
+
+def mujoco_landing_settle_check(args: argparse.Namespace, url: str) -> dict[str, Any]:
+    label = "mujoco_landing_settle"
+    samples: list[dict[str, Any]] = []
+    post(url, "/fixstand")
+    fixstand_status = poll(
+        "ctrl=fixstand before mujoco landing settle",
+        args.standby_timeout,
+        lambda: get(url, "/status"),
+        lambda s: s.get("ctrl") == "fixstand" and s.get("ready") is True,
+    )
+    samples.append({
+        "phase": "fixstand",
+        "status": compact_status(fixstand_status),
+    })
+    if args.mujoco_land_hold:
+        sim_control_checked_command(args, "hold", label, samples)
+
+    contact_samples_required = max(1, int(args.mujoco_land_contact_samples))
+    contact_s_required = max(0.0, float(args.mujoco_land_contact_s))
+    interval_s = max(0.0, float(args.mujoco_land_interval_s))
+    deadline = time.monotonic() + max(0.0, float(args.mujoco_land_timeout_s))
+    consecutive_contact = 0
+    contact_started_at: float | None = None
+    lower_count = 0
+    latest_sim: dict[str, Any] | None = None
+
+    while time.monotonic() <= deadline:
+        latest_sim = sim_control_checked_command(args, "lower", label, samples)
+        lower_count += 1
+        reason = sim_root_z_reason(label, latest_sim, args.min_root_z)
+        if reason is not None:
+            fail_recent(label, reason, samples, lower_count=lower_count)
+        now = time.monotonic()
+        consecutive_contact, contact_started_at = contact_recovery_update(
+            latest_sim,
+            now,
+            consecutive_contact,
+            contact_started_at,
+        )
+        if contact_recovered(
+            now,
+            contact_started_at,
+            consecutive_contact,
+            contact_samples_required,
+            contact_s_required,
+        ):
+            break
+        if interval_s > 0:
+            time.sleep(interval_s)
+    else:
+        fail_recent(
+            label,
+            (
+                f"{label}: timed out waiting for both contact "
+                f"({contact_samples_required} consecutive samples, "
+                f"{contact_s_required:.3f}s); latest={sim_control_compact(latest_sim or {})}"
+            ),
+            samples,
+            lower_count=lower_count,
+        )
+
+    post(url, "/standby")
+    standby_status = wait_standby(url, args.standby_timeout)
+    samples.append({
+        "phase": "standby_before_release",
+        "status": compact_status(standby_status),
+    })
+    reason = standby_stability_reason(
+        label,
+        standby_status,
+        latest_sim or {},
+        args.min_root_z,
+        require_sim_contact=True,
+    )
+    if reason is not None:
+        fail_recent(
+            label,
+            reason,
+            samples,
+            lower_count=lower_count,
+            standby_status=compact_status(standby_status),
+        )
+
+    sim_control_checked_command(args, "release", label, samples)
+
+    release_check_s = max(0.0, float(args.mujoco_land_release_check_s))
+    release_deadline = time.monotonic() + release_check_s
+    release_check: dict[str, Any] | None = None
+    release_contact_samples_required = contact_samples_required if release_check_s > 0 else 1
+    release_contact_s_required = contact_s_required if release_check_s > 0 else 0.0
+    release_consecutive_contact = 0
+    release_contact_started_at: float | None = None
+    release_contact_latest_at = time.monotonic()
+    release_sample_count = 0
+    first = True
+    while first or time.monotonic() < release_deadline:
+        first = False
+        release_sim = sim_control_checked_command(args, "status", label, samples)
+        release_status = get(url, "/status")
+        release_contact_latest_at = time.monotonic()
+        compact_release_status = compact_status(release_status)
+        samples.append({
+            "phase": "post_release",
+            "status": compact_release_status,
+        })
+        release_sample_count += 1
+        release_check = {
+            "command": "status",
+            "sim_control": release_sim,
+            "status": compact_release_status,
+        }
+        reason = standby_safety_reason(
+            label,
+            release_status,
+            release_sim,
+            args.min_root_z,
+        )
+        if reason is not None:
+            fail_recent(
+                label,
+                reason,
+                samples,
+                lower_count=lower_count,
+                release_check=release_check,
+            )
+        release_consecutive_contact, release_contact_started_at = contact_recovery_update(
+            release_sim,
+            release_contact_latest_at,
+            release_consecutive_contact,
+            release_contact_started_at,
+        )
+        if release_check_s <= 0:
+            break
+        if interval_s > 0:
+            time.sleep(interval_s)
+
+    release_contact_s = contact_recovery_s(release_contact_latest_at,
+                                           release_contact_started_at)
+    release_contact = {
+        "samples_required": release_contact_samples_required,
+        "s_required": release_contact_s_required,
+        "consecutive": release_consecutive_contact,
+        "continuous_s": release_contact_s,
+        "sample_count": release_sample_count,
+    }
+    if not contact_recovered(
+        release_contact_latest_at,
+        release_contact_started_at,
+        release_consecutive_contact,
+        release_contact_samples_required,
+        release_contact_s_required,
+    ):
+        fail_recent(
+            label,
+            (
+                f"{label}: post-release both contact did not recover "
+                f"({release_contact_samples_required} consecutive samples, "
+                f"{release_contact_s_required:.3f}s); "
+                f"latest={sim_control_compact((release_check or {}).get('sim_control', {}))}"
+            ),
+            samples,
+            lower_count=lower_count,
+            release_check=release_check,
+            release_contact=release_contact,
+        )
+
+    return {
+        "result": "PASS",
+        "hold": args.mujoco_land_hold,
+        "lower_count": lower_count,
+        "contact_samples_required": contact_samples_required,
+        "contact_s_required": contact_s_required,
+        "release_check_s": args.mujoco_land_release_check_s,
+        "release_contact": release_contact,
+        "release_check": release_check,
+        "standby_status": compact_status(standby_status),
+        "samples": samples[-8:],
+    }
+
+
+def standby_soak_reason(status: dict[str, Any],
+                        sim_status: dict[str, Any],
+                        min_root_z: float) -> str | None:
+    return standby_stability_reason(
+        "standby_soak",
+        status,
+        sim_status,
+        min_root_z,
+        require_sim_contact=False,
+    )
+
+
+def standby_soak_check(args: argparse.Namespace, url: str) -> dict[str, Any]:
+    label = "standby_soak"
+    post(url, "/standby")
+    wait_standby(url, args.standby_timeout)
+
+    duration_s = max(0.0, float(args.standby_soak_s))
+    interval_s = max(0.0, float(args.standby_soak_interval_s))
+    deadline = time.monotonic() + duration_s
+    samples: list[dict[str, Any]] = []
+    first = True
+    while first or time.monotonic() < deadline:
+        first = False
+        status = get(url, "/status")
+        sim_status = sim_control_status(args.sim_control_port, args.sim_control_timeout_ms)
+        sample = {
+            "status": compact_status(status),
+            "sim_control": sim_status,
+        }
+        samples.append(sample)
+        reason = standby_soak_reason(status, sim_status, args.min_root_z)
+        if reason is not None:
+            fail_recent(
+                label,
+                reason,
+                samples,
+                duration_s=duration_s,
+                sample_count=len(samples),
+            )
+        if duration_s <= 0:
+            break
+        if interval_s > 0:
+            time.sleep(interval_s)
+
+    return {
+        "result": "PASS",
+        "duration_s": duration_s,
+        "sample_count": len(samples),
+        "samples": samples[-8:],
+    }
 
 
 def standby_handoff_reason(status: dict[str, Any],
@@ -844,6 +1265,53 @@ def read_uint64(infile) -> int | None:
     return struct.unpack("<Q", data)[0]
 
 
+def read_trk_arrays(path: Path) -> list[TrkArray] | None:
+    try:
+        with path.open("rb") as infile:
+            if read_exact(infile, len(MAGIC)) != MAGIC:
+                return None
+            version = read_uint32(infile)
+            array_count = read_uint32(infile)
+            if version != 1 or array_count is None or array_count == 0 or array_count > 64:
+                return None
+            arrays: list[TrkArray] = []
+            for _index in range(array_count):
+                name_len = read_uint32(infile)
+                if name_len is None or name_len == 0 or name_len > 128:
+                    return None
+                name_data = read_exact(infile, name_len)
+                if name_data is None or b"\0" in name_data:
+                    return None
+                try:
+                    name = name_data.decode("ascii")
+                except UnicodeDecodeError:
+                    return None
+                dtype = read_uint32(infile)
+                ndim = read_uint32(infile)
+                if dtype not in TRK_DTYPE_SIZES or ndim is None or ndim > 4:
+                    return None
+                dims = []
+                for _dim in range(ndim):
+                    dim = read_uint32(infile)
+                    if dim is None:
+                        return None
+                    dims.append(dim)
+                shape = tuple(dims)
+                byte_count = read_uint64(infile)
+                if byte_count is None:
+                    return None
+                expected_bytes = trk_element_count(shape) * TRK_DTYPE_SIZES[dtype]
+                if byte_count != expected_bytes:
+                    return None
+                data = read_exact(infile, byte_count)
+                if data is None:
+                    return None
+                arrays.append(TrkArray(name=name, dtype=dtype, shape=shape, data=data))
+            return arrays
+    except OSError:
+        return None
+
+
 def trk_element_count(shape: tuple[int, ...]) -> int:
     count = 1
     for dim in shape:
@@ -921,6 +1389,46 @@ def trk_summary(path: Path) -> TrkCandidate | None:
     return TrkCandidate(path=path.resolve(), frames=frames, mtime_ns=stat.st_mtime_ns)
 
 
+def repeat_frame_data(data: bytes, source_frames: int, target_frames: int) -> bytes:
+    if source_frames <= 0 or target_frames <= 0:
+        raise ValueError("source_frames and target_frames must be positive")
+    if len(data) % source_frames != 0:
+        raise ValueError("TRK array byte count is not divisible by source frames")
+    frame_bytes = len(data) // source_frames
+    if target_frames <= source_frames:
+        return data[:target_frames * frame_bytes]
+    last_frame = data[(source_frames - 1) * frame_bytes:]
+    return data + last_frame * (target_frames - source_frames)
+
+
+def write_repeated_trk(source: Path, target: Path, frames: int) -> Path:
+    source_summary = trk_summary(source)
+    arrays = read_trk_arrays(source)
+    if source_summary is None or arrays is None:
+        fail(f"e2e-safe fixture source is not a valid TRK: {source}")
+    source_frames = source_summary.frames
+    mkdir(target.parent)
+    with target.open("wb") as out:
+        out.write(MAGIC)
+        write_scalar(out, "<I", 1)
+        write_scalar(out, "<I", len(arrays))
+        for array in arrays:
+            shape = array.shape
+            data = array.data
+            if shape and shape[0] == source_frames:
+                shape = (frames,) + shape[1:]
+                data = repeat_frame_data(data, source_frames, frames)
+            write_scalar(out, "<I", len(array.name))
+            out.write(array.name.encode("ascii"))
+            write_scalar(out, "<I", array.dtype)
+            write_scalar(out, "<I", len(shape))
+            for dim in shape:
+                write_scalar(out, "<I", dim)
+            write_scalar(out, "<Q", len(data))
+            out.write(data)
+    return target
+
+
 def trk_terminal_timeout_s(args: argparse.Namespace,
                            path: Path,
                            min_timeout_s: float) -> float:
@@ -955,6 +1463,8 @@ def is_obvious_synthetic_trk(path: Path, motion_dir: Path) -> bool:
             return True
     if name in NAMED_MANUAL_GATE_FIXTURES:
         return False
+    if name in LEGACY_MANUAL_GATE_FIXTURES:
+        return True
     if name.startswith("manual_gate_") or name.startswith("synthetic_"):
         return True
     if ("manual_gate" in name or "_synthetic" in name or name.startswith("fixture_") or
@@ -977,32 +1487,6 @@ def find_existing_trk_candidates(motion_dir: Path) -> list[TrkCandidate]:
     return candidates
 
 
-def pick_candidate(candidates: list[TrkCandidate], index: int) -> TrkCandidate:
-    return candidates[index % len(candidates)]
-
-
-def recent_fixture_paths(candidates: list[TrkCandidate]) -> dict[str, Path]:
-    recent = sorted(candidates, key=lambda item: (-item.mtime_ns, str(item.path)))
-    short = [item for item in recent if item.frames <= 200]
-    if not short:
-        short = sorted(candidates, key=lambda item: (item.frames, -item.mtime_ns, str(item.path)))
-    long = [item for item in recent if item.frames >= 200]
-    if not long:
-        long = recent
-    return {
-        "idle_a": pick_candidate(short, 0).path,
-        "idle_b": pick_candidate(short, 1).path,
-        "short": pick_candidate(short, 0).path,
-        "long_a": pick_candidate(long, 0).path,
-        "long_b": pick_candidate(long, 1).path,
-        "long_c": pick_candidate(long, 2).path,
-        "transition_a": pick_candidate(short, 0).path,
-        "transition_b": pick_candidate(long, 0).path,
-        "transition_c": pick_candidate(long, 1).path,
-        "loco": pick_candidate(short, 0).path,
-    }
-
-
 def named_manual_gate_fixture_candidates(candidates: list[TrkCandidate]) -> dict[str, TrkCandidate]:
     named: dict[str, TrkCandidate] = {}
     for candidate in sorted(candidates, key=lambda item: str(item.path)):
@@ -1016,18 +1500,7 @@ def existing_fixture_paths(candidates: list[TrkCandidate]) -> dict[str, Path] | 
     named = named_manual_gate_fixture_candidates(candidates)
     if len(named) == len(FIXTURE_KEYS):
         return {key: named[key].path for key in FIXTURE_KEYS}
-
-    fallback_candidates = [
-        candidate for candidate in candidates
-        if candidate.path.name.lower() not in NAMED_MANUAL_GATE_FIXTURES
-    ]
-    if not fallback_candidates:
-        return None
-
-    fixtures = recent_fixture_paths(fallback_candidates)
-    for key, candidate in named.items():
-        fixtures[key] = candidate.path
-    return fixtures
+    return None
 
 
 def fixture_path_report(fixtures: dict[str, Path],
@@ -1040,6 +1513,17 @@ def fixture_path_report(fixtures: dict[str, Path],
         }
         for key, path in fixtures.items()
     }
+
+
+def e2e_safe_fixture_candidates(fixtures: dict[str, Path]) -> list[TrkCandidate]:
+    return [
+        TrkCandidate(
+            path=path.resolve(),
+            frames=E2E_SAFE_FIXTURE_FRAMES[key],
+            mtime_ns=path.stat().st_mtime_ns,
+        )
+        for key, path in fixtures.items()
+    ]
 
 
 def motion_fixtures_will_run(args: argparse.Namespace) -> bool:
@@ -1070,10 +1554,31 @@ def resolve_fixtures(args: argparse.Namespace,
                     "selected": fixture_path_report(fixtures, candidates),
                 }
         if requested == "existing":
+            if candidates:
+                fail(
+                    f"--fixture-source existing found no complete e2e-safe fixture set "
+                    f"under {motion_dir}; expected manual_gate_e2e_safe_*.trk. "
+                    "Arbitrary generated and legacy manual_gate_*.trk files are not "
+                    "stable product gate fixtures"
+                )
             fail(
                 f"--fixture-source existing found no usable generated TRK under {motion_dir}; "
-                "manual_gate_*.trk/tmp/synthetic-looking files are ignored"
+                "expected manual_gate_e2e_safe_*.trk; legacy manual_gate_*.trk/tmp/"
+                "synthetic-looking files are ignored"
             )
+
+    if requested == "auto" and motion_fixtures_will_run(args):
+        fixtures = make_e2e_safe_fixtures(motion_dir)
+        log(f"[fixtures] source=e2e_safe motion_dir={motion_dir}")
+        return fixtures, {
+            "source": "e2e_safe",
+            "requested": requested,
+            "motion_dir": str(motion_dir),
+            "candidate_count": len(candidates),
+            "source_trk": str(E2E_SAFE_SOURCE_TRK),
+            "selected": fixture_path_report(fixtures, e2e_safe_fixture_candidates(fixtures)),
+            "note": "reference-derived e2e-safe fixtures keep manual_gate semantic checks low risk",
+        }
 
     if requested in ("auto", "synthetic") and motion_fixtures_will_run(args):
         sim_status = current_sim_status(args)
@@ -1104,6 +1609,17 @@ def resolve_fixtures(args: argparse.Namespace,
         "candidate_count": len(candidates),
         "selected": fixture_path_report(fixtures),
         "warning": "synthetic manual_gate_*.trk fixtures are for HTTP/status contracts only",
+    }
+
+
+def make_e2e_safe_fixtures(motion_dir: Path) -> dict[str, Path]:
+    return {
+        key: write_repeated_trk(
+            E2E_SAFE_SOURCE_TRK,
+            motion_dir / f"manual_gate_e2e_safe_{key}.trk",
+            E2E_SAFE_FIXTURE_FRAMES[key],
+        ).resolve()
+        for key in FIXTURE_KEYS
     }
 
 
@@ -1200,6 +1716,44 @@ def refuse_synthetic_physical_fixture(args: argparse.Namespace, url: str) -> Non
         "refusing to run manual_gate_*.trk as physical stability evidence",
         {"failure_evidence": evidence},
     )
+
+
+def queue_interrupt_status_contract_check(args: argparse.Namespace,
+                                          url: str,
+                                          fixtures: dict[str, Path]) -> dict[str, Any]:
+    a_id = execute(url, fixtures["long_a"], mode="queue", hold=True)
+    poll("A running", 10, lambda: run_status(url, a_id),
+         lambda s: s["state"] in ("running", "holding"))
+    b_id = execute(url, fixtures["long_b"], mode="queue")
+    b_queued = poll("B queued", 5, lambda: run_status(url, b_id),
+                    lambda s: s["state"] == "queued")
+    require(b_queued["queue_pos"] is not None, "B should expose queue_pos while queued")
+    c_id = execute(url, fixtures["long_c"], mode="interrupt", hold=True)
+    c_active = poll("C active after interrupt", 10, lambda: run_status(url, c_id),
+                    lambda s: s["state"] in ("running", "holding", "done"))
+    require(c_active["id"] == c_id, "C status id mismatch")
+    a_terminal = poll("A stopped by interrupt", 10, lambda: run_status(url, a_id),
+                      lambda s: s["state"] == "stopped")
+    b_terminal = poll("B canceled by interrupt", 10, lambda: run_status(url, b_id),
+                      lambda s: s["state"] == "canceled")
+    require(a_terminal["stop_reason"] == "interrupt",
+            f"A stop_reason should be interrupt: {a_terminal}")
+    require(b_terminal["stop_reason"] == "interrupt",
+            f"B stop_reason should be interrupt: {b_terminal}")
+    post(url, "/standby")
+    wait_standby(url)
+    return {
+        "result": "PASS",
+        "A": {"id": a_id, "state": a_terminal["state"], "hold": True},
+        "B": {"id": b_id, "state": b_terminal["state"], "hold": False},
+        "C": {"id": c_id, "state": c_active["state"], "hold": True},
+        "checkpoint": check_status_checkpoint(
+            args, url, "queue_interrupt_status_contract",
+            require_ctrls=STANDBY_CTRLS,
+            require_active_none=True,
+            require_queue_empty=True,
+        ),
+    }
 
 
 def run_e2e(args: argparse.Namespace, fixtures: dict[str, Path]) -> dict[str, Any]:
@@ -1319,7 +1873,7 @@ def run_e2e(args: argparse.Namespace, fixtures: dict[str, Path]) -> dict[str, An
         post(url, "/idle", {"paths": [str(fixtures["idle_a"]), str(fixtures["idle_b"])]})
         poll("idle enabled for active user standby", 8, lambda: get(url, "/status"),
              lambda s: s["idle"]["enabled"] is True and s["idle"]["n"] == 2)
-        active_idle_user_id = execute(url, fixtures["long_a"], mode="interrupt")
+        active_idle_user_id = execute(url, fixtures["long_a"], mode="interrupt", hold=True)
         active_idle_user = poll("active user with idle enabled", 10, lambda: get(url, "/status"),
                                 lambda s: active_kind(s) == "user" and
                                 ((s.get("exec") or {}).get("id") == active_idle_user_id or
@@ -1354,7 +1908,7 @@ def run_e2e(args: argparse.Namespace, fixtures: dict[str, Path]) -> dict[str, An
         post(url, "/idle", {"paths": [str(fixtures["idle_a"]), str(fixtures["idle_b"])]})
         poll("idle enabled for active user urgent_stop", 8, lambda: get(url, "/status"),
              lambda s: s["idle"]["enabled"] is True and s["idle"]["n"] == 2)
-        urgent_user_id = execute(url, fixtures["long_b"], mode="interrupt")
+        urgent_user_id = execute(url, fixtures["long_b"], mode="interrupt", hold=True)
         urgent_user = poll("active user before urgent_stop", 10, lambda: get(url, "/status"),
                            lambda s: active_kind(s) == "user" and
                            ((s.get("exec") or {}).get("id") == urgent_user_id or
@@ -1381,39 +1935,9 @@ def run_e2e(args: argparse.Namespace, fixtures: dict[str, Path]) -> dict[str, An
         recover_to_standby(url, args.passive_password)
 
         log("[e2e] queue_interrupt_status_contract")
-        a_id = execute(url, fixtures["long_a"], mode="queue")
-        poll("A running", 10, lambda: run_status(url, a_id),
-             lambda s: s["state"] in ("running", "holding"))
-        b_id = execute(url, fixtures["long_b"], mode="queue")
-        b_queued = poll("B queued", 5, lambda: run_status(url, b_id),
-                        lambda s: s["state"] == "queued")
-        require(b_queued["queue_pos"] is not None, "B should expose queue_pos while queued")
-        c_id = execute(url, fixtures["long_c"], mode="interrupt")
-        c_active = poll("C active after interrupt", 10, lambda: run_status(url, c_id),
-                        lambda s: s["state"] in ("running", "holding", "done"))
-        require(c_active["id"] == c_id, "C status id mismatch")
-        a_terminal = poll("A stopped by interrupt", 10, lambda: run_status(url, a_id),
-                          lambda s: s["state"] == "stopped")
-        b_terminal = poll("B canceled by interrupt", 10, lambda: run_status(url, b_id),
-                          lambda s: s["state"] == "canceled")
-        require(a_terminal["stop_reason"] == "interrupt",
-                f"A stop_reason should be interrupt: {a_terminal}")
-        require(b_terminal["stop_reason"] == "interrupt",
-                f"B stop_reason should be interrupt: {b_terminal}")
-        post(url, "/standby")
-        wait_standby(url)
-        results["queue_interrupt_status_contract"] = {
-            "result": "PASS",
-            "A": {"id": a_id, "state": a_terminal["state"]},
-            "B": {"id": b_id, "state": b_terminal["state"]},
-            "C": {"id": c_id, "state": c_active["state"]},
-            "checkpoint": check_status_checkpoint(
-                args, url, "queue_interrupt_status_contract",
-                require_ctrls=STANDBY_CTRLS,
-                require_active_none=True,
-                require_queue_empty=True,
-            ),
-        }
+        results["queue_interrupt_status_contract"] = (
+            queue_interrupt_status_contract_check(args, url, fixtures)
+        )
 
         log("[e2e] short_hold_settle_standby")
         hold_id = execute(url, fixtures["short"], mode="queue", hold=True)
@@ -1839,7 +2363,7 @@ def parse_args() -> argparse.Namespace:
                         help="directory allowed by tracker motion_dirs for TRK fixtures")
     parser.add_argument("--fixture-source", choices=("auto", "existing", "synthetic"),
                         default="auto",
-                        help="auto prefers existing generated TRK; synthetic is HTTP/status-only")
+                        help="auto uses e2e-safe reference-derived TRK; existing requires manual_gate_e2e_safe_*.trk; synthetic is HTTP/status-only")
     parser.add_argument("--artifacts-dir", type=Path,
                         default=Path("/tmp/agentic-et1-manual-gate"),
                         help="artifact directory for screenshots and reports")
@@ -1877,6 +2401,21 @@ def parse_args() -> argparse.Namespace:
                         help="UDP sim-control port for optional MuJoCo status evidence")
     parser.add_argument("--sim-control-timeout-ms", type=int, default=200,
                         help="timeout for optional MuJoCo sim-control status")
+    parser.add_argument("--mujoco-land-settle", action="store_true",
+                        help="opt-in MuJoCo sling landing helper before the selected gate")
+    parser.add_argument("--mujoco-land-hold", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="send sim-control hold before lower when --mujoco-land-settle is enabled")
+    parser.add_argument("--mujoco-land-timeout-s", type=float, default=20.0,
+                        help="timeout for opt-in MuJoCo lower/contact landing helper")
+    parser.add_argument("--mujoco-land-contact-samples", type=int, default=5,
+                        help="consecutive both-contact samples required before release and after release recovery")
+    parser.add_argument("--mujoco-land-contact-s", type=float, default=0.5,
+                        help="continuous both-contact duration required before release and after release recovery")
+    parser.add_argument("--mujoco-land-interval-s", type=float, default=0.1,
+                        help="lower/status sample interval for opt-in MuJoCo landing helper")
+    parser.add_argument("--mujoco-land-release-check-s", type=float, default=2.0,
+                        help="post-release both-contact/root_z check duration")
     parser.add_argument("--mujoco-process-regex",
                         default=r"(unitree_mujoco|mujoco|simulate)")
     parser.add_argument("--screenshot-command",
@@ -1884,10 +2423,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--visual-run-action", action=argparse.BooleanOptionalAction,
                         default=True)
     parser.add_argument("--visual-settle-s", type=float, default=1.0)
+    parser.add_argument("--standby-soak-s", type=float, default=0.0,
+                        help="opt-in post-gate standby soak duration; 0 disables it")
+    parser.add_argument("--standby-soak-interval-s", type=float, default=0.5,
+                        help="status sample interval for opt-in standby soak")
     parser.add_argument("--min-screenshot-bytes", type=int, default=20_000)
     parser.add_argument("--min-screenshot-width", type=int, default=640)
     parser.add_argument("--min-screenshot-height", type=int, default=360)
     args = parser.parse_args()
+    if args.mujoco_land_contact_samples < 1:
+        parser.error("--mujoco-land-contact-samples must be >= 1")
+    for field in (
+        "mujoco_land_timeout_s",
+        "mujoco_land_contact_s",
+        "mujoco_land_interval_s",
+        "mujoco_land_release_check_s",
+        "standby_soak_s",
+        "standby_soak_interval_s",
+    ):
+        if getattr(args, field) < 0:
+            parser.error(f"--{field.replace('_', '-')} must be >= 0")
     if args.url is None:
         args.url = f"http://127.0.0.1:{args.port}" if args.start_tracker else "http://127.0.0.1:8083"
     return args
@@ -1926,10 +2481,17 @@ def main() -> int:
             report["started"]["tracker_config"] = str(config)
             time.sleep(0.5)
 
+        if args.mujoco_land_settle:
+            log("[manual] mujoco_landing_settle")
+            report["mujoco_landing_settle"] = mujoco_landing_settle_check(args, args.url)
+
         if args.gate in ("all", "e2e"):
             report["e2e"] = run_e2e(args, fixtures)
         if args.gate in ("all", "visual"):
             report["visual"] = run_visual(args, fixtures)
+        if args.standby_soak_s > 0:
+            log("[manual] standby_soak")
+            report["standby_soak"] = standby_soak_check(args, args.url)
 
         report_path = mkdir(args.artifacts_dir) / f"manual_gate_report_{now_stamp()}.json"
         report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")

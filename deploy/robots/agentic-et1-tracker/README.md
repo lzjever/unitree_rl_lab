@@ -55,10 +55,14 @@ sessions; the script stops only processes it started. `visual` writes a MuJoCo
 screenshot and a JSON checklist report under `/tmp/agentic-et1-manual-gate` by
 default.
 
-For `--fixture-source auto` or `existing`, manual gate first uses stable named
-fixtures such as `manual_gate_long_c.trk` and `manual_gate_transition_a.trk`
-when they exist and pass `trk_summary`; recent generated actions are fallback
-fixtures only.
+For `--fixture-source auto`, manual gate writes reference-derived
+`manual_gate_e2e_safe_*.trk` fixtures into the selected `motion_dirs` directory
+and uses those for E2E/visual semantic checks. `--fixture-source existing`
+requires that complete e2e-safe named set to already exist. Recent arbitrary
+generated actions and legacy `manual_gate_long_*.trk` files are not product gate
+fixtures. When sim-control is available, final settle accepts only physical-safe
+fixture sources: `existing` and `e2e_safe`; synthetic fixtures remain HTTP/status
+contract-only.
 
 Release evidence for manual/e2e/visual coverage comes only from explicitly
 running these commands and recording their artifacts; this README does not claim
