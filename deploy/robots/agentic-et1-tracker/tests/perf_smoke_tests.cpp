@@ -108,6 +108,12 @@ class PerfSink final : public ExecutionCommandSink {
 
   ControlResult standbyVelocity() override { return {ErrorCode::Ok}; }
 
+  ControlResult standby() override { return {ErrorCode::Ok}; }
+
+  StopResult urgentStop() override {
+    return {ErrorCode::Ok, ControllerState::UrgentStopping, StopReason::UrgentStop, 0};
+  }
+
   IdleResult configureIdle(std::vector<IdleMotion> motions) override {
     IdleResult result;
     result.idle.enabled = !motions.empty();

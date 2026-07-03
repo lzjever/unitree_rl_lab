@@ -177,6 +177,16 @@ nlohmann::json poseSnapshotJson(const PoseSnapshot& pose) {
   };
 }
 
+nlohmann::json passiveReasonJson(const std::optional<PassiveReason>& reason) {
+  if (!reason) {
+    return nullptr;
+  }
+  return {
+      {"code", toString(reason->code)},
+      {"block", nullableString(reason->block)},
+  };
+}
+
 ActiveStatus effectiveActiveStatus(const StatusSnapshot& snapshot) {
   if (snapshot.active.kind == ActiveKind::None && snapshot.exec) {
     return {ActiveKind::User, snapshot.exec->id};
@@ -202,6 +212,7 @@ nlohmann::json statusSnapshotJson(const StatusSnapshot& snapshot) {
       {"low_ms", snapshot.low_ms},
       {"block", nullableString(snapshot.block)},
       {"err", nullableErrorJson(snapshot.err)},
+      {"passive_reason", passiveReasonJson(snapshot.passive_reason)},
       {"pose", poseSnapshotJson(snapshot.pose)},
       {"cap", {{"loco_upper", locoUpperCapabilityJson(snapshot.loco_upper)}}},
   };

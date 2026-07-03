@@ -1,5 +1,12 @@
 # Idle Transition Smoothing Handoff Plan
 
+> **Historical/Obsolete API names (2026-07):** This file is a historical
+> planning handoff and may still mention old public route names. The GA/current
+> API is `POST /standby` for ordinary standby and `POST /urgent_stop` for urgent
+> stop. Legacy `POST /standby_velocity` and `POST /stop` are not successful
+> aliases; if present they reject with `CONTROL_ROUTE_RENAMED`. Use `README.md`
+> and `CONTROL_STATE_MACHINE_REDESIGN_PLAN.md` as the current contract.
+
 本文档只规划 `agentic-et1-tracker` 后续开发，不修改运行代码。范围固定为：
 
 1. synthetic transition 太快，增加全局受控配置 `transition_duration_s`。

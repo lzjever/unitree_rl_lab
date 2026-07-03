@@ -9,22 +9,31 @@ Environment: local workspace `/home/galbot/works/et1`
 `tools/manual_gate.py` is the manual product-mind E2E and MuJoCo visual
 screenshot gate. It is deliberately not wired into default `ctest`, release
 selftest, or packaging gates.
+Evidence in this file for manual/e2e/visual coverage comes from explicit local
+runs and recorded artifacts only; it is not a claim that default release
+pipelines automatically cover those gates.
 
 - `tools/manual_gate.py e2e` covers the P0 black-box HTTP/status scenarios:
-  startup FixStand to StandbyVelocity recovery, standby/stop/passive idle
+  startup FixStand to standby recovery, standby/urgent_stop/passive idle
   retention and clearing semantics, idle set/preempt/resume/clear,
-  queue/interrupt A-B-C run status contract, transition-to-stopping execute
-  conflict, and opt-in loco-upper bounded execution when enabled.
+  active user + idle enabled -> standby handoff, queue/interrupt A-B-C run
+  status contract, transition interrupt -> standby handoff without generic
+  stopping success, and opt-in loco-upper bounded execution when enabled.
 - `tools/manual_gate.py visual` requires a running or explicitly started MuJoCo
   session, runs a short action unless disabled, writes a screenshot artifact,
   and emits a minimal checklist/result JSON for operator review.
+- `--fixture-source auto` and `existing` prefer stable named manual gate
+  fixtures such as `manual_gate_long_c.trk` and
+  `manual_gate_transition_a.trk` when they exist and pass `trk_summary`; recent
+  generated actions are fallback fixtures only.
 - Defaults connect to already running services. Process startup is explicit via
   `--start-tracker` and `--start-mujoco-cmd`; the script stops only processes
   it started.
 - Full local simulation acceptance should pass `--start-tracker
-  --enable-loco-temp --require-loco`. The script's generated config may lower
-  temporary runtime `hz` to make transition/stopping HTTP windows observable;
-  this does not change release config or default gates.
+  --enable-loco-temp --require-loco`. The script's generated config uses
+  sim-runtime timing defaults (`hz: 1000`, `transition_duration_s: 0.7`) unless
+  explicitly overridden with `--temp-hz` or `--temp-transition-duration-s`; this
+  does not change release config or default gates.
 
 ## Loco-upper simulation handoff status
 
@@ -222,7 +231,7 @@ fallback to the ET1 app tree:
 - Release packages carry this `general_tracker_cln` tracker policy directory
   and omit the unused legacy `config/policy/general_tracker` tracker policy
   directory.
-- StandbyVelocity: `config/policy/velocity/v0`
+- Standby/Velocity0: `config/policy/velocity/v0`
 - FixStand posture: `config/posture/fixstand/v0/fixstand.yaml`
 - Passive posture: `config/posture/passive/v0/passive.yaml`
 - Standby reference: `config/reference/standby/v0/standby_ref.trk`
@@ -303,22 +312,22 @@ Contract-level GA evidence must cover:
 - `/status.active.kind` is authoritative. `exec` and `queue` describe user runs
   only; idle progress lives under `idle` and is not queryable by
   `GET /status?id=...`.
-- `/stop` stops idle, clears idle config, and preserves the user stop watermark
+- `/urgent_stop` stops idle, clears idle config, and preserves the user stop watermark
   so work accepted after the stop is not canceled by the older stop.
 - `block:"lowcmd_occupied"` maps to manual/operator action and must not imply
   automatic wait/retry recovery.
 - `bad_orientation` enters the safety path; `/passive` and `/fixstand` are the
   software recovery exceptions when LowCmd is free.
 - `/passive` clears active work, user queue, pending idle config, and idle
-  status so later FixStand -> StandbyVelocity cannot resume old idle playback.
+  status so later FixStand -> standby cannot resume old idle playback.
 - Real `mode_machine: 1` startup may release Unitree MotionSwitcher default
   mode before LowCmd preflight. Sim `mode_machine: 0` startup must not call
   MotionSwitcher.
 
 ## Manual MuJoCo acceptance
 
-2026-06-17 local simulator-only acceptance was run for the current
-FixStand/StandbyVelocity/FSM semantics. It covered:
+2026-06-17 local simulator-only acceptance was run for the then-current
+FixStand/standby/FSM semantics. It covered:
 
 - old standby stable before loco work;
 - `zero` loco-upper hold stable;
@@ -344,7 +353,7 @@ config may need adjustment to match the chosen test directory. Enable
 `/execute_loco_upper` scenario.
 
 Smoke and normal acceptance runs must not begin by sending `/passive` when
-`/status` already reports `ready:true` and `ctrl:"standby_velocity"`. Passive is
+`/status` already reports `ready:true` and standby control. Passive is
 the safety sink/damping state; in MuJoCo without rope or operator support it can
 let the robot fall and trigger `ROBOT_BAD_ORIENTATION`. Send `/passive` only in
 a dedicated passive safety-sink scenario, and prepare MuJoCo reset/upright state
@@ -352,7 +361,7 @@ or operator support before doing so.
 
 When recovering from `bad_orientation`, call `/fixstand`, wait until `/status`
 shows `ready:true`, `ctrl:"fixstand"`, `block:null`, and `err:null`, then call
-`/standby_velocity`.
+`/standby`.
 
 Pending MuJoCo evidence must record:
 
@@ -364,13 +373,13 @@ Pending MuJoCo evidence must record:
   `motion_mode_release_failed` if release fails.
 - Startup `/status` with `ctrl:"fixstand"` when using default config.
 - `/status.pose` with compact `q/g/p/v` fields during idle and running states.
-- Manual `/fixstand` and `/standby_velocity` requests accepted with empty body
+- Manual `/fixstand` and `/standby` requests accepted with empty body
   only when `/status` shows a runtime that can consume them.
 - Dedicated `/passive` safety-sink scenario only after MuJoCo reset/upright or
   operator support is prepared; do not use `/passive` as a smoke/acceptance
-  prologue from an already ready `standby_velocity` state.
+  prologue from an already ready standby state.
 - Static not-ready startup/model-load failure snapshots reject `/fixstand` and
-  `/standby_velocity` with compact readiness errors and no queued control
+  `/standby` with compact readiness errors and no queued control
   command.
 - Operator-controlled MuJoCo rope/keyboard timing for track scenarios.
 - `/execute` with a local allowed `.trk` path only; no uploads or other formats.
@@ -379,13 +388,17 @@ Pending MuJoCo evidence must record:
 - Idle auto-play shows `active.kind:"idle"`, `active.id:null`, `exec:null`,
   and unchanged user `queue`.
 - `GET /status?id=<id>` works only for user run ids; idle is not queryable.
-- Queue FIFO, interrupt, and stop/cancel behavior.
-- `/stop` clears idle config while preserving stop-watermark behavior for user
+- Queue FIFO, interrupt, and standby/urgent_stop cancel behavior.
+- Active user + idle enabled -> `/standby` preserves idle config, does not enter
+  passive/fault, keeps `root_z >= min`, and finishes in standby or idle
+  background without generic `exec.state:"stopping"` success.
+- `/urgent_stop` clears idle config while preserving stop-watermark behavior for user
   work accepted after the stop.
-- After `.trk` done or `/stop`, top-level `ctrl:"standby_velocity"`.
+- After `.trk` done or `/standby`, top-level `ctrl:"standby"` or compatible
+  internal `ctrl:"standby_velocity"`.
 - `lowcmd_occupied -> manual` and `bad_orientation -> passive` with recovery
   through `/fixstand`, confirmed `ready:true ctrl:"fixstand" block:null
-  err:null`, then `/standby_velocity`.
+  err:null`, then `/standby`.
 - Fault/disconnect handling and latency/performance evidence.
 
 ## GA gates

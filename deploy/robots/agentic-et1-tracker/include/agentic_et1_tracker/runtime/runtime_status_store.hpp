@@ -32,6 +32,7 @@ class RuntimeStatusStore final : public StatusReader {
                                          std::uint64_t sequence,
                                          std::uint64_t stop_sequence);
   StopResult acceptStop();
+  StopResult acceptUrgentStop();
   ControlResult acceptControl(ControlMode mode, bool preserve_queued = false);
   IdleResult acceptIdleConfig(std::vector<IdleMotion> motions);
   bool clearIdleConfig();

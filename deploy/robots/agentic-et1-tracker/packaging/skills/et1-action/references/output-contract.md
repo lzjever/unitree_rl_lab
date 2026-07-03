@@ -13,6 +13,6 @@ Default failure output has:
 `next` is always one command: `run-text`, `run-trk`, `sequence-start`, `sequence-status`, `sequence-append`, `sequence-replace-tail`, `sequence-cancel`, `sequence-interrupt`, `standby`, `fixstand`, `passive`, `motion-mode`, `status`, `urgent-stop`, `idle-load`, or `cache-clear`.
 
 Do not rely on default output for full paths, prompts, durations, tracker status, or long logs.
-For `standby`, `state` may be `idle` when loaded idle motions immediately take over; `idle.enabled=true` means the idle configuration is still retained.
+For `standby`, `state` is `standby` for ordinary standby and may be `idle` when loaded idle motions immediately take over; `idle.enabled=true` means the idle configuration is still retained. Release tracker status uses `ctrl:"standby"` for ordinary standby.
 For `fixstand` and `passive`, successful output keeps compatibility `state:"fixstand"` or `state:"passive"` and adds `accepted:true, confirmed:false`; it is an accepted control request, not a confirmed `/status` state.
-For `urgent-stop --urgent`, successful output keeps compatibility `state:"stopped"`, adds `urgent:true`, and maps to `/stop`.
+For `urgent-stop --urgent`, successful output uses `state:"urgent_stop"`, adds `urgent:true`, and maps to tracker `POST /urgent_stop`.

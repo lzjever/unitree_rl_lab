@@ -7,6 +7,7 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -467,6 +468,7 @@ class FakeRobotIO final : public RobotIO {
 
   std::optional<LowStateSample> readLowState() const override {
     ++read_low_calls;
+    std::lock_guard<std::mutex> lock(mutex_);
     return low_state;
   }
 
@@ -479,12 +481,18 @@ class FakeRobotIO final : public RobotIO {
     last_mode_machine.store(frame.mode_machine);
   }
 
+  void setLowState(std::optional<LowStateSample> state) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    low_state = std::move(state);
+  }
+
   std::optional<LowStateSample> low_state;
   mutable std::atomic<int> read_low_calls{0};
   std::atomic<int> write_low_cmd_calls{0};
   std::atomic<std::uint8_t> last_mode_machine{0};
 
  private:
+  mutable std::mutex mutex_;
   std::shared_ptr<std::atomic<int>> destroy_counter_;
 };
 
@@ -820,7 +828,7 @@ TEST_CASE("Default AppRunner rejects control changes while publishing static not
   RunningApp app;
   auto client = app.client();
 
-  for (const auto* target : {"/fixstand", "/standby_velocity"}) {
+  for (const auto* target : {"/fixstand", "/standby"}) {
     const auto response = body(client.Post(target, "", "application/json"), 503);
 
     CAPTURE(target);
@@ -1027,6 +1035,34 @@ TEST_CASE("AppRunner with fake policy runtime becomes ready") {
   runner.stop();
 }
 
+TEST_CASE("AppRunner default FixStand retries transient missing lowstate on startup") {
+  TempTree tmp;
+  FakeRobotIO* robot = nullptr;
+  FakePolicy* policy = nullptr;
+  AppRunner runner(productionTestConfig(tmp), makeDeps(robot, policy));
+  robot->setLowState(std::nullopt);
+
+  REQUIRE(runner.start());
+  auto client = httplib::Client("127.0.0.1", runner.boundPort());
+
+  const auto waiting = pollJson(client, "/status", [](const nlohmann::json& json) {
+    return json.at("ready") == false && json.at("ctrl") == "fixstand" &&
+           json.at("block") == "lowstate_missing";
+  });
+  REQUIRE(waiting.at("err").at("code") == "ROBOT_DISCONNECTED");
+  REQUIRE(robot->write_low_cmd_calls.load() == 0);
+
+  robot->setLowState(readyLowState(deployConfig()));
+  const auto ready = pollJson(client, "/status", [](const nlohmann::json& json) {
+    return json.at("ready") == true && json.at("ctrl") == "fixstand" &&
+           json.at("block").is_null();
+  });
+  REQUIRE(ready.at("err").is_null());
+  REQUIRE(robot->write_low_cmd_calls.load() >= 1);
+
+  runner.stop();
+}
+
 TEST_CASE("HTTP execute reaches RuntimeControlLoop policy write") {
   TempTree tmp;
   FakeRobotIO* robot = nullptr;
@@ -1041,9 +1077,9 @@ TEST_CASE("HTTP execute reaches RuntimeControlLoop policy write") {
     return json.at("ready") == true;
   });
 
-  body(client.Post("/standby_velocity", "", "application/json"), 200);
+  body(client.Post("/standby", "", "application/json"), 200);
   pollJson(client, "/status", [](const nlohmann::json& json) {
-    return json.at("ctrl") == "standby_velocity";
+    return json.at("ctrl") == "standby";
   });
 
   const auto execute =
@@ -1084,9 +1120,9 @@ TEST_CASE("HTTP execute keeps baseline behavior when loco_upper is enabled but u
   REQUIRE(status.at("ready") == true);
   requireLocoUpperCapability(status, true, false, 0.8, 2.0, false);
 
-  body(client.Post("/standby_velocity", "", "application/json"), 200);
+  body(client.Post("/standby", "", "application/json"), 200);
   pollJson(client, "/status", [](const nlohmann::json& json) {
-    return json.at("ctrl") == "standby_velocity";
+    return json.at("ctrl") == "standby";
   });
 
   const auto execute =
@@ -1138,7 +1174,7 @@ TEST_CASE("AppRunner reports loco_upper ready when injected runtime includes loc
   runner.stop();
 }
 
-TEST_CASE("HTTP standby_velocity uses legacy runner when loco_upper runtime is ready but unused") {
+TEST_CASE("HTTP standby uses legacy runner when loco_upper runtime is ready but unused") {
   TempTree tmp;
   FakeRobotIO* robot = nullptr;
   FakePolicy* policy = nullptr;
@@ -1164,9 +1200,9 @@ TEST_CASE("HTTP standby_velocity uses legacy runner when loco_upper runtime is r
            json.at("cap").at("loco_upper").at("ready") == true;
   });
 
-  body(client.Post("/standby_velocity", "", "application/json"), 200);
+  body(client.Post("/standby", "", "application/json"), 200);
   pollJson(client, "/status", [&](const nlohmann::json& json) {
-    return json.at("ctrl") == "standby_velocity" &&
+    return json.at("ctrl") == "standby" &&
            velocity_policy->calls.load() >= 3;
   });
 
@@ -1217,9 +1253,9 @@ TEST_CASE("HTTP loco_upper disabled ignores injected loco deps and rejects execu
   REQUIRE(failure.at("next") == "status");
   REQUIRE(loco_lower_policy->calls.load() == 0);
 
-  body(client.Post("/standby_velocity", "", "application/json"), 200);
+  body(client.Post("/standby", "", "application/json"), 200);
   pollJson(client, "/status", [&](const nlohmann::json& json) {
-    return json.at("ctrl") == "standby_velocity" &&
+    return json.at("ctrl") == "standby" &&
            velocity_policy->calls.load() >= 3;
   });
 
@@ -1248,9 +1284,9 @@ TEST_CASE("HTTP execute_loco_upper queues valid fixture with app-owned upper lim
     return json.at("ready") == true && json.at("cap").at("loco_upper").at("ready") == true;
   });
 
-  body(client.Post("/standby_velocity", "", "application/json"), 200);
+  body(client.Post("/standby", "", "application/json"), 200);
   pollJson(client, "/status", [](const nlohmann::json& json) {
-    return json.at("ctrl") == "standby_velocity";
+    return json.at("ctrl") == "standby";
   });
 
   const auto execute =
@@ -1283,9 +1319,9 @@ TEST_CASE("HTTP execute_loco_upper queued status reports runtime envelope clamp"
     return json.at("ready") == true && json.at("cap").at("loco_upper").at("ready") == true;
   });
 
-  body(client.Post("/standby_velocity", "", "application/json"), 200);
+  body(client.Post("/standby", "", "application/json"), 200);
   pollJson(client, "/status", [](const nlohmann::json& json) {
-    return json.at("ctrl") == "standby_velocity";
+    return json.at("ctrl") == "standby";
   });
 
   const auto execute =
@@ -1326,9 +1362,9 @@ TEST_CASE("HTTP execute_loco_upper accepts bounded upper limit violations and re
     return json.at("ready") == true && json.at("cap").at("loco_upper").at("ready") == true;
   });
 
-  body(client.Post("/standby_velocity", "", "application/json"), 200);
+  body(client.Post("/standby", "", "application/json"), 200);
   pollJson(client, "/status", [](const nlohmann::json& json) {
-    return json.at("ctrl") == "standby_velocity";
+    return json.at("ctrl") == "standby";
   });
 
   const auto execute =
@@ -1368,9 +1404,9 @@ TEST_CASE("AppRunner passes sim mode_machine through to RuntimeControlLoop LowCm
     return json.at("ready") == true;
   });
 
-  body(client.Post("/standby_velocity", "", "application/json"), 200);
+  body(client.Post("/standby", "", "application/json"), 200);
   pollJson(client, "/status", [](const nlohmann::json& json) {
-    return json.at("ctrl") == "standby_velocity";
+    return json.at("ctrl") == "standby";
   });
 
   const auto execute =
@@ -1406,9 +1442,9 @@ TEST_CASE("Ready AppRunner rejects invalid trk before enqueue") {
   pollJson(client, "/status", [](const nlohmann::json& json) {
     return json.at("ready") == true;
   });
-  body(client.Post("/standby_velocity", "", "application/json"), 200);
+  body(client.Post("/standby", "", "application/json"), 200);
   pollJson(client, "/status", [](const nlohmann::json& json) {
-    return json.at("ctrl") == "standby_velocity";
+    return json.at("ctrl") == "standby";
   });
 
   const auto relative =

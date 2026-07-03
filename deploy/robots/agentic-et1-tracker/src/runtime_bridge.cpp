@@ -129,7 +129,7 @@ ControlResult RuntimeBridge::fixStand() {
   return result;
 }
 
-ControlResult RuntimeBridge::standbyVelocity() {
+ControlResult RuntimeBridge::standby() {
   std::lock_guard<std::mutex> lock(mutex_);
   const std::uint64_t sequence = next_sequence_++;
   const ControlResult result = status_.acceptControl(ControlMode::StandbyVelocity);
@@ -141,6 +141,26 @@ ControlResult RuntimeBridge::standbyVelocity() {
   MotionRequest request;
   request.sequence = sequence;
   push(CommandKind::StandbyVelocity, request, sequence);
+  return result;
+}
+
+ControlResult RuntimeBridge::standbyVelocity() {
+  return standby();
+}
+
+StopResult RuntimeBridge::urgentStop() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const std::uint64_t sequence = next_sequence_++;
+  const StopResult result = status_.acceptUrgentStop();
+  const bool had_idle_config = status_.clearIdleConfig();
+  clearAllPendingCommands();
+  const bool requires_runtime_command =
+      result.state == ControllerState::UrgentStopping || had_idle_config;
+  if (requires_runtime_command) {
+    MotionRequest request;
+    request.sequence = sequence;
+    push(CommandKind::UrgentStop, request, sequence, true);
+  }
   return result;
 }
 
@@ -187,6 +207,8 @@ std::optional<Command> RuntimeBridge::consumeNextCommand() {
 
 int RuntimeBridge::priority(CommandKind kind) {
   switch (kind) {
+    case CommandKind::UrgentStop:
+      return 5;
     case CommandKind::Stop:
       return 4;
     case CommandKind::Passive:
@@ -213,6 +235,7 @@ ControlMode controlModeForCommandKind(CommandKind kind) {
     case CommandKind::Queue:
     case CommandKind::Interrupt:
     case CommandKind::Stop:
+    case CommandKind::UrgentStop:
     case CommandKind::IdleConfig:
       break;
   }
@@ -304,6 +327,10 @@ void RuntimeBridge::clearPendingMotionsThrough(std::uint64_t sequence) {
                                          command.sequence <= sequence;
                                 }),
                  pending_.end());
+}
+
+void RuntimeBridge::clearAllPendingCommands() {
+  pending_.clear();
 }
 
 }  // namespace agentic_et1_tracker

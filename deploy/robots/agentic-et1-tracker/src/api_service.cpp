@@ -38,6 +38,7 @@ int httpStatus(ErrorCode code) {
     case ErrorCode::Ok:
       return 200;
     case ErrorCode::RequestInvalid:
+    case ErrorCode::ControlRouteRenamed:
       return 400;
     case ErrorCode::TrkPathNotAllowed:
       return 403;
@@ -147,17 +148,29 @@ bool parsePassivePassword(const std::string& body, const std::string& expected) 
 bool executeBlockedByController(ControllerState ctrl) {
   return ctrl == ControllerState::Starting || ctrl == ControllerState::Idle ||
          ctrl == ControllerState::Passive || ctrl == ControllerState::FixStand ||
-         ctrl == ControllerState::Stopping || ctrl == ControllerState::Fault;
+         ctrl == ControllerState::Stopping ||
+         ctrl == ControllerState::UrgentStopping ||
+         ctrl == ControllerState::Fault;
 }
 
 bool idleConfigBlockedByController(ControllerState ctrl) {
   return ctrl == ControllerState::Starting || ctrl == ControllerState::Idle ||
          ctrl == ControllerState::Passive || ctrl == ControllerState::FixStand ||
-         ctrl == ControllerState::Stopping || ctrl == ControllerState::Fault;
+         ctrl == ControllerState::Stopping ||
+         ctrl == ControllerState::UrgentStopping ||
+         ctrl == ControllerState::Fault;
 }
 
 bool fixStandRecoveryState(ControllerState ctrl) {
   return ctrl == ControllerState::Passive || ctrl == ControllerState::Fault;
+}
+
+bool controlBlockedByController(ControllerState ctrl, ControlMode mode) {
+  if (ctrl == ControllerState::UrgentStopping) {
+    return mode != ControlMode::Passive;
+  }
+  return mode == ControlMode::StandbyVelocity &&
+         (ctrl == ControllerState::Passive || ctrl == ControllerState::Fault);
 }
 
 ErrorCode lowCmdOccupiedReadiness(ErrorCode readiness) {
@@ -193,17 +206,18 @@ ErrorInfo controlStateConflictInfo(ControllerState ctrl) {
               NextAction::Status};
     case ControllerState::Passive:
       return {ErrorCode::ControlStateConflict,
-              "ctrl=passive; /fixstand then /standby_velocity",
+              "ctrl=passive; /fixstand then /standby",
               false,
               NextAction::FixStand};
     case ControllerState::FixStand:
       return {ErrorCode::ControlStateConflict,
-              "ctrl=fixstand; /standby_velocity",
+              "ctrl=fixstand; /standby",
               false,
-              NextAction::StandbyVelocity};
+              NextAction::Standby};
     case ControllerState::Stopping:
+    case ControllerState::UrgentStopping:
       return {ErrorCode::ControlStateConflict,
-              "ctrl=stopping; wait /status",
+              "ctrl=" + toString(ctrl) + "; wait /status",
               false,
               NextAction::Status};
     case ControllerState::Fault:
@@ -366,7 +380,7 @@ ApiResponse AgentApiService::handle(const ApiRequest& request) {
       return idle(request.body);
     }
     if (request.method == "POST" && target.path == "/stop") {
-      return stop(request.body);
+      return renamedRoute("/stop renamed to /urgent_stop", NextAction::UrgentStop);
     }
     if (request.method == "POST" && target.path == "/passive") {
       return passive(request.body);
@@ -374,8 +388,15 @@ ApiResponse AgentApiService::handle(const ApiRequest& request) {
     if (request.method == "POST" && target.path == "/fixstand") {
       return fixStand(request.body);
     }
+    if (request.method == "POST" && target.path == "/standby") {
+      return standby(request.body);
+    }
+    if (request.method == "POST" && target.path == "/urgent_stop") {
+      return urgentStop(request.body);
+    }
     if (request.method == "POST" && target.path == "/standby_velocity") {
-      return standbyVelocity(request.body);
+      return renamedRoute("/standby_velocity renamed to /standby",
+                          NextAction::Standby);
     }
     if (request.method == "GET" && target.path == "/status") {
       return status(request.target);
@@ -647,12 +668,16 @@ ApiResponse AgentApiService::idle(const std::string& body) {
   return {200, out};
 }
 
-ApiResponse AgentApiService::stop(const std::string& body) {
+ApiResponse AgentApiService::stop(const std::string&) {
+  return renamedRoute("/stop renamed to /urgent_stop", NextAction::UrgentStop);
+}
+
+ApiResponse AgentApiService::urgentStop(const std::string& body) {
   if (!blank(body)) {
     return error(ErrorCode::RequestInvalid);
   }
 
-  const StopResult result = commands_.stop();
+  const StopResult result = commands_.urgentStop();
   if (!result.ok()) {
     return error(result.code);
   }
@@ -700,6 +725,9 @@ ApiResponse AgentApiService::fixStand(const std::string& body) {
       !fixStandRecoveryAllowed(snapshot, readiness)) {
     return error(readiness);
   }
+  if (controlBlockedByController(snapshot.ctrl, ControlMode::FixStand)) {
+    return controlStateConflict(snapshot.ctrl);
+  }
 
   const ControlResult result = commands_.fixStand();
   if (!result.ok()) {
@@ -711,7 +739,7 @@ ApiResponse AgentApiService::fixStand(const std::string& body) {
   return {200, out};
 }
 
-ApiResponse AgentApiService::standbyVelocity(const std::string& body) {
+ApiResponse AgentApiService::standby(const std::string& body) {
   if (!blank(body)) {
     return error(ErrorCode::RequestInvalid);
   }
@@ -721,15 +749,14 @@ ApiResponse AgentApiService::standbyVelocity(const std::string& body) {
   if (lowCmdOccupied(snapshot)) {
     return error(manualReadinessInfo(lowCmdOccupiedReadiness(readiness)));
   }
-  if (snapshot.ctrl == ControllerState::Passive ||
-      snapshot.ctrl == ControllerState::Fault) {
+  if (controlBlockedByController(snapshot.ctrl, ControlMode::StandbyVelocity)) {
     return controlStateConflict(snapshot.ctrl);
   }
   if (readiness != ErrorCode::Ok) {
     return error(readiness);
   }
 
-  const ControlResult result = commands_.standbyVelocity();
+  const ControlResult result = commands_.standby();
   if (!result.ok()) {
     return error(result.code);
   }
@@ -737,6 +764,15 @@ ApiResponse AgentApiService::standbyVelocity(const std::string& body) {
   auto out = successBase();
   out["state"] = "accepted";
   return {200, out};
+}
+
+ApiResponse AgentApiService::standbyVelocity(const std::string&) {
+  return renamedRoute("/standby_velocity renamed to /standby", NextAction::Standby);
+}
+
+ApiResponse AgentApiService::renamedRoute(const std::string& message,
+                                          NextAction next) {
+  return error({ErrorCode::ControlRouteRenamed, message, false, next});
 }
 
 ApiResponse AgentApiService::status(const std::string& target) {

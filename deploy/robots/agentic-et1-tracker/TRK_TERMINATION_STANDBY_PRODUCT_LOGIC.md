@@ -1,5 +1,12 @@
 # TRK Termination To Standby Product Logic
 
+> **Historical/Obsolete API names (2026-07):** This file is a historical
+> planning handoff and may still mention old public route names. The GA/current
+> API is `POST /standby` for ordinary standby and `POST /urgent_stop` for urgent
+> stop. Legacy `POST /standby_velocity` and `POST /stop` are not successful
+> aliases; if present they reject with `CONTROL_ROUTE_RENAMED`. Use `README.md`
+> and `CONTROL_STATE_MACHINE_REDESIGN_PLAN.md` as the current contract.
+
 This document is the product/technical handoff for ordinary user requests like
 "stop", "pause", or "terminate the current TRK" while `agentic-et1-tracker` is
 executing a user motion.
@@ -51,8 +58,8 @@ Key code references:
 
 | Human intent | Skill/API mapping | Product meaning |
 | --- | --- | --- |
-| "stop", "pause", "terminate current action", "stand by" | `standby` / `/standby_velocity` | Ordinary cancellation; return to normal standby behavior. |
-| "emergency stop", "abort", "kill", explicit urgent stop | `urgent-stop --urgent` / `/stop` | Immediate abort; do not smooth; clear idle. |
+| "stop", "pause", "terminate current action", "stand by" | `standby` / `/standby` | Ordinary cancellation; return to normal standby behavior. |
+| "emergency stop", "abort", "kill", explicit urgent stop | `urgent-stop --urgent` / `/urgent_stop` | Immediate abort; do not smooth; clear idle. |
 | "passive", "power/control off", explicit authorized passive | `/passive` with password | Safety sink; no automatic recovery. |
 | "enter stand configuration" | `/fixstand` | Fixed preparation/recovery posture, not ordinary stop. |
 | "do not idle / completely still" | clear idle, then standby | Pure standby without background idle. |
@@ -60,7 +67,7 @@ Key code references:
 The LLM-facing contract should stay simple:
 
 - Ordinary stop uses standby.
-- Urgent stop uses `/stop`.
+- Urgent stop uses `/urgent_stop`.
 - Passive is explicit and passworded.
 - Fixstand is explicit recovery/preparation.
 
@@ -78,7 +85,7 @@ This distinction must remain clear in the skill:
 
 - "stop current action" => standby, preserve idle.
 - "stop and do not move / no idle" => idle clear, then standby.
-- urgent wording => `/stop`.
+- urgent wording => `/urgent_stop`.
 
 ## Recommended Product Logic
 

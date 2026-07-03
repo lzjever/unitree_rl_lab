@@ -104,6 +104,8 @@ void AgentHttpServer::installHandler() {
   server_->Post("/stop", handler);
   server_->Post("/passive", handler);
   server_->Post("/fixstand", handler);
+  server_->Post("/standby", handler);
+  server_->Post("/urgent_stop", handler);
   server_->Post("/standby_velocity", handler);
   server_->set_error_handler(
       [this](const httplib::Request& request, httplib::Response& response) {

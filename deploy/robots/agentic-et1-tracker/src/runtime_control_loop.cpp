@@ -50,6 +50,11 @@ bool isStartupOrWaitingError(ErrorCode error) {
   }
 }
 
+bool shouldLatchPassiveReason(const RobotReadinessStatus& readiness) {
+  return readiness.err == ErrorCode::RobotBadOrientation &&
+         readiness.block == "bad_orientation";
+}
+
 bool isGeneralTrackerRequest(const MotionRequest& request) {
   return request.executor == MotionExecutor::GeneralTracker;
 }
@@ -809,6 +814,29 @@ std::optional<TrkTrack> RuntimeControlLoop::controllableSourceTrack(
   return track;
 }
 
+std::optional<TrkTrack> RuntimeControlLoop::controllableStandbySourceTrack(
+    const TrkFrameView& reference_frame,
+    double fps,
+    const TrkFrameView& standby_target_frame) {
+  const std::optional<LowStateSample> entry_low_state = readLowStateForStatus();
+  const RobotReadinessStatus readiness =
+      mapRobotReadiness(entry_low_state,
+                        robot_io_->lowCmdOccupancy(),
+                        expected_mode_machine_);
+  if (readiness.err != ErrorCode::Ok) {
+    failActiveReadiness(readiness);
+    return std::nullopt;
+  }
+  applyReadiness(readiness);
+
+  const std::optional<HighStateSample> high_state = readHighStateForStatus();
+  return controllableSourceTrack(reference_frame,
+                                 fps,
+                                 *entry_low_state,
+                                 high_state,
+                                 &standby_target_frame);
+}
+
 void RuntimeControlLoop::tick() {
   if (fsm_state_ == RuntimeInternalState::Stopping) {
     consumeStoppingCommands();
@@ -885,6 +913,9 @@ bool RuntimeControlLoop::consumePendingCommands() {
       case CommandKind::Stop:
         handleStop(command->sequence, command->stop_requires_stopping);
         return true;
+      case CommandKind::UrgentStop:
+        handleUrgentStop(command->sequence);
+        return true;
       case CommandKind::Passive:
         handleControl(ControlMode::Passive);
         return true;
@@ -947,6 +978,9 @@ void RuntimeControlLoop::consumeStoppingCommands() {
       case CommandKind::Stop:
         cancelWaiting(StopReason::Stop, command->sequence);
         post_stop_control_ = ControlMode::StandbyVelocity;
+        break;
+      case CommandKind::UrgentStop:
+        handleUrgentStop(command->sequence);
         break;
       case CommandKind::Passive:
         cancelWaiting(StopReason::Stop, command->sequence);
@@ -1017,6 +1051,10 @@ void RuntimeControlLoop::handleStop(std::uint64_t sequence, bool requires_stoppi
   if (active_ && active_kind_ == ActiveKind::User &&
       active_->executor == MotionExecutor::LocoUpper) {
     post_stop_control_ = ControlMode::StandbyVelocity;
+    if (loco_upper_) {
+      beginLocoUpperStopping(StopReason::Stop);
+      return;
+    }
     markActiveStopping(StopReason::Stop);
     stop_reason_ = StopReason::Stop;
     enterStopping(StopReason::Stop);
@@ -1041,6 +1079,53 @@ void RuntimeControlLoop::handleStop(std::uint64_t sequence, bool requires_stoppi
   }
   stop_reason_ = StopReason::Stop;
   enterStopping(StopReason::Stop);
+}
+
+void RuntimeControlLoop::handleUrgentStop(std::uint64_t sequence) {
+  cancelWaiting(StopReason::UrgentStop, sequence);
+  clearIdleConfig();
+  const bool keep_fixstand =
+      fsm_state_ == RuntimeInternalState::FixStand && active_kind_ == ActiveKind::None &&
+      !active_ && waiting_.empty();
+  post_stop_control_ =
+      keep_fixstand ? ControlMode::FixStand : ControlMode::StandbyVelocity;
+
+  if (active_kind_ == ActiveKind::Idle) {
+    stopIdleActive();
+  } else if (active_kind_ == ActiveKind::Transition) {
+    abortTransition(MotionState::Canceled,
+                    StopReason::UrgentStop,
+                    ErrorCode::Ok);
+  } else if (active_) {
+    finishActive(MotionState::Canceled,
+                 StopReason::UrgentStop,
+                 ErrorCode::Ok);
+  }
+
+  active_.reset();
+  active_kind_ = ActiveKind::None;
+  active_track_.reset();
+  loco_upper_.reset();
+  policy_runner_.reset();
+  transition_.reset();
+  clearReference();
+
+  if (fsm_state_ == RuntimeInternalState::Passive ||
+      fsm_state_ == RuntimeInternalState::Fault) {
+    stop_reason_ = StopReason::None;
+    stop_to_idle_pending_ = false;
+    stopping_hold_ticks_remaining_ = 0;
+    return;
+  }
+  if (keep_fixstand) {
+    enterFixStandState();
+    stop_reason_ = StopReason::None;
+    stop_to_idle_pending_ = false;
+    stopping_hold_ticks_remaining_ = 0;
+    return;
+  }
+
+  enterUrgentStopping();
 }
 
 void RuntimeControlLoop::handleControl(ControlMode mode) {
@@ -1084,15 +1169,14 @@ void RuntimeControlLoop::handleControl(ControlMode mode) {
   }
   if (mode == ControlMode::StandbyVelocity && active_kind_ == ActiveKind::User &&
       active_ && active_->state == MotionState::Holding) {
+    cancelWaiting(StopReason::Stop);
     if (startTransitionFromHoldingToStandby()) {
       return;
     }
-    finishActive(MotionState::Done, StopReason::None, ErrorCode::Ok);
-    post_stop_control_ = ControlMode::StandbyVelocity;
-    stop_reason_ = StopReason::None;
-    stop_to_idle_pending_ = false;
-    stopping_hold_ticks_remaining_ = 0;
-    enterGeneralTrackerIdleState();
+    failActiveWithFault(ErrorCode::InternalError,
+                        RobotState::Fault,
+                        "standby_transition_failed",
+                        runtime_state_.low_ms);
     return;
   }
   if (fsm_state_ == RuntimeInternalState::Fault && mode != ControlMode::FixStand) {
@@ -1360,10 +1444,14 @@ void RuntimeControlLoop::enterPassiveState(const RobotReadinessStatus& readiness
     clearReference();
   }
   handleInternalEvent(RuntimeInternalEvent::SafetyPassive);
+  if (shouldLatchPassiveReason(readiness)) {
+    passive_reason_ = PassiveReason{readiness.err, readiness.block};
+  }
   applyReadiness(readiness);
 }
 
 void RuntimeControlLoop::enterFixStandState() {
+  passive_reason_.reset();
   enterInternalState(RuntimeInternalState::FixStand);
 }
 
@@ -3443,29 +3531,32 @@ bool RuntimeControlLoop::startTransitionFromHoldingToStandby() {
     return false;
   }
 
-  std::optional<LowStateSample> entry_low_state;
-  if (hasPolicyRuntime()) {
-    entry_low_state = readLowStateForStatus();
-    const RobotReadinessStatus readiness =
-        mapRobotReadiness(entry_low_state,
-                          robot_io_->lowCmdOccupancy(),
-                          expected_mode_machine_);
-    if (readiness.err != ErrorCode::Ok) {
-      failActiveReadiness(readiness);
-      return true;
-    }
-    applyReadiness(readiness);
+  const std::optional<TrkFrameView> reference_source_frame =
+      active_track_->frame(active_->frame);
+  const std::optional<TrkFrameView> target_frame = standby_track_->frame(0);
+  if (!reference_source_frame || !target_frame) {
+    return false;
   }
 
-  const std::optional<TrkFrameView> target_frame = standby_track_->frame(0);
-  if (!target_frame) {
-    return false;
+  std::optional<TrkTrack> source_track;
+  std::optional<TrkFrameView> source_frame = reference_source_frame;
+  if (hasPolicyRuntime()) {
+    source_track = controllableStandbySourceTrack(*reference_source_frame,
+                                                  active_track_->metadata.fps,
+                                                  *target_frame);
+    if (!source_track) {
+      return isSafetyTerminalState();
+    }
+    source_frame = source_track->frame(0);
+    if (!source_frame) {
+      return false;
+    }
   }
 
   PendingTransition target;
   target.target_kind = TransitionTargetKind::Standby;
   target.target_track = standby_track_;
-  return startSyntheticTransitionFromActiveFrame(std::move(target));
+  return startSyntheticTransitionFromFrame(std::move(target), *source_frame);
 }
 
 bool RuntimeControlLoop::startTransitionFromCurrentReferenceToUser(
@@ -4010,35 +4101,36 @@ RuntimeControlLoop::startTransitionFromActiveToStandbyCancellation() {
     return StandbyTransitionResult::Fallback;
   }
 
+  auto failStandbyHandoff = [this]() {
+    failActiveWithFault(ErrorCode::InternalError,
+                        RobotState::Fault,
+                        "standby_transition_failed",
+                        runtime_state_.low_ms);
+    return StandbyTransitionResult::SafetyTerminal;
+  };
+
   const std::optional<TrkFrameView> reference_source_frame =
       active_track_->frame(active_->frame);
-  if (!reference_source_frame || !standby_track_->frame(0)) {
-    return StandbyTransitionResult::Fallback;
+  const std::optional<TrkFrameView> standby_target_frame = standby_track_->frame(0);
+  if (!reference_source_frame || !standby_target_frame) {
+    return failStandbyHandoff();
   }
 
   std::optional<TrkTrack> source_track;
   std::optional<TrkFrameView> source_frame = reference_source_frame;
   if (hasPolicyRuntime()) {
-    const std::optional<LowStateSample> entry_low_state = readLowStateForStatus();
-    const RobotReadinessStatus readiness =
-        mapRobotReadiness(entry_low_state,
-                          robot_io_->lowCmdOccupancy(),
-                          expected_mode_machine_);
-    if (readiness.err != ErrorCode::Ok) {
-      return StandbyTransitionResult::Fallback;
-    }
-    applyReadiness(readiness);
-    const std::optional<HighStateSample> high_state = readHighStateForStatus();
-    source_track = controllableSourceTrack(*reference_source_frame,
-                                           active_track_->metadata.fps,
-                                           *entry_low_state,
-                                           high_state);
+    source_track = controllableStandbySourceTrack(*reference_source_frame,
+                                                  active_track_->metadata.fps,
+                                                  *standby_target_frame);
     if (!source_track) {
-      return StandbyTransitionResult::Fallback;
+      if (isSafetyTerminalState()) {
+        return StandbyTransitionResult::SafetyTerminal;
+      }
+      return failStandbyHandoff();
     }
     source_frame = source_track->frame(0);
     if (!source_frame) {
-      return StandbyTransitionResult::Fallback;
+      return failStandbyHandoff();
     }
   }
 
@@ -4061,8 +4153,10 @@ RuntimeControlLoop::startTransitionFromActiveToStandbyCancellation() {
   if (startSyntheticTransitionFromFrame(std::move(target), *source_frame)) {
     return StandbyTransitionResult::Started;
   }
-  return isSafetyTerminalState() ? StandbyTransitionResult::SafetyTerminal
-                                 : StandbyTransitionResult::Fallback;
+  if (isSafetyTerminalState()) {
+    return StandbyTransitionResult::SafetyTerminal;
+  }
+  return failStandbyHandoff();
 }
 
 bool RuntimeControlLoop::startSyntheticTransitionFromActiveFrame(
@@ -4131,12 +4225,16 @@ bool RuntimeControlLoop::startSyntheticTransitionFromFrame(
 
   const std::optional<double> transition_duration_s = transitionDurationForUse();
   const double transition_fps = transitionSampleFpsForTarget(*target.target_track);
+  const SyntheticTransitionOptions transition_options =
+      target.target_kind == TransitionTargetKind::Standby
+          ? controlledTransitionOptionsForTarget(*target.target_track)
+          : transitionOptionsForTarget(*target.target_track);
   std::optional<TrkTrack> transition_track =
       transition_duration_s
           ? makeSyntheticTransitionTrk(source_frame,
                                        *target_frame,
                                        transition_fps,
-                                       transitionOptionsForTarget(*target.target_track))
+                                       transition_options)
           : std::nullopt;
   if (!transition_track) {
     if (target.target_request && !target.target_request->id.empty()) {
@@ -4633,24 +4731,18 @@ bool RuntimeControlLoop::writeFixStand() {
   const RobotReadinessStatus readiness =
       mapRobotReadiness(low_state, occupancy, expected_mode_machine_);
   if (readiness.err != ErrorCode::Ok) {
-    const bool can_write_bad_orientation =
-        readiness.err == ErrorCode::RobotBadOrientation && low_state.has_value() &&
-        low_state->fresh &&
-        (low_state->mode_machine == 0 ||
-         low_state->mode_machine == expected_mode_machine_) &&
-        !occupancy.occupied;
-    if (!can_write_bad_orientation) {
-      if (readinessRequiresFault(readiness)) {
-        enterFault(readiness.err, readiness.robot, readiness.block, readiness.low_ms);
-      } else {
-        enterPassiveState(readiness);
-      }
+    if (readinessRequiresFault(readiness)) {
+      enterFault(readiness.err, readiness.robot, readiness.block, readiness.low_ms);
+      return false;
+    }
+    if (shouldLatchPassiveReason(readiness)) {
+      enterPassiveState(readiness);
       return false;
     }
     applyReadiness(readiness);
-  } else {
-    applyReadiness(readiness);
+    return false;
   }
+  applyReadiness(readiness);
 
   LowCmdFrame frame;
   try {
@@ -4993,7 +5085,16 @@ void RuntimeControlLoop::enterStopping(StopReason reason) {
   enterInternalState(RuntimeInternalState::Stopping);
   stop_reason_ = reason;
   stop_to_idle_pending_ = true;
-  stopping_hold_ticks_remaining_ = hasPolicyRuntime() ? stopHoldTicks() : 0;
+  stopping_hold_ticks_remaining_ = hasPolicyRuntime() ? stopHoldTicks(reason) : 0;
+}
+
+void RuntimeControlLoop::enterUrgentStopping() {
+  enterInternalState(RuntimeInternalState::Stopping);
+  ctrl_ = ControllerState::UrgentStopping;
+  stop_reason_ = StopReason::UrgentStop;
+  stop_to_idle_pending_ = true;
+  stopping_hold_ticks_remaining_ =
+      hasPolicyRuntime() ? stopHoldTicks(StopReason::UrgentStop) : 0;
 }
 
 std::size_t RuntimeControlLoop::ticksForPeriod(double seconds) const {
@@ -5167,11 +5268,14 @@ std::size_t RuntimeControlLoop::policyStartupHoldPolicySteps(double duration_s) 
   return static_cast<std::size_t>(steps);
 }
 
-std::size_t RuntimeControlLoop::stopHoldTicks() const {
-  if (!std::isfinite(config_.stop_hold_s) || config_.stop_hold_s <= 0.0) {
+std::size_t RuntimeControlLoop::stopHoldTicks(StopReason reason) const {
+  if (reason == StopReason::UrgentStop) {
     return 0;
   }
-  return ticksForPeriod(config_.stop_hold_s);
+  if (std::isfinite(config_.stop_hold_s) && config_.stop_hold_s > 0.0) {
+    return ticksForPeriod(config_.stop_hold_s);
+  }
+  return 0;
 }
 
 std::optional<double> RuntimeControlLoop::transitionDurationForUse() const {
@@ -5307,9 +5411,20 @@ void RuntimeControlLoop::publishSnapshot() {
       hasPolicyRuntime() && !runtime_state_.ready ? runtime_state_.robot : robotState();
   snapshot.ctrl = ctrl_;
   snapshot.stop_reason =
-      ctrl_ == ControllerState::Stopping ? stop_reason_ : StopReason::None;
+      (ctrl_ == ControllerState::Stopping ||
+       ctrl_ == ControllerState::UrgentStopping)
+          ? stop_reason_
+          : StopReason::None;
   snapshot.hz = config_.hz;
-  if (active_kind_ == ActiveKind::User && active_) {
+  const bool public_loco_standby_handoff =
+      active_kind_ == ActiveKind::User && active_ &&
+      active_->executor == MotionExecutor::LocoUpper &&
+      active_->state == MotionState::Stopping &&
+      active_->stop_reason == StopReason::Stop &&
+      post_stop_control_ == ControlMode::StandbyVelocity;
+  if (public_loco_standby_handoff) {
+    snapshot.active = {ActiveKind::Transition, ""};
+  } else if (active_kind_ == ActiveKind::User && active_) {
     snapshot.active = {ActiveKind::User, active_->id};
   } else if (active_kind_ == ActiveKind::Idle && active_) {
     snapshot.active = {ActiveKind::Idle, ""};
@@ -5330,8 +5445,18 @@ void RuntimeControlLoop::publishSnapshot() {
   } else {
     snapshot.err = ErrorCode::Ok;
   }
-  if (active_ && active_kind_ == ActiveKind::User) {
+  snapshot.passive_reason = passive_reason_;
+  if (active_ && active_kind_ == ActiveKind::User &&
+      !public_loco_standby_handoff) {
     snapshot.exec = toStatus(*active_);
+  }
+  if (public_loco_standby_handoff && active_) {
+    snapshot.transition.active = true;
+    snapshot.transition.target = "standby";
+    snapshot.transition.frame = active_->frame;
+    snapshot.transition.frames = active_->frames;
+    snapshot.transition.progress =
+        computeProgress(active_->frame, active_->frames, active_->state);
   }
   if (active_ && active_kind_ == ActiveKind::Transition && transition_) {
     snapshot.transition.active = true;
@@ -5432,7 +5557,8 @@ RobotState RuntimeControlLoop::robotState() const {
   if (ctrl_ == ControllerState::Running || ctrl_ == ControllerState::Preparing) {
     return RobotState::Running;
   }
-  if (ctrl_ == ControllerState::Stopping) {
+  if (ctrl_ == ControllerState::Stopping ||
+      ctrl_ == ControllerState::UrgentStopping) {
     return RobotState::Holding;
   }
   return RobotState::Idle;
@@ -5498,7 +5624,6 @@ void RuntimeControlLoop::enterFault(ErrorCode error,
                                     std::string block,
                                     std::optional<std::size_t> low_ms) {
   failWaiting(error);
-  clearIdleConfig();
   enterInternalState(RuntimeInternalState::Fault);
   runtime_state_.ready = false;
   runtime_state_.robot = robot;

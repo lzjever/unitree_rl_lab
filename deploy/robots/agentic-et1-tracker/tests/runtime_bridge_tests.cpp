@@ -350,6 +350,255 @@ TEST_CASE("RuntimeBridge stop clears idle status and emits stop for idle config"
   REQUIRE_FALSE(bridge.consumeNextCommand().has_value());
 }
 
+TEST_CASE("RuntimeBridge standby preserves idle config and enqueues standby control") {
+  const RuntimeConfig config = runtimeConfig(8);
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  store.publishSnapshot(readySnapshot(ControllerState::StandbyVelocity));
+
+  REQUIRE(bridge.configureIdle({idleMotion("/tmp/idle.trk")}).ok());
+  REQUIRE(store.snapshot().idle.enabled);
+
+  const ControlResult standby = bridge.standby();
+
+  REQUIRE(standby.code == ErrorCode::Ok);
+  REQUIRE(store.snapshot().idle.enabled);
+  REQUIRE(store.snapshot().idle.n == 1);
+  auto command = bridge.consumeNextCommand();
+  REQUIRE(command.has_value());
+  REQUIRE(command->kind == CommandKind::StandbyVelocity);
+  REQUIRE(command->control == ControlMode::StandbyVelocity);
+  command = bridge.consumeNextCommand();
+  REQUIRE(command.has_value());
+  REQUIRE(command->kind == CommandKind::IdleConfig);
+  REQUIRE_FALSE(bridge.consumeNextCommand().has_value());
+}
+
+TEST_CASE("RuntimeStatusStore urgent stop latches public status immediately") {
+  const RuntimeConfig config = runtimeConfig(8);
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+
+  auto running = readySnapshot(ControllerState::Running);
+  MotionStatus active;
+  active.id = "active";
+  active.state = MotionState::Running;
+  running.exec = active;
+  running.active = {ActiveKind::User, active.id};
+  store.publishSnapshot(running);
+
+  const StopResult stopped = bridge.urgentStop();
+
+  REQUIRE(stopped.code == ErrorCode::Ok);
+  REQUIRE(stopped.state == ControllerState::UrgentStopping);
+  REQUIRE(stopped.stop_reason == StopReason::UrgentStop);
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::UrgentStopping);
+  REQUIRE(snapshot.stop_reason == StopReason::UrgentStop);
+  REQUIRE(snapshot.active.kind == ActiveKind::None);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE_FALSE(snapshot.transition.active);
+}
+
+TEST_CASE("RuntimeBridge urgent stop clears idle and queued work immediately") {
+  const RuntimeConfig config = runtimeConfig(8);
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+
+  auto running = readySnapshot(ControllerState::Running);
+  MotionStatus active;
+  active.id = "active";
+  active.state = MotionState::Running;
+  running.exec = active;
+  store.publishSnapshot(running);
+
+  REQUIRE(bridge.configureIdle({idleMotion("/tmp/idle.trk")}).ok());
+  REQUIRE(bridge.submitQueue(executeCommand("queued-a")).ok());
+  REQUIRE(bridge.submitQueue(executeCommand("queued-b")).ok());
+
+  const StopResult stopped = bridge.urgentStop();
+
+  REQUIRE(stopped.code == ErrorCode::Ok);
+  REQUIRE(stopped.state == ControllerState::UrgentStopping);
+  REQUIRE(stopped.stop_reason == StopReason::UrgentStop);
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::UrgentStopping);
+  REQUIRE(snapshot.stop_reason == StopReason::UrgentStop);
+  REQUIRE(snapshot.active.kind == ActiveKind::None);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE_FALSE(snapshot.idle.enabled);
+  REQUIRE(snapshot.idle.n == 0);
+  REQUIRE(snapshot.queue.ids.empty());
+  for (const auto& id : {"queued-a", "queued-b"}) {
+    const auto found = store.findRun(id);
+    REQUIRE(found.code == ErrorCode::Ok);
+    REQUIRE(found.run->state == MotionState::Canceled);
+    REQUIRE(found.run->stop_reason == StopReason::UrgentStop);
+  }
+
+  auto command = bridge.consumeNextCommand();
+  REQUIRE(command.has_value());
+  REQUIRE(command->kind == CommandKind::UrgentStop);
+  REQUIRE_FALSE(bridge.consumeNextCommand().has_value());
+}
+
+TEST_CASE("RuntimeBridge urgent stop with FixStand idle config enqueues urgent command") {
+  const RuntimeConfig config = runtimeConfig(8);
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  store.publishSnapshot(readySnapshot(ControllerState::FixStand));
+
+  REQUIRE(bridge.configureIdle({idleMotion("/tmp/fixstand-idle.trk")}).ok());
+  REQUIRE(store.snapshot().idle.enabled);
+
+  const StopResult stopped = bridge.urgentStop();
+
+  REQUIRE(stopped.code == ErrorCode::Ok);
+  REQUIRE(stopped.state == ControllerState::UrgentStopping);
+  REQUIRE(stopped.stop_reason == StopReason::UrgentStop);
+  REQUIRE_FALSE(store.snapshot().idle.enabled);
+  REQUIRE(store.snapshot().queue.ids.empty());
+
+  auto command = bridge.consumeNextCommand();
+  REQUIRE(command.has_value());
+  REQUIRE(command->kind == CommandKind::UrgentStop);
+  REQUIRE(command->stop_requires_stopping);
+  REQUIRE_FALSE(bridge.consumeNextCommand().has_value());
+}
+
+TEST_CASE("RuntimeBridge fixstand cannot clear pending urgent stop before runtime consumption") {
+  const RuntimeConfig config = runtimeConfig(8);
+
+  SECTION("active run") {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+
+    auto running = readySnapshot(ControllerState::Running);
+    MotionStatus active;
+    active.id = "active";
+    active.state = MotionState::Running;
+    running.exec = active;
+    running.active = {ActiveKind::User, active.id};
+    store.publishSnapshot(running);
+
+    REQUIRE(bridge.urgentStop().state == ControllerState::UrgentStopping);
+    const ControlResult fixstand = bridge.fixStand();
+    REQUIRE(fixstand.code == ErrorCode::ControlStateConflict);
+
+    auto command = bridge.consumeNextCommand();
+    REQUIRE(command.has_value());
+    REQUIRE(command->kind == CommandKind::UrgentStop);
+    REQUIRE_FALSE(bridge.consumeNextCommand().has_value());
+  }
+
+  SECTION("queued run") {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    store.publishSnapshot(readySnapshot(ControllerState::StandbyVelocity));
+
+    REQUIRE(bridge.submitQueue(executeCommand("queued")).ok());
+    REQUIRE(bridge.urgentStop().state == ControllerState::UrgentStopping);
+    const ControlResult fixstand = bridge.fixStand();
+    REQUIRE(fixstand.code == ErrorCode::ControlStateConflict);
+
+    auto command = bridge.consumeNextCommand();
+    REQUIRE(command.has_value());
+    REQUIRE(command->kind == CommandKind::UrgentStop);
+    REQUIRE_FALSE(bridge.consumeNextCommand().has_value());
+  }
+
+  SECTION("idle motion") {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    store.publishSnapshot(readySnapshot(ControllerState::StandbyVelocity));
+
+    REQUIRE(bridge.configureIdle({idleMotion("/tmp/idle.trk")}).ok());
+    REQUIRE(bridge.urgentStop().state == ControllerState::UrgentStopping);
+    const ControlResult fixstand = bridge.fixStand();
+    REQUIRE(fixstand.code == ErrorCode::ControlStateConflict);
+
+    auto command = bridge.consumeNextCommand();
+    REQUIRE(command.has_value());
+    REQUIRE(command->kind == CommandKind::UrgentStop);
+    REQUIRE_FALSE(bridge.consumeNextCommand().has_value());
+  }
+}
+
+TEST_CASE("RuntimeBridge urgent stopping rejects ordinary commands without clearing urgent stop") {
+  const RuntimeConfig config = runtimeConfig(8);
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+
+  auto running = readySnapshot(ControllerState::Running);
+  MotionStatus active;
+  active.id = "active";
+  active.state = MotionState::Running;
+  running.exec = active;
+  running.active = {ActiveKind::User, active.id};
+  store.publishSnapshot(running);
+
+  REQUIRE(bridge.urgentStop().state == ControllerState::UrgentStopping);
+  REQUIRE(bridge.urgentStop().state == ControllerState::UrgentStopping);
+  REQUIRE(bridge.standby().code == ErrorCode::ControlStateConflict);
+  REQUIRE(bridge.submitQueue(executeCommand("queued")).code ==
+          ErrorCode::ControlStateConflict);
+  REQUIRE(bridge.submitInterrupt(executeCommand("interrupt", MotionMode::Interrupt))
+              .code == ErrorCode::ControlStateConflict);
+  REQUIRE(bridge.configureIdle({idleMotion("/tmp/nonempty-idle.trk")}).code ==
+          ErrorCode::ControlStateConflict);
+
+  auto command = bridge.consumeNextCommand();
+  REQUIRE(command.has_value());
+  REQUIRE(command->kind == CommandKind::UrgentStop);
+  REQUIRE_FALSE(bridge.consumeNextCommand().has_value());
+}
+
+TEST_CASE("RuntimeBridge keeps urgent stopping passive and idle clear semantics") {
+  const RuntimeConfig config = runtimeConfig(8);
+
+  SECTION("idle clear is allowed and does not outrank urgent stop") {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    store.publishSnapshot(readySnapshot(ControllerState::StandbyVelocity));
+
+    REQUIRE(bridge.configureIdle({idleMotion("/tmp/idle.trk")}).ok());
+    REQUIRE(bridge.urgentStop().state == ControllerState::UrgentStopping);
+    REQUIRE(bridge.configureIdle({}).ok());
+
+    auto command = bridge.consumeNextCommand();
+    REQUIRE(command.has_value());
+    REQUIRE(command->kind == CommandKind::UrgentStop);
+    command = bridge.consumeNextCommand();
+    REQUIRE(command.has_value());
+    REQUIRE(command->kind == CommandKind::IdleConfig);
+    REQUIRE(command->idle_motions.empty());
+    REQUIRE_FALSE(bridge.consumeNextCommand().has_value());
+  }
+
+  SECTION("passive remains accepted") {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+
+    auto running = readySnapshot(ControllerState::Running);
+    MotionStatus active;
+    active.id = "active";
+    active.state = MotionState::Running;
+    running.exec = active;
+    running.active = {ActiveKind::User, active.id};
+    store.publishSnapshot(running);
+
+    REQUIRE(bridge.urgentStop().state == ControllerState::UrgentStopping);
+    REQUIRE(bridge.passive().ok());
+
+    auto command = bridge.consumeNextCommand();
+    REQUIRE(command.has_value());
+    REQUIRE(command->kind == CommandKind::Passive);
+    REQUIRE_FALSE(bridge.consumeNextCommand().has_value());
+  }
+}
+
 TEST_CASE("RuntimeStatusStore lookup prefers current exec then accepted queue then recent") {
   const RuntimeConfig config = runtimeConfig(4);
   RuntimeStatusStore store(config);

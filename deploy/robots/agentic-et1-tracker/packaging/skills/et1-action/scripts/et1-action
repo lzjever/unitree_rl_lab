@@ -525,7 +525,7 @@ def execute_trk(base, path, mode, wait, timeout, poll, hold=False):
 
 
 def tracker_standby(base, timeout):
-    return http_request(base, "POST", "/standby_velocity", timeout=timeout)
+    return http_request(base, "POST", "/standby", timeout=timeout)
 
 
 def tracker_status(base, timeout):
@@ -540,8 +540,8 @@ def tracker_passive(base, password, timeout):
     return http_request(base, "POST", "/passive", {"password": password}, timeout=timeout)
 
 
-def tracker_stop(base, timeout):
-    return http_request(base, "POST", "/stop", timeout=timeout)
+def tracker_urgent_stop(base, timeout):
+    return http_request(base, "POST", "/urgent_stop", timeout=timeout)
 
 
 def tracker_idle_set(base, paths, timeout):
@@ -872,6 +872,12 @@ def standby_confirm_seconds(timeout):
 
 
 def standby_confirmed(status):
+    ctrl = status.get("ctrl") or status.get("state")
+    if ctrl in {"stopping", "urgent_stopping", "passive", "fault"}:
+        return False
+    exec_status = status.get("exec") if isinstance(status.get("exec"), dict) else {}
+    if exec_status.get("state") == "stopping":
+        return False
     active = status.get("active") if isinstance(status.get("active"), dict) else {}
     return active.get("kind") not in {"user", "transition"}
 
@@ -894,10 +900,10 @@ def standby_cmd(base, timeout, poll):
         if time.monotonic() >= deadline:
             if status and status.get("ok"):
                 fields.update(compact_tracker_state(status))
-            fields["state"] = "stopping"
+            fields["state"] = "standby_pending"
             return err_doc(
                 "standby",
-                "STOP_NOT_CONFIRMED",
+                "STANDBY_NOT_CONFIRMED",
                 "standby sent; motion still active",
                 "status",
                 **fields,
@@ -943,7 +949,8 @@ def passive_cmd(args, base, timeout):
 def urgent_stop_cmd(args, base, timeout):
     if not args.urgent:
         return err_doc("urgent-stop", "REQUEST_INVALID", "urgent-stop requires --urgent", "standby")
-    out = tracker_stop(base, timeout)
+    cancel_active_sequences("urgent-stop")
+    out = tracker_urgent_stop(base, timeout)
     if not out.get("ok"):
         error = out.get("error", {})
         return err_doc("urgent-stop", error.get("code", "TRACKER_STATE_CONFLICT"), error.get("message", "urgent stop failed"), "urgent-stop")
@@ -951,7 +958,7 @@ def urgent_stop_cmd(args, base, timeout):
         "urgent-stop",
         "standby",
         intent="urgent_stop",
-        state="stopped",
+        state="urgent_stop",
         urgent=True,
         accepted=True,
         confirmed=False,
@@ -1767,7 +1774,10 @@ def tracker_status_cmd(base, timeout, cmd="tracker-status"):
         error = out.get("error", {})
         return err_doc(cmd, error.get("code", "TRACKER_STATE_CONFLICT"), error.get("message", "status failed"), "standby")
     motion_mode = current_motion_mode()
-    return ok_doc(cmd, "standby", state=out.get("state") or out.get("ctrl"), motion_mode=motion_mode, executor=executor_for_motion_mode(motion_mode))
+    fields = compact_tracker_state(out)
+    fields["motion_mode"] = motion_mode
+    fields["executor"] = executor_for_motion_mode(motion_mode)
+    return ok_doc(cmd, "standby", **fields)
 
 
 def motion_mode_cmd(args):

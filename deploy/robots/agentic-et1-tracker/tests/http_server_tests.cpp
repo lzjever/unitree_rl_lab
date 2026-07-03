@@ -70,9 +70,19 @@ class FakeSink final : public ExecutionCommandSink {
     return fixstand_result;
   }
 
+  ControlResult standby() override {
+    ++standby_calls;
+    return standby_result;
+  }
+
   ControlResult standbyVelocity() override {
     ++standby_velocity_calls;
     return standby_velocity_result;
+  }
+
+  StopResult urgentStop() override {
+    ++urgent_stop_calls;
+    return urgent_stop_result;
   }
 
   IdleResult configureIdle(std::vector<IdleMotion> motions) override {
@@ -90,13 +100,20 @@ class FakeSink final : public ExecutionCommandSink {
   StopResult stop_result{ErrorCode::Ok, ControllerState::Stopping, StopReason::Stop, 0};
   ControlResult passive_result{ErrorCode::Ok};
   ControlResult fixstand_result{ErrorCode::Ok};
+  ControlResult standby_result{ErrorCode::Ok};
   ControlResult standby_velocity_result{ErrorCode::Ok};
+  StopResult urgent_stop_result{ErrorCode::Ok,
+                                ControllerState::UrgentStopping,
+                                StopReason::UrgentStop,
+                                0};
   int queue_calls{0};
   int interrupt_calls{0};
   int stop_calls{0};
   int passive_calls{0};
   int fixstand_calls{0};
+  int standby_calls{0};
   int standby_velocity_calls{0};
+  int urgent_stop_calls{0};
   int idle_calls{0};
   std::vector<ExecuteCommand> queue_commands;
   std::vector<ExecuteCommand> interrupt_commands;
@@ -493,12 +510,13 @@ TEST_CASE("POST /idle route configures and clears idle paths") {
   REQUIRE(r.h.sink.idle_motions.empty());
 }
 
-TEST_CASE("POST /stop empty body stops and non-empty body is rejected") {
+TEST_CASE("POST /urgent_stop empty body stops and non-empty body is rejected") {
   RunningHarness r;
-  r.h.sink.stop_result = {ErrorCode::Ok, ControllerState::Stopping, StopReason::Stop, 3};
+  r.h.sink.urgent_stop_result = {
+      ErrorCode::Ok, ControllerState::UrgentStopping, StopReason::UrgentStop, 3};
   httplib::Client client("127.0.0.1", r.h.server.boundPort());
 
-  auto result = client.Post("/stop", "", "application/json");
+  auto result = client.Post("/urgent_stop", "", "application/json");
   r.requireJson(result, 200);
   auto body = r.parse(result);
   REQUIRE(body.size() == 2);
@@ -506,14 +524,16 @@ TEST_CASE("POST /stop empty body stops and non-empty body is rejected") {
   REQUIRE(body.at("state") == "accepted");
   REQUIRE_FALSE(body.contains("cleared"));
   REQUIRE_FALSE(body.contains("stop_reason"));
-  REQUIRE(r.h.sink.stop_calls == 1);
+  REQUIRE(r.h.sink.urgent_stop_calls == 1);
+  REQUIRE(r.h.sink.stop_calls == 0);
 
-  result = client.Post("/stop", R"({})", "application/json");
+  result = client.Post("/urgent_stop", R"({})", "application/json");
   r.requireJson(result, 400);
   body = r.parse(result);
   REQUIRE(body.at("ok") == false);
   REQUIRE(body.at("error").at("code") == "REQUEST_INVALID");
-  REQUIRE(r.h.sink.stop_calls == 1);
+  REQUIRE(r.h.sink.urgent_stop_calls == 1);
+  REQUIRE(r.h.sink.stop_calls == 0);
 }
 
 TEST_CASE("POST /passive enforces password-gated HTTP behavior") {
@@ -561,15 +581,25 @@ TEST_CASE("POST control routes are installed and reject non-empty bodies") {
   REQUIRE(r.h.validator.calls == 0);
   REQUIRE(r.h.ids.calls == 0);
 
-  result = client.Post("/standby_velocity", "", "application/json");
+  result = client.Post("/standby", "", "application/json");
   r.requireJson(result, 200);
   body = r.parse(result);
   REQUIRE(body.size() == 2);
   REQUIRE(body.at("ok") == true);
   REQUIRE(body.at("state") == "accepted");
-  REQUIRE(r.h.sink.standby_velocity_calls == 1);
+  REQUIRE(r.h.sink.standby_calls == 1);
+  REQUIRE(r.h.sink.standby_velocity_calls == 0);
   REQUIRE(r.h.validator.calls == 0);
   REQUIRE(r.h.ids.calls == 0);
+
+  result = client.Post("/urgent_stop", "", "application/json");
+  r.requireJson(result, 200);
+  body = r.parse(result);
+  REQUIRE(body.size() == 2);
+  REQUIRE(body.at("ok") == true);
+  REQUIRE(body.at("state") == "accepted");
+  REQUIRE(r.h.sink.urgent_stop_calls == 1);
+  REQUIRE(r.h.sink.stop_calls == 0);
 
   result = client.Post("/fixstand", R"({})", "application/json");
   r.requireJson(result, 400);
@@ -578,20 +608,27 @@ TEST_CASE("POST control routes are installed and reject non-empty bodies") {
   REQUIRE(body.at("error").at("code") == "REQUEST_INVALID");
   REQUIRE(r.h.sink.fixstand_calls == 1);
 
-  result = client.Post("/standby_velocity", R"({})", "application/json");
+  result = client.Post("/standby", R"({})", "application/json");
   r.requireJson(result, 400);
   body = r.parse(result);
   REQUIRE(body.at("ok") == false);
   REQUIRE(body.at("error").at("code") == "REQUEST_INVALID");
-  REQUIRE(r.h.sink.standby_velocity_calls == 1);
+  REQUIRE(r.h.sink.standby_calls == 1);
+
+  result = client.Post("/urgent_stop", R"({})", "application/json");
+  r.requireJson(result, 400);
+  body = r.parse(result);
+  REQUIRE(body.at("ok") == false);
+  REQUIRE(body.at("error").at("code") == "REQUEST_INVALID");
+  REQUIRE(r.h.sink.urgent_stop_calls == 1);
 }
 
-TEST_CASE("POST standby_velocity conflict returns compact next action") {
+TEST_CASE("POST standby conflict returns compact next action") {
   RunningHarness r;
-  r.h.sink.standby_velocity_result = {ErrorCode::ControlStateConflict};
+  r.h.sink.standby_result = {ErrorCode::ControlStateConflict};
   httplib::Client client("127.0.0.1", r.h.server.boundPort());
 
-  const auto result = client.Post("/standby_velocity", "", "application/json");
+  const auto result = client.Post("/standby", "", "application/json");
 
   r.requireJson(result, 409);
   const auto body = r.parse(result);
@@ -600,7 +637,32 @@ TEST_CASE("POST standby_velocity conflict returns compact next action") {
   REQUIRE(body.at("error").at("message") == "wrong ctrl; check /status");
   REQUIRE(body.at("error").at("retryable") == false);
   REQUIRE(body.at("next") == "status");
-  REQUIRE(r.h.sink.standby_velocity_calls == 1);
+  REQUIRE(r.h.sink.standby_calls == 1);
+  REQUIRE(r.h.sink.standby_velocity_calls == 0);
+}
+
+TEST_CASE("POST old control routes return renamed errors over HTTP") {
+  RunningHarness r;
+  httplib::Client client("127.0.0.1", r.h.server.boundPort());
+
+  auto result = client.Post("/standby_velocity", "", "application/json");
+  r.requireJson(result, 400);
+  auto body = r.parse(result);
+  REQUIRE(body.at("ok") == false);
+  REQUIRE(body.at("error").at("code") == "CONTROL_ROUTE_RENAMED");
+  REQUIRE(body.at("next") == "standby");
+
+  result = client.Post("/stop", "", "application/json");
+  r.requireJson(result, 400);
+  body = r.parse(result);
+  REQUIRE(body.at("ok") == false);
+  REQUIRE(body.at("error").at("code") == "CONTROL_ROUTE_RENAMED");
+  REQUIRE(body.at("next") == "urgent_stop");
+
+  REQUIRE(r.h.sink.standby_calls == 0);
+  REQUIRE(r.h.sink.standby_velocity_calls == 0);
+  REQUIRE(r.h.sink.stop_calls == 0);
+  REQUIRE(r.h.sink.urgent_stop_calls == 0);
 }
 
 TEST_CASE("invalid method or unknown route returns JSON request invalid") {

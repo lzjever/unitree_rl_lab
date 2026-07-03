@@ -1,5 +1,12 @@
 # Agentic ET1 Tracker GA 状态机与 Idle 动作池开发计划
 
+> **Historical/Obsolete API names (2026-07):** This file is a historical
+> planning handoff and may still mention old public route names. The GA/current
+> API is `POST /standby` for ordinary standby and `POST /urgent_stop` for urgent
+> stop. Legacy `POST /standby_velocity` and `POST /stop` are not successful
+> aliases; if present they reject with `CONTROL_ROUTE_RENAMED`. Use `README.md`
+> and `CONTROL_STATE_MACHINE_REDESIGN_PLAN.md` as the current contract.
+
 本文档是当前 GA idle/status 实现计划和验收参考，不是临时草稿。
 
 ## 0. 收敛澄清（2026-06-02）

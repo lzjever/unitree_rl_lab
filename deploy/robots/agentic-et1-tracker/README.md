@@ -55,10 +55,20 @@ sessions; the script stops only processes it started. `visual` writes a MuJoCo
 screenshot and a JSON checklist report under `/tmp/agentic-et1-manual-gate` by
 default.
 
+For `--fixture-source auto` or `existing`, manual gate first uses stable named
+fixtures such as `manual_gate_long_c.trk` and `manual_gate_transition_a.trk`
+when they exist and pass `trk_summary`; recent generated actions are fallback
+fixtures only.
+
+Release evidence for manual/e2e/visual coverage comes only from explicitly
+running these commands and recording their artifacts; this README does not claim
+the default local or release pipeline runs them automatically.
+
 For full local simulation acceptance, use an explicit temporary tracker config
 with `--start-tracker --enable-loco-temp --require-loco`. The generated config
-keeps release defaults untouched and lowers only the temporary runtime `hz` to
-make short transition/stopping HTTP windows observable.
+keeps release defaults untouched and uses sim-runtime timing defaults:
+`hz: 1000` and `transition_duration_s: 0.7`. Override only with explicit
+`--temp-hz` or `--temp-transition-duration-s` test arguments.
 
 ## HTTP Contract
 
@@ -87,7 +97,7 @@ Commands:
   projected/clamped and accepted. The loco radius guard applies while the
   loco-upper executor itself is active in `entry`, `motion`, `holding`, and
   bounded `exit`; at the boundary it suppresses outward radial velocity and
-  reports `radius_limit_reached` without entering passive/fault. `/stop` still
+  reports `radius_limit_reached` without entering passive/fault. `/urgent_stop` still
   cancels that executor immediately. The sim example keeps this disabled by
   default; turn it on manually in `config.sim.yaml.example` only when testing
   `/execute_loco_upper`.
@@ -95,15 +105,15 @@ Commands:
   the same client-facing default as `cap.loco_upper.default_radius_m`.
 - `POST /idle`: `{"paths":["/absolute/idle-a.trk","/absolute/idle-b.trk"]}`.
 - `POST /idle`: `{"paths":[]}` clears the idle pool.
-- `POST /stop`: empty body; urgent/immediate software stop. It stops active
-  work, cancels queued work, and clears idle config. Use `/standby_velocity`
+- `POST /urgent_stop`: empty body; urgent/immediate software stop. It stops active
+  work, cancels queued work, and clears idle config. Use `/standby`
   for ordinary stop/standby when idle config should be preserved.
 - `POST /passive`: `{"password":"galaxy"}` by default; enter Passive safety
   sink when LowCmd is free; stops active work, clears queued work, and clears
   the idle pool. Configure the password with top-level `passive_password`.
 - `POST /fixstand`: empty body; enter fixed stand configuration/recovery. This
   is not ordinary quiet standing.
-- `POST /standby_velocity`: empty body; enter ordinary StandbyVelocity/Velocity0
+- `POST /standby`: empty body; enter ordinary standby/Velocity0
   standby while preserving idle config.
 
 `/execute` accepts local `.trk` paths allowed by `motion_dirs` only. It rejects
@@ -120,28 +130,28 @@ replaces the idle pool after validating every path with the same local `.trk`
 rules as `/execute`; any failed path leaves the old idle config unchanged.
 `{"paths":[]}` clears the config without path validation and is accepted in any
 controller state. Non-empty `/idle` is accepted only after the control chain has
-reached StandbyVelocity, or while a user motion is preparing/running. Idle does
+reached standby, or while a user motion is preparing/running. Idle does
 not use `queue.limit`, `queue.ids`, `exec`, or `GET /status?id=...`.
 
-`/standby_velocity` is the ordinary stop/standby command. It does not create a
+`/standby` is the ordinary stop/standby command. It does not create a
 user run and does not clear idle config; with idle motions loaded, background
 idle may restart after the runtime returns to the standby chain.
 
-`/stop` is highest priority for active work and is reserved for urgent/immediate
+`/urgent_stop` is highest priority for active work and is reserved for urgent/immediate
 software stop semantics. It stops idle playback, immediately aborts holding runs
 and internal transitions, cancels queued work, and clears the idle config. It
 does not play `standby_ref.trk`. It preserves the stop watermark: user
 queue/interrupt requests accepted after a pending stop are not canceled by that
 older stop. For loco-upper this is an immediate cancellation path: runtime
 clears the active loco executor state and returns through the existing
-stopping/standby bookkeeping without further loco radius-guard ticks.
+urgent-stop/standby bookkeeping without further loco radius-guard ticks.
 
 Control-changing routes return the current `/status.err` readiness error before
 claiming success when the runtime is unavailable or not ready. Passworded
 `/passive` and `/fixstand` are the software exceptions for
 `block:"bad_orientation"` when LowCmd is not externally occupied; neither
 bypasses `lowcmd_occupied`.
-`/standby_velocity` returns `CONTROL_STATE_CONFLICT` from `passive` and `fault`.
+`/standby` returns `CONTROL_STATE_CONFLICT` from `passive` and `fault`.
 
 Startup safety:
 
@@ -161,11 +171,11 @@ Startup safety:
 Error envelope:
 
 ```json
-{"ok":false,"error":{"code":"CONTROL_STATE_CONFLICT","message":"ctrl=fixstand; /standby_velocity","retryable":false},"next":"standby_velocity"}
+{"ok":false,"error":{"code":"CONTROL_STATE_CONFLICT","message":"ctrl=fixstand; /standby","retryable":false},"next":"standby"}
 ```
 
 `next` is one token-level action: `status`, `retry`, `wait_robot`, `fix`,
-`fixstand`, `standby_velocity`, `stop`, or `manual`.
+`fixstand`, `standby`, `urgent_stop`, or `manual`.
 
 Common error handling:
 
@@ -188,7 +198,7 @@ Status schemas:
 
 ```json
 // GET /status
-{"ok":true,"ready":true,"mode":"sim","robot":"idle","ctrl":"standby_velocity","stop_reason":null,"hz":1000,"active":{"kind":"none","id":null},"exec":null,"queue":{"n":0,"limit":8,"ids":[]},"transition":{"active":false,"target":null,"target_id":null,"target_state":null,"frame":0,"frames":0,"progress":0},"idle":{"enabled":true,"n":2,"active":false,"current":null,"frame":0,"frames":0,"time_s":0,"duration_s":0,"progress":0},"low_ms":0,"block":null,"err":null,"pose":{"q":[1,0,0,0],"g":[0,0,0],"p":null,"v":null},"cap":{"loco_upper":{"enabled":true,"ready":true,"default_radius_m":0.8,"max_radius_m":2.0,"strict_pose":false}}}
+{"ok":true,"ready":true,"mode":"sim","robot":"idle","ctrl":"standby","stop_reason":null,"hz":1000,"active":{"kind":"none","id":null},"exec":null,"queue":{"n":0,"limit":8,"ids":[]},"transition":{"active":false,"target":null,"target_id":null,"target_state":null,"frame":0,"frames":0,"progress":0},"idle":{"enabled":true,"n":2,"active":false,"current":null,"frame":0,"frames":0,"time_s":0,"duration_s":0,"progress":0},"low_ms":0,"block":null,"err":null,"passive_reason":null,"pose":{"q":[1,0,0,0],"g":[0,0,0],"p":null,"v":null},"cap":{"loco_upper":{"enabled":true,"ready":true,"default_radius_m":0.8,"max_radius_m":2.0,"strict_pose":false}}}
 
 // GET /status while idle is playing
 {"ok":true,"ready":true,"mode":"sim","robot":"running","ctrl":"running","stop_reason":null,"hz":1000,"active":{"kind":"idle","id":null},"exec":null,"queue":{"n":0,"limit":8,"ids":[]},"transition":{"active":false,"target":null,"target_id":null,"target_state":null,"frame":0,"frames":0,"progress":0},"idle":{"enabled":true,"n":2,"active":true,"current":0,"frame":12,"frames":120,"time_s":0.24,"duration_s":2.4,"progress":0.1},"low_ms":0,"block":null,"err":null,"pose":{"q":[1,0,0,0],"g":[0,0,0],"p":null,"v":null},"cap":{"loco_upper":{"enabled":true,"ready":true,"default_radius_m":0.8,"max_radius_m":2.0,"strict_pose":false}}}
@@ -217,6 +227,12 @@ applies, `queued` for a user transition target, or `running` for an idle
 transition target.
 `queue_pos` is 1-based and `null` when the user run is not queued. `top_err` is
 the full `/status.err` code or `null`.
+
+`passive_reason` is `null` unless runtime entered Passive through a latched
+safety sink such as `{"code":"ROBOT_BAD_ORIENTATION","block":"bad_orientation"}`.
+It stays set until `/fixstand` starts recovery. Transient startup readiness
+blocks such as `lowstate_missing` remain top-level `err`/`block` only, and
+passworded user `/passive` does not set this field.
 `pose` is intentionally small for frequent polling: `q` is lowstate quaternion
 `[w,x,y,z]`, `g` is lowstate gyro `[x,y,z]`, `p` is highstate position or
 `null`, and `v` is highstate linear velocity or `null`.
@@ -264,27 +280,27 @@ Controller states:
 | ctrl | robot behavior | accepts | rejects/notes |
 | --- | --- | --- | --- |
 | `starting` | Runtime is initializing. | `/status`, `/health` | Control routes return readiness errors such as `SERVICE_NOT_READY` or `MODEL_NOT_READY`; wait for `ready:true`. |
-| `passive` | Safety sink; publishes passive damping command; idle pool is cleared. | `/fixstand`, passworded `/passive`, `/stop`, `/idle {"paths":[]}` | `/execute`, `/standby_velocity`, and non-empty `/idle` return `CONTROL_STATE_CONFLICT`. If `block:"lowcmd_occupied"`, next action is `manual`. |
-| `fixstand` | Holds configured stand posture. | `/standby_velocity`, passworded `/passive`, `/stop`, `/fixstand`, `/idle {"paths":[]}` | `/execute` and non-empty `/idle` return conflict; call `/standby_velocity` first. Passworded `/passive` and `/fixstand` are the `bad_orientation` software recovery exceptions. |
-| `standby_velocity` | Velocity policy with zero command; robot stands idle. | `/execute`, `/idle`, passworded `/passive`, `/fixstand`, `/stop` | Normal state for starting user `.trk`; idle auto-play may start only when ready/safe and no user active/queue exists. |
-| idle active (`active.kind:"idle"`) | GeneralTracker plays an idle pool motion without a user id. | `/execute`, `/stop`, `/idle`, passworded `/passive`, `/fixstand`, `/standby_velocity` | `exec:null`, user `queue` unchanged. User `/execute` preempts idle playback but keeps idle config. |
-| `preparing`/`running` with `active.kind:"user"` | Preparing or executing a user `.trk`. | `/stop`, passworded `/passive`, `/execute` queue/interrupt, `/idle` config/clear | `queue` waits; `interrupt` preempts current user run. Poll `/status?id=<id>`. |
-| holding (`active.kind:"user"`, `exec.state:"holding"`) | Holds the last reference frame of a user `.trk` submitted with `hold:true`. | `/execute` queue/interrupt, `/stop`, passworded `/passive`, `/fixstand`, `/standby_velocity`, `/idle` config/clear | Same user id remains queryable. `/stop`, passworded `/passive`, and `/fixstand` end it immediately; no `standby_ref.trk` playback. |
-| transition active (`active.kind:"transition"`) | Internal synthetic reference transition toward `transition.target`. | `/execute` queue/interrupt, `/stop`, passworded `/passive`, `/fixstand`, `/standby_velocity`, `/idle` config/clear | Not a user run; no id, queue entry, queue limit use, or user history entry. `/stop` aborts immediately. |
-| `stopping` | Stop/interrupt transition to StandbyVelocity or a safety state. | `/status`, passworded `/passive`, `/stop`, `/idle {"paths":[]}` | `/execute` and non-empty `/idle` return conflict at the HTTP API; wait for a stable state. |
-| `fault` | Safety/manual state; no normal track execution. | passworded `/passive` only for `bad_orientation`, `/fixstand`, `/stop`, `/idle {"paths":[]}` | `/execute`, `/standby_velocity`, and non-empty `/idle` return conflict until resolved. `lowcmd_occupied` remains manual/operator. |
+| `passive` | Safety sink; publishes passive damping command; idle pool is cleared. | `/fixstand`, passworded `/passive`, `/urgent_stop`, `/idle {"paths":[]}` | `/execute`, `/standby`, and non-empty `/idle` return `CONTROL_STATE_CONFLICT`. If `block:"lowcmd_occupied"`, next action is `manual`. |
+| `fixstand` | Holds configured stand posture. | `/standby`, passworded `/passive`, `/urgent_stop`, `/fixstand`, `/idle {"paths":[]}` | `/execute` and non-empty `/idle` return conflict; call `/standby` first. Passworded `/passive` and `/fixstand` are the `bad_orientation` software recovery exceptions. |
+| `standby` | Velocity policy with zero command; robot stands idle. Public status reports `ctrl:"standby"`. | `/execute`, `/idle`, passworded `/passive`, `/fixstand`, `/urgent_stop` | Normal state for starting user `.trk`; idle auto-play may start only when ready/safe and no user active/queue exists. |
+| idle active (`active.kind:"idle"`) | GeneralTracker plays an idle pool motion without a user id. | `/execute`, `/standby`, `/urgent_stop`, `/idle`, passworded `/passive`, `/fixstand` | `exec:null`, user `queue` unchanged. User `/execute` preempts idle playback but keeps idle config; `/standby` stops current idle playback and keeps idle config; `/urgent_stop` clears idle config. |
+| `preparing`/`running` with `active.kind:"user"` | Preparing or executing a user `.trk`. | `/standby`, `/urgent_stop`, passworded `/passive`, `/execute` queue/interrupt, `/idle` config/clear | `queue` waits; `interrupt` preempts current user run. Poll `/status?id=<id>`. |
+| holding (`active.kind:"user"`, `exec.state:"holding"`) | Holds the last reference frame of a user `.trk` submitted with `hold:true`. | `/execute` queue/interrupt, `/standby`, `/urgent_stop`, passworded `/passive`, `/fixstand`, `/idle` config/clear | Same user id remains queryable. `/urgent_stop`, passworded `/passive`, and `/fixstand` end it immediately; `/standby` is the ordinary release path. |
+| transition active (`active.kind:"transition"`) | Internal synthetic reference transition toward `transition.target`. | `/execute` queue/interrupt, `/standby`, `/urgent_stop`, passworded `/passive`, `/fixstand`, `/idle` config/clear | Not a user run; no id, queue entry, queue limit use, or user history entry. `/urgent_stop` aborts immediately; `/standby` targets the ordinary standby chain. |
+| `urgent_stopping` | Urgent-stop transition to standby, passive, fault, or manual handling. | `/status`, passworded `/passive`, `/urgent_stop`, `/idle {"paths":[]}` | `/execute` and non-empty `/idle` return conflict at the HTTP API; wait for a stable state. Ordinary `/standby` should not expose generic `stopping` as a success path. |
+| `fault` | Safety/manual state; no normal track execution. | passworded `/passive` only for `bad_orientation`, `/fixstand`, `/urgent_stop`, `/idle {"paths":[]}` | `/execute`, `/standby`, and non-empty `/idle` return conflict until resolved. `lowcmd_occupied` remains manual/operator. |
 
 `/execute` checks request shape, then readiness, then controller state. If
 `starting` is not ready it returns the readiness error, not
 `CONTROL_STATE_CONFLICT`. `/execute` does not enqueue in `idle`, `passive`,
-`fixstand`, `stopping`, or `fault`; those ready controller states return
+`fixstand`, `urgent_stopping`, or `fault`; those ready controller states return
 `CONTROL_STATE_CONFLICT`. In `running` and `preparing`, queue and interrupt
 requests are accepted because the runtime can process them without manual
 control-state steps.
 
-Startup defaults to FixStand. After a `.trk` run finishes or `/stop` completes
-from active motion, the real runtime returns to StandbyVelocity. `/stop` in
-Passive remains Passive, and `/stop` in idle FixStand remains FixStand. The app
+Startup defaults to FixStand. After a `.trk` run finishes or `/standby` completes
+from active motion, the real runtime returns to standby. `/urgent_stop` in
+Passive remains Passive, and `/urgent_stop` in idle FixStand remains FixStand. The app
 does not automatically drive MuJoCo rope timing, keyboard controls, or other
 simulator-side actions; those remain manual operator actions during MuJoCo
 acceptance.
@@ -296,7 +312,7 @@ Release policy/control assets are owned by `agentic-et1-tracker` and live under
 
 - Default GeneralTrackerDR3 policy:
   `config/policy/general_tracker_dr3`
-- StandbyVelocity policy: `config/policy/velocity/v0`
+- Standby/Velocity0 policy: `config/policy/velocity/v0`
 - FixStand posture: `config/posture/fixstand/v0/fixstand.yaml`
 - Passive posture: `config/posture/passive/v0/passive.yaml`
 - Standby reference asset: `config/reference/standby/v0/standby_ref.trk`
@@ -317,9 +333,10 @@ DR3 and CLN/footstate do not add `.et1trk` as a service input.
 `standby_ref.trk` is now an app-owned release asset with simulator visual
 acceptance recorded in its manifest. Runtime playback is gated internally by
 unit-covered transitions from user reference to standby reference and then back
-to StandbyVelocity/Velocity0. The real-robot/operator gate remains pending, and
-this does not claim overall GA. Direct `/standby_velocity` and the
-StandbyVelocity/Velocity0 policy path remain available.
+to standby/Velocity0. The real-robot/operator gate remains pending, and this
+does not claim overall GA. The public ordinary standby route is `/standby`;
+older `standby_velocity` naming is historical/internal, not a release status
+or agent-facing route.
 
 For manual or integration simulation testing in this workspace, the installed
 Unitree MuJoCo simulator under `/home/galbot/works/et1` can be used. Test
@@ -341,17 +358,17 @@ part of the agent-facing command contract.
 This is a manual integration acceptance skeleton, not a complete GA simulation
 evidence script. The standby reference asset has targeted simulator visual
 acceptance, but complete GA simulation evidence still needs recorded queue
-FIFO, interrupt, stop-to-standby_velocity, `/fixstand`, `/standby_velocity`,
+FIFO, interrupt, standby/urgent-stop handoff, `/fixstand`, `/standby`,
 fault/disconnect, and performance results.
 
 This is an acceptance operation-order note only, not a code semantics change or
-new API. If `/status` already reports `ready:true` and
-`ctrl:"standby_velocity"`, smoke and normal acceptance should not first send
+new API. If `/status` already reports `ready:true` and `ctrl:"standby"`,
+smoke and normal acceptance should not first send
 passworded `/passive`. Use passworded `/passive` only for a dedicated passive
 safety-sink scenario after MuJoCo reset/upright state or operator support is
 prepared. To recover from `bad_orientation`, send `/fixstand`, wait for
 `ready:true`, `ctrl:"fixstand"`, `block:null`, and `err:null`, then send
-`/standby_velocity`.
+`/standby`.
 
 Prerequisites:
 
@@ -390,19 +407,19 @@ agentic-et1-tracker \
 TRK=$(find /home/galbot/works/agent-test/generated -maxdepth 1 -name '*.trk' | head -n 1)
 curl http://127.0.0.1:8083/health
 curl http://127.0.0.1:8083/status
-# if already ready with ctrl:"standby_velocity", do not send passworded /passive first
+# if already ready in standby, do not send passworded /passive first
 curl -X POST http://127.0.0.1:8083/fixstand
-curl -X POST http://127.0.0.1:8083/standby_velocity
+curl -X POST http://127.0.0.1:8083/standby
 curl -X POST http://127.0.0.1:8083/execute \
   -H 'Content-Type: application/json' \
   -d "{\"path\":\"$TRK\"}"
 
 # manually control MuJoCo rope/keyboard timing as needed for the scenario
 
-# poll status until frame progress is visible, then stop
+# poll status until frame progress is visible, then enter ordinary standby
 curl http://127.0.0.1:8083/status
-curl -X POST http://127.0.0.1:8083/stop
+curl -X POST http://127.0.0.1:8083/standby
 
-# after done or stop, the top-level controller should be standby_velocity
+# after done or standby, the top-level controller should be standby
 curl http://127.0.0.1:8083/status
 ```

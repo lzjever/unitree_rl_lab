@@ -1,5 +1,12 @@
 # TRK Hold 与 Reference Transition 后续开发计划
 
+> **Historical/Obsolete API names (2026-07):** This file is a historical
+> planning handoff and may still mention old public route names. The GA/current
+> API is `POST /standby` for ordinary standby and `POST /urgent_stop` for urgent
+> stop. Legacy `POST /standby_velocity` and `POST /stop` are not successful
+> aliases; if present they reject with `CONTROL_ROUTE_RENAMED`. Use `README.md`
+> and `CONTROL_STATE_MACHINE_REDESIGN_PLAN.md` as the current contract.
+
 本文档面向 `agentic-et1-tracker` 后续开发 handoff。目标是把用户 `.trk`
 动作结束后的末帧保持、`.trk` reference 到 `.trk` reference 的平滑内部过渡、
 以及内置 standby 过渡 reference asset 收敛到一个小而明确的实现范围。
@@ -19,7 +26,7 @@
   `standby_ref.trk`，内部 playback/abort 行为已有 unit/runtime/release
   selftest 覆盖。targeted standby_ref simulator asset accepted 已记录；broader
   MuJoCo/operator 场景和 real robot GA gates 仍 pending。
-- direct `/standby_velocity` 与 StandbyVelocity/Velocity0 policy 路径仍然可用；
+- direct `/standby` 与 Standby/Velocity0 policy 路径仍然可用；
   standby reference 不替代 Velocity0，也不能作为整体 GA 能力宣称。
 
 ## 1. 目标范围

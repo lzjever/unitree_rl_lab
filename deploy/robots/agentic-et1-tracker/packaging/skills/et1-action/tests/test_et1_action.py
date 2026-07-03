@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "et1-action"
-PACKAGING = ROOT.parents[1]
+PACKAGING = Path(os.environ.get("ET1_ACTION_PACKAGING_ROOT", ROOT.parents[1]))
 P0_NEXT = {
     "run-text",
     "run-trk",
@@ -66,7 +66,7 @@ class TrackerState:
         self.status = {
             "ok": True,
             "state": "running",
-            "ctrl": "standby_velocity",
+            "ctrl": "standby",
             "active": {"kind": "none", "id": None},
             "idle": {"enabled": False, "active": False, "n": 0},
         }
@@ -106,7 +106,7 @@ class Handler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query)
             run_id = query.get("id", [""])[0]
             if run_id:
-                self.send_json({"ok": True, "id": run_id, "state": state.run_state, "ctrl": "standby_velocity"})
+                self.send_json({"ok": True, "id": run_id, "state": state.run_state, "ctrl": "standby"})
             else:
                 if state.status_sequence:
                     self.send_json(state.status_sequence.pop(0))
@@ -126,14 +126,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "id": state.run_id()})
             else:
                 self.send_json({"ok": False, "error": {"code": "MODEL_NOT_READY", "message": "loco_upper disabled"}})
-        elif self.path == "/standby_velocity":
-            self.send_json({"ok": True, "ctrl": "standby_velocity"})
+        elif self.path == "/standby":
+            self.send_json({"ok": True, "ctrl": "standby"})
         elif self.path == "/fixstand":
             self.send_json({"ok": True, "ctrl": "fixstand"})
         elif self.path == "/passive":
             self.send_json({"ok": True, "ctrl": "passive"})
-        elif self.path == "/stop":
-            self.send_json({"ok": True, "stopped": True})
+        elif self.path == "/urgent_stop":
+            self.send_json({"ok": True, "urgent_stop": True})
         elif self.path == "/idle":
             self.send_json({"ok": True, "idle": {"enabled": True, "n": len((payload or {}).get("paths", []))}})
         else:
@@ -344,12 +344,12 @@ print(json.dumps({"ok": True}))
         self.assertEqual(out["ctrl"], "preparing")
         self.assertEqual(out["active"], {"kind": "idle"})
         self.assertEqual(out["idle"], {"enabled": True, "active": True, "n": 2})
-        self.assertEqual([record[1] for record in self.tracker.records], ["/standby_velocity", "/status"])
+        self.assertEqual([record[1] for record in self.tracker.records], ["/standby", "/status"])
 
-    def test_standby_uses_standby_velocity_not_stop_and_preserves_idle_config(self):
+    def test_standby_uses_standby_not_urgent_stop_and_preserves_idle_config(self):
         self.tracker.status = {
             "ok": True,
-            "ctrl": "standby_velocity",
+            "ctrl": "standby",
             "active": {"kind": "none", "id": None},
             "idle": {"enabled": True, "active": False, "n": 2},
         }
@@ -360,8 +360,8 @@ print(json.dumps({"ok": True}))
         self.assertEqual(out["state"], "standby")
         self.assertEqual(out["idle"], {"enabled": True, "active": False, "n": 2})
         post_paths = [record[1] for record in self.tracker.records if record[0] == "POST"]
-        self.assertEqual(post_paths, ["/standby_velocity"])
-        self.assertNotIn("/stop", post_paths)
+        self.assertEqual(post_paths, ["/standby"])
+        self.assertNotIn("/urgent_stop", post_paths)
 
     def test_standby_waits_until_user_motion_leaves_active_state(self):
         self.tracker.status_sequence = [
@@ -373,7 +373,7 @@ print(json.dumps({"ok": True}))
             },
             {
                 "ok": True,
-                "ctrl": "standby_velocity",
+                "ctrl": "standby",
                 "active": {"kind": "none", "id": None},
                 "idle": {"enabled": False, "active": False, "n": 0},
             },
@@ -388,7 +388,7 @@ print(json.dumps({"ok": True}))
         self.assertEqual(out["state"], "standby")
         self.assertEqual(
             [record[1] for record in self.tracker.records],
-            ["/standby_velocity", "/status", "/status"],
+            ["/standby", "/status", "/status"],
         )
 
     def test_standby_returns_clear_error_when_motion_stays_active(self):
@@ -408,8 +408,8 @@ print(json.dumps({"ok": True}))
         self.assertNotEqual(proc.returncode, 0)
         self.assertFalse(out["ok"])
         self.assertEqual(out["cmd"], "standby")
-        self.assertEqual(out["state"], "stopping")
-        self.assertEqual(out["error"]["code"], "STOP_NOT_CONFIRMED")
+        self.assertEqual(out["state"], "standby_pending")
+        self.assertEqual(out["error"]["code"], "STANDBY_NOT_CONFIRMED")
         self.assertEqual(out["next"], "status")
 
     def test_run_text_preset_hit_skips_nl2trk_and_runs_staged_path(self):
@@ -495,7 +495,7 @@ print(json.dumps({"ok": True}))
         self.assertEqual(state["state"], "canceled")
         self.assertIsNone(state["active"])
         self.assertEqual([seg["status"] for seg in state["segments"]], ["canceled", "canceled"])
-        self.assertEqual(self.tracker.records[0][1], "/standby_velocity")
+        self.assertEqual(self.tracker.records[0][1], "/standby")
 
     def test_sequence_start_cancels_existing_sequence(self):
         old_path = self.write_active_sequence()
@@ -756,12 +756,36 @@ print(json.dumps({"ok": True}))
         self.assertEqual(bad["error"]["code"], "REQUEST_INVALID")
         out, _ = self.cli("urgent-stop", "--urgent")
         self.assertEqual(out["intent"], "urgent_stop")
-        self.assertEqual(out["state"], "stopped")
+        self.assertEqual(out["state"], "urgent_stop")
         self.assertTrue(out["urgent"])
         self.assertTrue(out["accepted"])
         self.assertFalse(out["confirmed"])
         paths = [record[1] for record in self.tracker.records if record[0] == "POST"]
-        self.assertEqual(paths, ["/standby_velocity", "/stop"])
+        self.assertEqual(paths, ["/standby", "/urgent_stop"])
+
+    def test_urgent_stop_guard_does_not_cancel_active_sequence(self):
+        state_path = self.write_active_sequence()
+        bad, proc = self.cli("urgent-stop", check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse(bad["ok"])
+        self.assertEqual(bad["error"]["code"], "REQUEST_INVALID")
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["state"], "running")
+        self.assertIsNotNone(state["active"])
+        self.assertEqual([seg["status"] for seg in state["segments"]], ["running", "pending"])
+        self.assertEqual([record[1] for record in self.tracker.records if record[0] == "POST"], [])
+
+    def test_urgent_stop_cancels_existing_sequence_before_tracker_stop(self):
+        state_path = self.write_active_sequence()
+        out, _ = self.cli("urgent-stop", "--urgent")
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["intent"], "urgent_stop")
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["state"], "canceled")
+        self.assertIsNone(state["active"])
+        self.assertEqual(state["last_cmd"], "urgent-stop")
+        self.assertEqual([seg["status"] for seg in state["segments"]], ["canceled", "canceled"])
+        self.assertEqual([record[1] for record in self.tracker.records if record[0] == "POST"], ["/urgent_stop"])
 
     def test_fixstand_is_explicit_stand_configuration(self):
         out, _ = self.cli("fixstand")
@@ -775,7 +799,7 @@ print(json.dumps({"ok": True}))
         self.assertEqual(self.tracker.records[-1][1], "/fixstand")
 
     def test_passive_requires_password(self):
-        out, proc = self.cli("passive", env_extra={"ET1_PASSIVE_PASSWORD": "secret"}, check=False)
+        out, proc = self.cli("passive", check=False)
         self.assertNotEqual(proc.returncode, 0)
         self.assertFalse(out["ok"])
         self.assertEqual(out["cmd"], "passive")
@@ -799,11 +823,12 @@ print(json.dumps({"ok": True}))
         self.assertEqual(self.tracker.records[-1][1], "/passive")
         self.assertEqual(self.tracker.records[-1][2], {"password": "secret"})
 
-    def test_status_public_alias_queries_tracker_status(self):
+    def test_status_public_standby_queries_tracker_status(self):
         out, _ = self.cli("status")
         self.assertTrue(out["ok"])
         self.assertEqual(out["cmd"], "status")
-        self.assertEqual(out["state"], "running")
+        self.assertEqual(out["state"], "standby")
+        self.assertEqual(out["ctrl"], "standby")
         self.assertEqual(self.tracker.records[-1][1], "/status")
 
     def test_idle_load_stages_files_and_calls_idle_set(self):
@@ -1131,7 +1156,7 @@ print(json.dumps({"ok": True}))
         self.wait_for_execs(1)
         self.cli("sequence-interrupt", seq_id, "--text", "new generated", "--duration", "2", "--seed", "7", "--diffusion-steps", "42")
         post_paths = [r[1] for r in self.tracker.records if r[0] == "POST"]
-        self.assertEqual(post_paths[-2:], ["/standby_velocity", "/execute"])
+        self.assertEqual(post_paths[-2:], ["/standby", "/execute"])
         self.assertEqual([c[0] for c in self.calls()], ["nl2trk"])
         self.assertIn("--seed", self.calls()[0][1])
         self.assertIn("7", self.calls()[0][1])
@@ -1162,7 +1187,34 @@ print(json.dumps({"ok": True}))
         self.assertEqual(out["error"]["code"], "WORKER_DIED")
         self.assertEqual(out["next"], "sequence-status")
 
+    def test_skill_docs_reject_old_patrol_recovery_mapping(self):
+        docs = "\n".join(
+            [
+                (ROOT / "SKILL.md").read_text(encoding="utf-8"),
+                (ROOT / "references" / "intent-mapping.md").read_text(encoding="utf-8"),
+                (ROOT / "references" / "sequence-workflow.md").read_text(encoding="utf-8"),
+                (ROOT / "agents" / "openai.yaml").read_text(encoding="utf-8"),
+            ]
+        )
+        for forbidden in (
+            "task_cancel",
+            "patrol_watcher",
+            "自动续接巡逻",
+            "巡逻监控",
+            "恢复之前的工作",
+            "恢复原任务",
+            "重新启动巡逻",
+        ):
+            self.assertNotIn(forbidden, docs)
+        self.assertIn("Do not depend on typed tools, plugins, curl, or multi-tool parallel calls.", docs)
+        self.assertIn("Ordinary stop, pause", docs)
+        self.assertIn("`standby` maps to tracker `POST /standby`", docs)
+        self.assertIn("Direct `run-text` and `run-trk` default to tracker interrupt", docs)
+        self.assertIn("Do not block the turn with `sleep && sequence-status`", docs)
+
     def test_release_packaging_exposes_only_et1_action_skill(self):
+        if not (PACKAGING / "build_release.sh").exists():
+            self.skipTest("release packaging root is not available in installed skill tree")
         build = (PACKAGING / "build_release.sh").read_text(encoding="utf-8")
         self.assertIn("skills/et1-action", build)
         self.assertIn('package_root/bin/et1-action', build)

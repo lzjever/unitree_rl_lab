@@ -21,7 +21,9 @@ class RuntimeBridge final : public ExecutionCommandSink {
   StopResult stop() override;
   ControlResult passive() override;
   ControlResult fixStand() override;
+  ControlResult standby() override;
   ControlResult standbyVelocity() override;
+  StopResult urgentStop() override;
   IdleResult configureIdle(std::vector<IdleMotion> motions) override;
 
   std::optional<Command> consumeNextCommand();
@@ -40,6 +42,7 @@ class RuntimeBridge final : public ExecutionCommandSink {
   void clearPendingControlsAfter(std::uint64_t sequence);
   void clearPendingMotionsAfter(std::uint64_t sequence);
   void clearPendingMotionsThrough(std::uint64_t sequence);
+  void clearAllPendingCommands();
 
   RuntimeStatusStore& status_;
   std::mutex mutex_;

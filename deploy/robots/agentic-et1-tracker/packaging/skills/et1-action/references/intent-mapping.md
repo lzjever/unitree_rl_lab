@@ -11,7 +11,7 @@ Map user interruptions to one workflow command:
 - New user motion request while anything is running: use `run-text` or a new `sequence-start`; these cancel old local sequences and submit the first motion with tracker interrupt. Direct `run-text` and `run-trk` also default to interrupt; use `--mode queue` only for explicit append-after-current tracker work. Raw HTTP `/execute` and `/execute_loco_upper` still default to queue when `mode` is omitted.
 - Immediately change a known active sequence to a ready `.trk`: `sequence-interrupt --trk`.
 - Immediately change a known active sequence to new text: `sequence-interrupt --text`; it cancels old tail work, generates, then submits with tracker interrupt.
-- Ordinary stop, pause, or "do not move": `sequence-cancel` or `standby`.
-- Emergency stop, abort, kill, or explicit urgent wording: `urgent-stop --urgent`.
+- Ordinary stop, pause, "do not move", stand still, resume, relax, "停下", "不要动", "站着别动", "恢复", or "放松": `sequence-cancel` or `standby`; `standby` maps to tracker `POST /standby` and preserves idle config.
+- Emergency stop, abort, kill, explicit urgent/quick stop wording, "紧急停止", or "赶快停止": `urgent-stop --urgent`; it maps to tracker `POST /urgent_stop` and clears idle config.
 
 Do not map hesitation, ordinary cancellation, or status checks to urgent stop.

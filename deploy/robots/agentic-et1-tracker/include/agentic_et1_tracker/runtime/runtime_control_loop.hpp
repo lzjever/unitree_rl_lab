@@ -188,6 +188,7 @@ class RuntimeControlLoop final {
   bool consumePendingCommands();
   void consumeStoppingCommands();
   void handleStop(std::uint64_t sequence, bool requires_stopping);
+  void handleUrgentStop(std::uint64_t sequence);
   void handleControl(ControlMode mode);
   void handleIdleConfig(std::vector<IdleMotion> motions);
   void handleInterrupt(MotionRequest request);
@@ -317,6 +318,7 @@ class RuntimeControlLoop final {
   void stopIdleActive();
   void clearIdleConfig();
   void enterStopping(StopReason reason);
+  void enterUrgentStopping();
   std::size_t ticksForPeriod(double seconds) const;
   std::size_t ticksForRate(double rate_hz) const;
   bool consumeStepDue(std::size_t& ticks_until_next, std::size_t interval_ticks);
@@ -332,7 +334,7 @@ class RuntimeControlLoop final {
   std::size_t velocityPolicyIntervalTicks() const;
   std::size_t activePolicyIntervalTicks() const;
   std::size_t policyStartupHoldPolicySteps(double duration_s) const;
-  std::size_t stopHoldTicks() const;
+  std::size_t stopHoldTicks(StopReason reason) const;
   std::optional<double> transitionDurationForUse() const;
   SyntheticTransitionLimits transitionLimitsForUse() const;
   double transitionSampleFpsForTarget(const TrkTrack& target) const;
@@ -349,6 +351,10 @@ class RuntimeControlLoop final {
       const LowStateSample& low_state,
       const std::optional<HighStateSample>& high_state,
       const TrkFrameView* contact_frame = nullptr) const;
+  std::optional<TrkTrack> controllableStandbySourceTrack(
+      const TrkFrameView& reference_frame,
+      double fps,
+      const TrkFrameView& standby_target_frame);
   void publishActive();
   void publishReferenceActive();
   void publishReferenceTransition();
@@ -402,6 +408,7 @@ class RuntimeControlLoop final {
   std::optional<MotionRequest> active_;
   ActiveKind active_kind_{ActiveKind::None};
   std::shared_ptr<const TrkTrack> active_track_;
+  std::optional<PassiveReason> passive_reason_;
   std::optional<PendingTransition> transition_;
   std::optional<LocoUpperRuntimeState> loco_upper_;
   std::optional<PolicyStepRunner> policy_runner_;

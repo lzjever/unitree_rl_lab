@@ -36,6 +36,8 @@ std::string toString(ErrorCode code) {
       return "RUN_STATE_CONFLICT";
     case ErrorCode::ControlStateConflict:
       return "CONTROL_STATE_CONFLICT";
+    case ErrorCode::ControlRouteRenamed:
+      return "CONTROL_ROUTE_RENAMED";
     case ErrorCode::SafetyLimitTriggered:
       return "SAFETY_LIMIT_TRIGGERED";
     case ErrorCode::InternalError:
@@ -56,10 +58,14 @@ std::string toString(NextAction next) {
       return "fix";
     case NextAction::FixStand:
       return "fixstand";
+    case NextAction::Standby:
+      return "standby";
     case NextAction::StandbyVelocity:
-      return "standby_velocity";
+      return "standby";
+    case NextAction::UrgentStop:
+      return "urgent_stop";
     case NextAction::Stop:
-      return "stop";
+      return "urgent_stop";
     case NextAction::Manual:
       return "manual";
   }
@@ -205,13 +211,15 @@ std::string toString(ControllerState state) {
     case ControllerState::FixStand:
       return "fixstand";
     case ControllerState::StandbyVelocity:
-      return "standby_velocity";
+      return "standby";
     case ControllerState::Preparing:
       return "preparing";
     case ControllerState::Running:
       return "running";
     case ControllerState::Stopping:
       return "stopping";
+    case ControllerState::UrgentStopping:
+      return "urgent_stopping";
     case ControllerState::Fault:
       return "fault";
   }
@@ -225,9 +233,9 @@ std::string toString(ControlMode mode) {
     case ControlMode::FixStand:
       return "fixstand";
     case ControlMode::StandbyVelocity:
-      return "standby_velocity";
+      return "standby";
   }
-  return "standby_velocity";
+  return "standby";
 }
 
 std::string toString(RobotState state) {
@@ -254,6 +262,8 @@ std::string toString(StopReason reason) {
       return "null";
     case StopReason::Stop:
       return "stop";
+    case StopReason::UrgentStop:
+      return "urgent_stop";
     case StopReason::Interrupt:
       return "interrupt";
   }
@@ -294,6 +304,8 @@ ErrorInfo errorInfo(ErrorCode code) {
       return {code, "run state conflicts with the requested action", true, NextAction::Stop};
     case ErrorCode::ControlStateConflict:
       return {code, "wrong ctrl; check /status", false, NextAction::Status};
+    case ErrorCode::ControlRouteRenamed:
+      return {code, "control route was renamed", false, NextAction::Status};
     case ErrorCode::SafetyLimitTriggered:
       return {code, "safety limit triggered", false, NextAction::Manual};
     case ErrorCode::InternalError:

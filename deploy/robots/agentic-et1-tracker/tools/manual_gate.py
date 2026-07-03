@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -72,6 +73,16 @@ FIXTURE_KEYS = (
     "transition_c",
     "loco",
 )
+NAMED_MANUAL_GATE_FIXTURES = {
+    f"manual_gate_{key}.trk": key for key in FIXTURE_KEYS
+}
+STANDBY_CTRLS = ("standby", "standby_velocity")
+UNSTABLE_CTRL_STATES = ("passive", "fault", "stopping", "urgent_stopping")
+USER_PREEMPTED_IDLE_RUN_STATES = ("running", "done", "holding")
+TERMINAL_RUN_STATES = ("done", "stopped", "failed", "canceled")
+FAILED_TERMINAL_RUN_STATES = ("failed", "canceled")
+HOLD_SETTLE_S = 0.25
+VISUAL_CAMERA_TRACK_BODY = "pelvis_link"
 
 
 class TrkCandidate(NamedTuple):
@@ -178,6 +189,12 @@ def parse_sim_control_status(raw: str) -> dict[str, Any]:
         if value in ("0", "1") and key in ("left_contact", "right_contact", "both"):
             parsed[key] = value == "1"
             continue
+        if key == "camera_trackbodyid":
+            try:
+                parsed[key] = int(value)
+            except ValueError:
+                parsed[key] = value
+            continue
         try:
             parsed[key] = float(value)
         except ValueError:
@@ -185,17 +202,25 @@ def parse_sim_control_status(raw: str) -> dict[str, Any]:
     return parsed
 
 
-def sim_control_status(port: int, timeout_ms: int) -> dict[str, Any]:
+def sim_control_command(port: int, timeout_ms: int, command: str) -> dict[str, Any]:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(timeout_ms / 1000.0)
     try:
-        sock.sendto(b"status", ("127.0.0.1", port))
-        data, _ = sock.recvfrom(512)
+        sock.sendto(command.encode("ascii"), ("127.0.0.1", port))
+        data, _ = sock.recvfrom(1024)
         return parse_sim_control_status(data.decode("utf-8", errors="replace"))
     except OSError as err:
         return {"available": False, "error": str(err)}
     finally:
         sock.close()
+
+
+def sim_control_status(port: int, timeout_ms: int) -> dict[str, Any]:
+    return sim_control_command(port, timeout_ms, "status")
+
+
+def sim_control_camera_align(port: int, timeout_ms: int) -> dict[str, Any]:
+    return sim_control_command(port, timeout_ms, "camera_align")
 
 
 def compact_status(status: Any) -> Any:
@@ -215,6 +240,69 @@ def is_user_transition_to(status: Any, target_id: str) -> bool:
     return (transition.get("active") is True and
             transition.get("target") == "user" and
             transition.get("target_id") == target_id)
+
+
+def user_preempted_idle(run_status: Any, status: Any, target_id: str) -> bool:
+    if not isinstance(run_status, dict) or run_status.get("id") != target_id:
+        return False
+    state = run_status.get("state")
+    if state in USER_PREEMPTED_IDLE_RUN_STATES:
+        return True
+    if state != "queued" or not is_user_transition_to(status, target_id):
+        return False
+    transition = status.get("transition") if isinstance(status, dict) else None
+    return isinstance(transition, dict) and transition.get("target_state") == "queued"
+
+
+def active_kind(status: dict[str, Any]) -> str | None:
+    active = status.get("active")
+    if isinstance(active, dict):
+        return active.get("kind")
+    return None
+
+
+def is_standby_ctrl(status: dict[str, Any]) -> bool:
+    return status.get("ctrl") in STANDBY_CTRLS
+
+
+def is_idle_background(status: dict[str, Any]) -> bool:
+    idle = status.get("idle")
+    if not isinstance(idle, dict):
+        return False
+    return idle.get("enabled") is True and idle.get("active") is True and active_kind(status) == "idle"
+
+
+def is_standby_or_idle_background(status: dict[str, Any]) -> bool:
+    return (is_standby_ctrl(status) and active_kind(status) == "none") or is_idle_background(status)
+
+
+def generic_stopping_reason(status: dict[str, Any], label: str) -> str | None:
+    if status.get("ctrl") == "stopping":
+        return f"{label}: ctrl is generic stopping; {compact_status_line(status)}"
+    if status.get("state") == "stopping":
+        return f"{label}: state is generic stopping; {compact_status_line(status)}"
+    exec_state = None
+    exec_status = status.get("exec")
+    if isinstance(exec_status, dict):
+        exec_state = exec_status.get("state")
+    if exec_state == "stopping":
+        return f"{label}: exec.state is generic stopping; {compact_status_line(status)}"
+    return None
+
+
+def idle_config_reason(status: dict[str, Any],
+                       label: str,
+                       *,
+                       enabled: bool,
+                       n: int | None = None) -> str | None:
+    idle = status.get("idle")
+    if not isinstance(idle, dict):
+        return f"{label}: idle status is missing; {compact_status_line(status)}"
+    if idle.get("enabled") is not enabled:
+        return f"{label}: idle.enabled is not {enabled}; {compact_status_line(status)}"
+    if n is not None and idle.get("n") != n:
+        return f"{label}: idle.n is not {n}; {compact_status_line(status)}"
+    return None
 
 
 def compact_status_line(status: dict[str, Any]) -> str:
@@ -237,20 +325,78 @@ def status_clear_reason(status: dict[str, Any],
                         label: str,
                         require_ready: bool = True,
                         require_ctrl: str | None = None,
+                        require_ctrls: tuple[str, ...] | None = None,
                         require_active_none: bool = False,
-                        require_queue_empty: bool = False) -> str | None:
+                        require_queue_empty: bool = False,
+                        forbid_ctrls: tuple[str, ...] = (),
+                        forbid_robot_fault: bool = True) -> str | None:
     if status.get("block") is not None:
         return f"{label}: block is not null ({status.get('block')}); {compact_status_line(status)}"
     if status.get("err") is not None:
         return f"{label}: err is not null ({status.get('err')}); {compact_status_line(status)}"
     if require_ready and status.get("ready") is not True:
         return f"{label}: ready is not true; {compact_status_line(status)}"
+    if forbid_robot_fault and status.get("robot") == "fault":
+        return f"{label}: robot is fault; {compact_status_line(status)}"
+    if status.get("ctrl") in forbid_ctrls:
+        return f"{label}: ctrl is {status.get('ctrl')}; {compact_status_line(status)}"
     if require_ctrl is not None and status.get("ctrl") != require_ctrl:
         return f"{label}: ctrl is not {require_ctrl}; {compact_status_line(status)}"
+    if require_ctrls is not None and status.get("ctrl") not in require_ctrls:
+        return f"{label}: ctrl is not one of {require_ctrls}; {compact_status_line(status)}"
     if require_active_none and (status.get("active") or {}).get("kind") != "none":
         return f"{label}: active.kind is not none; {compact_status_line(status)}"
     if require_queue_empty and (status.get("queue") or {}).get("n") != 0:
         return f"{label}: queue is not empty; {compact_status_line(status)}"
+    return None
+
+
+def sim_root_z_reason(label: str,
+                      sim_status: dict[str, Any],
+                      min_root_z: float) -> str | None:
+    if not sim_status.get("available"):
+        return None
+    root_z = sim_status.get("root_z")
+    if isinstance(root_z, bool) or not isinstance(root_z, (int, float)):
+        return f"{label}: sim-control root_z is not numeric ({root_z})"
+    if root_z < min_root_z:
+        return f"{label}: sim-control root_z {root_z:.3f} < {min_root_z:.3f}"
+    return None
+
+
+def sim_control_required_reason(label: str, sim_status: dict[str, Any]) -> str | None:
+    if not sim_status.get("available"):
+        error = sim_status.get("error")
+        suffix = f" ({error})" if error else ""
+        return f"{label}: sim-control unavailable{suffix}"
+    if sim_status.get("ok") is not True:
+        raw = sim_status.get("raw")
+        suffix = f"; raw={raw}" if raw is not None else ""
+        return f"{label}: sim-control status is not ok{suffix}"
+    return None
+
+
+def visual_camera_reason(sim_status: dict[str, Any],
+                         expected_body: str = VISUAL_CAMERA_TRACK_BODY) -> str | None:
+    reason = sim_control_required_reason("visual camera", sim_status)
+    if reason is not None:
+        return reason
+    camera_fields = ("camera_type", "camera_track_body", "camera_trackbodyid")
+    missing = [field for field in camera_fields if field not in sim_status]
+    if missing:
+        return f"visual camera: sim-control missing camera fields {missing}"
+    if sim_status.get("camera_type") != "tracking":
+        return f"visual camera: camera_type is {sim_status.get('camera_type')}, expected tracking"
+    if sim_status.get("camera_track_body") != expected_body:
+        return (
+            f"visual camera: camera_track_body is {sim_status.get('camera_track_body')}, "
+            f"expected {expected_body}"
+        )
+    trackbodyid = sim_status.get("camera_trackbodyid")
+    if isinstance(trackbodyid, bool) or not isinstance(trackbodyid, (int, float)):
+        return f"visual camera: camera_trackbodyid is not numeric ({trackbodyid})"
+    if trackbodyid < 0:
+        return f"visual camera: camera_trackbodyid {trackbodyid} < 0"
     return None
 
 
@@ -261,16 +407,33 @@ def final_settle_reason(status: dict[str, Any],
         status,
         label="final settle",
         require_ready=True,
-        require_ctrl="standby_velocity",
+        require_ctrls=STANDBY_CTRLS,
         require_active_none=True,
         require_queue_empty=True,
     )
     if reason is not None:
         return reason
-    root_z = sim_status.get("root_z")
-    if sim_status.get("available") and isinstance(root_z, (int, float)) and root_z < min_root_z:
-        return f"final settle: sim-control root_z {root_z:.3f} < {min_root_z:.3f}"
-    return None
+    return sim_root_z_reason("final settle", sim_status, min_root_z)
+
+
+def visual_stability_reason(status: dict[str, Any],
+                            sim_status: dict[str, Any],
+                            min_root_z: float) -> str | None:
+    reason = status_clear_reason(
+        status,
+        label="visual stability",
+        require_ready=True,
+        forbid_ctrls=UNSTABLE_CTRL_STATES,
+    )
+    if reason is not None:
+        return reason
+    reason = sim_control_required_reason("visual stability", sim_status)
+    if reason is not None:
+        return reason
+    reason = sim_root_z_reason("visual stability", sim_status, min_root_z)
+    if reason is not None:
+        return reason
+    return visual_camera_reason(sim_status)
 
 
 def runtime_evidence(args: argparse.Namespace, url: str) -> dict[str, Any]:
@@ -289,15 +452,19 @@ def check_status_checkpoint(args: argparse.Namespace,
                             label: str,
                             *,
                             require_ctrl: str | None = None,
+                            require_ctrls: tuple[str, ...] | None = None,
                             require_active_none: bool = False,
-                            require_queue_empty: bool = False) -> dict[str, Any]:
+                            require_queue_empty: bool = False,
+                            forbid_ctrls: tuple[str, ...] = ()) -> dict[str, Any]:
     status = get(url, "/status")
     reason = status_clear_reason(
         status,
         label=label,
         require_ctrl=require_ctrl,
+        require_ctrls=require_ctrls,
         require_active_none=require_active_none,
         require_queue_empty=require_queue_empty,
+        forbid_ctrls=forbid_ctrls,
     )
     if reason is not None:
         fail(reason, {"failure_evidence": runtime_evidence(args, url)})
@@ -330,6 +497,269 @@ def final_settle_check(args: argparse.Namespace, url: str) -> dict[str, Any]:
         )
     evidence["result"] = "PASS"
     return evidence
+
+
+def visual_stability_check(args: argparse.Namespace, url: str) -> dict[str, Any]:
+    status = get(url, "/status")
+    sim_status = sim_control_status(args.sim_control_port, args.sim_control_timeout_ms)
+    evidence = {
+        "status": compact_status(status),
+        "sim_control": sim_status,
+        "min_root_z": args.min_root_z,
+    }
+    reason = visual_stability_reason(status, sim_status, args.min_root_z)
+    if reason is not None:
+        fail(reason, {"visual_stability": evidence})
+    evidence["result"] = "PASS"
+    evidence["sim_control_result"] = "PASS"
+    return evidence
+
+
+def visual_camera_align_check(args: argparse.Namespace) -> dict[str, Any]:
+    sim_status = sim_control_camera_align(args.sim_control_port, args.sim_control_timeout_ms)
+    evidence: dict[str, Any] = {"sim_control": sim_status}
+    reason = visual_camera_reason(sim_status)
+    if reason is not None:
+        fail(reason, {"visual_camera_align": evidence})
+    evidence["result"] = "PASS"
+    return evidence
+
+
+def standby_handoff_reason(status: dict[str, Any],
+                           sim_status: dict[str, Any],
+                           label: str,
+                           *,
+                           idle_n: int | None = None,
+                           require_idle_enabled: bool = False,
+                           final: bool = False,
+                           min_root_z: float = 0.2) -> str | None:
+    reason = status_clear_reason(
+        status,
+        label=label,
+        require_ready=True,
+        forbid_ctrls=UNSTABLE_CTRL_STATES,
+    )
+    if reason is not None:
+        return reason
+    reason = generic_stopping_reason(status, label)
+    if reason is not None:
+        return reason
+    if require_idle_enabled:
+        reason = idle_config_reason(status, label, enabled=True, n=idle_n)
+        if reason is not None:
+            return reason
+    reason = sim_root_z_reason(label, sim_status, min_root_z)
+    if reason is not None:
+        return reason
+    if final and not is_standby_or_idle_background(status):
+        return f"{label}: final status is neither standby nor idle background; {compact_status_line(status)}"
+    return None
+
+
+def standby_handoff_check(args: argparse.Namespace,
+                          url: str,
+                          label: str,
+                          *,
+                          idle_n: int | None = None,
+                          require_idle_enabled: bool = False,
+                          timeout_s: float = 10.0) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_s
+    samples: list[dict[str, Any]] = []
+    latest_status = None
+    latest_sim = None
+    while time.monotonic() < deadline:
+        latest_status = get(url, "/status")
+        latest_sim = sim_control_status(args.sim_control_port, args.sim_control_timeout_ms)
+        samples.append({
+            "status": compact_status(latest_status),
+            "sim_control": latest_sim,
+        })
+        reason = standby_handoff_reason(
+            latest_status,
+            latest_sim,
+            label,
+            idle_n=idle_n,
+            require_idle_enabled=require_idle_enabled,
+            min_root_z=args.min_root_z,
+        )
+        if reason is not None:
+            fail(reason, {label: {
+                "result": "FAIL",
+                "samples": samples[-8:],
+            }})
+        if is_standby_or_idle_background(latest_status):
+            final_reason = standby_handoff_reason(
+                latest_status,
+                latest_sim,
+                label,
+                idle_n=idle_n,
+                require_idle_enabled=require_idle_enabled,
+                final=True,
+                min_root_z=args.min_root_z,
+            )
+            if final_reason is not None:
+                fail(final_reason, {label: {
+                    "result": "FAIL",
+                    "samples": samples[-8:],
+                }})
+            result = {
+                "result": "PASS",
+                "status": compact_status(latest_status),
+                "sim_control": latest_sim,
+                "samples": samples[-8:],
+            }
+            if latest_sim and latest_sim.get("available"):
+                result["sim_control_result"] = "PASS"
+            else:
+                result["sim_control_result"] = "SKIP"
+                result["sim_control_reason"] = "sim-control unavailable; physical root_z was not checked"
+            return result
+        time.sleep(0.05)
+    fail(
+        f"{label}: timed out waiting for standby or idle background; "
+        f"latest={json.dumps(compact_status(latest_status), sort_keys=True)}",
+        {label: {
+            "result": "FAIL",
+            "latest_status": compact_status(latest_status),
+            "latest_sim_control": latest_sim,
+            "samples": samples[-8:],
+        }},
+    )
+
+
+def urgent_stop_idle_clear_check(args: argparse.Namespace,
+                                 url: str,
+                                 label: str,
+                                 *,
+                                 timeout_s: float = 10.0) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_s
+    samples: list[dict[str, Any]] = []
+    latest_status = None
+    latest_sim = None
+    while time.monotonic() < deadline:
+        latest_status = get(url, "/status")
+        latest_sim = sim_control_status(args.sim_control_port, args.sim_control_timeout_ms)
+        samples.append({
+            "status": compact_status(latest_status),
+            "sim_control": latest_sim,
+        })
+        reason = generic_stopping_reason(latest_status, label)
+        if reason is not None:
+            fail(reason, {label: {
+                "result": "FAIL",
+                "samples": samples[-8:],
+            }})
+        reason = sim_root_z_reason(label, latest_sim, args.min_root_z)
+        if reason is not None:
+            fail(reason, {label: {
+                "result": "FAIL",
+                "samples": samples[-8:],
+            }})
+        idle = latest_status.get("idle") if isinstance(latest_status.get("idle"), dict) else {}
+        idle_cleared = (
+            idle.get("enabled") is False and
+            idle.get("n") == 0 and
+            active_kind(latest_status) not in ("user", "transition")
+        )
+        stable_reason = status_clear_reason(
+            latest_status,
+            label=label,
+            require_ready=True,
+            forbid_ctrls=UNSTABLE_CTRL_STATES,
+        )
+        if idle_cleared and stable_reason is None:
+            result = {
+                "result": "PASS",
+                "status": compact_status(latest_status),
+                "sim_control": latest_sim,
+                "samples": samples[-8:],
+            }
+            if latest_sim and latest_sim.get("available"):
+                result["sim_control_result"] = "PASS"
+            else:
+                result["sim_control_result"] = "SKIP"
+                result["sim_control_reason"] = "sim-control unavailable; physical root_z was not checked"
+            return result
+        time.sleep(0.05)
+    fail(
+        f"{label}: timed out waiting for urgent_stop to clear idle and reach stable status; "
+        f"latest={json.dumps(compact_status(latest_status), sort_keys=True)}",
+        {label: {
+            "result": "FAIL",
+            "latest_status": compact_status(latest_status),
+            "latest_sim_control": latest_sim,
+            "samples": samples[-8:],
+        }},
+    )
+
+
+def visual_action_terminal_check(args: argparse.Namespace,
+                                 url: str,
+                                 run_id: str,
+                                 track: Path) -> dict[str, Any]:
+    timeout_s = trk_terminal_timeout_s(args, track, min_timeout_s=12.0)
+    terminal = poll(
+        "visual action terminal",
+        timeout_s,
+        lambda: run_status(url, run_id),
+        lambda s: s.get("state") in TERMINAL_RUN_STATES,
+    )
+    state = terminal.get("state")
+    evidence = {
+        "id": run_id,
+        "state": state,
+        "run": terminal,
+        "timeout_s": timeout_s,
+    }
+    if state in FAILED_TERMINAL_RUN_STATES:
+        fail(f"visual action terminal state is {state}: {terminal}",
+             {"visual_action_terminal": evidence})
+    evidence["result"] = "PASS"
+    return evidence
+
+
+def visual_action_standby_check(args: argparse.Namespace,
+                                url: str,
+                                label: str = "visual action standby") -> dict[str, Any]:
+    deadline = time.monotonic() + args.standby_timeout
+    samples: list[dict[str, Any]] = []
+    latest_status = None
+    while time.monotonic() < deadline:
+        latest_status = get(url, "/status")
+        samples.append(compact_status(latest_status))
+        reason = status_clear_reason(
+            latest_status,
+            label=label,
+            require_ready=True,
+            require_ctrls=STANDBY_CTRLS,
+            require_active_none=True,
+            require_queue_empty=True,
+            forbid_ctrls=UNSTABLE_CTRL_STATES,
+        )
+        if reason is None:
+            return {
+                "result": "PASS",
+                "status": compact_status(latest_status),
+                "samples": samples[-8:],
+            }
+        if (latest_status.get("ctrl") in UNSTABLE_CTRL_STATES or
+                latest_status.get("block") is not None or
+                latest_status.get("err") is not None or
+                latest_status.get("robot") == "fault"):
+            fail(reason, {label: {
+                "result": "FAIL",
+                "samples": samples[-8:],
+            }})
+        time.sleep(0.05)
+    fail(
+        f"{label}: timed out waiting for standby with no active run and empty queue; "
+        f"latest={json.dumps(compact_status(latest_status), sort_keys=True)}",
+        {label: {
+            "result": "FAIL",
+            "latest_status": compact_status(latest_status),
+            "samples": samples[-8:],
+        }},
+    )
 
 
 def element_count(shape: tuple[int, ...]) -> int:
@@ -491,6 +921,24 @@ def trk_summary(path: Path) -> TrkCandidate | None:
     return TrkCandidate(path=path.resolve(), frames=frames, mtime_ns=stat.st_mtime_ns)
 
 
+def trk_terminal_timeout_s(args: argparse.Namespace,
+                           path: Path,
+                           min_timeout_s: float) -> float:
+    if not getattr(args, "start_tracker", False):
+        return min_timeout_s
+    summary = trk_summary(path)
+    if summary is None:
+        return min_timeout_s
+    hz = getattr(args, "temp_hz", None)
+    transition_s = getattr(args, "temp_transition_duration_s", 0.0)
+    if not isinstance(hz, (int, float)) or not math.isfinite(hz) or hz <= 0.0:
+        return min_timeout_s
+    if not isinstance(transition_s, (int, float)) or not math.isfinite(transition_s):
+        transition_s = 0.0
+    transition_s = max(0.0, transition_s)
+    return max(min_timeout_s, summary.frames / hz + transition_s + 4.0)
+
+
 def is_obvious_synthetic_trk(path: Path, motion_dir: Path) -> bool:
     try:
         relative = path.relative_to(motion_dir)
@@ -498,16 +946,20 @@ def is_obvious_synthetic_trk(path: Path, motion_dir: Path) -> bool:
     except ValueError:
         parts = [part.lower() for part in path.parts]
     name = path.name.lower()
+    for part in parts[:-1]:
+        if part in ("tmp", "temp", "synthetic", "fixture", "fixtures"):
+            return True
+        if part.startswith("tmp") or part.endswith("_tmp"):
+            return True
+        if "manual_gate" in part and name not in NAMED_MANUAL_GATE_FIXTURES:
+            return True
+    if name in NAMED_MANUAL_GATE_FIXTURES:
+        return False
     if name.startswith("manual_gate_") or name.startswith("synthetic_"):
         return True
     if ("manual_gate" in name or "_synthetic" in name or name.startswith("fixture_") or
             "tmp" in name):
         return True
-    for part in parts[:-1]:
-        if part in ("tmp", "temp", "synthetic", "fixture", "fixtures"):
-            return True
-        if part.startswith("tmp") or part.endswith("_tmp") or "manual_gate" in part:
-            return True
     return False
 
 
@@ -529,7 +981,7 @@ def pick_candidate(candidates: list[TrkCandidate], index: int) -> TrkCandidate:
     return candidates[index % len(candidates)]
 
 
-def existing_fixture_paths(candidates: list[TrkCandidate]) -> dict[str, Path]:
+def recent_fixture_paths(candidates: list[TrkCandidate]) -> dict[str, Path]:
     recent = sorted(candidates, key=lambda item: (-item.mtime_ns, str(item.path)))
     short = [item for item in recent if item.frames <= 200]
     if not short:
@@ -549,6 +1001,33 @@ def existing_fixture_paths(candidates: list[TrkCandidate]) -> dict[str, Path]:
         "transition_c": pick_candidate(long, 1).path,
         "loco": pick_candidate(short, 0).path,
     }
+
+
+def named_manual_gate_fixture_candidates(candidates: list[TrkCandidate]) -> dict[str, TrkCandidate]:
+    named: dict[str, TrkCandidate] = {}
+    for candidate in sorted(candidates, key=lambda item: str(item.path)):
+        key = NAMED_MANUAL_GATE_FIXTURES.get(candidate.path.name.lower())
+        if key is not None:
+            named[key] = candidate
+    return named
+
+
+def existing_fixture_paths(candidates: list[TrkCandidate]) -> dict[str, Path] | None:
+    named = named_manual_gate_fixture_candidates(candidates)
+    if len(named) == len(FIXTURE_KEYS):
+        return {key: named[key].path for key in FIXTURE_KEYS}
+
+    fallback_candidates = [
+        candidate for candidate in candidates
+        if candidate.path.name.lower() not in NAMED_MANUAL_GATE_FIXTURES
+    ]
+    if not fallback_candidates:
+        return None
+
+    fixtures = recent_fixture_paths(fallback_candidates)
+    for key, candidate in named.items():
+        fixtures[key] = candidate.path
+    return fixtures
 
 
 def fixture_path_report(fixtures: dict[str, Path],
@@ -581,14 +1060,15 @@ def resolve_fixtures(args: argparse.Namespace,
         candidates = find_existing_trk_candidates(motion_dir)
         if candidates:
             fixtures = existing_fixture_paths(candidates)
-            log(f"[fixtures] source=existing candidates={len(candidates)} motion_dir={motion_dir}")
-            return fixtures, {
-                "source": "existing",
-                "requested": requested,
-                "motion_dir": str(motion_dir),
-                "candidate_count": len(candidates),
-                "selected": fixture_path_report(fixtures, candidates),
-            }
+            if fixtures is not None:
+                log(f"[fixtures] source=existing candidates={len(candidates)} motion_dir={motion_dir}")
+                return fixtures, {
+                    "source": "existing",
+                    "requested": requested,
+                    "motion_dir": str(motion_dir),
+                    "candidate_count": len(candidates),
+                    "selected": fixture_path_report(fixtures, candidates),
+                }
         if requested == "existing":
             fail(
                 f"--fixture-source existing found no usable generated TRK under {motion_dir}; "
@@ -650,8 +1130,8 @@ def wait_ready(url: str, timeout_s: float = 15.0) -> Any:
 
 
 def wait_standby(url: str, timeout_s: float = 8.0) -> Any:
-    return poll("ctrl=standby_velocity", timeout_s, lambda: get(url, "/status"),
-                lambda s: s.get("ctrl") == "standby_velocity" and
+    return poll("ctrl=standby", timeout_s, lambda: get(url, "/status"),
+                lambda s: s.get("ctrl") in STANDBY_CTRLS and
                 s.get("ready") is True)
 
 
@@ -661,18 +1141,18 @@ def recover_to_standby(url: str, passive_password: str) -> Any:
         post(url, "/fixstand")
         poll("ctrl=fixstand after passive", 8, lambda: get(url, "/status"),
              lambda s: s.get("ctrl") == "fixstand")
-    if status.get("ctrl") not in ("standby_velocity", "fixstand"):
-        post(url, "/stop")
-        poll("stable after stop", 8, lambda: get(url, "/status"),
-             lambda s: s.get("ctrl") in ("standby_velocity", "fixstand", "passive"))
+    if status.get("ctrl") not in (*STANDBY_CTRLS, "fixstand"):
+        post(url, "/standby")
+        poll("stable after standby", 8, lambda: get(url, "/status"),
+             lambda s: s.get("ctrl") in (*STANDBY_CTRLS, "fixstand", "passive"))
         status = get(url, "/status")
         if status.get("ctrl") == "passive":
             post(url, "/fixstand")
-            poll("ctrl=fixstand after stop/passive", 8, lambda: get(url, "/status"),
+            poll("ctrl=fixstand after standby/passive", 8, lambda: get(url, "/status"),
                  lambda s: s.get("ctrl") == "fixstand")
     status = get(url, "/status")
     if status.get("ctrl") == "fixstand":
-        post(url, "/standby_velocity")
+        post(url, "/standby")
     return wait_standby(url)
 
 
@@ -734,34 +1214,44 @@ def run_e2e(args: argparse.Namespace, fixtures: dict[str, Path]) -> dict[str, An
         fixstand = poll("ctrl=fixstand", 8, lambda: get(url, "/status"),
                         lambda s: s.get("ctrl") == "fixstand")
         require(fixstand["active"]["kind"] == "none", "fixstand should not expose user active")
-        post(url, "/standby_velocity")
+        post(url, "/standby")
         standby = wait_standby(url)
         require(standby["active"]["kind"] == "none", "standby should have no active user")
         results["startup_control_recovery"] = {
             "result": "PASS",
             "checkpoint": check_status_checkpoint(
                 args, url, "startup_control_recovery",
-                require_ctrl="standby_velocity",
+                require_ctrls=STANDBY_CTRLS,
                 require_active_none=True,
                 require_queue_empty=True,
             ),
         }
 
-        log("[e2e] normal stop vs passive sink idle semantics")
+        log("[e2e] standby vs urgent_stop/passive idle semantics")
         post(url, "/idle", {"paths": [str(fixtures["idle_a"])]})
         idle_set = poll("idle enabled", 8, lambda: get(url, "/status"),
                         lambda s: s["idle"]["enabled"] is True and s["idle"]["n"] == 1)
-        require(idle_set["ctrl"] in ("standby_velocity", "running"),
+        require(idle_set["ctrl"] in (*STANDBY_CTRLS, "running"),
                 f"unexpected ctrl after idle set: {idle_set['ctrl']}")
-        post(url, "/standby_velocity")
-        standby_idle = wait_standby(url)
+        post(url, "/standby")
+        standby_idle_result = standby_handoff_check(
+            args,
+            url,
+            "standby_vs_urgent_stop_passive_sink_standby_idle",
+            idle_n=1,
+            require_idle_enabled=True,
+            timeout_s=args.standby_timeout,
+        )
+        standby_idle = get(url, "/status")
         require(standby_idle["idle"]["enabled"] is True and standby_idle["idle"]["n"] == 1,
-                "standby_velocity should retain idle config")
-        post(url, "/stop")
-        stopped = poll("stop clears idle", 8, lambda: get(url, "/status"),
-                       lambda s: s["idle"]["enabled"] is False and s["idle"]["n"] == 0)
-        require(stopped["ctrl"] == "standby_velocity",
-                f"/stop from standby should stay standby_velocity, got {stopped['ctrl']}")
+                "/standby should retain idle config")
+        post(url, "/urgent_stop")
+        urgent_stop_idle_clear = urgent_stop_idle_clear_check(
+            args,
+            url,
+            "standby_vs_urgent_stop_passive_sink_urgent_stop",
+            timeout_s=args.standby_timeout,
+        )
         recover_to_standby(url, args.passive_password)
         post(url, "/idle", {"paths": [str(fixtures["idle_a"])]})
         poll("idle reset before passive", 8, lambda: get(url, "/status"),
@@ -773,13 +1263,15 @@ def run_e2e(args: argparse.Namespace, fixtures: dict[str, Path]) -> dict[str, An
         post(url, "/fixstand")
         poll("fixstand after passive", 8, lambda: get(url, "/status"),
              lambda s: s["ctrl"] == "fixstand")
-        post(url, "/standby_velocity")
+        post(url, "/standby")
         wait_standby(url)
-        results["normal_stop_vs_passive_sink"] = {
+        results["standby_vs_urgent_stop_passive_sink"] = {
             "result": "PASS",
+            "standby_idle": standby_idle_result,
+            "urgent_stop_idle_clear": urgent_stop_idle_clear,
             "checkpoint": check_status_checkpoint(
-                args, url, "normal_stop_vs_passive_sink",
-                require_ctrl="standby_velocity",
+                args, url, "standby_vs_urgent_stop_passive_sink",
+                require_ctrls=STANDBY_CTRLS,
                 require_active_none=True,
                 require_queue_empty=True,
             ),
@@ -790,10 +1282,19 @@ def run_e2e(args: argparse.Namespace, fixtures: dict[str, Path]) -> dict[str, An
         poll("idle active or configured", 8, lambda: get(url, "/status"),
              lambda s: s["idle"]["enabled"] is True and s["idle"]["n"] == 2)
         user_id = execute(url, fixtures["short"], mode="queue")
-        user = poll("user preempts idle", 8, lambda: run_status(url, user_id),
-                    lambda s: s["state"] in ("running", "done", "holding"))
+        user_preempt = poll(
+            "user preempts idle",
+            args.transition_timeout,
+            lambda: {
+                "run": run_status(url, user_id),
+                "status": get(url, "/status"),
+            },
+            lambda s: user_preempted_idle(s["run"], s["status"], user_id),
+        )
+        user = user_preempt["run"]
         require(user["id"] == user_id, "user status id mismatch")
-        poll("user terminal", 12, lambda: run_status(url, user_id),
+        user_terminal_timeout = trk_terminal_timeout_s(args, fixtures["short"], 12.0)
+        poll("user terminal", user_terminal_timeout, lambda: run_status(url, user_id),
              lambda s: s["state"] in ("done", "stopped", "failed"))
         resumed = poll("idle resumes after user terminal", 10, lambda: get(url, "/status"),
                        lambda s: s["idle"]["enabled"] is True and s["active"]["kind"] == "idle")
@@ -808,11 +1309,76 @@ def run_e2e(args: argparse.Namespace, fixtures: dict[str, Path]) -> dict[str, An
             "result": "PASS",
             "checkpoint": check_status_checkpoint(
                 args, url, "idle_set_preempt_resume_clear",
-                require_ctrl="standby_velocity",
+                require_ctrls=STANDBY_CTRLS,
                 require_active_none=True,
                 require_queue_empty=True,
             ),
         }
+
+        log("[e2e] active_user_idle_enabled_standby_handoff")
+        post(url, "/idle", {"paths": [str(fixtures["idle_a"]), str(fixtures["idle_b"])]})
+        poll("idle enabled for active user standby", 8, lambda: get(url, "/status"),
+             lambda s: s["idle"]["enabled"] is True and s["idle"]["n"] == 2)
+        active_idle_user_id = execute(url, fixtures["long_a"], mode="interrupt")
+        active_idle_user = poll("active user with idle enabled", 10, lambda: get(url, "/status"),
+                                lambda s: active_kind(s) == "user" and
+                                ((s.get("exec") or {}).get("id") == active_idle_user_id or
+                                 (s.get("active") or {}).get("id") == active_idle_user_id))
+        require(active_idle_user["idle"]["enabled"] is True and active_idle_user["idle"]["n"] == 2,
+                "active user standby hard gate requires idle config to be enabled before /standby")
+        post(url, "/standby")
+        active_user_standby = standby_handoff_check(
+            args,
+            url,
+            "active_user_idle_enabled_standby_handoff",
+            idle_n=2,
+            require_idle_enabled=True,
+            timeout_s=args.standby_timeout,
+        )
+        active_user_terminal = poll("active user terminal after standby", 10,
+                                    lambda: run_status(url, active_idle_user_id),
+                                    lambda s: s["state"] in ("stopped", "done", "holding", "canceled"))
+        require(active_user_terminal["state"] != "canceled",
+                f"/standby should stop or complete active user, not cancel it: {active_user_terminal}")
+        results["active_user_idle_enabled_standby_handoff"] = {
+            "result": "PASS",
+            "id": active_idle_user_id,
+            "before": compact_status(active_idle_user),
+            "terminal": {"state": active_user_terminal["state"]},
+            "handoff": active_user_standby,
+        }
+        post(url, "/idle", {"paths": []})
+        recover_to_standby(url, args.passive_password)
+
+        log("[e2e] active_user_idle_enabled_urgent_stop_clears_idle")
+        post(url, "/idle", {"paths": [str(fixtures["idle_a"]), str(fixtures["idle_b"])]})
+        poll("idle enabled for active user urgent_stop", 8, lambda: get(url, "/status"),
+             lambda s: s["idle"]["enabled"] is True and s["idle"]["n"] == 2)
+        urgent_user_id = execute(url, fixtures["long_b"], mode="interrupt")
+        urgent_user = poll("active user before urgent_stop", 10, lambda: get(url, "/status"),
+                           lambda s: active_kind(s) == "user" and
+                           ((s.get("exec") or {}).get("id") == urgent_user_id or
+                            (s.get("active") or {}).get("id") == urgent_user_id))
+        require(urgent_user["idle"]["enabled"] is True and urgent_user["idle"]["n"] == 2,
+                "active user urgent_stop gate requires idle config to be enabled before /urgent_stop")
+        post(url, "/urgent_stop")
+        urgent_stop_clear = urgent_stop_idle_clear_check(
+            args,
+            url,
+            "active_user_idle_enabled_urgent_stop_clears_idle",
+            timeout_s=args.standby_timeout,
+        )
+        urgent_terminal = poll("active user terminal after urgent_stop", 10,
+                               lambda: run_status(url, urgent_user_id),
+                               lambda s: s["state"] in ("stopped", "done", "failed", "canceled"))
+        results["active_user_idle_enabled_urgent_stop_clears_idle"] = {
+            "result": "PASS",
+            "id": urgent_user_id,
+            "before": compact_status(urgent_user),
+            "terminal": {"state": urgent_terminal["state"]},
+            "urgent_stop": urgent_stop_clear,
+        }
+        recover_to_standby(url, args.passive_password)
 
         log("[e2e] queue_interrupt_status_contract")
         a_id = execute(url, fixtures["long_a"], mode="queue")
@@ -834,7 +1400,7 @@ def run_e2e(args: argparse.Namespace, fixtures: dict[str, Path]) -> dict[str, An
                 f"A stop_reason should be interrupt: {a_terminal}")
         require(b_terminal["stop_reason"] == "interrupt",
                 f"B stop_reason should be interrupt: {b_terminal}")
-        post(url, "/stop")
+        post(url, "/standby")
         wait_standby(url)
         results["queue_interrupt_status_contract"] = {
             "result": "PASS",
@@ -843,13 +1409,40 @@ def run_e2e(args: argparse.Namespace, fixtures: dict[str, Path]) -> dict[str, An
             "C": {"id": c_id, "state": c_active["state"]},
             "checkpoint": check_status_checkpoint(
                 args, url, "queue_interrupt_status_contract",
-                require_ctrl="standby_velocity",
+                require_ctrls=STANDBY_CTRLS,
                 require_active_none=True,
                 require_queue_empty=True,
             ),
         }
 
-        log("[e2e] transition_interrupt_and_stopping_conflict")
+        log("[e2e] short_hold_settle_standby")
+        hold_id = execute(url, fixtures["short"], mode="queue", hold=True)
+        held = poll("hold action holding", 12, lambda: run_status(url, hold_id),
+                    lambda s: s["state"] == "holding")
+        time.sleep(HOLD_SETTLE_S)
+        hold_settle = check_status_checkpoint(
+            args,
+            url,
+            "short_hold_settle_standby hold settle",
+            forbid_ctrls=UNSTABLE_CTRL_STATES,
+        )
+        post(url, "/standby")
+        wait_standby(url)
+        results["short_hold_settle_standby"] = {
+            "result": "PASS",
+            "id": hold_id,
+            "holding": {"state": held["state"]},
+            "settle_s": HOLD_SETTLE_S,
+            "hold_settle": hold_settle,
+            "checkpoint": check_status_checkpoint(
+                args, url, "short_hold_settle_standby",
+                require_ctrls=STANDBY_CTRLS,
+                require_active_none=True,
+                require_queue_empty=True,
+            ),
+        }
+
+        log("[e2e] transition_interrupt_and_standby_handoff")
         recover_to_standby(url, args.passive_password)
         ta_id = execute(url, fixtures["transition_a"], mode="queue")
         tb_id = execute(url, fixtures["transition_b"], mode="queue")
@@ -872,35 +1465,22 @@ def run_e2e(args: argparse.Namespace, fixtures: dict[str, Path]) -> dict[str, An
         old_target = poll("old transition target terminal", 5,
                           lambda: run_status(url, tb_id),
                           lambda s: s["state"] in ("canceled", "stopped"))
-        stopping_queue = after_interrupt_status["queue"]
-        post(url, "/standby_velocity")
-        control_after_standby = poll("ctrl=stopping or standby after transition standby",
-                                     args.stopping_timeout,
-                                     lambda: get(url, "/status"),
-                                     lambda s: s["ctrl"] in ("stopping", "standby_velocity"))
-        stopping_observed = control_after_standby["ctrl"] == "stopping"
-        stopping_queue = control_after_standby["queue"]
-        conflict = None
-        if stopping_observed:
-            conflict = execute_response(url, fixtures["transition_b"], mode="interrupt", expected=409)
-            require(conflict["error"]["code"] == "CONTROL_STATE_CONFLICT",
-                    f"execute during stopping should return CONTROL_STATE_CONFLICT: {conflict}")
-            require(conflict["next"] == "status",
-                    f"execute during stopping should advise status: {conflict}")
-            require("id" not in conflict, f"409 response should not allocate/expose an id: {conflict}")
-            after_conflict = get(url, "/status")
-            require(after_conflict["queue"] == stopping_queue,
-                    f"execute during stopping should not change queue: before={stopping_queue} after={after_conflict['queue']}")
-        else:
-            stopped_after_standby = poll("interrupt target stopped after standby",
-                                         5,
-                                         lambda: run_status(url, tc_id),
-                                         lambda s: s["state"] in ("stopped", "canceled", "done"))
-            require(stopped_after_standby["state"] != "canceled",
-                    f"standby_velocity should stop or complete interrupt target, not cancel it: {stopped_after_standby}")
-            after_fast_standby = get(url, "/status")
-            require(after_fast_standby["queue"] == stopping_queue,
-                    f"fast standby should not change queue: before={stopping_queue} after={after_fast_standby['queue']}")
+        post(url, "/standby")
+        standby_after_transition = standby_handoff_check(
+            args,
+            url,
+            "transition_interrupt_and_standby_handoff",
+            timeout_s=args.standby_timeout,
+        )
+        stopped_after_standby = poll("interrupt target stopped after standby",
+                                     5,
+                                     lambda: run_status(url, tc_id),
+                                     lambda s: s["state"] in ("stopped", "canceled", "done"))
+        require(stopped_after_standby["state"] != "canceled",
+                f"/standby should stop or complete interrupt target, not cancel it: {stopped_after_standby}")
+        after_fast_standby = get(url, "/status")
+        require(after_fast_standby["queue"]["ids"] == [],
+                f"/standby should not leave queued ids: {after_fast_standby['queue']}")
         poll("transition A terminal", 10, lambda: run_status(url, ta_id),
              lambda s: s["state"] in ("done", "stopped", "canceled"))
         poll("transition B terminal", 10, lambda: run_status(url, tb_id),
@@ -908,17 +1488,17 @@ def run_e2e(args: argparse.Namespace, fixtures: dict[str, Path]) -> dict[str, An
         poll("transition C terminal", 10, lambda: run_status(url, tc_id),
              lambda s: s["state"] in ("stopped", "canceled", "done"))
         wait_standby(url)
-        results["transition_interrupt_and_stopping_conflict"] = {
+        results["transition_interrupt_and_standby_handoff"] = {
             "result": "PASS",
             "initial_target": tb_id,
             "interrupt_target": tc_id,
             "pre_interrupt_queue": before_interrupt_queue,
-            "stopping_observed": stopping_observed,
-            "stopping_conflict_checked": conflict is not None,
-            "stopping_queue": stopping_queue,
+            "interrupt_running": {"state": c_running["state"]},
+            "old_target": {"state": old_target["state"]},
+            "handoff": standby_after_transition,
             "checkpoint": check_status_checkpoint(
-                args, url, "transition_interrupt_and_stopping_conflict",
-                require_ctrl="standby_velocity",
+                args, url, "transition_interrupt_and_standby_handoff",
+                require_ctrls=STANDBY_CTRLS,
                 require_active_none=True,
                 require_queue_empty=True,
             ),
@@ -935,7 +1515,7 @@ def run_e2e(args: argparse.Namespace, fixtures: dict[str, Path]) -> dict[str, An
                 "reason": "disabled by config",
                 "checkpoint": check_status_checkpoint(
                     args, url, "loco_upper_bounded_blackbox_skip",
-                    require_ctrl="standby_velocity",
+                    require_ctrls=STANDBY_CTRLS,
                     require_active_none=True,
                     require_queue_empty=True,
                 ),
@@ -951,14 +1531,34 @@ def run_e2e(args: argparse.Namespace, fixtures: dict[str, Path]) -> dict[str, An
             for field in ("max_radius_m", "distance_m", "phase", "radius_clamped",
                           "radius_limit_reached", "upper_clamped"):
                 require(field in loco, f"missing loco status field {field}: {status}")
-            post(url, "/stop")
-            wait_standby(url)
+            active_loco = poll(
+                "active loco before urgent_stop",
+                10,
+                lambda: get(url, "/status"),
+                lambda s: active_kind(s) == "user" and
+                ((s.get("active") or {}).get("id") == loco_id or
+                 (s.get("exec") or {}).get("id") == loco_id) and
+                (s.get("exec") or {}).get("executor") == "loco_upper",
+            )
+            post(url, "/urgent_stop")
+            urgent_stop_clear = urgent_stop_idle_clear_check(
+                args,
+                url,
+                "loco_upper_bounded_blackbox_urgent_stop",
+                timeout_s=args.standby_timeout,
+            )
+            terminal = poll("loco terminal after urgent_stop",
+                            10,
+                            lambda: run_status(url, loco_id),
+                            lambda s: s["state"] in ("stopped", "done", "failed", "canceled"))
             results["loco_upper_bounded_blackbox"] = {
                 "result": "PASS",
                 "id": loco_id,
+                "active": compact_status(active_loco),
+                "terminal": {"state": terminal["state"]},
+                "urgent_stop": urgent_stop_clear,
                 "checkpoint": check_status_checkpoint(
                     args, url, "loco_upper_bounded_blackbox",
-                    require_ctrl="standby_velocity",
                     require_active_none=True,
                     require_queue_empty=True,
                 ),
@@ -1085,9 +1685,12 @@ def run_visual(args: argparse.Namespace, fixtures: dict[str, Path]) -> dict[str,
     else:
         result["action"] = {
             "submitted": False,
-            "reason": "visual_run_action=false; capture allowed even when tracker is non-ready",
+            "reason": "visual_run_action=false; action submission skipped before capture",
         }
 
+    result["camera_align"] = visual_camera_align_check(args)
+    if result["camera_align"].get("result") == "PASS":
+        time.sleep(0.2)
     capture_screenshot(screenshot, args.screenshot_command)
     require(screenshot.exists(), f"screenshot was not created: {screenshot}")
     size_bytes = screenshot.stat().st_size
@@ -1097,17 +1700,32 @@ def run_visual(args: argparse.Namespace, fixtures: dict[str, Path]) -> dict[str,
     require(dims is not None, "screenshot is not a PNG/JPEG with readable dimensions")
     require(dims[0] >= args.min_screenshot_width and dims[1] >= args.min_screenshot_height,
             f"screenshot dimensions too small: {dims}")
+    stability = visual_stability_check(args, url)
+    if args.visual_run_action:
+        result["action"]["terminal"] = visual_action_terminal_check(
+            args, url, result["action"]["id"], fixtures["short"])
+        result["action"]["standby"] = visual_action_standby_check(args, url)
+        result["final_settle"] = final_settle_check(args, url)
     result.update({
         "result": "PASS",
-        "post_status": runtime_evidence(args, url),
+        "post_status": {
+            "status": stability["status"],
+            "sim_control": stability["sim_control"],
+        },
+        "stability": stability,
         "screenshot": str(screenshot),
         "bytes": size_bytes,
         "dimensions": {"width": dims[0], "height": dims[1]},
         "checklist": [
             "MuJoCo process was present",
             "action was submitted before capture" if args.visual_run_action else "action submission skipped by flag",
+            "camera_align was applied through sim-control",
             "screenshot file exists",
             "screenshot dimensions and byte size passed minimum checks",
+            "post-capture tracker, sim-control stability, and camera tracking checks passed",
+            "action reached a non-failed terminal state" if args.visual_run_action else "no action terminal wait required",
+            "tracker returned to standby with no active run and empty queue" if args.visual_run_action else "no action standby wait required",
+            "final settle check passed" if args.visual_run_action else "final settle skipped without visual action",
             "operator still must visually inspect posture/no-fall/no-snap",
         ],
     })
@@ -1228,7 +1846,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--passive-password", default="galaxy")
     parser.add_argument("--ready-timeout", type=float, default=20.0)
     parser.add_argument("--transition-timeout", type=float, default=8.0)
-    parser.add_argument("--stopping-timeout", type=float, default=8.0)
+    parser.add_argument("--standby-timeout", type=float, default=8.0)
     parser.add_argument("--require-loco", action="store_true",
                         help="fail instead of skip when loco_upper is disabled")
     parser.add_argument("--loco-radius", type=float, default=0.8)
@@ -1248,9 +1866,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--domain-id", type=int, default=0)
     parser.add_argument("--enable-loco-temp", action="store_true",
                         help="enable loco_upper in the generated temp config")
-    parser.add_argument("--temp-transition-duration-s", type=float, default=2.0,
+    parser.add_argument("--temp-transition-duration-s", type=float, default=0.7,
                         help="transition_duration_s used only in generated --start-tracker config")
-    parser.add_argument("--temp-hz", type=float, default=10.0,
+    parser.add_argument("--temp-hz", type=float, default=1000.0,
                         help="runtime hz used only in generated --start-tracker config")
 
     parser.add_argument("--start-mujoco-cmd",

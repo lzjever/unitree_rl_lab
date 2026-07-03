@@ -74,6 +74,11 @@ struct PoseSnapshot {
   std::optional<std::array<float, 3>> velocity_xyz;
 };
 
+struct PassiveReason {
+  ErrorCode code{ErrorCode::Ok};
+  std::string block;
+};
+
 struct StatusSnapshot {
   bool ready{false};
   RuntimeMode mode{RuntimeMode::Unknown};
@@ -89,6 +94,7 @@ struct StatusSnapshot {
   std::size_t low_ms{0};
   std::string block;
   ErrorCode err{ErrorCode::Ok};
+  std::optional<PassiveReason> passive_reason;
   PoseSnapshot pose;
   LocoUpperCapability loco_upper;
 };

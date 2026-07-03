@@ -1,5 +1,12 @@
 # agentic-et1-tracker adaptive motion handoff GA 收口计划
 
+> **Historical/Obsolete API names (2026-07):** This file is a historical
+> planning handoff and may still mention old public route names. The GA/current
+> API is `POST /standby` for ordinary standby and `POST /urgent_stop` for urgent
+> stop. Legacy `POST /standby_velocity` and `POST /stop` are not successful
+> aliases; if present they reject with `CONTROL_ROUTE_RENAMED`. Use `README.md`
+> and `CONTROL_STATE_MACHINE_REDESIGN_PLAN.md` as the current contract.
+
 本文按当前 reviewer 结论收口 adaptive motion handoff。它不是从零实现方案，也不再把已经完成的 core adaptive transition 能力继续列为待实现 delta。当前阶段只做 GA 合同收口、测试补齐和 release 验收。
 
 GA 策略保持 KISS/DRY/YAGNI：

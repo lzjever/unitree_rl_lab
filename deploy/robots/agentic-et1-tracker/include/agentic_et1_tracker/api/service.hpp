@@ -80,6 +80,8 @@ class ExecutionCommandSink {
   virtual ControlResult passive() = 0;
   virtual ControlResult fixStand() = 0;
   virtual ControlResult standbyVelocity() = 0;
+  virtual ControlResult standby() = 0;
+  virtual StopResult urgentStop() = 0;
   virtual IdleResult configureIdle(std::vector<IdleMotion> motions) = 0;
 };
 
@@ -124,9 +126,12 @@ class AgentApiService {
   ApiResponse executeLocoUpper(const std::string& body);
   ApiResponse idle(const std::string& body);
   ApiResponse stop(const std::string& body);
+  ApiResponse urgentStop(const std::string& body);
   ApiResponse passive(const std::string& body);
   ApiResponse fixStand(const std::string& body);
+  ApiResponse standby(const std::string& body);
   ApiResponse standbyVelocity(const std::string& body);
+  ApiResponse renamedRoute(const std::string& message, NextAction next);
   ApiResponse status(const std::string& target);
   ApiResponse health();
   ApiResponse error(ErrorCode code);

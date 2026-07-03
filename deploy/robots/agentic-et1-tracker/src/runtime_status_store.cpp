@@ -149,7 +149,20 @@ std::vector<std::string> acceptedQueuedIds(const std::deque<MotionStatus>& accep
 bool hasActiveOrStopping(const StatusSnapshot& snapshot) {
   return snapshot.exec.has_value() || snapshot.ctrl == ControllerState::Preparing ||
          snapshot.ctrl == ControllerState::Running ||
-         snapshot.ctrl == ControllerState::Stopping;
+         snapshot.ctrl == ControllerState::Stopping ||
+         snapshot.ctrl == ControllerState::UrgentStopping;
+}
+
+bool hasActiveOwnerOrStopping(const StatusSnapshot& snapshot) {
+  return snapshot.active.kind != ActiveKind::None || hasActiveOrStopping(snapshot);
+}
+
+bool urgentStopping(const StatusSnapshot& snapshot) {
+  return snapshot.ctrl == ControllerState::UrgentStopping;
+}
+
+bool controlBlockedByUrgentStop(const StatusSnapshot& snapshot, ControlMode mode) {
+  return urgentStopping(snapshot) && mode != ControlMode::Passive;
 }
 
 bool hasActivePublishedRun(const std::deque<MotionStatus>& statuses) {
@@ -264,6 +277,10 @@ HealthSnapshot RuntimeStatusStore::health() const {
 ExecuteResult RuntimeStatusStore::acceptQueued(const ExecuteCommand& command,
                                                std::uint64_t sequence) {
   std::lock_guard<std::mutex> lock(mutex_);
+  if (urgentStopping(snapshot_)) {
+    return {ErrorCode::ControlStateConflict, command.id, MotionState::Queued,
+            queuedIdsLocked().size()};
+  }
   const std::size_t current_queue_size = queuedIdsLocked().size();
   if (current_queue_size >= config_.queue_limit) {
     return {ErrorCode::QueueFull, command.id, MotionState::Queued, current_queue_size};
@@ -276,6 +293,10 @@ ExecuteResult RuntimeStatusStore::acceptQueued(const ExecuteCommand& command,
 ExecuteResult RuntimeStatusStore::acceptInterrupt(const ExecuteCommand& command,
                                                   std::uint64_t sequence) {
   std::lock_guard<std::mutex> lock(mutex_);
+  if (urgentStopping(snapshot_)) {
+    return {ErrorCode::ControlStateConflict, command.id, MotionState::Queued,
+            queuedIdsLocked().size()};
+  }
   cancelQueuedLocked(StopReason::Interrupt);
   upsertAccepted(accepted_, queuedStatus(command, sequence));
   return {ErrorCode::Ok, command.id, MotionState::Queued, queuedIdsLocked().size()};
@@ -285,6 +306,10 @@ ExecuteResult RuntimeStatusStore::acceptInterruptAfterStop(const ExecuteCommand&
                                                            std::uint64_t sequence,
                                                            std::uint64_t stop_sequence) {
   std::lock_guard<std::mutex> lock(mutex_);
+  if (urgentStopping(snapshot_)) {
+    return {ErrorCode::ControlStateConflict, command.id, MotionState::Queued,
+            queuedIdsLocked().size()};
+  }
   cancelQueuedAfterLocked(StopReason::Interrupt, stop_sequence);
   upsertAccepted(accepted_, queuedStatus(command, sequence));
   return {ErrorCode::Ok, command.id, MotionState::Queued, queuedIdsLocked().size()};
@@ -302,8 +327,40 @@ StopResult RuntimeStatusStore::acceptStop() {
   return {ErrorCode::Ok, ControllerState::Stopping, StopReason::Stop, 0};
 }
 
+StopResult RuntimeStatusStore::acceptUrgentStop() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const std::size_t canceled = cancelQueuedLocked(StopReason::UrgentStop);
+  const bool has_idle = !idle_config_.empty() || idle_status_.enabled ||
+                        snapshot_.idle.enabled ||
+                        snapshot_.active.kind == ActiveKind::Idle;
+
+  if (!hasActiveOwnerOrStopping(snapshot_) && !hasActivePublishedRun(accepted_) &&
+      !hasActivePublishedRun(recent_) && canceled == 0 && !has_idle) {
+    return {ErrorCode::Ok, snapshot_.ctrl, StopReason::None, 0};
+  }
+
+  snapshot_.ctrl = ControllerState::UrgentStopping;
+  snapshot_.stop_reason = StopReason::UrgentStop;
+  snapshot_.active = {ActiveKind::None, ""};
+  snapshot_.exec.reset();
+  snapshot_.transition = TransitionStatus{};
+  snapshot_.queue.ids.clear();
+  snapshot_.queue.n = 0;
+
+  return {ErrorCode::Ok,
+          ControllerState::UrgentStopping,
+          StopReason::UrgentStop,
+          canceled};
+}
+
 ControlResult RuntimeStatusStore::acceptControl(ControlMode mode, bool preserve_queued) {
   std::lock_guard<std::mutex> lock(mutex_);
+  if (controlBlockedByUrgentStop(snapshot_, mode)) {
+    return {ErrorCode::ControlStateConflict};
+  }
+  if (mode == ControlMode::FixStand) {
+    snapshot_.passive_reason.reset();
+  }
   if (mode == ControlMode::StandbyVelocity &&
       (snapshot_.ctrl == ControllerState::Passive ||
        snapshot_.ctrl == ControllerState::Fault)) {
@@ -323,6 +380,9 @@ ControlResult RuntimeStatusStore::acceptControl(ControlMode mode, bool preserve_
 
 IdleResult RuntimeStatusStore::acceptIdleConfig(std::vector<IdleMotion> motions) {
   std::lock_guard<std::mutex> lock(mutex_);
+  if (!motions.empty() && urgentStopping(snapshot_)) {
+    return {ErrorCode::ControlStateConflict, idle_status_};
+  }
   idle_config_ = std::move(motions);
   idle_status_ = idleStatusForConfig(idle_config_);
   snapshot_.idle = idle_status_;

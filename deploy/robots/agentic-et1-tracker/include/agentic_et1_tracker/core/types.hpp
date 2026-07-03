@@ -24,6 +24,7 @@ enum class ErrorCode {
   RunNotFound,
   RunStateConflict,
   ControlStateConflict,
+  ControlRouteRenamed,
   SafetyLimitTriggered,
   InternalError,
 };
@@ -34,7 +35,9 @@ enum class NextAction {
   WaitRobot,
   Fix,
   FixStand,
+  Standby,
   StandbyVelocity,
+  UrgentStop,
   Stop,
   Manual,
 };
@@ -119,6 +122,7 @@ enum class ControllerState {
   Preparing,
   Running,
   Stopping,
+  UrgentStopping,
   Fault,
 };
 
@@ -140,6 +144,7 @@ enum class RobotState {
 enum class StopReason {
   None,
   Stop,
+  UrgentStop,
   Interrupt,
 };
 

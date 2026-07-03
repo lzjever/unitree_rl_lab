@@ -1,5 +1,12 @@
 # ET1 Skill Sequence Workflow 后续开发计划
 
+> **Historical/Obsolete API names (2026-07):** This file is a historical
+> planning handoff and may still mention old public route names. The GA/current
+> API is `POST /standby` for ordinary standby and `POST /urgent_stop` for urgent
+> stop. Legacy `POST /standby_velocity` and `POST /stop` are not successful
+> aliases; if present they reject with `CONTROL_ROUTE_RENAMED`. Use `README.md`
+> and `CONTROL_STATE_MACHINE_REDESIGN_PLAN.md` as the current contract.
+
 更新日期：2026-06-05
 
 本文档只规划 ET1 动作生成与执行 skill/workflow 层的最小改进。目标是让

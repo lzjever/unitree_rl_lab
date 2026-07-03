@@ -10,7 +10,15 @@
 #include <utility>
 #include <vector>
 
+#include "agentic_et1_tracker/api/json_codec.hpp"
+#include "agentic_et1_tracker/core/status.hpp"
+#include "agentic_et1_tracker/core/tracker_controller.hpp"
+#include "agentic_et1_tracker/core/types.hpp"
+#include "agentic_et1_tracker/loco_upper/precheck.hpp"
+
+#define private public
 #include "agentic_et1_tracker/api/service.hpp"
+#undef private
 
 namespace agentic_et1_tracker {
 namespace {
@@ -32,7 +40,12 @@ class FakeSink final : public ExecutionCommandSink {
   StopResult stop_result{ErrorCode::Ok, ControllerState::Stopping, StopReason::Stop, 0};
   ControlResult passive_result{ErrorCode::Ok};
   ControlResult fixstand_result{ErrorCode::Ok};
+  ControlResult standby_result{ErrorCode::Ok};
   ControlResult standby_velocity_result{ErrorCode::Ok};
+  StopResult urgent_stop_result{ErrorCode::Ok,
+                                ControllerState::UrgentStopping,
+                                StopReason::UrgentStop,
+                                0};
   IdleResult idle_result{ErrorCode::Ok, IdleStatus{}};
 
   ExecuteResult submitQueue(const ExecuteCommand& command) override {
@@ -75,9 +88,22 @@ class FakeSink final : public ExecutionCommandSink {
     return fixstand_result;
   }
 
+  ControlResult standby() override {
+    ++standby_calls;
+    return standby_result;
+  }
+
   ControlResult standbyVelocity() override {
     ++standby_velocity_calls;
     return standby_velocity_result;
+  }
+
+  StopResult urgentStop() override {
+    if (throw_stop) {
+      throw std::runtime_error("urgent stop failed");
+    }
+    ++urgent_stop_calls;
+    return urgent_stop_result;
   }
 
   IdleResult configureIdle(std::vector<IdleMotion> motions) override {
@@ -95,7 +121,9 @@ class FakeSink final : public ExecutionCommandSink {
   int stop_calls{0};
   int passive_calls{0};
   int fixstand_calls{0};
+  int standby_calls{0};
   int standby_velocity_calls{0};
+  int urgent_stop_calls{0};
   int idle_calls{0};
   bool throw_stop{false};
   std::vector<ExecuteCommand> queue_commands;
@@ -877,6 +905,7 @@ TEST_CASE("POST idle nonempty rejects unsafe controller states before validation
         ControllerState::Passive,
         ControllerState::FixStand,
         ControllerState::Stopping,
+        ControllerState::UrgentStopping,
         ControllerState::Fault}) {
     Harness h;
     h.status.snapshot_value.ready = true;
@@ -1039,7 +1068,7 @@ TEST_CASE("POST execute reports lowcmd occupancy as manual next action") {
 }
 
 TEST_CASE("POST control endpoints report lowcmd occupancy as manual before sink") {
-  for (const auto& target : {"/passive", "/fixstand", "/standby_velocity"}) {
+  for (const auto& target : {"/passive", "/fixstand", "/standby"}) {
     for (const ControllerState ctrl :
          {ControllerState::Passive, ControllerState::Fault}) {
       Harness h;
@@ -1060,7 +1089,9 @@ TEST_CASE("POST control endpoints report lowcmd occupancy as manual before sink"
       REQUIRE(nextAction(response) == "manual");
       REQUIRE(h.sink.passive_calls == 0);
       REQUIRE(h.sink.fixstand_calls == 0);
+      REQUIRE(h.sink.standby_calls == 0);
       REQUIRE(h.sink.standby_velocity_calls == 0);
+      REQUIRE(h.sink.urgent_stop_calls == 0);
       REQUIRE(h.validator.calls == 0);
       REQUIRE(h.ids.calls == 0);
     }
@@ -1074,6 +1105,7 @@ TEST_CASE("POST execute rejects controller states that cannot execute queued mot
         ControllerState::Passive,
         ControllerState::FixStand,
         ControllerState::Stopping,
+        ControllerState::UrgentStopping,
         ControllerState::Fault}) {
     Harness h;
     h.status.snapshot_value.ready = true;
@@ -1087,12 +1119,12 @@ TEST_CASE("POST execute rejects controller states that cannot execute queued mot
     REQUIRE(response.status == 409);
     requireFailure(response, "CONTROL_STATE_CONFLICT");
     if (ctrl == ControllerState::FixStand) {
-      REQUIRE(nextAction(response) == "standby_velocity");
-      REQUIRE(errorMessage(response) == "ctrl=fixstand; /standby_velocity");
+      REQUIRE(nextAction(response) == "standby");
+      REQUIRE(errorMessage(response) == "ctrl=fixstand; /standby");
     } else if (ctrl == ControllerState::Passive) {
       REQUIRE(nextAction(response) == "fixstand");
       REQUIRE(errorMessage(response) ==
-              "ctrl=passive; /fixstand then /standby_velocity");
+              "ctrl=passive; /fixstand then /standby");
     } else if (ctrl == ControllerState::Fault) {
       REQUIRE(nextAction(response) == "fixstand");
       REQUIRE(errorMessage(response) == "ctrl=fault; /fixstand");
@@ -1111,25 +1143,136 @@ TEST_CASE("POST execute rejects controller states that cannot execute queued mot
   }
 }
 
-TEST_CASE("POST stop with no body only submits stop even when not ready") {
+TEST_CASE("POST execute and nonempty idle reject latched urgent stopping status") {
+  SECTION("execute") {
+    Harness h;
+    h.status.snapshot_value.ready = true;
+    h.status.snapshot_value.ctrl = ControllerState::UrgentStopping;
+    h.status.snapshot_value.robot = RobotState::Holding;
+
+    const auto response =
+        h.service.handle({"POST", "/execute", R"({"path":"/tracks/a.trk"})"});
+
+    REQUIRE(response.status == 409);
+    requireFailure(response, "CONTROL_STATE_CONFLICT");
+    REQUIRE(nextAction(response) == "status");
+    REQUIRE(errorMessage(response) == "ctrl=urgent_stopping; wait /status");
+    REQUIRE(h.validator.calls == 0);
+    REQUIRE(h.sink.queue_calls == 0);
+    REQUIRE(h.sink.interrupt_calls == 0);
+    REQUIRE(h.ids.calls == 0);
+  }
+
+  SECTION("idle") {
+    Harness h;
+    h.status.snapshot_value.ready = true;
+    h.status.snapshot_value.ctrl = ControllerState::UrgentStopping;
+    h.status.snapshot_value.robot = RobotState::Holding;
+
+    const auto response =
+        h.service.handle({"POST", "/idle", R"({"paths":["/tracks/idle.trk"]})"});
+
+    REQUIRE(response.status == 409);
+    requireFailure(response, "CONTROL_STATE_CONFLICT");
+    REQUIRE(nextAction(response) == "status");
+    REQUIRE(errorMessage(response) == "ctrl=urgent_stopping; wait /status");
+    REQUIRE(h.validator.calls == 0);
+    REQUIRE(h.sink.idle_calls == 0);
+    REQUIRE(h.ids.calls == 0);
+  }
+}
+
+TEST_CASE("POST ordinary controls reject latched urgent stopping status before sink") {
+  for (const auto& target : {"/fixstand", "/standby"}) {
+    Harness h;
+    h.status.snapshot_value.ready = true;
+    h.status.snapshot_value.ctrl = ControllerState::UrgentStopping;
+    h.status.snapshot_value.robot = RobotState::Holding;
+
+    const auto response = h.service.handle({"POST", target, ""});
+
+    CAPTURE(target);
+    REQUIRE(response.status == 409);
+    requireFailure(response, "CONTROL_STATE_CONFLICT");
+    REQUIRE(nextAction(response) == "status");
+    REQUIRE(errorMessage(response) == "ctrl=urgent_stopping; wait /status");
+    REQUIRE(h.sink.fixstand_calls == 0);
+    REQUIRE(h.sink.standby_calls == 0);
+    REQUIRE(h.sink.standby_velocity_calls == 0);
+    REQUIRE(h.validator.calls == 0);
+    REQUIRE(h.ids.calls == 0);
+  }
+}
+
+TEST_CASE("POST urgent stopping preserves passive and idle clear allowances") {
+  SECTION("passive") {
+    Harness h;
+    h.status.snapshot_value.ready = true;
+    h.status.snapshot_value.ctrl = ControllerState::UrgentStopping;
+    h.status.snapshot_value.robot = RobotState::Holding;
+
+    const auto response =
+        h.service.handle({"POST", "/passive", R"({"password":"galaxy"})"});
+
+    REQUIRE(response.status == 200);
+    requireFields(response.body, {"ok", "state"});
+    REQUIRE(response.body.at("ok") == true);
+    REQUIRE(response.body.at("state") == "accepted");
+    REQUIRE(h.sink.passive_calls == 1);
+    REQUIRE(h.sink.fixstand_calls == 0);
+    REQUIRE(h.sink.standby_calls == 0);
+  }
+
+  SECTION("idle clear") {
+    Harness h;
+    h.status.snapshot_value.ready = true;
+    h.status.snapshot_value.ctrl = ControllerState::UrgentStopping;
+    h.status.snapshot_value.robot = RobotState::Holding;
+
+    const auto response = h.service.handle({"POST", "/idle", R"({"paths":[]})"});
+
+    REQUIRE(response.status == 200);
+    requireFields(response.body, {"ok", "idle"});
+    REQUIRE(response.body.at("idle").at("enabled") == false);
+    REQUIRE(response.body.at("idle").at("n") == 0);
+    REQUIRE(h.sink.idle_calls == 1);
+    REQUIRE(h.sink.idle_motions.empty());
+    REQUIRE(h.validator.calls == 0);
+  }
+}
+
+TEST_CASE("POST urgent_stop with no body only submits urgent stop even when not ready") {
   Harness h;
   h.status.snapshot_value.ready = false;
   h.status.snapshot_value.ctrl = ControllerState::Fault;
   h.status.snapshot_value.robot = RobotState::Fault;
   h.status.snapshot_value.err = ErrorCode::SafetyLimitTriggered;
-  h.sink.stop_result = {ErrorCode::Ok, ControllerState::Fault, StopReason::Stop, 7};
+  h.sink.urgent_stop_result = {
+      ErrorCode::Ok, ControllerState::UrgentStopping, StopReason::UrgentStop, 7};
 
-  const auto response = h.service.handle({"POST", "/stop", ""});
+  const auto response = h.service.handle({"POST", "/urgent_stop", ""});
 
   REQUIRE(response.status == 200);
   requireFields(response.body, {"ok", "state"});
   REQUIRE(response.body.at("ok") == true);
   REQUIRE(response.body.at("state") == "accepted");
-  REQUIRE(h.sink.stop_calls == 1);
+  REQUIRE(h.sink.urgent_stop_calls == 1);
+  REQUIRE(h.sink.stop_calls == 0);
   REQUIRE(h.sink.queue_calls == 0);
   REQUIRE(h.sink.interrupt_calls == 0);
   REQUIRE(h.validator.calls == 0);
   REQUIRE(h.ids.calls == 0);
+}
+
+TEST_CASE("GET status serializes standby public control name") {
+  Harness h;
+  h.status.snapshot_value.ctrl = ControllerState::StandbyVelocity;
+
+  const auto response = h.service.handle({"GET", "/status", ""});
+
+  REQUIRE(response.status == 200);
+  REQUIRE(response.body.at("ok") == true);
+  REQUIRE(response.body.at("ctrl") == "standby");
 }
 
 TEST_CASE("POST control endpoints accept empty body without validator or id generator") {
@@ -1144,7 +1287,9 @@ TEST_CASE("POST control endpoints accept empty body without validator or id gene
     REQUIRE(response.body.at("state") == "accepted");
     REQUIRE(h.sink.passive_calls == 0);
     REQUIRE(h.sink.fixstand_calls == 1);
+    REQUIRE(h.sink.standby_calls == 0);
     REQUIRE(h.sink.standby_velocity_calls == 0);
+    REQUIRE(h.sink.urgent_stop_calls == 0);
     REQUIRE(h.sink.stop_calls == 0);
     REQUIRE(h.sink.queue_calls == 0);
     REQUIRE(h.sink.interrupt_calls == 0);
@@ -1152,10 +1297,10 @@ TEST_CASE("POST control endpoints accept empty body without validator or id gene
     REQUIRE(h.ids.calls == 0);
   }
 
-  SECTION("standby velocity") {
+  SECTION("standby") {
     Harness h;
 
-    const auto response = h.service.handle({"POST", "/standby_velocity", ""});
+    const auto response = h.service.handle({"POST", "/standby", ""});
 
     REQUIRE(response.status == 200);
     requireFields(response.body, {"ok", "state"});
@@ -1163,8 +1308,10 @@ TEST_CASE("POST control endpoints accept empty body without validator or id gene
     REQUIRE(response.body.at("state") == "accepted");
     REQUIRE(h.sink.passive_calls == 0);
     REQUIRE(h.sink.fixstand_calls == 0);
-    REQUIRE(h.sink.standby_velocity_calls == 1);
+    REQUIRE(h.sink.standby_calls == 1);
+    REQUIRE(h.sink.standby_velocity_calls == 0);
     REQUIRE(h.sink.stop_calls == 0);
+    REQUIRE(h.sink.urgent_stop_calls == 0);
     REQUIRE(h.sink.queue_calls == 0);
     REQUIRE(h.sink.interrupt_calls == 0);
     REQUIRE(h.validator.calls == 0);
@@ -1231,7 +1378,7 @@ TEST_CASE("POST passive uses configured password") {
 }
 
 TEST_CASE("POST control endpoints reject static not-ready snapshots before sink") {
-  for (const auto& target : {"/passive", "/fixstand", "/standby_velocity"}) {
+  for (const auto& target : {"/passive", "/fixstand", "/standby"}) {
     Harness h;
     h.status.snapshot_value.ready = false;
     h.status.snapshot_value.ctrl = ControllerState::Starting;
@@ -1250,7 +1397,9 @@ TEST_CASE("POST control endpoints reject static not-ready snapshots before sink"
     REQUIRE(errorMessage(response) == "policy model is not ready");
     REQUIRE(h.sink.passive_calls == 0);
     REQUIRE(h.sink.fixstand_calls == 0);
+    REQUIRE(h.sink.standby_calls == 0);
     REQUIRE(h.sink.standby_velocity_calls == 0);
+    REQUIRE(h.sink.urgent_stop_calls == 0);
     REQUIRE(h.sink.stop_calls == 0);
     REQUIRE(h.sink.queue_calls == 0);
     REQUIRE(h.sink.interrupt_calls == 0);
@@ -1337,7 +1486,7 @@ TEST_CASE("POST fixstand rejects non-orientation recovery faults before sink") {
 }
 
 TEST_CASE("POST control endpoints reject non-empty bodies before ports") {
-  for (const auto& target : {"/fixstand", "/standby_velocity"}) {
+  for (const auto& target : {"/fixstand", "/standby", "/urgent_stop"}) {
     Harness h;
 
     const auto response = h.service.handle({"POST", target, R"({})"});
@@ -1347,36 +1496,39 @@ TEST_CASE("POST control endpoints reject non-empty bodies before ports") {
     requireFailure(response, "REQUEST_INVALID");
     REQUIRE(h.sink.passive_calls == 0);
     REQUIRE(h.sink.fixstand_calls == 0);
+    REQUIRE(h.sink.standby_calls == 0);
     REQUIRE(h.sink.standby_velocity_calls == 0);
     REQUIRE(h.sink.stop_calls == 0);
+    REQUIRE(h.sink.urgent_stop_calls == 0);
     REQUIRE(h.validator.calls == 0);
     REQUIRE(h.ids.calls == 0);
   }
 }
 
-TEST_CASE("POST standby_velocity returns conflict when controller state rejects it") {
+TEST_CASE("POST standby returns conflict when controller state rejects it") {
   Harness h;
-  h.sink.standby_velocity_result = {ErrorCode::ControlStateConflict};
+  h.sink.standby_result = {ErrorCode::ControlStateConflict};
 
-  const auto response = h.service.handle({"POST", "/standby_velocity", ""});
+  const auto response = h.service.handle({"POST", "/standby", ""});
 
   REQUIRE(response.status == 409);
   requireFailure(response, "CONTROL_STATE_CONFLICT");
   REQUIRE(nextAction(response) == "status");
   REQUIRE(errorMessage(response) == "wrong ctrl; check /status");
-  REQUIRE(h.sink.standby_velocity_calls == 1);
+  REQUIRE(h.sink.standby_calls == 1);
+  REQUIRE(h.sink.standby_velocity_calls == 0);
   REQUIRE(h.sink.fixstand_calls == 0);
   REQUIRE(h.validator.calls == 0);
   REQUIRE(h.ids.calls == 0);
 }
 
-TEST_CASE("POST standby_velocity rejects Passive and Fault before command sink") {
+TEST_CASE("POST standby rejects Passive and Fault before command sink") {
   for (const ControllerState ctrl : {ControllerState::Passive, ControllerState::Fault}) {
     Harness h;
     h.status.snapshot_value.ready = true;
     h.status.snapshot_value.ctrl = ctrl;
 
-    const auto response = h.service.handle({"POST", "/standby_velocity", ""});
+    const auto response = h.service.handle({"POST", "/standby", ""});
 
     CAPTURE(toString(ctrl));
     REQUIRE(response.status == 409);
@@ -1384,23 +1536,78 @@ TEST_CASE("POST standby_velocity rejects Passive and Fault before command sink")
     REQUIRE(nextAction(response) == "fixstand");
     if (ctrl == ControllerState::Passive) {
       REQUIRE(errorMessage(response) ==
-              "ctrl=passive; /fixstand then /standby_velocity");
+              "ctrl=passive; /fixstand then /standby");
     } else {
       REQUIRE(errorMessage(response) == "ctrl=fault; /fixstand");
     }
+    REQUIRE(h.sink.standby_calls == 0);
     REQUIRE(h.sink.standby_velocity_calls == 0);
     REQUIRE(h.sink.fixstand_calls == 0);
   }
+}
+
+TEST_CASE("POST old control routes return renamed errors without executing controls") {
+  struct Case {
+    std::string route;
+    std::string next;
+  };
+
+  for (const auto& item :
+       std::vector<Case>{{"/standby_velocity", "standby"}, {"/stop", "urgent_stop"}}) {
+    Harness h;
+
+    const auto response = h.service.handle({"POST", item.route, ""});
+
+    CAPTURE(item.route);
+    REQUIRE(response.status == 400);
+    requireFailure(response, "CONTROL_ROUTE_RENAMED");
+    REQUIRE(nextAction(response) == item.next);
+    REQUIRE(h.sink.standby_calls == 0);
+    REQUIRE(h.sink.standby_velocity_calls == 0);
+    REQUIRE(h.sink.stop_calls == 0);
+    REQUIRE(h.sink.urgent_stop_calls == 0);
+    REQUIRE(h.sink.queue_calls == 0);
+    REQUIRE(h.sink.interrupt_calls == 0);
+  }
+}
+
+TEST_CASE("Direct old control handlers return renamed errors without executing controls") {
+  struct Case {
+    std::string name;
+    std::string next;
+    ApiResponse response;
+  };
+
+  Harness h;
+  std::vector<Case> cases{
+      {"standbyVelocity", "standby", h.service.standbyVelocity("")},
+      {"stop", "urgent_stop", h.service.stop("")},
+  };
+
+  for (const auto& item : cases) {
+    CAPTURE(item.name);
+    REQUIRE(item.response.status == 400);
+    requireFailure(item.response, "CONTROL_ROUTE_RENAMED");
+    REQUIRE(nextAction(item.response) == item.next);
+  }
+
+  REQUIRE(h.sink.standby_calls == 0);
+  REQUIRE(h.sink.standby_velocity_calls == 0);
+  REQUIRE(h.sink.stop_calls == 0);
+  REQUIRE(h.sink.urgent_stop_calls == 0);
+  REQUIRE(h.sink.queue_calls == 0);
+  REQUIRE(h.sink.interrupt_calls == 0);
 }
 
 TEST_CASE("API handle converts std exceptions from ports to internal error envelopes") {
   Harness h;
   h.sink.throw_stop = true;
 
-  const auto response = h.service.handle({"POST", "/stop", ""});
+  const auto response = h.service.handle({"POST", "/urgent_stop", ""});
 
   REQUIRE(response.status == 500);
   requireFailure(response, "INTERNAL_ERROR");
+  REQUIRE(h.sink.urgent_stop_calls == 0);
   REQUIRE(h.sink.stop_calls == 0);
 }
 
@@ -1434,6 +1641,7 @@ TEST_CASE("GET status renders idle nulls and queue short fields") {
   REQUIRE(response.body.at("idle").at("active") == false);
   REQUIRE(response.body.at("idle").at("current").is_null());
   REQUIRE(response.body.at("err").is_null());
+  REQUIRE(response.body.at("passive_reason").is_null());
   REQUIRE(response.body.at("stop_reason").is_null());
 
   requireFields(response.body.at("transition"),
@@ -1566,12 +1774,17 @@ TEST_CASE("GET status renders Passive as an explicit controller state") {
   h.status.snapshot_value.ready = false;
   h.status.snapshot_value.err = ErrorCode::RobotBadOrientation;
   h.status.snapshot_value.block = "bad_orientation";
+  h.status.snapshot_value.passive_reason =
+      PassiveReason{ErrorCode::RobotBadOrientation, "bad_orientation"};
 
   const auto response = h.service.handle({"GET", "/status", ""});
 
   REQUIRE(response.status == 200);
   REQUIRE(response.body.at("ctrl") == "passive");
   REQUIRE(response.body.at("block") == "bad_orientation");
+  REQUIRE(response.body.at("passive_reason").at("code") ==
+          "ROBOT_BAD_ORIENTATION");
+  REQUIRE(response.body.at("passive_reason").at("block") == "bad_orientation");
 }
 
 TEST_CASE("GET status renders running progress and top-level stopping reason") {

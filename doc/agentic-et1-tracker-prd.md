@@ -1,6 +1,22 @@
 # agentic-et1-tracker PRD
 
-GA 范围，KISS 收口版。
+> **ARCHIVE / HISTORICAL NOTICE (2026-07):** This PRD is an archived planning
+> handoff, not the current operator or agent contract. It intentionally preserves
+> historical product wording and may mention obsolete route names in body text.
+> The current authoritative sources are:
+>
+> - `deploy/robots/agentic-et1-tracker/README.md`
+> - `deploy/robots/agentic-et1-tracker/CONTROL_STATE_MACHINE_REDESIGN_PLAN.md`
+> - the packaged `et1-action` skill under
+>   `deploy/robots/agentic-et1-tracker/packaging/skills/et1-action/`
+>
+> Current API names: `POST /standby` is ordinary standby, and
+> `POST /urgent_stop` is urgent stop. Legacy `POST /standby_velocity` and
+> `POST /stop` are not successful aliases in the current implementation; they
+> must be rejected with `CONTROL_ROUTE_RENAMED`.
+
+Archived GA planning scope, KISS 收口版。Do not copy API examples from this file
+without checking the current authoritative docs listed above.
 
 ## 1. 结论
 
@@ -19,6 +35,10 @@ GA 范围，KISS 收口版。
 
 ## 2. GA 范围
 
+> **Archive warning:** This section records historical GA planning scope. Current
+> route names are `/standby` and `/urgent_stop`; old `/standby_velocity` and
+> `/stop` are rejection paths with `CONTROL_ROUTE_RENAMED`.
+
 必须支持：
 
 - 只执行 `.trk`。
@@ -27,9 +47,9 @@ GA 范围，KISS 收口版。
 - 异步返回短 `id`。
 - 动作顺序排队执行。
 - 立即接受抢断请求，取消等待队列，并触发受控 stop-to-standby_velocity；新动作只能在 stop-to-standby_velocity 后开始。
-- 普通“停下/静止/待命”入口是 `/standby_velocity`，保留 idle 配置；`/stop` 是 urgent/immediate 软件停止，取消控制线程消费 stop 命令时已经存在的 active，以及 sequence 不大于该 stop command 且仍 queued/pending 的动作，并清空 idle 配置。健康可控路径回到 `ctrl:"standby_velocity"`。
+- 普通“停下/静止/待命”当前入口是 `/standby`，保留 idle 配置；urgent/immediate 停止当前入口是 `/urgent_stop`。历史 `/standby_velocity` 和 `/stop` route 必须拒绝并返回 `CONTROL_ROUTE_RENAMED`。
 - `/passive` 是 password-gated safety sink，停止 active work、清 queue、清 idle 配置，不自动恢复。
-- `/fixstand` 是固定构型/姿态恢复入口，不等于普通静止站立；要回到正常可执行待命链路需显式 `/standby_velocity`。
+- `/fixstand` 是固定构型/姿态恢复入口，不等于普通静止站立；要回到正常可执行待命链路需显式 `/standby`。
 - 查询当前动作、队列、机器人和控制器状态。
 - 真机和仿真使用同一套 HTTP 接口。
 
@@ -68,15 +88,21 @@ KISS 的关键不是删掉队列和抢断，而是把它们限制成最小确定
 
 ### 3.2 核心使用流
 
-原始 GA 核心接口是 4 个 route path：`/health`、`/status`、`/execute`、`/stop`。当前公开控制合同还包括 `/idle`、`/passive`、`/fixstand`、`/standby_velocity`，以及可选的 `/execute_loco_upper`。其中 `/status?id=ID` 是 `/status` 的查询形态，不是额外 route。agent 高频核心动作是 `/status`、`/status?id=ID`、`/execute`、`/standby_velocity`；`/stop` 只用于 urgent/immediate 停止；`/health` 仅用于 readiness 探活。
+> **Archive warning:** Historical body text below may still use old route names.
+> For current code and packaged skill behavior, ordinary standby is
+> `POST /standby`, urgent stop is `POST /urgent_stop`, and legacy
+> `POST /standby_velocity` / `POST /stop` must reject with
+> `CONTROL_ROUTE_RENAMED`.
+
+原始 GA 核心接口是 4 个 route path：`/health`、`/status`、`/execute`、`/stop`。历史控制合同还包括 `/idle`、`/passive`、`/fixstand`、`/standby_velocity`，以及可选的 `/execute_loco_upper`。其中 `/status?id=ID` 是 `/status` 的查询形态，不是额外 route。当前 agent 高频核心动作应以权威 README/skill 为准：`/status`、`/status?id=ID`、`/execute`、`/standby`；urgent/immediate 停止使用 `/urgent_stop`；`/health` 仅用于 readiness 探活。
 
 ```text
 GET  /health
 GET  /status
 POST /execute       # queue 或 interrupt
 GET  /status?id=ID  # 查询指定动作
-POST /standby_velocity # 普通停止/待命，保留 idle 配置
-POST /stop          # urgent/immediate 停止，清 queue 和 idle 配置
+POST /standby       # 当前普通停止/待命，保留 idle 配置
+POST /urgent_stop   # 当前 urgent/immediate 停止，清 queue 和 idle 配置
 ```
 
 顺序执行：
@@ -98,14 +124,18 @@ curl -s -X POST http://127.0.0.1:8080/execute \
 普通停止并进入待命：
 
 ```bash
-curl -s -X POST http://127.0.0.1:8080/standby_velocity
+curl -s -X POST http://127.0.0.1:8080/standby
 ```
 
 urgent/immediate 停止：
 
 ```bash
-curl -s -X POST http://127.0.0.1:8080/stop
+curl -s -X POST http://127.0.0.1:8080/urgent_stop
 ```
+
+Obsolete historical examples, kept only to explain old review context:
+`POST /standby_velocity` and `POST /stop` must not be used against the current
+implementation; they reject with `CONTROL_ROUTE_RENAMED`.
 
 ## 4. 与 ET1 App 的关系
 
@@ -487,6 +517,12 @@ start gate 不满足时不得推进 reference、不得加载新 `.trk`、不得�
 
 ### 6.3 Stop and standby
 
+> **Archive warning:** This historical section uses old names. In the current
+> implementation, read `POST /standby_velocity` as obsolete historical
+> `POST /standby`, and read `POST /stop` as obsolete historical
+> `POST /urgent_stop`. The old routes themselves must reject with
+> `CONTROL_ROUTE_RENAMED`.
+
 `POST /standby_velocity` 是普通“停下/静止/待命”入口，保留 idle 配置；如果 idle pool 非空且无 user work，回到可播放 idle 的待命链路后 background idle manager 可按规则重新播放 idle。
 
 `POST /stop` 是 urgent/immediate 软件停止，语义固定：
@@ -784,7 +820,11 @@ ready 响应必须是 `ok:true,state:"ready"`。starting 或 error/not-ready 响
 - 若外部 HTTP 请求发生在 `ctrl:"stopping"` 期间，返回 `CONTROL_STATE_CONFLICT`，不分配 id、不改等待队列。只有低层/internal 已保留的 post-stop work 可在 stop-to-standby_velocity 完成后继续。
 - 返回新动作 `id`。
 
-### 7.5 `POST /stop`
+### 7.5 Historical `POST /stop` semantics (obsolete route)
+
+> **Do not copy this route name.** Current urgent stop is
+> `POST /urgent_stop`. Current `POST /stop` must reject with
+> `CONTROL_ROUTE_RENAMED`.
 
 用途：请求停止本次已有工作；响应只表示 stop 命令已 accepted。
 
@@ -819,7 +859,7 @@ stop accepted: sequence=10
 - 如果没有 active，HTTP 也返回成功；控制线程消费 stop 时仍按 watermark 清空旧 queued/pending。
 - 取消和停止结果通过后续 `/status` 和 `/status?id=ID` 查询体现。
 
-agent 调用 `/stop` 后应轮询 `/status`，直到：
+agent 调用当前 `/urgent_stop` 后应轮询 `/status`，直到：
 
 - 健康可控路径：`ctrl:"standby_velocity"`，且本次 stop 涉及的 active 不再是 `running/stopping`。
 - 若调用方 stop 后没有提交新工作，通常还应看到 `exec:null`、`queue.n == 0`。
@@ -1136,13 +1176,19 @@ agentic_et1_tracker:
 - best-effort 检测发现疑似已有控制进程占用时应拒绝启动或进入 `error`，但 PRD 不把它描述成硬互斥保证。
 - `.trk` 路径必须受 allowlist 限制。
 - 执行中允许 queue 和 interrupt，但语义必须确定。
-- `/stop` 必须取消 stop 被控制线程消费时已有的 active/queued，并清 idle 配置；健康可控路径回到 `ctrl:"standby_velocity"`，fault/disconnected 只承诺明确 `block/err`。
+- 当前 `/urgent_stop` 必须取消 stop 被控制线程消费时已有的 active/queued，并清 idle 配置；健康可控路径回到待命控制态，fault/disconnected 只承诺明确 `block/err`。历史 `/stop` route 必须拒绝并返回 `CONTROL_ROUTE_RENAMED`。
 - `interrupt` 必须先进入受控 stop-to-standby_velocity 过渡，再加载新 `.trk`，不能在真机中直接硬切 reference。
 - tracker 执行态必须由新 app 自己实现 bad-orientation safety fallback；检测到坏姿态时应进入 `fault` 或拒绝继续执行。
 - 出现 safety/fault 时拒绝新执行。
 - HTTP 不直接写 `LowCmd`。
 
 ## 14. 验收标准
+
+> **Archive warning:** This acceptance section is historical. Current acceptance
+> must be checked against the README, control-state-machine redesign plan, and
+> packaged skill. Where old `/standby_velocity` or `/stop` names appear below,
+> the current copyable API names are `/standby` and `/urgent_stop`; the old
+> names are rejection tests for `CONTROL_ROUTE_RENAMED`, not successful paths.
 
 ### 14.1 隔离性
 
@@ -1174,10 +1220,10 @@ agentic_et1_tracker:
 - 由 interrupt 触发的 stopping 期间，`/status` 只出现 `ctrl:"stopping"` 和 `stop_reason:"interrupt"`，不出现单独的抢断 ctrl 状态。
 - `ctrl:"stopping"` 且 robot/model ready 时，外部 HTTP `/execute queue|interrupt` 返回 `CONTROL_STATE_CONFLICT`，不分配 id、不改 queue。
 - 若低层/internal 已存在 post-stop work，当前顶层 `stop_reason` 仍为进入 stopping 时的原因；该 work 只能在 stop-to-standby_velocity 后继续。
-- 执行中 `POST /stop` 后，HTTP 响应只表示 accepted；本次 stop 被控制线程消费时已有 active 最终 `stopped` 或明确 `failed`，已有 queued 变为 `canceled`。
+- 执行中 `POST /urgent_stop` 后，HTTP 响应只表示 accepted；本次 stop 被控制线程消费时已有 active 最终 `stopped` 或明确 `failed`，已有 queued 变为 `canceled`。历史 `POST /stop` 应作为 `CONTROL_ROUTE_RENAMED` 拒绝路径验证。
 - 健康可控且 stop 后无新请求时，控制器回到 `ctrl:"standby_velocity"`，`exec:null`，`queue.n==0`，idle 配置已清空。
 - 低层/internal post-stop work 不属于本次 stop 的取消集合；`queue.n>0` 或后续新 `exec` 不使本次 stop 验收失败。外部 HTTP 在 `stopping` 中不得通过这种路径新增 work。
-- robot disconnect 或 fault 期间 `/stop` 不承诺 `ctrl:"standby_velocity"`，但 `/status` 必须返回明确 `block` 或 `err`。
+- robot disconnect 或 fault 期间 `/urgent_stop` 不承诺回到待命控制态，但 `/status` 必须返回明确 `block` 或 `err`。
 - 提交 metadata/schema 损坏或缺少关键数组的 `.trk`，请求被拒绝，控制进程不崩溃；payload 语义错误（如 contact 值域非法）若 metadata 合法可被 accepted，但控制线程加载失败并将动作标记为 `failed`。
 - oversized metadata、frame_count 不一致、非法 dtype 或畸形 byte_count 的 `.trk` 被拒绝。
 - 包含未知但合法数组的 `.trk` 可被 validator/loader 跳过未知 payload，不分配 unknown payload。
@@ -1198,7 +1244,7 @@ agentic_et1_tracker:
 - 默认 core tests 不依赖 Unitree SDK2 或 ONNX Runtime。
 - 默认不打开 `AGENTIC_ET1_BUILD_ONNX`、`AGENTIC_ET1_BUILD_ROBOT`、`AGENTIC_ET1_BUILD_PERF_SMOKE` 时，core tests 不依赖 MuJoCo、Unitree SDK2 或 ONNX Runtime。
 - queue、interrupt/stop 状态机、accept gate/start gate、progress、`TrkSchema`、`TrkValidator` 都有核心单测。
-- `/stop` 单测覆盖响应只表示 accepted、低层/internal post-stop work 不属于本次 stop 取消集合，且不要求无条件 `queue.n==0`；HTTP/API 测试必须覆盖 public `ctrl:"stopping"` 中 `/execute queue|interrupt` 返回 conflict 且无 id/queue side effect。
+- `/urgent_stop` 单测覆盖响应只表示 accepted、低层/internal post-stop work 不属于本次 stop 取消集合，且不要求无条件 `queue.n==0`；HTTP/API 测试必须覆盖 public `ctrl:"stopping"` 中 `/execute queue|interrupt` 返回 conflict 且无 id/queue side effect；历史 `/stop` 必须覆盖 `CONTROL_ROUTE_RENAMED`。
 - 路径安全单测覆盖 URL/相对路径拒绝、canonical allowlist、symlink escape、控制线程重校验失败。
 - loader 单测覆盖同一打开文件句柄 scan+payload read 的 TOCTOU 约束。
 
@@ -1210,13 +1256,13 @@ agentic_et1_tracker:
 
 ### 14.6 Agent 体验
 
-agent 高频使用的是状态、执行和普通待命动作，另有 `GET /health` 用于 readiness 探活；当前公开 route path 包括 `/health`、`/status`、`/execute`、`/idle`、`/standby_velocity`、`/stop`、`/passive`、`/fixstand`，以及可选 `/execute_loco_upper`。
+agent 高频使用的是状态、执行和普通待命动作，另有 `GET /health` 用于 readiness 探活；当前可复制 route path 以 README 和 packaged skill 为准，普通待命使用 `/standby`，urgent/immediate 停止使用 `/urgent_stop`。历史 `/standby_velocity` 和 `/stop` 只应作为 `CONTROL_ROUTE_RENAMED` 拒绝路径。
 
 - `GET /status`
 - `GET /status?id=ID`
 - `POST /execute`
-- `POST /standby_velocity`
-- `POST /stop`（urgent/immediate）
+- `POST /standby`
+- `POST /urgent_stop`
 
 `GET /health` 仅用于探活。
 
@@ -1262,12 +1308,12 @@ agent 高频使用的是状态、执行和普通待命动作，另有 `GET /heal
 
 ## 17. 开发交付定义
 
-本节只评价 PRD/产品范围成熟度，不宣称当前代码实现已经达到 GA runtime。PRD/产品范围已闭合；当前代码已有主要 runtime/integration slices、AppRunner/runtime wiring、HTTP via `RuntimeBridge`、ONNX/RobotIO opt-in、Reference/Observation、LowCmd、stop_hold、asset isolation 和 focused tests 的实现证据，但仍不是可直接真机/仿真 GA runtime。GA 取决于 app-owned frozen profile 资产证据、`ONNX+ROBOT` build、MuJoCo/真机验收和真实 integration perf 记录。
+本节只评价历史 PRD/产品范围成熟度，不是当前实现合同，也不宣称当前代码实现已经达到 GA runtime。当前合同以 README、控制状态机重设计计划和 packaged skill 为准。
 
 ### 17.1 产品/文档闭合
 
 - 产品范围闭合：只做 `.trk` 执行、queue、interrupt、urgent stop、status 和当前控制合同。
-- 接口闭合：核心执行/状态需要 `/health`、`/status`、`/execute`；当前控制合同还包括 `/idle`、`/standby_velocity`、urgent `/stop`、passworded `/passive` 和 recovery `/fixstand`。
+- 接口闭合：核心执行/状态需要 `/health`、`/status`、`/execute`；当前普通待命和 urgent stop route 名称以 README/skill 为准：`/standby` 和 `/urgent_stop`。历史 `/standby_velocity`、`/stop` 是 `CONTROL_ROUTE_RENAMED` 拒绝路径。
 - 工程边界闭合：独立 app，不改、不包、不链 ET1 app，CMake 只用 target-level include/link。
 - 状态机闭合：`starting/standby_velocity/preparing/running/stopping/fault`，并包含 current control states `passive`/`fixstand`。
 - 停止语义闭合：不暴露单独抢断状态，统一用 `ctrl:"stopping"` 和 `stop_reason`；stop 取消集合由 command sequence/watermark 定义。
@@ -1284,10 +1330,10 @@ GA 代码交付必须保留已有 runtime/integration 实现，并满足以下�
 
 - 默认 app-owned frozen profile 交付时必须存在于新 app 目录或外部部署资产目录，默认配置指向真实存在的 agentic-owned ONNX/deploy 资产；当前资产证据应包括 manifest、hash 校验和 non-symlink 检查记录。
 - `AGENTIC_ET1_BUILD_ONNX=ON` 且 `AGENTIC_ET1_BUILD_ROBOT=ON` 的 non-stub runtime factory 可构建、链接并运行真实 ONNX Runtime 与 Unitree SDK2 RobotIO。
-- MuJoCo 仿真验收按第 14 节完成，覆盖 generated `.trk`、HTTP `/health`、`/status`、`/execute`、frame progress、`/standby_velocity`、urgent `/stop`、queue/interrupt/stop-to-standby_velocity 和 fault/disconnect 基本路径。
+- MuJoCo 仿真验收按当前权威文档和第 14 节历史范围完成，覆盖 generated `.trk`、HTTP `/health`、`/status`、`/execute`、frame progress、当前 `/standby`、当前 urgent `/urgent_stop`、queue/interrupt/stop-to-standby 相关路径和 fault/disconnect 基本路径；历史 `/standby_velocity` 和 `/stop` 作为 `CONTROL_ROUTE_RENAMED` 拒绝路径。
 - 真机验收按第 14 节完成，覆盖 LowCmd 通道占用 best-effort、`mode_machine`、readiness/safety gates、stop_hold、fault fallback 和部署层单控制进程约束。真机验收为 external pending，需要 ET1 硬件和操作者窗口；这不阻止 MuJoCo、`ONNX+ROBOT` build、fake tests 和证据记录继续推进。
 - 真实 integration perf 记录按第 11 节和第 14 节完成，至少覆盖 50 Hz 控制循环、HTTP p95、queue/interrupt/stop-to-standby_velocity、fault/disconnect 和资产隔离。
 
 ### 17.3 成熟度结论
 
-文档稳定成熟，无产品开放问题；当前实现已有主要 runtime/integration slices、focused tests 和 app-owned assets 的 manifest/hash/non-symlink 证据，但仍需按 GA 验收/证据清单完成 `ONNX+ROBOT` build、MuJoCo/真机验收和真实 perf 记录。真机验收仍是 external pending，不得因此阻塞 MuJoCo、build、fake tests 和非真机证据推进；也不能把未完成验收的状态标记为 GA runtime。
+历史 PRD 在当时的产品范围上已闭合，但不是当前实现合同；当前合同以 README、控制状态机重设计计划和 packaged skill 为准。实现证据仍需按当前权威文档完成 `ONNX+ROBOT` build、MuJoCo/真机验收和真实 perf 记录。真机验收仍是 external pending，不得因此阻塞 MuJoCo、build、fake tests 和非真机证据推进；也不能把未完成验收的状态标记为 GA runtime。
