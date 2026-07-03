@@ -136,6 +136,13 @@ class RuntimeControlLoop final {
     SafetyTerminal,
   };
 
+  enum class UserHandoffResult {
+    Started,
+    NoTransition,
+    TargetFailed,
+    SafetyTerminal,
+  };
+
   enum class StartupHoldMode {
     Run,
     Reduced,
@@ -207,6 +214,13 @@ class RuntimeControlLoop final {
   void handleInterrupt(MotionRequest request);
   RunningInterruptHandoffResult tryStartRunningUserInterruptHandoff(
       const MotionRequest& request);
+  UserHandoffResult tryStartUserHandoffFromFrame(
+      const TrkFrameView& source_frame,
+      const MotionRequest& request,
+      MotionState source_completion_state,
+      StopReason source_completion_reason,
+      ErrorCode source_completion_error,
+      bool publish_target_failure);
   void cancelWaiting(StopReason reason);
   void cancelWaiting(StopReason reason, std::uint64_t sequence);
   void failWaiting(ErrorCode error);

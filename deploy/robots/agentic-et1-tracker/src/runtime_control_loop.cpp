@@ -1279,6 +1279,33 @@ void RuntimeControlLoop::handleInterrupt(MotionRequest request) {
       return;
     }
   }
+  if (active_kind_ == ActiveKind::User && active_ &&
+      active_->state == MotionState::Holding &&
+      active_->executor == MotionExecutor::GeneralTracker &&
+      isGeneralTrackerRequest(request)) {
+    const std::optional<TrkFrameView> source_frame =
+        active_track_ ? active_track_->frame(active_->frame) : std::nullopt;
+    const UserHandoffResult handoff_result =
+        source_frame
+            ? tryStartUserHandoffFromFrame(*source_frame,
+                                           request,
+                                           MotionState::Stopped,
+                                           StopReason::Interrupt,
+                                           ErrorCode::Ok,
+                                           true)
+            : UserHandoffResult::NoTransition;
+    if (handoff_result == UserHandoffResult::Started ||
+        handoff_result == UserHandoffResult::SafetyTerminal ||
+        handoff_result == UserHandoffResult::TargetFailed) {
+      return;
+    }
+
+    waiting_.push_back(std::move(request));
+    markActiveStopping(StopReason::Interrupt);
+    post_stop_control_ = ControlMode::StandbyVelocity;
+    enterStopping(StopReason::Interrupt);
+    return;
+  }
   waiting_.push_back(std::move(request));
   if (active_kind_ == ActiveKind::User && active_ &&
       active_->executor == MotionExecutor::LocoUpper) {
@@ -1307,6 +1334,39 @@ RuntimeControlLoop::tryStartRunningUserInterruptHandoff(
     return RunningInterruptHandoffResult::Fallback;
   }
 
+  const std::optional<TrkFrameView> source_frame =
+      active_track_->frame(active_->frame);
+  if (!source_frame) {
+    return RunningInterruptHandoffResult::Fallback;
+  }
+
+  const UserHandoffResult handoff_result =
+      tryStartUserHandoffFromFrame(*source_frame,
+                                   request,
+                                   MotionState::Stopped,
+                                   StopReason::Interrupt,
+                                   ErrorCode::Ok,
+                                   false);
+  switch (handoff_result) {
+    case UserHandoffResult::Started:
+      return RunningInterruptHandoffResult::Started;
+    case UserHandoffResult::SafetyTerminal:
+      return RunningInterruptHandoffResult::SafetyTerminal;
+    case UserHandoffResult::TargetFailed:
+    case UserHandoffResult::NoTransition:
+      return RunningInterruptHandoffResult::Fallback;
+  }
+  return RunningInterruptHandoffResult::Fallback;
+}
+
+RuntimeControlLoop::UserHandoffResult
+RuntimeControlLoop::tryStartUserHandoffFromFrame(
+    const TrkFrameView& source_frame,
+    const MotionRequest& request,
+    MotionState source_completion_state,
+    StopReason source_completion_reason,
+    ErrorCode source_completion_error,
+    bool publish_target_failure) {
   auto publishTargetFailed = [this](MotionRequest failed, ErrorCode error) {
     failed.state = MotionState::Failed;
     failed.frame = 0;
@@ -1327,14 +1387,8 @@ RuntimeControlLoop::tryStartRunningUserInterruptHandoff(
     if (readiness.err != ErrorCode::Ok) {
       publishTargetFailed(request, readiness.err);
       failActiveReadiness(readiness);
-      return RunningInterruptHandoffResult::SafetyTerminal;
+      return UserHandoffResult::SafetyTerminal;
     }
-  }
-
-  const std::optional<TrkFrameView> source_frame =
-      active_track_->frame(active_->frame);
-  if (!source_frame) {
-    return RunningInterruptHandoffResult::Fallback;
   }
 
   MotionRequest target_request = request;
@@ -1345,7 +1399,11 @@ RuntimeControlLoop::tryStartRunningUserInterruptHandoff(
 
   TrkLoadResult loaded = loader_.load(target_request.path);
   if (!loaded.ok()) {
-    return RunningInterruptHandoffResult::Fallback;
+    if (publish_target_failure) {
+      publishTargetFailed(std::move(target_request), toCoreErrorCode(loaded.code));
+      return UserHandoffResult::TargetFailed;
+    }
+    return UserHandoffResult::NoTransition;
   }
 
   target_request.frames = loaded.track->metadata.frames;
@@ -1356,13 +1414,13 @@ RuntimeControlLoop::tryStartRunningUserInterruptHandoff(
   ErrorCode transition_error = ErrorCode::InternalError;
   bool transition_build_rejected = false;
   std::optional<UserTransitionTracks> tracks =
-      makeUserTransitionTracks(*source_frame,
+      makeUserTransitionTracks(source_frame,
                                target_track,
                                transition_error,
                                transition_build_rejected);
 
   if (!tracks) {
-    tracks = makeUserTransitionTracksFromControllableSource(*source_frame,
+    tracks = makeUserTransitionTracksFromControllableSource(source_frame,
                                                             target_track,
                                                             entry_low_state,
                                                             transition_error,
@@ -1379,13 +1437,13 @@ RuntimeControlLoop::tryStartRunningUserInterruptHandoff(
       readiness.err = transition_error;
       publishTargetFailed(std::move(target_request), transition_error);
       failActiveReadiness(readiness);
-      return RunningInterruptHandoffResult::SafetyTerminal;
+      return UserHandoffResult::SafetyTerminal;
     }
     if (isSafetyTerminalState()) {
       publishTargetFailed(std::move(target_request), transition_error);
-      return RunningInterruptHandoffResult::SafetyTerminal;
+      return UserHandoffResult::SafetyTerminal;
     }
-    return RunningInterruptHandoffResult::Fallback;
+    return UserHandoffResult::NoTransition;
   }
 
   const MotionRequest source_to_complete = *active_;
@@ -1395,37 +1453,38 @@ RuntimeControlLoop::tryStartRunningUserInterruptHandoff(
   target.target_state = MotionState::Queued;
   target.target_track = std::move(tracks->target_track);
   target.target_request = std::move(target_request);
-  target.source_completion_state = MotionState::Stopped;
-  target.source_completion_reason = StopReason::Interrupt;
-  target.source_completion_error = ErrorCode::Ok;
+  target.source_completion_state = source_completion_state;
+  target.source_completion_reason = source_completion_reason;
+  target.source_completion_error = source_completion_error;
 
   const bool started = startInternalTransition(std::move(tracks->transition_track),
                                                std::move(target),
                                                std::move(entry_low_state),
-                                               false);
+                                               publish_target_failure);
   if (!started) {
     if (last_transition_start_fatal_) {
       const TransitionStartFatal fatal = std::move(*last_transition_start_fatal_);
       last_transition_start_fatal_.reset();
       publishTargetFailed(request, fatal.error);
       failActiveWithFault(fatal.error, fatal.robot, fatal.block, fatal.low_ms);
-      return RunningInterruptHandoffResult::SafetyTerminal;
+      return UserHandoffResult::SafetyTerminal;
     }
     if (isSafetyTerminalState()) {
       publishTargetFailed(request, runtime_state_.err);
-      return RunningInterruptHandoffResult::SafetyTerminal;
+      return UserHandoffResult::SafetyTerminal;
     }
-    return RunningInterruptHandoffResult::Fallback;
+    return publish_target_failure ? UserHandoffResult::TargetFailed
+                                  : UserHandoffResult::NoTransition;
   }
 
   MotionRequest completed = source_to_complete;
-  completed.state = MotionState::Stopped;
-  completed.err = ErrorCode::Ok;
-  completed.stop_reason = StopReason::Interrupt;
+  completed.state = source_completion_state;
+  completed.err = source_completion_error;
+  completed.stop_reason = source_completion_reason;
   completed.ended_at = std::chrono::steady_clock::now();
   status_.publishRunStatus(toStatus(completed));
   post_stop_control_ = ControlMode::StandbyVelocity;
-  return RunningInterruptHandoffResult::Started;
+  return UserHandoffResult::Started;
 }
 
 void RuntimeControlLoop::cancelWaiting(StopReason reason) {
@@ -3612,58 +3671,45 @@ bool RuntimeControlLoop::startTransitionFromHoldingToNextUser() {
     return false;
   }
 
-  std::optional<LowStateSample> entry_low_state;
-  if (hasPolicyRuntime()) {
-    entry_low_state = readLowStateForStatus();
-    const RobotReadinessStatus readiness =
-        mapRobotReadiness(entry_low_state,
-                          robot_io_->lowCmdOccupancy(),
-                          expected_mode_machine_);
-    if (readiness.err != ErrorCode::Ok) {
-      failActiveReadiness(readiness);
-      return true;
-    }
-    applyReadiness(readiness);
-  }
+  auto releaseHoldingToQueuedFallback = [this]() {
+    MotionRequest pending = std::move(waiting_.front());
+    waiting_.pop_front();
+    finishActive(MotionState::Done, StopReason::None, ErrorCode::Ok);
+    post_stop_control_ = ControlMode::StandbyVelocity;
+    enterGeneralTrackerIdleState();
+    waiting_.push_front(std::move(pending));
+  };
 
-  MotionRequest target_request = std::move(waiting_.front());
-  waiting_.pop_front();
-  target_request.state = MotionState::Queued;
-  target_request.frame = 0;
-  target_request.err = ErrorCode::Ok;
-  target_request.stop_reason = StopReason::None;
-
-  TrkLoadResult loaded = loader_.load(target_request.path);
-  if (!loaded.ok()) {
-    target_request.state = MotionState::Failed;
-    target_request.frame = 0;
-    target_request.err = toCoreErrorCode(loaded.code);
-    target_request.ended_at = std::chrono::steady_clock::now();
-    status_.publishRunStatus(toStatus(target_request));
-    return true;
-  }
-
-  target_request.frames = loaded.track->metadata.frames;
-  target_request.fps = loaded.track->metadata.fps;
-  target_request.duration_s = loaded.track->metadata.duration_s;
-  auto target_track = std::make_shared<TrkTrack>(std::move(*loaded.track));
   const std::optional<TrkFrameView> source_frame = active_track_->frame(active_->frame);
-  const std::optional<TrkFrameView> target_frame = target_track->frame(0);
-  if (!source_frame || !target_frame) {
-    target_request.state = MotionState::Failed;
-    target_request.err = ErrorCode::InternalError;
-    target_request.ended_at = std::chrono::steady_clock::now();
-    status_.publishRunStatus(toStatus(target_request));
+  if (!source_frame) {
+    // A holding GeneralTracker run reaches this state from a validated loaded
+    // track and pins frame to frames-1, so this should not be reachable through
+    // the public queue path. If the invariant is violated, release the held
+    // source once and let the queued target continue through the no-active path
+    // instead of retrying the same impossible handoff every tick.
+    releaseHoldingToQueuedFallback();
     return true;
   }
 
-  PendingTransition target;
-  target.target_kind = TransitionTargetKind::User;
-  target.target_id = target_request.id;
-  target.target_state = MotionState::Queued;
-  target.target_track = std::move(target_track);
-  target.target_request = std::move(target_request);
-  return startSyntheticTransitionFromActiveFrame(std::move(target));
+  const MotionRequest target_request = waiting_.front();
+  const UserHandoffResult handoff_result =
+      tryStartUserHandoffFromFrame(*source_frame,
+                                   target_request,
+                                   MotionState::Done,
+                                   StopReason::None,
+                                   ErrorCode::Ok,
+                                   true);
+  if (handoff_result == UserHandoffResult::Started ||
+      handoff_result == UserHandoffResult::TargetFailed ||
+      handoff_result == UserHandoffResult::SafetyTerminal) {
+    if (!waiting_.empty() && waiting_.front().id == target_request.id) {
+      waiting_.pop_front();
+    }
+    return true;
+  }
+
+  releaseHoldingToQueuedFallback();
+  return true;
 }
 
 bool RuntimeControlLoop::startTransitionFromHoldingToStandby() {
