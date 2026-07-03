@@ -64,6 +64,7 @@ class TrackerState:
     def __init__(self):
         self.records = []
         self.next_id = 1
+        self.execute_state = None
         self.run_state = "running"
         self.loco_upper_enabled = True
         self.status = {
@@ -123,10 +124,16 @@ class Handler(BaseHTTPRequestHandler):
         payload = self.body()
         state.records.append(("POST", self.path, payload))
         if self.path == "/execute":
-            self.send_json({"ok": True, "id": state.run_id()})
+            out = {"ok": True, "id": state.run_id()}
+            if state.execute_state:
+                out["state"] = state.execute_state
+            self.send_json(out)
         elif self.path == "/execute_loco_upper":
             if state.loco_upper_enabled:
-                self.send_json({"ok": True, "id": state.run_id()})
+                out = {"ok": True, "id": state.run_id()}
+                if state.execute_state:
+                    out["state"] = state.execute_state
+                self.send_json(out)
             else:
                 self.send_json({"ok": False, "error": {"code": "MODEL_NOT_READY", "message": "loco_upper disabled"}})
         elif self.path == "/standby":
@@ -454,6 +461,23 @@ print(json.dumps({"ok": True}))
         self.assertTrue((Path(execute[2]["path"]).parent / "meta.json").exists())
         self.assertFalse((Path(execute[2]["path"]).parent / "action.bvh").exists())
 
+    def test_direct_run_text_preserves_tracker_queued_state_as_accepted_not_confirmed(self):
+        self.tracker.execute_state = "queued"
+
+        out, _ = self.cli(
+            "run-text",
+            "wave",
+            "--stage-dir",
+            str(self.stage),
+            env_extra={"FAKE_PRESET_MODE": "hit"},
+        )
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["state"], "queued")
+        self.assertTrue(out["accepted"])
+        self.assertFalse(out["confirmed"])
+        self.assertEqual(out["active"], {"run_id": "run1"})
+
     def test_motion_mode_switches_later_runs_to_loco_upper(self):
         out, _ = self.cli("motion-mode")
         self.assertTrue(out["ok"])
@@ -658,6 +682,109 @@ print(json.dumps({"ok": True}))
         self.assertEqual(self.tracker.records[-1][1], "/execute")
         self.assertTrue(self.tracker.records[-1][2]["hold"])
         self.assertTrue(out["hold"])
+
+    def test_direct_run_trk_preserves_tracker_queued_state_without_standby_retry(self):
+        self.tracker.execute_state = "queued"
+        self.tracker.status = {
+            "ok": True,
+            "ctrl": "holding",
+            "active": {"kind": "user", "id": "held-run"},
+            "idle": {"enabled": False, "active": False, "n": 0},
+        }
+
+        out, _ = self.cli("run-trk", str(self.ready_trk))
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["state"], "queued")
+        self.assertTrue(out["accepted"])
+        self.assertFalse(out["confirmed"])
+        self.assertEqual(out["active"], {"run_id": "run1"})
+        self.assertEqual(
+            [record[1] for record in self.tracker.records],
+            ["/execute"],
+        )
+        self.assertEqual(self.tracker.records[-1][2]["mode"], "interrupt")
+
+    def test_run_trk_wait_failed_run_returns_tracker_run_failed(self):
+        self.tracker.run_state = "failed"
+
+        out, proc = self.cli(
+            "--timeout",
+            "0.2",
+            "--poll",
+            "0.01",
+            "run-trk",
+            str(self.ready_trk),
+            "--wait",
+            check=False,
+        )
+
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["cmd"], "run-trk")
+        self.assertEqual(out["error"]["code"], "TRACKER_RUN_FAILED")
+
+    def test_run_text_wait_failed_run_returns_tracker_run_failed(self):
+        self.tracker.run_state = "failed"
+
+        out, proc = self.cli(
+            "--timeout",
+            "0.2",
+            "--poll",
+            "0.01",
+            "run-text",
+            "wave",
+            "--stage-dir",
+            str(self.stage),
+            "--wait",
+            env_extra={"FAKE_PRESET_MODE": "hit"},
+            check=False,
+        )
+
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["cmd"], "run-text")
+        self.assertEqual(out["error"]["code"], "TRACKER_RUN_FAILED")
+
+    def test_run_trk_wait_done_confirms_final_tracker_state(self):
+        self.tracker.run_state = "done"
+
+        out, _ = self.cli(
+            "--timeout",
+            "0.2",
+            "--poll",
+            "0.01",
+            "run-trk",
+            str(self.ready_trk),
+            "--wait",
+        )
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["state"], "done")
+        self.assertTrue(out["accepted"])
+        self.assertTrue(out["confirmed"])
+        self.assertEqual(out["active"], {"run_id": "run1"})
+
+    def test_run_trk_hold_wait_holding_confirms_final_tracker_state(self):
+        self.tracker.run_state = "holding"
+
+        out, _ = self.cli(
+            "--timeout",
+            "0.2",
+            "--poll",
+            "0.01",
+            "run-trk",
+            str(self.ready_trk),
+            "--hold",
+            "--wait",
+        )
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["state"], "holding")
+        self.assertTrue(out["accepted"])
+        self.assertTrue(out["confirmed"])
+        self.assertTrue(out["hold"])
+        self.assertEqual(self.tracker.records[0][2]["hold"], True)
 
     def test_run_trk_relative_path_resolves_under_user_motion_and_adds_suffix(self):
         work = self.base / "work"
@@ -1355,6 +1482,8 @@ print(json.dumps({"ok": True}))
         self.assertIn("`idle-load`, `idle-clear`, or `cache-clear`", docs)
         self.assertNotIn("Treat ordinary stop, do-not-move, standing still", docs)
         self.assertIn("Direct `run-text` and `run-trk` default to tracker interrupt", docs)
+        self.assertIn("Direct `run-text` / `run-trk` non-`--wait` success means accepted/submitted", docs)
+        self.assertIn("`--wait` can set `confirmed:true` when the final tracker state is `done` or `holding`", docs)
         self.assertIn("Default queue-ahead is `3`", docs)
         self.assertIn("performance optimization, not a tracker playlist", docs)
         self.assertIn("`TAIL_ALREADY_SUBMITTED`", docs)

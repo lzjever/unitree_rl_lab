@@ -15,6 +15,8 @@ Default failure output has:
 `next` is always one command: `run-text`, `run-trk`, `sequence-start`, `sequence-status`, `sequence-append`, `sequence-replace-tail`, `sequence-cancel`, `sequence-interrupt`, `standby`, `fixstand`, `passive`, `motion-mode`, `status`, `urgent-stop`, `idle-load`, `idle-clear`, or `cache-clear`.
 
 Do not rely on default output for full paths, prompts, durations, tracker status, or long logs.
+For `run-text` and `run-trk`, direct non-`--wait` success means accepted/submitted only. The output keeps the tracker returned `state`, commonly `queued`, sets `accepted:true` and `confirmed:false`, and does not imply the run is already running or complete. If the tracker omits `state`, the CLI reports `state:"submitted"` rather than inventing `running`.
+For `run-text --wait` and `run-trk --wait`, success means the submitted run reached `state:"done"` or `state:"holding"` and the output sets `accepted:true` and `confirmed:true`. Failed wait states such as `failed`, `canceled`, or `stopped` return `ok:false` with `error.code:"TRACKER_RUN_FAILED"`.
 For `standby`, `state` is `standby` for ordinary standby and may be `idle` when loaded idle motions immediately take over; `idle.enabled=true` means the idle configuration is still retained. Release tracker status uses `ctrl:"standby"` for ordinary standby.
 For `idle-clear`, successful output uses `cmd:"idle-clear"`, `intent:"cancel_to_still"`, and the compact tracker `idle` fields after clearing idle config and entering standby.
 For `fixstand` and `passive`, successful output keeps compatibility `state:"fixstand"` or `state:"passive"` and adds `accepted:true, confirmed:false`; it is an accepted control request, not a confirmed `/status` state.

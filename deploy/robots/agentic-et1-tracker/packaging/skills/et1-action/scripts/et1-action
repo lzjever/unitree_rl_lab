@@ -19,6 +19,7 @@ from pathlib import Path
 DEFAULT_URL = "http://127.0.0.1:8083"
 TERMINAL = {"done", "stopped", "canceled", "failed"}
 GOOD_TERMINAL = {"done"}
+RUN_WAIT_SUCCESS_STATES = {"done", "holding"}
 ACTIVE_STATES = {"starting", "running", "waiting_for_generation", "canceling"}
 INACTIVE_STATES = {"canceled", "completed", "failed"}
 P0_NEXT = {
@@ -517,12 +518,23 @@ def execute_trk(base, path, mode, wait, timeout, poll, hold=False):
         if not last.get("ok"):
             return last
         state = last.get("state")
+        if state in RUN_WAIT_SUCCESS_STATES:
+            if run_id and not last.get("id"):
+                last = dict(last)
+                last["id"] = run_id
+            return last
         if state in TERMINAL:
-            if state in GOOD_TERMINAL:
-                return last
             return {"ok": False, "error": {"code": "TRACKER_RUN_FAILED", "message": f"state={state}"}}
         time.sleep(poll)
     return {"ok": False, "error": {"code": "WAIT_TIMEOUT", "message": f"id={run_id}"}}
+
+
+def run_submit_state(result):
+    return result.get("state") or "submitted"
+
+
+def run_confirmed(result, wait):
+    return bool(wait and result.get("state") in RUN_WAIT_SUCCESS_STATES)
 
 
 def tracker_standby(base, timeout):
@@ -819,7 +831,19 @@ def run_text_cmd(args, base, timeout, poll):
         return err_doc("run-text", error.get("code", "TRACKER_RUN_FAILED"), error.get("message", "tracker run failed"), "run-text")
     active = {"run_id": started.get("id")} if started.get("id") else None
     motion_mode = current_motion_mode()
-    return ok_doc("run-text", "standby", intent="run_text", state="running", active=active, segments={"submitted": 1}, hold=hold, motion_mode=motion_mode, executor=executor_for_motion_mode(motion_mode))
+    return ok_doc(
+        "run-text",
+        "standby",
+        intent="run_text",
+        state=run_submit_state(started),
+        active=active,
+        segments={"submitted": 1},
+        accepted=True,
+        confirmed=run_confirmed(started, args.wait),
+        hold=hold,
+        motion_mode=motion_mode,
+        executor=executor_for_motion_mode(motion_mode),
+    )
 
 
 def run_trk_cmd(args, base, timeout, poll):
@@ -831,7 +855,20 @@ def run_trk_cmd(args, base, timeout, poll):
         return err_doc("run-trk", error.get("code", "TRACKER_RUN_FAILED"), error.get("message", "tracker run failed"), "run-trk")
     active = {"run_id": started.get("id")} if started.get("id") else None
     motion_mode = current_motion_mode()
-    return ok_doc("run-trk", "standby", intent="run_trk", state="running", active=active, segments={"submitted": 1}, hold=args.hold, matched=matched, motion_mode=motion_mode, executor=executor_for_motion_mode(motion_mode))
+    return ok_doc(
+        "run-trk",
+        "standby",
+        intent="run_trk",
+        state=run_submit_state(started),
+        active=active,
+        segments={"submitted": 1},
+        accepted=True,
+        confirmed=run_confirmed(started, args.wait),
+        hold=args.hold,
+        matched=matched,
+        motion_mode=motion_mode,
+        executor=executor_for_motion_mode(motion_mode),
+    )
 
 
 def compact_tracker_state(status):
