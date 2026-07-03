@@ -1,6 +1,6 @@
-# User Interrupt Smooth Handoff Development Plan
+# User Interrupt Smooth Handoff
 
-本文档是 `agentic-et1-tracker` 后续改进计划，目标是解决连续用户动作/插话场景下的产品语义和执行稳定性缺口。
+本文档记录 `agentic-et1-tracker` 已实现的用户动作 interrupt 平滑交接行为，以及该实现的产品/工程边界。该行为用于解决连续用户动作/插话场景下的产品语义和执行稳定性缺口。
 
 范围只限：
 
@@ -17,10 +17,10 @@
 
 - `ROBOT_BAD_ORIENTATION` 来自当前机器人 low state 姿态安全检查，不是 `.trk` 文件首帧校验。
 - `et1-action run-text` 默认提交 tracker `mode:"interrupt"`，命令返回成功只表示“动作已生成并提交”，不表示机器人已经执行完成。
-- 当前 runtime 对 active running user 的 interrupt 是保守 stop/restart：旧 user 进入 stopping，新 user 等 stop 后再启动。
-- runtime 已经具备 synthetic transition 能力，但主要覆盖 idle/background/holding/completed user 等路径；active running user interrupt 还没有优先走 current-frame transition。
+- 当前 runtime 对 active running GeneralTracker user 的 interrupt 会先尝试 current-frame synthetic handoff；成功时进入 `transition.target:"user"`，失败的 benign reject 才 fallback 到 controlled stop/restart。
+- safety/readiness/fault 仍是最高优先级。bad orientation、fault、model/write error 不为了 interrupt 平滑而 fallback 或绕过安全路径。
 
-产品层面的缺口是：用户和 LLM agent 认为“现在改做新动作”应该是前景意图接管，而当前 running user interrupt 更接近“先停，再冷启动新动作”。这个语义在生成动作质量不稳定、频繁插话或连续动作里容易把机器人推到策略能力边界。
+产品层面的合同是：用户和 LLM agent 认为“现在改做新动作”就是前景意图接管。tracker 对这个合同只暴露 `mode:"interrupt"`，内部优先做平滑交接，不能安全交接时再回到 controlled stop/restart。
 
 ## 2. Product Contract
 
@@ -282,16 +282,16 @@ fallback 行为：
 - 不降低 orientation safety threshold。
 - 不自动从 passive 恢复。
 
-## 9. Handoff Checklist
+## 9. Implementation Checklist
 
-- [ ] 先写 C++ failing tests，覆盖 running user interrupt smooth handoff 和 fallback。
-- [ ] 实现窄 helper，使用 no-commit transition build + 三态返回，复用现有 transition builder。
-- [ ] 跑 `runtime_control_loop_tests` 相关测试。
-- [ ] 更新 skill docs/tests，锁定 sequence queue-ahead 和 intent mapping。
-- [ ] 更新冲突文档：`MOTION_TRANSITION_BEHAVIOR_MATRIX.md` 和 `SKILL_SEQUENCE_WORKFLOW_PLAN.md`。
-- [ ] 运行 tracker 单测最小集。
-- [ ] 手动仿真 e2e/visual gate，确认 interrupt 切换状态和肉眼效果。
-- [ ] review 确认未新增 API、未影响 urgent_stop/passive/fixstand/standby。
+- [x] 写 C++ tests，覆盖 running user interrupt smooth handoff、benign fallback、invalid target、safety terminal 和 transition-start fatal。
+- [x] 实现窄路径，在 `waiting_.push_back()` 前尝试 current-frame transition，成功后只通过 `transition.target_id` 暴露目标 run。
+- [x] 跑 `runtime_control_loop_tests` 相关测试。
+- [x] 更新 skill docs/tests，锁定 sequence queue-ahead 和 intent mapping。
+- [x] 更新冲突文档，确保 active running user interrupt 不再被描述成必须 controlled stop/restart。
+- [x] 运行 tracker 单测最小集。
+- [x] 手动仿真 e2e/visual gate，确认 interrupt 切换状态和肉眼效果。
+- [x] review 确认未新增 API、未影响 urgent_stop/passive/fixstand/standby。
 
 ## 10. Team Review Summary
 

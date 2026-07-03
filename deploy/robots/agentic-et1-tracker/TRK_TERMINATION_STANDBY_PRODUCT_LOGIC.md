@@ -125,7 +125,6 @@ This should be an implementation improvement behind the existing empty-body
 | Smooth active idle to standby | Nice visual improvement, but not core "terminate user TRK". |
 | Separate pure-standby command | Existing idle clear + standby is enough. |
 | Per-request transition speed | Adds agent decision burden and API surface. Keep global `transition_duration_s`. |
-| Direct active user interrupt via current-frame transition | Higher safety risk; existing controlled stop path is conservative. |
 | Standby asset selection or upload | The app-owned standby reference is already the boundary; do not make it user motion or idle input. |
 
 ## Implementation Boundary
@@ -200,9 +199,15 @@ preferably `Stopped` with `StopReason::Stop`, not natural completion.
   from the current reference frame.
 - A queued user TRK during background standby/idle transition still follows the
   existing background-preempt rules.
-- Foreground user interrupt policy remains conservative unless separately
-  changed: do not introduce direct current-frame active-user interrupt as part
-  of this work.
+- Active running GeneralTracker user interrupt is already implemented as a
+  foreground handoff: runtime first attempts a current-frame synthetic
+  transition to the new user run.
+- On successful handoff, status reports `transition.target="user"` and
+  `transition.target_id` as the new run id; the old user run is terminal with
+  interrupt stop reason.
+- If that handoff receives a benign transition reject, runtime falls back to the
+  controlled stop/restart path. Safety/fatal failures do not fallback and still
+  route to the existing safety/fault path.
 
 ### Skill/Agent Contract
 
