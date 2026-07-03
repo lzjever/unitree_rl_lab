@@ -8,6 +8,7 @@ By default it connects to an already running tracker and MuJoCo session.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -780,10 +781,11 @@ def mujoco_landing_settle_check(args: argparse.Namespace, url: str) -> dict[str,
         "phase": "standby_before_release",
         "status": compact_status(standby_status),
     })
+    standby_sim = sim_control_checked_command(args, "status", label, samples)
     reason = standby_stability_reason(
         label,
         standby_status,
-        latest_sim or {},
+        standby_sim,
         args.min_root_z,
         require_sim_contact=True,
     )
@@ -794,6 +796,7 @@ def mujoco_landing_settle_check(args: argparse.Namespace, url: str) -> dict[str,
             samples,
             lower_count=lower_count,
             standby_status=compact_status(standby_status),
+            standby_sim_control=standby_sim,
         )
 
     sim_control_checked_command(args, "release", label, samples)
@@ -889,6 +892,7 @@ def mujoco_landing_settle_check(args: argparse.Namespace, url: str) -> dict[str,
         "release_contact": release_contact,
         "release_check": release_check,
         "standby_status": compact_status(standby_status),
+        "standby_sim_control": standby_sim,
         "samples": samples[-8:],
     }
 
@@ -1497,22 +1501,65 @@ def named_manual_gate_fixture_candidates(candidates: list[TrkCandidate]) -> dict
 
 
 def existing_fixture_paths(candidates: list[TrkCandidate]) -> dict[str, Path] | None:
-    named = named_manual_gate_fixture_candidates(candidates)
-    if len(named) == len(FIXTURE_KEYS):
+    named = existing_fixture_candidates(candidates)
+    if named is not None:
         return {key: named[key].path for key in FIXTURE_KEYS}
     return None
 
 
+def existing_fixture_candidates(candidates: list[TrkCandidate]) -> dict[str, TrkCandidate] | None:
+    named = named_manual_gate_fixture_candidates(candidates)
+    if len(named) != len(FIXTURE_KEYS):
+        return None
+    for key in FIXTURE_KEYS:
+        if named[key].frames != E2E_SAFE_FIXTURE_FRAMES[key]:
+            return None
+    return {key: named[key] for key in FIXTURE_KEYS}
+
+
+def existing_fixture_frame_mismatches(candidates: list[TrkCandidate]) -> dict[str, dict[str, Any]]:
+    named = named_manual_gate_fixture_candidates(candidates)
+    mismatches: dict[str, dict[str, Any]] = {}
+    for key, candidate in named.items():
+        expected = E2E_SAFE_FIXTURE_FRAMES[key]
+        if candidate.frames != expected:
+            mismatches[key] = {
+                "path": str(candidate.path),
+                "frames": candidate.frames,
+                "expected_frames": expected,
+            }
+    return mismatches
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as infile:
+        for chunk in iter(lambda: infile.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def fixture_path_report(fixtures: dict[str, Path],
-                        candidates: list[TrkCandidate] | None = None) -> dict[str, Any]:
-    frame_by_path = {str(candidate.path): candidate.frames for candidate in candidates or []}
-    return {
-        key: {
-            "path": str(path),
-            **({"frames": frame_by_path[str(path)]} if str(path) in frame_by_path else {}),
-        }
-        for key, path in fixtures.items()
+                        candidates: list[TrkCandidate] | None = None,
+                        provenance: str | None = None) -> dict[str, Any]:
+    candidate_by_path = {
+        str(candidate.path.resolve()): candidate for candidate in candidates or []
     }
+    report: dict[str, Any] = {}
+    for key, path in fixtures.items():
+        resolved = path.resolve()
+        candidate = candidate_by_path.get(str(resolved))
+        entry: dict[str, Any] = {"path": str(path)}
+        if candidate is not None:
+            entry["frames"] = candidate.frames
+        if provenance is not None:
+            entry["provenance"] = provenance
+        try:
+            entry["sha256"] = file_sha256(resolved)
+        except OSError:
+            pass
+        report[key] = entry
+    return report
 
 
 def e2e_safe_fixture_candidates(fixtures: dict[str, Path]) -> list[TrkCandidate]:
@@ -1542,30 +1589,6 @@ def resolve_fixtures(args: argparse.Namespace,
     candidates: list[TrkCandidate] = []
     if requested in ("auto", "existing"):
         candidates = find_existing_trk_candidates(motion_dir)
-        if candidates:
-            fixtures = existing_fixture_paths(candidates)
-            if fixtures is not None:
-                log(f"[fixtures] source=existing candidates={len(candidates)} motion_dir={motion_dir}")
-                return fixtures, {
-                    "source": "existing",
-                    "requested": requested,
-                    "motion_dir": str(motion_dir),
-                    "candidate_count": len(candidates),
-                    "selected": fixture_path_report(fixtures, candidates),
-                }
-        if requested == "existing":
-            if candidates:
-                fail(
-                    f"--fixture-source existing found no complete e2e-safe fixture set "
-                    f"under {motion_dir}; expected manual_gate_e2e_safe_*.trk. "
-                    "Arbitrary generated and legacy manual_gate_*.trk files are not "
-                    "stable product gate fixtures"
-                )
-            fail(
-                f"--fixture-source existing found no usable generated TRK under {motion_dir}; "
-                "expected manual_gate_e2e_safe_*.trk; legacy manual_gate_*.trk/tmp/"
-                "synthetic-looking files are ignored"
-            )
 
     if requested == "auto" and motion_fixtures_will_run(args):
         fixtures = make_e2e_safe_fixtures(motion_dir)
@@ -1576,9 +1599,50 @@ def resolve_fixtures(args: argparse.Namespace,
             "motion_dir": str(motion_dir),
             "candidate_count": len(candidates),
             "source_trk": str(E2E_SAFE_SOURCE_TRK),
-            "selected": fixture_path_report(fixtures, e2e_safe_fixture_candidates(fixtures)),
+            "selected": fixture_path_report(
+                fixtures,
+                e2e_safe_fixture_candidates(fixtures),
+                provenance="app_standby_ref_derived",
+            ),
             "note": "reference-derived e2e-safe fixtures keep manual_gate semantic checks low risk",
         }
+
+    if requested == "existing":
+        fixtures_by_key = existing_fixture_candidates(candidates)
+        if fixtures_by_key is not None:
+            fixtures = {key: fixtures_by_key[key].path for key in FIXTURE_KEYS}
+            log(f"[fixtures] source=existing candidates={len(candidates)} motion_dir={motion_dir}")
+            return fixtures, {
+                "source": "existing",
+                "requested": requested,
+                "motion_dir": str(motion_dir),
+                "candidate_count": len(candidates),
+                "selected": fixture_path_report(
+                    fixtures,
+                    list(fixtures_by_key.values()),
+                    provenance="existing_named_e2e_safe",
+                ),
+            }
+        if candidates:
+            frame_mismatches = existing_fixture_frame_mismatches(candidates)
+            if frame_mismatches:
+                fail(
+                    f"--fixture-source existing found manual_gate_e2e_safe_*.trk with "
+                    f"wrong expected e2e-safe fixture frames under {motion_dir}: "
+                    f"{json.dumps(frame_mismatches, sort_keys=True)}"
+                )
+            else:
+                fail(
+                    f"--fixture-source existing found no complete e2e-safe fixture set "
+                    f"under {motion_dir}; expected manual_gate_e2e_safe_*.trk. "
+                    "Arbitrary generated and legacy manual_gate_*.trk files are not "
+                    "stable product gate fixtures"
+                )
+        fail(
+            f"--fixture-source existing found no usable generated TRK under {motion_dir}; "
+            "expected manual_gate_e2e_safe_*.trk; legacy manual_gate_*.trk/tmp/"
+            "synthetic-looking files are ignored"
+        )
 
     if requested in ("auto", "synthetic") and motion_fixtures_will_run(args):
         sim_status = current_sim_status(args)

@@ -735,6 +735,7 @@ class ManualGateMujocoLandingSettleTests(unittest.TestCase):
                 "sim:lower",
                 "post:/standby",
                 "get:/status",
+                "sim:status",
                 "sim:release",
                 "sim:status",
                 "get:/status",
@@ -743,8 +744,93 @@ class ManualGateMujocoLandingSettleTests(unittest.TestCase):
         self.assertEqual(result["result"], "PASS")
         self.assertEqual(result["lower_count"], 3)
         self.assertEqual(result["standby_status"]["ctrl"], "standby")
+        self.assertEqual(result["standby_sim_control"]["both"], True)
         self.assertEqual(result["release_check"]["sim_control"]["both"], True)
         self.assertEqual(result["release_check"]["status"]["ctrl"], "standby")
+
+    def test_landing_settle_samples_fresh_status_before_release(self):
+        old_command = manual_gate.sim_control_command
+        old_get = manual_gate.get
+        old_post = manual_gate.post
+        events = []
+        statuses = [
+            status(ctrl="fixstand"),
+            status(ctrl="standby"),
+        ]
+
+        def fake_command(_port, _timeout_ms, command):
+            events.append(f"sim:{command}")
+            if command == "hold":
+                return {"available": True, "ok": True, "root_z": 0.95, "both": False}
+            if command == "lower":
+                return {"available": True, "ok": True, "root_z": 0.74, "both": True}
+            if command == "status":
+                return {"available": True, "ok": True, "root_z": 0.10, "both": True}
+            if command == "release":
+                self.fail("release must not run before fresh standby status passes")
+            self.fail(f"unexpected command {command}")
+
+        try:
+            manual_gate.sim_control_command = fake_command
+            manual_gate.get = (
+                lambda _url, _path: statuses.pop(0) if statuses else status(ctrl="standby")
+            )
+            manual_gate.post = lambda _url, _path, body=None: {"ok": True}
+            with self.assertRaises(manual_gate.GateError) as raised:
+                manual_gate.mujoco_landing_settle_check(
+                    self.args(mujoco_land_contact_samples=1),
+                    "http://tracker",
+                )
+        finally:
+            manual_gate.sim_control_command = old_command
+            manual_gate.get = old_get
+            manual_gate.post = old_post
+
+        self.assertIn("sim-control root_z 0.100 < 0.200", str(raised.exception))
+        self.assertIn("sim:status", events)
+        self.assertNotIn("sim:release", events)
+
+    def test_landing_settle_fresh_status_requires_contact_before_release(self):
+        old_command = manual_gate.sim_control_command
+        old_get = manual_gate.get
+        old_post = manual_gate.post
+        events = []
+        statuses = [
+            status(ctrl="fixstand"),
+            status(ctrl="standby"),
+        ]
+
+        def fake_command(_port, _timeout_ms, command):
+            events.append(f"sim:{command}")
+            if command == "hold":
+                return {"available": True, "ok": True, "root_z": 0.95, "both": False}
+            if command == "lower":
+                return {"available": True, "ok": True, "root_z": 0.74, "both": True}
+            if command == "status":
+                return {"available": True, "ok": True, "root_z": 0.74, "both": False}
+            if command == "release":
+                self.fail("release must not run before fresh standby contact passes")
+            self.fail(f"unexpected command {command}")
+
+        try:
+            manual_gate.sim_control_command = fake_command
+            manual_gate.get = (
+                lambda _url, _path: statuses.pop(0) if statuses else status(ctrl="standby")
+            )
+            manual_gate.post = lambda _url, _path, body=None: {"ok": True}
+            with self.assertRaises(manual_gate.GateError) as raised:
+                manual_gate.mujoco_landing_settle_check(
+                    self.args(mujoco_land_contact_samples=1),
+                    "http://tracker",
+                )
+        finally:
+            manual_gate.sim_control_command = old_command
+            manual_gate.get = old_get
+            manual_gate.post = old_post
+
+        self.assertIn("both contact is not true", str(raised.exception))
+        self.assertIn("sim:status", events)
+        self.assertNotIn("sim:release", events)
 
     def test_landing_settle_can_skip_initial_hold(self):
         old_command = manual_gate.sim_control_command
@@ -790,6 +876,7 @@ class ManualGateMujocoLandingSettleTests(unittest.TestCase):
                 "sim:lower",
                 "post:/standby",
                 "get:/status",
+                "sim:status",
                 "sim:release",
                 "sim:status",
                 "get:/status",
@@ -805,7 +892,10 @@ class ManualGateMujocoLandingSettleTests(unittest.TestCase):
             "hold": [{"available": True, "ok": True, "root_z": 0.95, "both": False}],
             "lower": [{"available": True, "ok": True, "root_z": 0.74, "both": True}],
             "release": [{"available": True, "ok": True, "root_z": 0.74, "both": True}],
-            "status": [{"available": True, "ok": True, "root_z": 0.74, "both": False}],
+            "status": [
+                {"available": True, "ok": True, "root_z": 0.74, "both": True},
+                {"available": True, "ok": True, "root_z": 0.74, "both": False},
+            ],
         }
         statuses = [
             status(ctrl="fixstand"),
@@ -849,6 +939,7 @@ class ManualGateMujocoLandingSettleTests(unittest.TestCase):
             {"available": True, "ok": True, "root_z": 0.74, "both": True},
         ]
         seen_release_both = []
+        pre_release_status = {"used": False}
         statuses = [
             status(ctrl="fixstand"),
             status(ctrl="standby"),
@@ -866,6 +957,9 @@ class ManualGateMujocoLandingSettleTests(unittest.TestCase):
             if command == "release":
                 return {"available": True, "ok": True, "root_z": 0.74, "both": True}
             if command == "status":
+                if not pre_release_status["used"]:
+                    pre_release_status["used"] = True
+                    return {"available": True, "ok": True, "root_z": 0.74, "both": True}
                 sample = release_samples.pop(0) if release_samples else {
                     "available": True,
                     "ok": True,
@@ -910,6 +1004,7 @@ class ManualGateMujocoLandingSettleTests(unittest.TestCase):
         old_monotonic = manual_gate.time.monotonic
         old_sleep = manual_gate.time.sleep
         clock = {"t": 0.0}
+        pre_release_status = {"used": False}
         statuses = [
             status(ctrl="fixstand"),
             status(ctrl="standby"),
@@ -924,7 +1019,12 @@ class ManualGateMujocoLandingSettleTests(unittest.TestCase):
                 return {"available": True, "ok": True, "root_z": 0.95, "both": False}
             if command == "lower":
                 return {"available": True, "ok": True, "root_z": 0.74, "both": True}
-            if command in ("release", "status"):
+            if command == "release":
+                return {"available": True, "ok": True, "root_z": 0.74, "both": True}
+            if command == "status":
+                if not pre_release_status["used"]:
+                    pre_release_status["used"] = True
+                    return {"available": True, "ok": True, "root_z": 0.74, "both": True}
                 return {"available": True, "ok": True, "root_z": 0.74, "both": False}
             self.fail(f"unexpected command {command}")
 
@@ -1239,10 +1339,17 @@ class ManualGateFixtureSelectionTests(unittest.TestCase):
         self.assertEqual(manual_gate.repeat_frame_data(data, 3, 5), b"aabbcccccc")
         self.assertEqual(manual_gate.repeat_frame_data(data, 3, 2), b"aabb")
 
-    def test_auto_prefers_existing_e2e_safe_named_fixtures(self):
+    def test_auto_overwrites_existing_named_fixtures_from_reference(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            named = self.write_named_fixtures(root)
+            stale = {
+                key: manual_gate.write_trk(
+                    root / f"manual_gate_e2e_safe_{key}.trk",
+                    3,
+                    9.0,
+                )
+                for key in manual_gate.FIXTURE_KEYS
+            }
             manual_gate.write_trk(root / "manual_gate_long_c.trk", 220, 0.6)
             manual_gate.write_trk(
                 root / "et1-generated-turn_around_180_degrees-newer.trk", 20, 0.2
@@ -1250,9 +1357,19 @@ class ManualGateFixtureSelectionTests(unittest.TestCase):
 
             fixtures, report = manual_gate.resolve_fixtures(self.args("auto"), root)
 
-        self.assertEqual(report["source"], "existing")
-        self.assertGreaterEqual(report["candidate_count"], len(named))
-        self.assertEqual(fixtures, {key: path.resolve() for key, path in named.items()})
+            self.assertEqual(report["source"], "e2e_safe")
+            self.assertGreaterEqual(report["candidate_count"], len(stale))
+            self.assertEqual(set(fixtures.keys()), set(manual_gate.FIXTURE_KEYS))
+            for key, path in fixtures.items():
+                self.assertEqual(path.resolve(), stale[key].resolve())
+                self.assertEqual(
+                    manual_gate.trk_summary(path).frames,
+                    manual_gate.E2E_SAFE_FIXTURE_FRAMES[key],
+                )
+                self.assertEqual(report["selected"][key]["frames"],
+                                 manual_gate.E2E_SAFE_FIXTURE_FRAMES[key])
+                self.assertEqual(report["selected"][key]["provenance"],
+                                 "app_standby_ref_derived")
 
     def test_auto_generates_reference_derived_e2e_safe_fixtures_not_recent_generated(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1302,6 +1419,34 @@ class ManualGateFixtureSelectionTests(unittest.TestCase):
 
         self.assertIn("no complete e2e-safe fixture set", str(raised.exception))
         self.assertIn("manual_gate_e2e_safe_", str(raised.exception))
+
+    def test_existing_source_accepts_expected_named_frames_and_reports_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            named = self.write_named_fixtures(root)
+
+            fixtures, report = manual_gate.resolve_fixtures(self.args("existing"), root)
+
+        self.assertEqual(report["source"], "existing")
+        self.assertEqual(fixtures, {key: path.resolve() for key, path in named.items()})
+        for key in manual_gate.FIXTURE_KEYS:
+            selected = report["selected"][key]
+            self.assertEqual(selected["frames"], manual_gate.E2E_SAFE_FIXTURE_FRAMES[key])
+            self.assertEqual(selected["provenance"], "existing_named_e2e_safe")
+            self.assertRegex(selected["sha256"], r"^[0-9a-f]{64}$")
+
+    def test_existing_source_rejects_named_fixtures_with_wrong_frames(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_named_fixtures(root)
+            manual_gate.write_trk(root / "manual_gate_e2e_safe_short.trk", 99, 0.3)
+
+            with self.assertRaises(manual_gate.GateError) as raised:
+                manual_gate.resolve_fixtures(self.args("existing"), root)
+
+        self.assertIn("expected e2e-safe fixture frames", str(raised.exception))
+        self.assertIn("short", str(raised.exception))
+        self.assertIn("99", str(raised.exception))
 
     def test_existing_source_fails_when_only_synthetic_files_exist(self):
         with tempfile.TemporaryDirectory() as tmp:

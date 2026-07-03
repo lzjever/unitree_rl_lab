@@ -13,7 +13,7 @@ P0 rules:
 - `sequence-cancel` cancels unsubmitted local work and calls standby.
 - `sequence-interrupt --trk PATH` runs the ready `.trk` with mode `interrupt`.
 - `sequence-interrupt --text TEXT` first calls standby, then generates and submits the new action with mode `interrupt`.
-- Direct `run-text`, `run-trk`, and `standby` cancel active local sequences before calling the tracker, so old workers do not keep generating or submitting stale motions.
+- Direct `run-text`, `run-trk`, `standby`, and `idle-clear` cancel active local sequences before calling the tracker, so old workers do not keep generating or submitting stale motions.
 - Direct `run-text` and `run-trk` default to tracker interrupt as a skill product default. Raw HTTP `/execute` and `/execute_loco_upper` default to queue when `mode` is omitted.
 
 Text segments accept:

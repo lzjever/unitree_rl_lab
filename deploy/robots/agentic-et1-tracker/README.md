@@ -55,24 +55,38 @@ sessions; the script stops only processes it started. `visual` writes a MuJoCo
 screenshot and a JSON checklist report under `/tmp/agentic-et1-manual-gate` by
 default.
 
-For `--fixture-source auto`, manual gate writes reference-derived
-`manual_gate_e2e_safe_*.trk` fixtures into the selected `motion_dirs` directory
-and uses those for E2E/visual semantic checks. `--fixture-source existing`
-requires that complete e2e-safe named set to already exist. Recent arbitrary
-generated actions and legacy `manual_gate_long_*.trk` files are not product gate
-fixtures. When sim-control is available, final settle accepts only physical-safe
-fixture sources: `existing` and `e2e_safe`; synthetic fixtures remain HTTP/status
-contract-only.
+For `--fixture-source auto`, manual gate writes or overwrites reference-derived
+`manual_gate_e2e_safe_*.trk` fixtures from the app-owned
+`config/reference/standby/v0/standby_ref.trk` into the selected `motion_dirs`
+directory and uses those for E2E/visual semantic checks. The
+`--fixture-source existing` mode requires a complete e2e-safe named set with
+the expected fixture frame counts and readable TRK structure; the report
+records each selected fixture's frames, hash, and provenance. Recent arbitrary
+generated actions and legacy `manual_gate_long_*.trk` files are not product
+gate fixtures. When sim-control is available, final settle accepts only
+physical-safe fixture sources: `existing` and `e2e_safe`; synthetic fixtures
+remain HTTP/status contract-only.
 
 Release evidence for manual/e2e/visual coverage comes only from explicitly
 running these commands and recording their artifacts; this README does not claim
 the default local or release pipeline runs them automatically.
 
 For full local simulation acceptance, use an explicit temporary tracker config
-with `--start-tracker --enable-loco-temp --require-loco`. The generated config
-keeps release defaults untouched and uses sim-runtime timing defaults:
-`hz: 1000` and `transition_duration_s: 0.7`. Override only with explicit
-`--temp-hz` or `--temp-transition-duration-s` test arguments.
+with `--start-tracker --enable-loco-temp --require-loco`, the MuJoCo landing
+settle helper, and an explicit standby soak:
+
+```sh
+tools/manual_gate.py all \
+  --start-tracker \
+  --enable-loco-temp \
+  --require-loco \
+  --mujoco-land-settle \
+  --standby-soak-s 30
+```
+
+The generated config keeps release defaults untouched and uses sim-runtime
+timing defaults: `hz: 1000` and `transition_duration_s: 0.7`. Override only
+with explicit `--temp-hz` or `--temp-transition-duration-s` test arguments.
 
 ## HTTP Contract
 

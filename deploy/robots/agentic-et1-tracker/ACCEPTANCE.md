@@ -39,22 +39,37 @@ pipelines automatically cover those gates.
   sim-control is available. The intended full MuJoCo landing/standby flow is
   `fixstand` -> landing/lower contact -> `standby` -> `release` -> soak.
   Failures include the latest sample summary.
-- `--fixture-source auto` writes reference-derived
-  `manual_gate_e2e_safe_*.trk` fixtures into the selected `motion_dirs`
-  directory for E2E/visual semantic checks. `--fixture-source existing`
-  requires that complete e2e-safe named set to already exist. Recent arbitrary
-  generated actions and legacy `manual_gate_long_*.trk` files are not product
-  gate fixtures. When sim-control is available, final settle accepts only
-  physical-safe fixture sources: `existing` and `e2e_safe`; synthetic fixtures
-  remain HTTP/status contract-only.
+- `--fixture-source auto` writes or overwrites reference-derived
+  `manual_gate_e2e_safe_*.trk` fixtures from the app-owned
+  `config/reference/standby/v0/standby_ref.trk` into the selected
+  `motion_dirs` directory for E2E/visual semantic checks. The
+  `--fixture-source existing` mode requires a complete e2e-safe named set with
+  the expected fixture frame counts and readable TRK structure; the report
+  records each selected fixture's frames, hash, and provenance. Recent
+  arbitrary generated actions and legacy `manual_gate_long_*.trk` files are not
+  product gate fixtures. When sim-control is available, final settle accepts
+  only physical-safe fixture sources: `existing` and `e2e_safe`; synthetic
+  fixtures remain HTTP/status contract-only.
 - Defaults connect to already running services. Process startup is explicit via
   `--start-tracker` and `--start-mujoco-cmd`; the script stops only processes
   it started.
 - Full local simulation acceptance should pass `--start-tracker
-  --enable-loco-temp --require-loco`. The script's generated config uses
-  sim-runtime timing defaults (`hz: 1000`, `transition_duration_s: 0.7`) unless
-  explicitly overridden with `--temp-hz` or `--temp-transition-duration-s`; this
-  does not change release config or default gates.
+  --enable-loco-temp --require-loco`, `--mujoco-land-settle`, and an explicit
+  standby soak such as `--standby-soak-s 30`:
+
+  ```sh
+  tools/manual_gate.py all \
+    --start-tracker \
+    --enable-loco-temp \
+    --require-loco \
+    --mujoco-land-settle \
+    --standby-soak-s 30
+  ```
+
+  The script's generated config uses sim-runtime timing defaults (`hz: 1000`,
+  `transition_duration_s: 0.7`) unless explicitly overridden with `--temp-hz`
+  or `--temp-transition-duration-s`; this does not change release config or
+  default gates.
 
 ## Loco-upper simulation handoff status
 
