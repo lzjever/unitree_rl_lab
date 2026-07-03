@@ -306,6 +306,16 @@ def active_kind(status: dict[str, Any]) -> str | None:
     return None
 
 
+def is_active_user_run(status: dict[str, Any], target_id: str) -> bool:
+    if active_kind(status) != "user":
+        return False
+    active = status.get("active")
+    exec_status = status.get("exec")
+    active_id = active.get("id") if isinstance(active, dict) else None
+    exec_id = exec_status.get("id") if isinstance(exec_status, dict) else None
+    return active_id == target_id or exec_id == target_id
+
+
 def is_standby_ctrl(status: dict[str, Any]) -> bool:
     return status.get("ctrl") in STANDBY_CTRLS
 
@@ -1820,6 +1830,72 @@ def queue_interrupt_status_contract_check(args: argparse.Namespace,
     }
 
 
+def held_interrupt_handoff_check(args: argparse.Namespace,
+                                 url: str,
+                                 fixtures: dict[str, Path]) -> dict[str, Any]:
+    recover_to_standby(url, args.passive_password)
+    a_id = execute(url, fixtures["short"], mode="queue", hold=True)
+    a_holding = poll("A holding before interrupt", 12, lambda: run_status(url, a_id),
+                     lambda s: s["state"] == "holding")
+
+    c_id = execute(url, fixtures["long_c"], mode="interrupt")
+
+    def c_handoff_sample() -> dict[str, Any]:
+        run = run_status(url, c_id)
+        if run.get("state") in FAILED_TERMINAL_RUN_STATES:
+            fail(f"C should not fail before handoff: {run}")
+        return {
+            "run": run,
+            "status": get(url, "/status"),
+        }
+
+    def c_handoff_ready(sample: dict[str, Any]) -> bool:
+        status = sample["status"]
+        queue = status.get("queue") or {}
+        if queue.get("ids") != []:
+            return False
+        return is_user_transition_to(status, c_id) or is_active_user_run(status, c_id)
+
+    handoff_timeout_s = getattr(args, "transition_timeout", 8.0) + 4.0
+    c_handoff = poll(
+        "C transition target=user or active user with empty queue",
+        handoff_timeout_s,
+        c_handoff_sample,
+        c_handoff_ready,
+    )
+
+    a_terminal = poll("A stopped by held interrupt", 10, lambda: run_status(url, a_id),
+                      lambda s: s["state"] == "stopped")
+    require(a_terminal.get("stop_reason") == "interrupt",
+            f"A stop_reason should be interrupt: {a_terminal}")
+
+    post(url, "/standby")
+    wait_standby(url, getattr(args, "standby_timeout", 8.0))
+    checkpoint = check_status_checkpoint(
+        args,
+        url,
+        "held_interrupt_handoff",
+        require_ctrls=STANDBY_CTRLS,
+        require_active_none=True,
+        require_queue_empty=True,
+    )
+    return {
+        "result": "PASS",
+        "A": {
+            "id": a_id,
+            "holding": {"state": a_holding["state"]},
+            "state": a_terminal["state"],
+            "stop_reason": a_terminal.get("stop_reason"),
+        },
+        "C": {
+            "id": c_id,
+            "state": c_handoff["run"].get("state"),
+            "handoff": compact_status(c_handoff["status"]),
+        },
+        "checkpoint": checkpoint,
+    }
+
+
 def run_e2e(args: argparse.Namespace, fixtures: dict[str, Path]) -> dict[str, Any]:
     url = args.url
     results: dict[str, Any] = {}
@@ -2001,6 +2077,11 @@ def run_e2e(args: argparse.Namespace, fixtures: dict[str, Path]) -> dict[str, An
         log("[e2e] queue_interrupt_status_contract")
         results["queue_interrupt_status_contract"] = (
             queue_interrupt_status_contract_check(args, url, fixtures)
+        )
+
+        log("[e2e] held_interrupt_handoff")
+        results["held_interrupt_handoff"] = (
+            held_interrupt_handoff_check(args, url, fixtures)
         )
 
         log("[e2e] short_hold_settle_standby")

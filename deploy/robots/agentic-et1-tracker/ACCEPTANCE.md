@@ -17,8 +17,9 @@ pipelines automatically cover those gates.
   startup FixStand to standby recovery, standby/urgent_stop/passive idle
   retention and clearing semantics, idle set/preempt/resume/clear,
   active user + idle enabled -> standby handoff, queue/interrupt A-B-C run
-  status contract, transition interrupt -> standby handoff without generic
-  stopping success, and opt-in loco-upper bounded execution when enabled.
+  status contract, held_interrupt_handoff, transition interrupt -> standby
+  handoff without generic stopping success, and opt-in loco-upper bounded
+  execution when enabled.
 - `tools/manual_gate.py visual` requires a running or explicitly started MuJoCo
   session, runs a short action unless disabled, writes a screenshot artifact,
   and emits a minimal checklist/result JSON for operator review.
@@ -26,6 +27,9 @@ pipelines automatically cover those gates.
   are not default release gates, and the shorter visual/e2e checks are not
   evidence of long MuJoCo/tracker standby stability unless the explicit soak
   options below were run and archived.
+- `held_interrupt_handoff` is part of the manual/sim E2E scenario set when that
+  gate is explicitly run. It remains an opt-in manual/sim gate and is not added
+  to the default release gate.
 - MuJoCo sling landing/settle is opt-in via `--mujoco-land-settle`. When
   enabled, the script follows the ET1 manual landing sequence: request tracker
   `fixstand`, optionally send sim-control `hold`, repeatedly issue `lower`

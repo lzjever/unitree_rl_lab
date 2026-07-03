@@ -1244,6 +1244,154 @@ class ManualGateStandbySoakTests(unittest.TestCase):
 
 
 class ManualGateQueueInterruptContractTests(unittest.TestCase):
+    def test_held_interrupt_handoff_waits_for_holding_before_interrupt(self):
+        old_get = manual_gate.get
+        old_post = manual_gate.post
+        saw_holding = False
+        events = []
+        top_statuses = [
+            status(),
+            status(),
+            status(),
+            status(
+                ctrl="running",
+                active={"kind": "transition", "id": None},
+                transition={
+                    "active": True,
+                    "target": "user",
+                    "target_id": "C",
+                    "target_state": "queued",
+                },
+            ),
+            status(),
+            status(),
+        ]
+        run_statuses = {
+            "A": [
+                {"id": "A", "state": "running"},
+                {"id": "A", "state": "holding"},
+                {"id": "A", "state": "stopped", "stop_reason": "interrupt"},
+            ],
+            "C": [
+                {"id": "C", "state": "queued"},
+            ],
+        }
+        posts = []
+
+        def fake_get(_url, path):
+            nonlocal saw_holding
+            if path == "/status":
+                return top_statuses.pop(0) if top_statuses else status()
+            if path.startswith("/status?id="):
+                run_id = path.rsplit("=", 1)[1]
+                states = run_statuses[run_id]
+                current = states.pop(0) if len(states) > 1 else states[0]
+                events.append(("run", run_id, current["state"]))
+                if run_id == "A" and current["state"] == "holding":
+                    saw_holding = True
+                return current
+            self.fail(f"unexpected GET path {path}")
+
+        def fake_post(_url, path, body=None, expected=200):
+            self.assertEqual(expected, 200)
+            posts.append((path, body))
+            if path == "/execute":
+                if len([post for post in posts if post[0] == "/execute"]) == 1:
+                    self.assertEqual(body["mode"], "queue")
+                    self.assertIs(body["hold"], True)
+                    events.append(("execute", "queue"))
+                    return {"ok": True, "id": "A"}
+                self.assertTrue(saw_holding, "interrupt submitted before A reached holding")
+                self.assertEqual(body["mode"], "interrupt")
+                self.assertNotIn("hold", body)
+                events.append(("execute", "interrupt"))
+                return {"ok": True, "id": "C"}
+            if path == "/standby":
+                return {"ok": True}
+            self.fail(f"unexpected POST path {path}")
+
+        try:
+            manual_gate.get = fake_get
+            manual_gate.post = fake_post
+            fixtures = {
+                key: Path(f"/motions/manual_gate_e2e_safe_{key}.trk")
+                for key in manual_gate.FIXTURE_KEYS
+            }
+
+            result = manual_gate.held_interrupt_handoff_check(
+                SimpleNamespace(passive_password="test", standby_timeout=1.0),
+                "http://tracker",
+                fixtures,
+            )
+        finally:
+            manual_gate.get = old_get
+            manual_gate.post = old_post
+
+        self.assertEqual(result["result"], "PASS")
+        self.assertEqual(result["A"]["state"], "stopped")
+        self.assertEqual(result["A"]["stop_reason"], "interrupt")
+        self.assertEqual(result["C"]["id"], "C")
+        self.assertEqual(posts[-1][0], "/standby")
+        self.assertLess(
+            events.index(("run", "A", "holding")),
+            events.index(("execute", "interrupt")),
+        )
+
+    def test_held_interrupt_handoff_rejects_failed_new_run(self):
+        old_get = manual_gate.get
+        old_post = manual_gate.post
+        top_statuses = [status(), status(), status()]
+        run_statuses = {
+            "A": [
+                {"id": "A", "state": "holding"},
+            ],
+            "C": [
+                {"id": "C", "state": "failed", "error": "load failed"},
+            ],
+        }
+        execute_count = 0
+        standby_posts = []
+
+        def fake_get(_url, path):
+            if path == "/status":
+                return top_statuses.pop(0) if top_statuses else status()
+            if path.startswith("/status?id="):
+                run_id = path.rsplit("=", 1)[1]
+                return run_statuses[run_id][0]
+            self.fail(f"unexpected GET path {path}")
+
+        def fake_post(_url, path, body=None, expected=200):
+            nonlocal execute_count
+            self.assertEqual(expected, 200)
+            if path == "/execute":
+                execute_count += 1
+                return {"ok": True, "id": "A" if execute_count == 1 else "C"}
+            if path == "/standby":
+                standby_posts.append(path)
+                return {"ok": True}
+            self.fail(f"unexpected POST path {path}")
+
+        try:
+            manual_gate.get = fake_get
+            manual_gate.post = fake_post
+            fixtures = {
+                key: Path(f"/motions/manual_gate_e2e_safe_{key}.trk")
+                for key in manual_gate.FIXTURE_KEYS
+            }
+
+            with self.assertRaises(manual_gate.GateError) as raised:
+                manual_gate.held_interrupt_handoff_check(
+                    SimpleNamespace(passive_password="test", standby_timeout=1.0),
+                    "http://tracker",
+                    fixtures,
+                )
+        finally:
+            manual_gate.get = old_get
+            manual_gate.post = old_post
+
+        self.assertIn("C should not fail", str(raised.exception))
+        self.assertEqual(standby_posts, [])
+
     def test_queue_interrupt_contract_holds_active_safe_fixtures(self):
         old_execute = manual_gate.execute
         old_run_status = manual_gate.run_status

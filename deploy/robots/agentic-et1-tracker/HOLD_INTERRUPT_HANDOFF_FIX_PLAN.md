@@ -9,7 +9,8 @@
 - `packaging/skills/et1-action` 输出合同的最小修正。
 - 对应 unit tests、skill tests、manual/sim e2e gate。
 
-本文件只是计划文档，不代表代码已经修复。
+本文件保留为修复计划和验收记录；当前实现已完成，公开行为基线以
+`README.md`、`MOTION_TRANSITION_BEHAVIOR_MATRIX.md` 和 `ACCEPTANCE.md` 为准。
 
 ## 1. 当前问题
 

@@ -102,7 +102,10 @@ Commands:
   `mode` defaults to `queue`, and omitted `hold` behaves as `false`.
   The packaged `et1-action` skill intentionally defaults `run-text` and
   `run-trk` to `mode:"interrupt"` for new user intent; that is a skill
-  product decision, not the raw HTTP default.
+  product decision, not the raw HTTP default. Direct skill run success is
+  submission only: it reports `accepted:true` and `confirmed:false`. With
+  `--wait`, success requires tracker state `done` or `holding` and reports
+  `accepted:true` and `confirmed:true`.
 - `POST /execute_loco_upper`:
   `{"path":"/absolute/file.trk","mode":"queue|interrupt","hold":true,"max_radius_m":0.8}`.
   Same local `.trk` allowlist contract as `/execute`, but routes the motion
@@ -145,11 +148,17 @@ frame enters `state:"holding"` and keeps the same run id queryable through
 Accepted `/execute` output means the request was accepted/submitted, not that
 the robot has completed the motion; poll `GET /status?id=<id>` or full
 `GET /status` for running, done, holding, passive, or fault progress.
-`mode:"interrupt"` is the single foreground takeover API. For active running
+`mode:"interrupt"` is the single foreground takeover API. Holding remains
+foreground user intent, not idle/background. For active running or holding
 GeneralTracker user -> GeneralTracker user, the runtime may internally smooth
-handoff through `active.kind:"transition"` and `transition.target:"user"`; if
-that handoff is rejected, it falls back to controlled stop/restart. Clients do
-not choose a stop profile or smoothing mode.
+handoff through `active.kind:"transition"` and `transition.target:"user"`.
+Holding interrupt cancels local waiting and attempts held-frame ->
+replacement-user handoff; on success the old source is stopped with
+`stop_reason:"interrupt"` and `queue.ids` is empty. Holding queue reuses the
+same held-frame handoff for the appended user; on success the old source is
+`done` with `stop_reason:null`. Benign no-transition rejects use a deterministic
+fallback and must not fail a valid target with `INTERNAL_ERROR`. Clients do not
+choose a stop profile or smoothing mode.
 
 `/idle` is a config endpoint, not a run submission endpoint. It atomically
 replaces the idle pool after validating every path with the same local `.trk`
@@ -311,7 +320,7 @@ Controller states:
 | `standby` | Velocity policy with zero command; robot stands idle. Public status reports `ctrl:"standby"`. | `/execute`, `/idle`, passworded `/passive`, `/fixstand`, `/urgent_stop` | Normal state for starting user `.trk`; idle auto-play may start only when ready/safe and no user active/queue exists. |
 | idle active (`active.kind:"idle"`) | GeneralTracker plays an idle pool motion without a user id. | `/execute`, `/standby`, `/urgent_stop`, `/idle`, passworded `/passive`, `/fixstand` | `exec:null`, user `queue` unchanged. User `/execute` preempts idle playback but keeps idle config; `/standby` stops current idle playback and keeps idle config; `/urgent_stop` clears idle config. |
 | `preparing`/`running` with `active.kind:"user"` | Preparing or executing a user `.trk`. | `/standby`, `/urgent_stop`, passworded `/passive`, `/execute` queue/interrupt, `/idle` config/clear | `queue` waits; `interrupt` preempts current user run. Running GeneralTracker interrupts may expose `transition.target:"user"` before the new run is active; preparing and fallback paths use controlled stop/restart. Poll `/status?id=<id>`. |
-| holding (`active.kind:"user"`, `exec.state:"holding"`) | Holds the last reference frame of a user `.trk` submitted with `hold:true`. | `/execute` queue/interrupt, `/standby`, `/urgent_stop`, passworded `/passive`, `/fixstand`, `/idle` config/clear | Same user id remains queryable. `/urgent_stop`, passworded `/passive`, and `/fixstand` end it immediately; `/standby` is the ordinary release path. |
+| holding (`active.kind:"user"`, `exec.state:"holding"`) | Holds the last reference frame of a foreground user `.trk` submitted with `hold:true`. | `/execute` queue/interrupt, `/standby`, `/urgent_stop`, passworded `/passive`, `/fixstand`, `/idle` config/clear | Same user id remains queryable. `/execute` interrupt attempts held-frame -> replacement-user handoff, stops the old source as interrupt, and leaves the queue empty on success; `/execute` queue reuses the handoff and marks the old source done on success. `/urgent_stop`, passworded `/passive`, and `/fixstand` end it immediately; `/standby` is the ordinary release path. |
 | transition active (`active.kind:"transition"`) | Internal synthetic reference transition toward `transition.target`. | `/execute` queue/interrupt, `/standby`, `/urgent_stop`, passworded `/passive`, `/fixstand`, `/idle` config/clear | Not a user run; no id, queue entry, queue limit use, or user history entry. `/urgent_stop` aborts immediately; `/standby` targets the ordinary standby chain. |
 | `urgent_stopping` | Urgent-stop transition to standby, passive, fault, or manual handling. | `/status`, passworded `/passive`, `/urgent_stop`, `/idle {"paths":[]}` | `/execute` and non-empty `/idle` return conflict at the HTTP API; wait for a stable state. Ordinary `/standby` should not expose generic `stopping` as a success path. |
 | `fault` | Safety/manual state; no normal track execution. | passworded `/passive` only for `bad_orientation`, `/fixstand`, `/urgent_stop`, `/idle {"paths":[]}` | `/execute`, `/standby`, and non-empty `/idle` return conflict until resolved. `lowcmd_occupied` remains manual/operator. |
