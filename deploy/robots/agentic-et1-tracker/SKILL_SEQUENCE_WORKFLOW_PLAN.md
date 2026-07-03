@@ -24,7 +24,7 @@ agent 面对长动作序列、多段生成、异步执行和用户中途插话�
 - 明确用户插话语义：追加、替换尾部、打断、取消到 standby、紧急停止各自有稳定映射。
 - 保持输出短、确定、机器可读：一行 compact JSON，错误有明确 `code` 和 `next`。
 - 保持现有低层能力复用，降低 skill 文档负担，减少 agent 临场拼命令的机会。
-- wrapper 维护本地 sequence state；P0 只向 tracker 提交当前段，下一段可以生成、stage、ready，但必须留在 wrapper 本地 state，等当前段结束后再提交。
+- wrapper 维护本地 sequence state；当前实现使用 bounded queue-ahead，默认最多向 tracker 提前提交 3 个 unfinished runs。queue-ahead 只是性能优化，不是 tracker playlist；submitted 段不可由 `sequence-replace-tail` 删除、重排或替换。
 
 非目标：
 
@@ -73,7 +73,7 @@ user intent
   -> et1-action
        -> preset lookup/staging
        -> nl2trk generation when preset misses
-       -> trk2motion run/status/standby/stop/idle
+       -> tracker run/status/standby/urgent_stop/idle
        -> local sequence state file
   -> tracker executes .trk only
 ```
@@ -83,9 +83,9 @@ user intent
 - `et1-action` 负责意图到 workflow 命令、长序列状态、异步 job、插话修改队列。
 - `et1-nl2trk-preset` 负责常见动作复用和 preset staging。
 - `et1-nl2trk` 负责生成单段 `.trk`，包括连续动作所需 `serial_id`。
-- `et1-trk2motion` 负责把单个 `.trk` 交给 tracker、查询状态、standby、urgent stop。
+- `et1-action` 负责把单个 `.trk` 交给 tracker、查询状态、standby、urgent stop 和 idle 配置。
 - tracker 只接收 `.trk` 执行请求和已有控制请求，不知道“长序列”这个概念。
-- wrapper 是 sequence queue 的权威；P0 tracker queue 只用于当前段执行，不作为可编辑长序列存储或未来段缓冲。
+- wrapper 是 sequence queue 的权威；tracker queue 只承载 bounded queue-ahead 已提交 runs，不作为可编辑长序列存储、playlist 或未来段数据库。
 
 本地状态建议：
 
@@ -102,7 +102,7 @@ user intent
 
 P0 一等命令只包括：`run-text`、`run-trk`、`sequence-start`、`sequence-status`、
 `sequence-append`、`sequence-replace-tail`、`sequence-cancel`、`sequence-interrupt`、
-`standby`、`urgent-stop`、`idle-load`。
+`standby`、`urgent-stop`、`idle-load`、`idle-clear`。
 
 ### 单次动作
 
@@ -110,14 +110,14 @@ P0 一等命令只包括：`run-text`、`run-trk`、`sequence-start`、`sequence
 
 - 输入自然语言动作。
 - 先查 preset；命中则 stage preset；未命中则调用 nl2trk。
-- 默认提交给 trk2motion 执行。
+- 默认通过 tracker `/execute` 或 `/execute_loco_upper` 提交执行。
 - 短动作可选 `--wait`，但默认不 wait。
 - skill 产品默认用 tracker `mode:"interrupt"` 提交新用户意图；如果用户明确要求“排在当前动作后面”，才显式 `--mode queue`。raw HTTP `/execute` / `/execute_loco_upper` 省略 `mode` 时仍默认 `queue`，这是服务端合同，不因 skill 默认而改变。
 
 `run-trk`：
 
 - 输入本地绝对 `.trk`。
-- 直接调用 trk2motion `run`。
+- 直接提交给 tracker 执行。
 - 用于兼容现有工作流和调试。
 - 默认同样使用 tracker `mode:"interrupt"`；需要保留当前 tracker work 时显式 `--mode queue`。
 
@@ -148,15 +148,16 @@ P0 一等命令只包括：`run-text`、`run-trk`、`sequence-start`、`sequence
 
 - 只替换 wrapper 本地尚未提交给 tracker 的尾部段。
 - 当前正在执行的段默认不中断。
-- 已提交到 tracker 的 run 不能假设可删除；如果必须改变已经提交或正在执行的动作，必须走 `sequence-interrupt` 或 `standby`。
+- 已提交到 tracker 的 run 不能假设可删除；如果请求触及已经 submitted 的尾部，默认 compact JSON 必须返回 `ok:false`、`error.code:"TAIL_ALREADY_SUBMITTED"`、`replaceable_count`、`submitted_count` 和单一 `next:"sequence-interrupt"`。
+- 如果必须改变已经提交或正在执行的动作，必须走 `sequence-interrupt`、新的 `run-text`/`run-trk` foreground intent，或用户明确要求的 `standby`。
 - 如果用户明确要求“现在改成/别做后面的/后面换成”，映射到这个命令。
 
 `sequence-interrupt`：
 
 - 用户明确要求“立刻/马上/打断当前动作并改做...”时的稳定入口。
 - 取消 wrapper 本地未提交段。
-- 如果目标 `.trk` 已 ready/staged，或 preset hit 后已经完成 staging，立即调用
-  trk2motion `run --mode interrupt`。
+- 如果目标 `.trk` 已 ready/staged，或 preset hit 后已经完成 staging，立即用
+  tracker `mode:"interrupt"` 提交。
 - 如果目标动作还需要 nl2trk 生成，P0 最小语义是先执行 `standby`，让当前 sequence
   cancel_to_standby；然后后台生成，生成完成后普通执行，不承诺无缝立即切。
 
@@ -164,20 +165,21 @@ P0 一等命令只包括：`run-text`、`run-trk`、`sequence-start`、`sequence
 
 `idle-load`：
 
-- 封装 idle preset 查找、staging 和 trk2motion `idle set`。
+- 封装 idle preset 查找、staging 和 tracker `POST /idle`。
 - 用户说“加载 idle 动作/放松点/别直挺挺站着”时走这个命令。
 - 只配置 idle pool，不提交用户 run，不调用 urgent stop。
 
 `standby`：
 
 - 进入 StandbyVelocity/普通站立待命。
-- 普通“停下/停止/不要动/站着别动”在长序列层映射为 `cancel_to_standby`/`standby`。
+- 普通“停下/停止/待命”在长序列层映射为 `cancel_to_standby`/`standby`。
 - 普通停止必须保留 idle 配置，不调用 urgent stop，不清 idle pool。
+- 明确“不要动/站着别动/completely still/no idle”使用 `idle-clear`：先清 idle pool，再进入 standby。
 
 `urgent-stop`：
 
 - 只在用户明确表达紧急停止、abort、kill、紧急停止、赶快停止时使用。
-- 调用 trk2motion `stop --urgent`。
+- 调用 `et1-action urgent-stop --urgent`，底层映射到 tracker `POST /urgent_stop`。
 - 不把普通取消、状态查询、用户犹豫或“等一下”映射到 urgent stop。
 
 `fixstand` 和 `passive`：
@@ -192,11 +194,11 @@ P0 一等命令只包括：`run-text`、`run-trk`、`sequence-start`、`sequence
 
 - 长序列默认异步，立即返回 `seq_id`。
 - 第一段生成完成后立即执行，降低首动作延迟。
-- 后续段在前一段执行期间生成并 stage 到 wrapper 本地 ready 状态，形成“当前段执行 -> 下一段生成/stage/ready -> 当前段结束后再提交”的流水线。
+- 后续段在前一段执行期间生成并 stage，worker 按 serial 顺序维持 bounded queue-ahead。默认 `ET1_ACTION_QUEUE_AHEAD=3`，最多向 tracker 提前提交 3 个 unfinished runs。
 - 默认不并发生成，避免 Kimodo `serial_id` 连续性、资源占用和错误恢复复杂化。
-- P0 不一次性提交整套长序列到 tracker queue，也不提交任何未来段；wrapper 只提交当前段。
-- 下一段可以是 `generating|ready`，但必须留在 wrapper 本地 state；当前段结束后，worker 才能提交下一段。
-- 已提交到 tracker 的段视为当前段且不可编辑。wrapper 可以取消本地未提交段，但不能承诺删除、替换或重排 tracker 内部 run。
+- P0 不一次性提交整套长序列到 tracker queue；queue-ahead 是有限性能窗口，不是 playlist。
+- queue-ahead 窗口之外的段留在 wrapper 本地 state；worker 在 unfinished submitted runs 少于窗口时才继续提交。
+- 已提交到 tracker 的段视为不可编辑。wrapper 可以取消本地未提交段，但不能承诺删除、替换或重排 tracker 内部 run。
 
 连续动作：
 
@@ -214,11 +216,11 @@ P0 一等命令只包括：`run-text`、`run-trk`、`sequence-start`、`sequence
 
 执行队列：
 
-- workflow 只把当前要执行的 ready `.trk` 交给 trk2motion；本地 ready 的下一段不能提前提交。
+- workflow 最多把 queue-ahead 窗口内的 ready `.trk` 交给 tracker；窗口之外的 ready 段不能提前提交。
 - 不要求 tracker 支持 `paths` 或 playlist。
 - 不要求 tracker 支持按 run id 删除/替换未来队列；这是 P0 设计的硬边界。
 - `replace_tail`、`append`、`cancel` 的主要操作对象是 wrapper 本地 state 中尚未提交的 segments。
-- `sequence-cancel`/`standby` 只需停止当前段并清理本地后续；因为 P0 没有 tracker 未来段提交，不会遗留 tracker 已提交的未来 run。
+- `sequence-cancel`/`standby` 清理本地未提交段并调用 ordinary standby；对于已进入 queue-ahead 的 submitted runs，不承诺 tracker 侧删除或重排。
 - 如果下一段未及时生成完成，sequence 状态显示 `waiting_for_generation`，不要忙等刷屏。
 - 如果 tracker 返回控制状态冲突，workflow 可以保留底层 `error.code` 和
   `error.message`，并补充 sequence 的 `seq_id`、`segment_id`。默认 `next` 必须归一化为单个 P0 命令；底层 raw `next` 只能进入 `--debug`/`--verbose`。
@@ -237,28 +239,33 @@ P0 一等命令只包括：`run-text`、`run-trk`、`sequence-start`、`sequence
 
 - 用户说“后面的不要了，换成.../之后改成.../别做后面那些了”。
 - 保留当前正在执行段，只替换 wrapper 本地尚未提交给 tracker 的尾部。
-- 如果目标尾部已经提交给 tracker，P0 不能承诺删除；应返回当前可替换数量，并把默认 `next` 指向 `sequence-interrupt`。说明文字或 debug/verbose 可以提示也可选择 `standby`。
+- 如果目标尾部已经提交给 tracker，P0 不能承诺删除；应返回 `TAIL_ALREADY_SUBMITTED`、当前可替换数量 `replaceable_count`、已提交数量 `submitted_count`，并把默认 `next` 指向 `sequence-interrupt`。说明文字或 debug/verbose 可以提示也可选择 `standby`。
 
 `interrupt`：
 
 - 用户说“立刻改做.../马上换成.../打断当前动作”。
 - 使用 P0 一等命令 `sequence-interrupt`；取消 wrapper 本地未提交段。
-- 只有新目标动作已经 ready，才可以立即使用 trk2motion `run --mode interrupt`。ready
+- 只有新目标动作已经 ready，才可以立即使用 tracker `mode:"interrupt"`。ready
   包括现成/staged `.trk`，或 preset hit 后已经完成 staging。
 - 如果新目标动作还需要 nl2trk 生成，P0 最小语义是先执行 `standby`，让当前 sequence
   cancel_to_standby；然后后台生成，生成完成后再普通执行，不承诺无缝立即切换。
 
 `cancel_to_standby`：
 
-- 用户普通说“停下/停止/不要动/站着别动/先别做了”。
-- 取消当前 sequence，清掉 workflow 未开始段，调用 trk2motion `standby`。
-- 保留 idle 配置，不调用 `/stop`，不清 idle pool，不自动进入 fixstand/passive。
+- 用户普通说“停下/停止/待命/先别做了”。
+- 取消当前 sequence，清掉 workflow 未开始段，调用 ordinary `standby`。
+- 保留 idle 配置，不调用 `/urgent_stop`，不清 idle pool，不自动进入 fixstand/passive。
+
+`idle-clear`：
+
+- 用户明确说“不要动/站着别动/do not move/completely still/no idle/别播放 idle”。
+- 清 idle pool 后调用 ordinary standby；不使用 urgent stop。
 
 `urgent-stop`：
 
 - 用户明确说“紧急停止/赶快停止/abort/kill/emergency stop”。
-- 调用 trk2motion `stop --urgent`。
-- 这是安全急停语义，会沿用底层 `/stop` 的强语义；不要用于普通停下。
+- 调用 `urgent-stop --urgent`，底层映射到 tracker `POST /urgent_stop`。
+- 这是安全急停语义，会沿用底层 `/urgent_stop` 的强语义；不要用于普通停下。
 
 插话输出应包含：
 
@@ -275,15 +282,17 @@ P0 一等命令只包括：`run-text`、`run-trk`、`sequence-start`、`sequence
 
 - stdout 永远一行 compact JSON。
 - 默认字段只包含 `ok`、`cmd`、`intent`、`seq_id`、`state`、`active`、
-  `segments`、`next`、`error`。不相关字段可以省略，但不要新增默认字段。
+  `segments`、`next`、`error`。不相关字段可以省略；`TAIL_ALREADY_SUBMITTED`
+  失败还必须包含 `replaceable_count` 和 `submitted_count`。
 - 成功输出 `ok:true`；失败输出 `ok:false`，必须有 `error.code`、`error.message`、`next`。
 - 默认不输出 `.trk` 路径、prompt、duration、完整 tracker status、完整 pose、长数组、
   大段日志或多行说明；这些只放在 `--debug`/`--verbose`。
 - 子命令调用失败时，默认可以保留底层 `error.code` 和 `error.message`；workflow 只补充上下文，不重命名错误。默认 `next` 必须归一化为单个 P0 命令，底层 raw `next` 只能进入 `--debug`/`--verbose`。
 - 输出的 `next` 只是给 agent/user 的建议，不触发 wrapper 自动执行后续控制命令。
+- `accepted`、`submitted` 或 run id 只代表请求已被 tracker 接受/提交，不代表机器人动作已经执行完成；完成/holding/running 进度必须通过 `sequence-status`、`/status?id=<run_id>` 或 full `/status` 确认。
 - 默认 `next` 只能是单个 P0 一等命令：`run-text`、`run-trk`、`sequence-start`、
   `sequence-status`、`sequence-append`、`sequence-replace-tail`、`sequence-cancel`、
-  `sequence-interrupt`、`standby`、`urgent-stop`、`idle-load`。
+  `sequence-interrupt`、`standby`、`urgent-stop`、`idle-load`、`idle-clear`。
 
 建议成功示例：
 
@@ -374,10 +383,11 @@ P0 测试重点：
 - 单动作兼容：`run-text` preset 命中时不调用 nl2trk；preset miss 时调用 nl2trk；
   最终调用 trk2motion run。
 - 序列状态机：`sequence-start` 创建 `seq_id`；第一段 ready 后立即 run；后续段进入
-  generating/pending/ready；P0 只提交当前段，下一段 ready 后仍留在 wrapper 本地 state；
-  当前段结束后才提交下一段；完成后 `completed`。
+  generating/pending/ready；worker 默认维持 queue-ahead=3 的 unfinished submitted 窗口，
+  窗口之外的段仍留在 wrapper 本地 state；完成后 `completed`。
 - 取消/插话：`sequence-cancel` 清未开始段并调用 standby；`replace-tail` 不影响当前段；
-  `replace-tail` 不能修改已 submitted 当前段；ready 目标的 `sequence-interrupt` 可用
+  `replace-tail` 不能修改已 submitted 段，触及时返回 `TAIL_ALREADY_SUBMITTED`、
+  `replaceable_count`、`submitted_count` 和 `next:"sequence-interrupt"`；ready 目标的 `sequence-interrupt` 可用
   `mode=interrupt`；未 ready 目标的 `sequence-interrupt` 先走 `standby`，后台生成后普通执行；
   `sequence-interrupt` 不误用 urgent stop。
 - worker 状态：heartbeat 正常更新；worker 死亡输出 `WORKER_DIED`；heartbeat 超时且进程未知输出
@@ -395,7 +405,7 @@ P0 测试重点：
 - mock `et1-trk2motion`、`et1-nl2trk`、`find_preset.py` 为本地假 CLI，断言调用顺序和参数。
 - 用临时目录模拟 sequence state。
 - 用失败注入覆盖生成失败、tracker run 失败、状态文件不存在、取消中追加、已 submitted
-  当前段替换、未 ready interrupt、worker stale、裸 intent `next`、组合 next、底层非 P0
+  tail 替换、未 ready interrupt、worker stale、裸 intent `next`、组合 next、底层非 P0
   raw next 泄漏等边界。
 - 不需要真机、不需要真实 Kimodo、不需要真实 tracker 服务即可覆盖 P0。
 
@@ -417,11 +427,11 @@ P1/P2 可补：
 - 新增 `et1-action` workflow CLI 的最小子命令：
   `run-text`、`run-trk`、`sequence-start`、`sequence-status`、
   `sequence-cancel`、`sequence-append`、`sequence-replace-tail`、`sequence-interrupt`、
-  `standby`、`urgent-stop`、`idle-load`。
+  `standby`、`urgent-stop`、`idle-load`、`idle-clear`。
 - `sequence-start` 默认异步返回 `seq_id`。
 - 第一段生成完成立即执行，后续段串行生成。
-- wrapper 本地维护 sequence state；P0 只提交当前段，不向 tracker 提交任何未来段。
-- 下一段可以生成/stage/ready，但必须留在 wrapper 本地 state，等当前段结束后再提交。
+- wrapper 本地维护 sequence state；P0 使用 bounded queue-ahead，默认最多提前提交 3 个 unfinished tracker runs。
+- queue-ahead 窗口之外的段留在 wrapper 本地 state，等 unfinished submitted runs 少于窗口后再提交。
 - `replace-tail` 只替换本地未 submitted 段，不承诺删除 tracker queue 中的 run。
 - `sequence-interrupt` 是明确打断入口：ready/staged 目标可立即 `run --mode interrupt`；
   未 ready 目标先 `standby`，后台生成完成后再普通执行。
@@ -481,7 +491,8 @@ P0 完成时应能证明：
 - sequence 执行中用户普通说“停下”，workflow 执行 cancel + standby，不调用 urgent stop。
 - sequence 执行中用户说“后面加一个挥手”，workflow append 到尾部。
 - sequence 执行中用户说“后面的换成鞠躬”，workflow replace_tail 只替换未 submitted 尾部，不影响当前段。
-- sequence 不会一次性把所有段提交进 tracker queue，也不会向 tracker 提交任何未来段；tracker 中只有当前段。
+- sequence 不会一次性把所有段提交进 tracker queue；tracker 中最多只有 queue-ahead 窗口内的 unfinished runs。
+- 如果“后面的换成...”触及已经 submitted 的尾部，workflow 返回 `TAIL_ALREADY_SUBMITTED`、`replaceable_count`、`submitted_count` 和单一 `next:"sequence-interrupt"`，不沉默成功。
 - sequence 执行中用户明确说“立刻改做...”，`sequence-interrupt` 对 ready/staged 目标使用
   `run --mode interrupt`，对未 ready 目标先 standby、后台生成、生成后普通执行。
 - worker 死亡或 heartbeat 超时时，`sequence-status` 能输出 failed/stale 和明确错误 code。

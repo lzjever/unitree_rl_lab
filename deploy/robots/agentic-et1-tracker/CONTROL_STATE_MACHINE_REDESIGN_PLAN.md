@@ -38,7 +38,7 @@ YAGNI：
 
 ### standby
 
-`standby` 是普通“停下/待命/站着别动”的产品入口。它是可恢复、非紧急、保留 idle config 的控制意图。
+`standby` 是普通“停下/待命”的产品入口。它是可恢复、非紧急、保留 idle config 的控制意图。明确“不要动/站着别动/completely still/no idle”属于清 idle 后 standby，skill 层使用 `idle-clear`，底层顺序是 `POST /idle {"paths":[]}` then `POST /standby`。
 
 - 接口：`POST /standby`，空 body。
 - 可中断 active user、active idle、active transition 和 queued user work。
@@ -90,6 +90,8 @@ YAGNI：
 
 - `mode:"queue"` 追加用户 run。
 - `mode:"interrupt"` 表示新用户意图抢占当前用户/idle/background owner。
+- `mode:"interrupt"` 不新增 smooth/stop profile 参数。active running GeneralTracker user 收到 GeneralTracker interrupt 时，runtime 内部优先尝试 current-frame synthetic handoff 到新 user；benign reject fallback controlled stop/restart。Preparing、LocoUpper、safety/fault 路径保持原合同。
+- `/execute` accepted/submitted 只表示 run 已被接受/提交，不表示动作完成；完成、holding、fault/passive 等进度必须通过 `/status?id=<run_id>` 或 full `/status` 确认。
 - queue/interrupt 不能作为普通停止或紧急停止的隐式替代。
 - `exec` 和 `queue` 只描述用户 run；idle 和 transition 必须分别在 `idle`、`transition` 中表达。
 
@@ -110,7 +112,8 @@ YAGNI：
 
 | 意图 | 新接口 | idle config | 是否用户 run | 说明 |
 | --- | --- | --- | --- | --- |
-| 普通待命 | `POST /standby` | 保留 | 否 | 普通“停下/待命/站着别动”。 |
+| 普通待命 | `POST /standby` | 保留 | 否 | 普通“停下/待命”。 |
+| 完全静止/no idle | `POST /idle {"paths":[]}` then `POST /standby` | 清空 | 否 | “不要动/站着别动/completely still/no idle”；不使用 urgent stop。 |
 | 紧急停止 | `POST /urgent_stop` | 清空 | 否 | emergency/abort/kill 语义。 |
 | 安全 sink | `POST /passive` | 清空 | 否 | password-gated，不自动恢复。 |
 | 姿态恢复 | `POST /fixstand` | 保留但禁播 | 否 | 显式恢复入口，不是普通 standby。 |
@@ -131,7 +134,7 @@ YAGNI：
 
 - README、ACCEPTANCE、manual gate 文档、skill references、skill output-contract、intent-mapping 统一改成 `/standby` 和 `/urgent_stop`。
 - high-level skill 命令可以继续叫 `standby` 和 `urgent-stop --urgent`，但底层 HTTP 必须分别映射到 `/standby` 和 `/urgent_stop`。
-- skill 必须明确：普通“停止/不要动/站着别动”走 `standby`；只有 emergency/abort/kill/紧急措辞走 `urgent-stop --urgent`。
+- skill 必须明确：普通“停止/待命”走 `standby`；明确“不要动/站着别动/completely still/no idle”走 `idle-clear`；只有 emergency/abort/kill/紧急措辞走 `urgent-stop --urgent`。
 - 搜索并消除 release 路径中的旧 token：`/standby_velocity`、`standby_velocity`、`/stop`、`next:"stop"`。测试 fixture 若需要旧路由，只能用于验证“旧路由被拒绝/提示 renamed”。
 
 ## 5. 内部状态机模型
@@ -179,7 +182,7 @@ YAGNI：
 | `standby` | `/execute` queue/interrupt | `user` 或 `transition -> user` | 可从 standby reference handoff 到用户首帧。 |
 | `standby` | idle auto-play | `idle` 或 `transition -> idle` | 仅 idle config 非空、无 user work、ready/safe。 |
 | `user` | user queue | `user` 后续 FIFO | 当前 user 完成/holding/canceled 后启动下一 run。 |
-| `user` | user interrupt | `transition -> user` | 取消当前 user，构建到新 user 的 handoff。 |
+| `user` | user interrupt | `transition -> user` 或 fallback stop/restart | running GeneralTracker user 优先 smooth handoff；Preparing/LocoUpper 或 benign transition reject 保持 controlled stop/restart。 |
 | `user` | `/standby` | `transition -> standby` | 必须走 standby handoff；失败走 fail-safe。 |
 | `idle` | `/execute` | `transition -> user` | 停止当前 idle playback，保留 idle config。 |
 | `idle` | `/standby` | `transition -> standby` 或 `standby` | 停止当前 idle playback，保留 idle config。 |
@@ -272,7 +275,7 @@ active user + idle enabled -> `/standby` 的失败必须显式且安全：
 - release README、skill references、intent mapping、output-contract 中不再出现旧 public token。
 - skill `standby` 调用 `/standby`。
 - skill `urgent-stop --urgent` 调用 `/urgent_stop`。
-- 普通中文“停下/不要动/站着别动”映射 standby；“紧急停止/abort/kill”才映射 urgent-stop。
+- 普通中文“停下/待命”映射 standby；明确“不要动/站着别动/no idle”映射 `idle-clear`；“紧急停止/abort/kill”才映射 urgent-stop。
 
 ## 7. manual / e2e / visual gate
 

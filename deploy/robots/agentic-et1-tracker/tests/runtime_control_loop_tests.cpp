@@ -4285,7 +4285,7 @@ TEST_CASE("RuntimeControlLoop clears reference on stop interrupt and loader fail
     REQUIRE(store.snapshot().ctrl == ControllerState::Stopping);
   }
 
-  SECTION("interrupt clears active reference") {
+  SECTION("interrupt fallback clears active reference") {
     RuntimeStatusStore store(config);
     RuntimeBridge bridge(config, store);
     FakeReferenceSink reference;
@@ -4295,6 +4295,7 @@ TEST_CASE("RuntimeControlLoop clears reference on stop interrupt and loader fail
     REQUIRE(bridge.submitInterrupt(
                 executeCommand("ref-next", next_path, MotionMode::Interrupt, 2))
                 .ok());
+    loop.forceNextRootYawResidualForTest(0.06);
     loop.tick();
 
     REQUIRE_FALSE(reference.latest.active);
@@ -12366,23 +12367,35 @@ TEST_CASE("RuntimeControlLoop interrupt during preparing uses controlled stop",
   REQUIRE(store.findRun("preparing-urgent").run->stop_reason == StopReason::None);
 }
 
-TEST_CASE("RuntimeControlLoop interrupt stops active, cancels local waiting, then starts urgent") {
+TEST_CASE("RuntimeControlLoop running GeneralTracker interrupt starts user transition") {
   TempTree tmp;
   const RuntimeConfig config = runtimeConfig();
   RuntimeStatusStore store(config);
   RuntimeBridge bridge(config, store);
-  auto loop = makeLoop(config, bridge, store, tmp.trkConfig());
+  FakeReferenceSink reference;
+  RuntimeControlLoop loop(config, bridge, store, TrkLoader(tmp.trkConfig()), &reference);
 
-  const auto active_path = validTrk(tmp, "active.trk", 5);
+  const auto active_path = transitionReadyTrk(tmp, "active.trk", 8, 0.2F);
   const auto old_path = validTrk(tmp, "old.trk", 4);
-  const auto urgent_path = validTrk(tmp, "urgent.trk", 3);
+  const auto urgent_path = transitionReadyTrk(tmp, "urgent.trk", 3, 0.1F);
 
   REQUIRE(bridge.submitQueue(executeCommand("active", active_path)).ok());
   startQueuedRun(loop, store, "active");
+  loop.tick();
+  loop.tick();
+  REQUIRE(store.snapshot().active.kind == ActiveKind::User);
+  REQUIRE(store.snapshot().exec.has_value());
+  REQUIRE(store.snapshot().exec->id == "active");
+  REQUIRE(store.snapshot().exec->state == MotionState::Running);
+  REQUIRE(store.snapshot().exec->frame > 0);
 
   REQUIRE(bridge.submitQueue(executeCommand("old-waiting", old_path)).ok());
   loop.tick();
   REQUIRE(store.snapshot().queue.ids == std::vector<std::string>{"old-waiting"});
+  const ReferenceFrameSnapshot interrupted_frame = reference.latest;
+  REQUIRE(interrupted_frame.active);
+  REQUIRE(store.snapshot().exec.has_value());
+  REQUIRE(store.snapshot().exec->frame > 0);
 
   REQUIRE(bridge.submitInterrupt(
               executeCommand("urgent", urgent_path, MotionMode::Interrupt))
@@ -12392,22 +12405,287 @@ TEST_CASE("RuntimeControlLoop interrupt stops active, cancels local waiting, the
 
   loop.tick();
   auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Running);
+  REQUIRE(snapshot.active.kind == ActiveKind::Transition);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.transition.active);
+  REQUIRE(snapshot.transition.target == "user");
+  REQUIRE(snapshot.transition.target_id == "urgent");
+  REQUIRE(snapshot.transition.target_state == MotionState::Queued);
+  REQUIRE(snapshot.transition.frame == 0);
+  REQUIRE(snapshot.queue.ids.empty());
+  REQUIRE(store.findRun("active").run->state == MotionState::Stopped);
+  REQUIRE(store.findRun("active").run->stop_reason == StopReason::Interrupt);
+  REQUIRE(store.findRun("urgent").run->state == MotionState::Queued);
+  REQUIRE(store.findRun("transition").code == ErrorCode::RunNotFound);
+  requireReferenceStartsFrom(reference, interrupted_frame);
+
+  snapshot = requireActiveUserAfterTransition(loop, store, "urgent");
+  REQUIRE(snapshot.queue.ids.empty());
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->frame == 0);
+  REQUIRE(snapshot.exec->frames == 3);
+  REQUIRE(snapshot.exec->progress == Catch::Approx(1.0 / 3.0));
+  REQUIRE(store.findRun("active").run->state == MotionState::Stopped);
+  REQUIRE(store.findRun("active").run->stop_reason == StopReason::Interrupt);
+  REQUIRE(store.findRun("urgent").run->state == MotionState::Running);
+}
+
+TEST_CASE("RuntimeControlLoop running GeneralTracker interrupt fallback uses controlled stop") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  auto loop = makeLoop(config, bridge, store, tmp.trkConfig());
+
+  const auto active_path = transitionReadyTrk(tmp, "fallback_active.trk", 8, 0.2F);
+  const auto urgent_path = transitionReadyTrk(tmp, "fallback_urgent.trk", 3, 0.1F);
+
+  REQUIRE(bridge.submitQueue(
+              executeCommand("fallback-active", active_path, MotionMode::Queue, 8))
+              .ok());
+  startQueuedRun(loop, store, "fallback-active");
+  loop.tick();
+  REQUIRE(store.snapshot().active.kind == ActiveKind::User);
+  REQUIRE(store.snapshot().exec.has_value());
+  REQUIRE(store.snapshot().exec->state == MotionState::Running);
+
+  REQUIRE(bridge.submitInterrupt(
+              executeCommand("fallback-urgent",
+                             urgent_path,
+                             MotionMode::Interrupt,
+                             3))
+              .ok());
+  loop.forceNextRootYawResidualForTest(0.06);
+  loop.tick();
+
+  auto snapshot = store.snapshot();
   REQUIRE(snapshot.ctrl == ControllerState::Stopping);
   REQUIRE(snapshot.stop_reason == StopReason::Interrupt);
+  REQUIRE(snapshot.active.kind == ActiveKind::User);
+  REQUIRE_FALSE(snapshot.transition.active);
   REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->id == "fallback-active");
   REQUIRE(snapshot.exec->state == MotionState::Stopping);
-  REQUIRE(snapshot.queue.ids == std::vector<std::string>{"urgent"});
-  REQUIRE(store.findRun("active").run->state == MotionState::Stopping);
-  REQUIRE(store.findRun("active").run->stop_reason == StopReason::Interrupt);
+  REQUIRE(snapshot.queue.ids == std::vector<std::string>{"fallback-urgent"});
+  REQUIRE(store.findRun("fallback-active").run->state == MotionState::Stopping);
+  REQUIRE(store.findRun("fallback-active").run->stop_reason ==
+          StopReason::Interrupt);
+  const auto queued = store.findRun("fallback-urgent");
+  REQUIRE(queued.ok());
+  REQUIRE(queued.run->state == MotionState::Queued);
+  REQUIRE(queued.run->err == ErrorCode::Ok);
+  REQUIRE(queued.run->stop_reason == StopReason::None);
 
   loop.tick();
   requireIdle(store);
-  REQUIRE(store.findRun("active").run->state == MotionState::Stopped);
-  REQUIRE(store.snapshot().queue.ids == std::vector<std::string>{"urgent"});
+  REQUIRE(store.findRun("fallback-active").run->state == MotionState::Stopped);
+  REQUIRE(store.snapshot().queue.ids ==
+          std::vector<std::string>{"fallback-urgent"});
+  startQueuedRun(loop, store, "fallback-urgent");
+}
 
-  startQueuedRun(loop, store, "urgent");
+TEST_CASE("RuntimeControlLoop running GeneralTracker interrupt invalid target keeps old failure path") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  auto loop = makeLoop(config, bridge, store, tmp.trkConfig());
+
+  const auto active_path =
+      transitionReadyTrk(tmp, "invalid_interrupt_active.trk", 8, 0.2F);
+  const auto invalid_path =
+      invalidContactTrk(tmp, "invalid_interrupt_target.trk");
+
+  REQUIRE(bridge.submitQueue(
+              executeCommand("invalid-active", active_path, MotionMode::Queue, 8))
+              .ok());
+  startQueuedRun(loop, store, "invalid-active");
+  loop.tick();
+  REQUIRE(store.snapshot().active.kind == ActiveKind::User);
+  REQUIRE(store.snapshot().exec.has_value());
+  REQUIRE(store.snapshot().exec->state == MotionState::Running);
+
+  REQUIRE(bridge.submitInterrupt(
+              executeCommand("invalid-target",
+                             invalid_path,
+                             MotionMode::Interrupt,
+                             3))
+              .ok());
+  loop.tick();
+
+  auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Stopping);
+  REQUIRE(snapshot.stop_reason == StopReason::Interrupt);
+  REQUIRE(snapshot.active.kind == ActiveKind::User);
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->id == "invalid-active");
+  REQUIRE(snapshot.exec->state == MotionState::Stopping);
+  REQUIRE(snapshot.queue.ids == std::vector<std::string>{"invalid-target"});
+  REQUIRE(store.findRun("invalid-active").run->state == MotionState::Stopping);
+  REQUIRE(store.findRun("invalid-active").run->stop_reason ==
+          StopReason::Interrupt);
+  REQUIRE(store.findRun("invalid-target").run->state == MotionState::Queued);
+  REQUIRE(store.findRun("invalid-target").run->err == ErrorCode::Ok);
+
+  loop.tick();
+  requireIdle(store);
+  REQUIRE(store.findRun("invalid-active").run->state == MotionState::Stopped);
+  REQUIRE(store.findRun("invalid-active").run->stop_reason ==
+          StopReason::Interrupt);
+  REQUIRE(store.snapshot().queue.ids ==
+          std::vector<std::string>{"invalid-target"});
+
+  loop.tick();
   snapshot = store.snapshot();
-  REQUIRE(snapshot.exec->frame == 0);
+  REQUIRE(snapshot.ctrl == ControllerState::Preparing);
+  REQUIRE(snapshot.exec.has_value());
+  REQUIRE(snapshot.exec->id == "invalid-target");
+
+  loop.tick();
+  snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Idle);
+  REQUIRE(snapshot.active.kind == ActiveKind::None);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE(snapshot.queue.ids.empty());
+  const auto failed = store.findRun("invalid-target");
+  REQUIRE(failed.ok());
+  REQUIRE(failed.run->state == MotionState::Failed);
+  REQUIRE(failed.run->err == ErrorCode::TrkValidationFailed);
+  REQUIRE(failed.run->stop_reason == StopReason::None);
+}
+
+TEST_CASE("RuntimeControlLoop running GeneralTracker interrupt transition start policy fatal does not fallback") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy policy;
+  auto loop = makePolicyLoop(config,
+                             bridge,
+                             store,
+                             tmp.trkConfig(),
+                             robot,
+                             policy,
+                             deploy_config);
+
+  const auto active_path =
+      transitionReadyTrk(tmp, "fatal_interrupt_active.trk", 8, 0.2F);
+  const auto urgent_path =
+      transitionReadyTrk(tmp, "fatal_interrupt_urgent.trk", 3, 0.1F);
+  REQUIRE(bridge.submitQueue(
+              executeCommand("fatal-active", active_path, MotionMode::Queue, 8))
+              .ok());
+  startQueuedRun(loop, store, "fatal-active");
+  REQUIRE(store.snapshot().active.kind == ActiveKind::User);
+  REQUIRE(store.snapshot().exec.has_value());
+  REQUIRE(store.snapshot().exec->state == MotionState::Running);
+
+  const auto anchor_sdk_slot =
+      static_cast<std::size_t>(deploy_config.sdk_joint_ids_map.at(12));
+  robot.low_state->motors.at(anchor_sdk_slot).q =
+      std::numeric_limits<float>::quiet_NaN();
+
+  REQUIRE(bridge.submitInterrupt(
+              executeCommand("fatal-urgent",
+                             urgent_path,
+                             MotionMode::Interrupt,
+                             3))
+              .ok());
+  loop.tick();
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Fault);
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Fault);
+  REQUIRE(snapshot.active.kind == ActiveKind::None);
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.queue.ids.empty());
+  REQUIRE(snapshot.err == ErrorCode::ModelInferenceFailed);
+  REQUIRE(snapshot.block == "policy_inference_failed");
+  REQUIRE(store.findRun("fatal-active").run->state == MotionState::Failed);
+  REQUIRE(store.findRun("fatal-active").run->err ==
+          ErrorCode::ModelInferenceFailed);
+  REQUIRE(store.findRun("fatal-active").run->stop_reason == StopReason::None);
+  const auto target = store.findRun("fatal-urgent");
+  REQUIRE(target.ok());
+  REQUIRE(target.run->state == MotionState::Failed);
+  REQUIRE(target.run->err == ErrorCode::ModelInferenceFailed);
+  REQUIRE(target.run->stop_reason == StopReason::None);
+}
+
+TEST_CASE("RuntimeControlLoop running GeneralTracker interrupt safety terminal does not fallback") {
+  TempTree tmp;
+  const RuntimeConfig config = runtimeConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy policy;
+  auto loop = makePolicyLoop(config,
+                             bridge,
+                             store,
+                             tmp.trkConfig(),
+                             robot,
+                             policy,
+                             deploy_config);
+
+  const auto active_path =
+      transitionReadyTrk(tmp, "safety_interrupt_active.trk", 8, 0.2F);
+  const auto urgent_path =
+      transitionReadyTrk(tmp, "safety_interrupt_urgent.trk", 3, 0.1F);
+  REQUIRE(bridge.submitQueue(
+              executeCommand("safety-active", active_path, MotionMode::Queue, 8))
+              .ok());
+  startQueuedRun(loop, store, "safety-active");
+  REQUIRE(store.snapshot().active.kind == ActiveKind::User);
+  REQUIRE(store.snapshot().exec.has_value());
+
+  robot.low_state = badOrientationLowState(deploy_config, 73);
+  REQUIRE(bridge.submitInterrupt(
+              executeCommand("safety-urgent",
+                             urgent_path,
+                             MotionMode::Interrupt,
+                             3))
+              .ok());
+  loop.tick();
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Passive);
+  REQUIRE(loop.internalStateForTest() == RuntimeInternalState::Passive);
+  REQUIRE(snapshot.active.kind == ActiveKind::None);
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.queue.ids.empty());
+  REQUIRE(snapshot.err == ErrorCode::RobotBadOrientation);
+  REQUIRE(snapshot.block == "bad_orientation");
+  REQUIRE(store.findRun("safety-active").run->state == MotionState::Failed);
+  REQUIRE(store.findRun("safety-active").run->err ==
+          ErrorCode::RobotBadOrientation);
+  REQUIRE(store.findRun("safety-active").run->stop_reason == StopReason::None);
+  const auto target = store.findRun("safety-urgent");
+  REQUIRE(target.ok());
+  REQUIRE(target.run->state == MotionState::Failed);
+  REQUIRE(target.run->err == ErrorCode::RobotBadOrientation);
+  REQUIRE(target.run->stop_reason == StopReason::None);
+
+  loop.tick();
+  const auto after = store.snapshot();
+  REQUIRE(after.ctrl == ControllerState::Passive);
+  REQUIRE(after.active.kind == ActiveKind::None);
+  REQUIRE_FALSE(after.transition.active);
+  REQUIRE_FALSE(after.exec.has_value());
+  REQUIRE(after.queue.ids.empty());
+  REQUIRE(store.findRun("safety-active").run->state == MotionState::Failed);
+  REQUIRE(store.findRun("safety-active").run->err ==
+          ErrorCode::RobotBadOrientation);
+  REQUIRE(store.findRun("safety-urgent").run->state == MotionState::Failed);
+  REQUIRE(store.findRun("safety-urgent").run->err ==
+          ErrorCode::RobotBadOrientation);
 }
 
 }  // namespace agentic_et1_tracker

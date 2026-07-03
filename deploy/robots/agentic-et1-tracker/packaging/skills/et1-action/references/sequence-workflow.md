@@ -7,14 +7,15 @@ P0 rules:
 - First ready segment runs as soon as it is available.
 - `sequence-start` cancels any prior active local sequence before starting the new one.
 - Future segments are generated in order for serial continuity, then submitted up to `ET1_ACTION_QUEUE_AHEAD` unfinished tracker runs. Default queue-ahead is `3`.
-- Queue-ahead reduces playback gaps. It also means `sequence-replace-tail` can only replace segments not yet submitted to the tracker.
+- Queue-ahead is a performance optimization, not a tracker playlist. It reduces playback gaps, but it also means `sequence-replace-tail` can only replace segments not yet submitted to the tracker.
 - `sequence-append` adds unsubmitted local segments.
-- `sequence-replace-tail` replaces only unsubmitted local segments.
+- `sequence-replace-tail` replaces only unsubmitted local segments. If the requested tail is already submitted, it must return `ok:false`, `error.code:"TAIL_ALREADY_SUBMITTED"`, `replaceable_count`, `submitted_count`, and the single `next:"sequence-interrupt"`.
 - `sequence-cancel` cancels unsubmitted local work and calls standby.
 - `sequence-interrupt --trk PATH` runs the ready `.trk` with mode `interrupt`.
 - `sequence-interrupt --text TEXT` first calls standby, then generates and submits the new action with mode `interrupt`.
 - Direct `run-text`, `run-trk`, `standby`, and `idle-clear` cancel active local sequences before calling the tracker, so old workers do not keep generating or submitting stale motions.
 - Direct `run-text` and `run-trk` default to tracker interrupt as a skill product default. Raw HTTP `/execute` and `/execute_loco_upper` default to queue when `mode` is omitted.
+- `accepted` or submitted run ids only mean the tracker accepted/submitted the request. accepted/submitted does not mean the robot has completed the motion; use `sequence-status`, `/status?id=<run_id>`, or full `/status` to confirm progress.
 
 Text segments accept:
 

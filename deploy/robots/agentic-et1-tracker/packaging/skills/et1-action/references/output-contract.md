@@ -10,6 +10,8 @@ Default failure output has:
 {"ok":false,"cmd":"sequence-status","error":{"code":"WORKER_DIED","message":"sequence worker process is not running"},"next":"sequence-status"}
 ```
 
+`sequence-replace-tail` failures that touch already submitted tracker runs use `error.code:"TAIL_ALREADY_SUBMITTED"` and include `replaceable_count`, `submitted_count`, and `next:"sequence-interrupt"`.
+
 `next` is always one command: `run-text`, `run-trk`, `sequence-start`, `sequence-status`, `sequence-append`, `sequence-replace-tail`, `sequence-cancel`, `sequence-interrupt`, `standby`, `fixstand`, `passive`, `motion-mode`, `status`, `urgent-stop`, `idle-load`, `idle-clear`, or `cache-clear`.
 
 Do not rely on default output for full paths, prompts, durations, tracker status, or long logs.

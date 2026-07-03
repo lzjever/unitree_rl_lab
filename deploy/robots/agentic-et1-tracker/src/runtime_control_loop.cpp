@@ -1268,6 +1268,17 @@ void RuntimeControlLoop::handleInterrupt(MotionRequest request) {
     }
     return;
   }
+  if (active_kind_ == ActiveKind::User && active_ &&
+      active_->state == MotionState::Running &&
+      active_->executor == MotionExecutor::GeneralTracker &&
+      isGeneralTrackerRequest(request)) {
+    const RunningInterruptHandoffResult handoff_result =
+        tryStartRunningUserInterruptHandoff(request);
+    if (handoff_result == RunningInterruptHandoffResult::Started ||
+        handoff_result == RunningInterruptHandoffResult::SafetyTerminal) {
+      return;
+    }
+  }
   waiting_.push_back(std::move(request));
   if (active_kind_ == ActiveKind::User && active_ &&
       active_->executor == MotionExecutor::LocoUpper) {
@@ -1284,6 +1295,137 @@ void RuntimeControlLoop::handleInterrupt(MotionRequest request) {
     post_stop_control_ = ControlMode::StandbyVelocity;
     enterStopping(StopReason::Interrupt);
   }
+}
+
+RuntimeControlLoop::RunningInterruptHandoffResult
+RuntimeControlLoop::tryStartRunningUserInterruptHandoff(
+    const MotionRequest& request) {
+  if (active_kind_ != ActiveKind::User || !active_ ||
+      active_->state != MotionState::Running ||
+      active_->executor != MotionExecutor::GeneralTracker ||
+      !active_track_ || !isGeneralTrackerRequest(request)) {
+    return RunningInterruptHandoffResult::Fallback;
+  }
+
+  auto publishTargetFailed = [this](MotionRequest failed, ErrorCode error) {
+    failed.state = MotionState::Failed;
+    failed.frame = 0;
+    failed.err = error;
+    failed.stop_reason = StopReason::None;
+    failed.ended_at = std::chrono::steady_clock::now();
+    status_.publishRunStatus(toStatus(failed));
+  };
+
+  std::optional<LowStateSample> entry_low_state;
+  if (hasPolicyRuntime()) {
+    entry_low_state = readLowStateForStatus();
+    const RobotReadinessStatus readiness =
+        mapRobotReadiness(entry_low_state,
+                          robot_io_->lowCmdOccupancy(),
+                          expected_mode_machine_);
+    applyReadiness(readiness);
+    if (readiness.err != ErrorCode::Ok) {
+      publishTargetFailed(request, readiness.err);
+      failActiveReadiness(readiness);
+      return RunningInterruptHandoffResult::SafetyTerminal;
+    }
+  }
+
+  const std::optional<TrkFrameView> source_frame =
+      active_track_->frame(active_->frame);
+  if (!source_frame) {
+    return RunningInterruptHandoffResult::Fallback;
+  }
+
+  MotionRequest target_request = request;
+  target_request.state = MotionState::Queued;
+  target_request.frame = 0;
+  target_request.err = ErrorCode::Ok;
+  target_request.stop_reason = StopReason::None;
+
+  TrkLoadResult loaded = loader_.load(target_request.path);
+  if (!loaded.ok()) {
+    return RunningInterruptHandoffResult::Fallback;
+  }
+
+  target_request.frames = loaded.track->metadata.frames;
+  target_request.fps = loaded.track->metadata.fps;
+  target_request.duration_s = loaded.track->metadata.duration_s;
+  auto target_track = std::make_shared<const TrkTrack>(std::move(*loaded.track));
+
+  ErrorCode transition_error = ErrorCode::InternalError;
+  bool transition_build_rejected = false;
+  std::optional<UserTransitionTracks> tracks =
+      makeUserTransitionTracks(*source_frame,
+                               target_track,
+                               transition_error,
+                               transition_build_rejected);
+
+  if (!tracks) {
+    tracks = makeUserTransitionTracksFromControllableSource(*source_frame,
+                                                            target_track,
+                                                            entry_low_state,
+                                                            transition_error,
+                                                            transition_build_rejected);
+  }
+
+  if (!tracks) {
+    if (hasPolicyRuntime() && transition_error != ErrorCode::Ok &&
+        transition_error != ErrorCode::InternalError) {
+      RobotReadinessStatus readiness;
+      readiness.robot = runtime_state_.robot;
+      readiness.low_ms = runtime_state_.low_ms;
+      readiness.block = runtime_state_.block;
+      readiness.err = transition_error;
+      publishTargetFailed(std::move(target_request), transition_error);
+      failActiveReadiness(readiness);
+      return RunningInterruptHandoffResult::SafetyTerminal;
+    }
+    if (isSafetyTerminalState()) {
+      publishTargetFailed(std::move(target_request), transition_error);
+      return RunningInterruptHandoffResult::SafetyTerminal;
+    }
+    return RunningInterruptHandoffResult::Fallback;
+  }
+
+  const MotionRequest source_to_complete = *active_;
+  PendingTransition target;
+  target.target_kind = TransitionTargetKind::User;
+  target.target_id = target_request.id;
+  target.target_state = MotionState::Queued;
+  target.target_track = std::move(tracks->target_track);
+  target.target_request = std::move(target_request);
+  target.source_completion_state = MotionState::Stopped;
+  target.source_completion_reason = StopReason::Interrupt;
+  target.source_completion_error = ErrorCode::Ok;
+
+  const bool started = startInternalTransition(std::move(tracks->transition_track),
+                                               std::move(target),
+                                               std::move(entry_low_state),
+                                               false);
+  if (!started) {
+    if (last_transition_start_fatal_) {
+      const TransitionStartFatal fatal = std::move(*last_transition_start_fatal_);
+      last_transition_start_fatal_.reset();
+      publishTargetFailed(request, fatal.error);
+      failActiveWithFault(fatal.error, fatal.robot, fatal.block, fatal.low_ms);
+      return RunningInterruptHandoffResult::SafetyTerminal;
+    }
+    if (isSafetyTerminalState()) {
+      publishTargetFailed(request, runtime_state_.err);
+      return RunningInterruptHandoffResult::SafetyTerminal;
+    }
+    return RunningInterruptHandoffResult::Fallback;
+  }
+
+  MotionRequest completed = source_to_complete;
+  completed.state = MotionState::Stopped;
+  completed.err = ErrorCode::Ok;
+  completed.stop_reason = StopReason::Interrupt;
+  completed.ended_at = std::chrono::steady_clock::now();
+  status_.publishRunStatus(toStatus(completed));
+  post_stop_control_ = ControlMode::StandbyVelocity;
+  return RunningInterruptHandoffResult::Started;
 }
 
 void RuntimeControlLoop::cancelWaiting(StopReason reason) {
@@ -4288,6 +4430,7 @@ bool RuntimeControlLoop::startInternalTransition(
     PendingTransition target,
     std::optional<LowStateSample> entry_low_state,
     bool publish_target_failure) {
+  last_transition_start_fatal_.reset();
   if (fault_next_transition_start_for_test_) {
     fault_next_transition_start_for_test_ = false;
     failActiveWithFault(ErrorCode::ModelInferenceFailed,
@@ -4320,6 +4463,12 @@ bool RuntimeControlLoop::startInternalTransition(
         status_.publishRunStatus(toStatus(*target.target_request));
       }
       if (!publish_target_failure) {
+        last_transition_start_fatal_ = TransitionStartFatal{
+            ErrorCode::RobotNotReady,
+            RobotState::NotReady,
+            "low_state_missing",
+            std::nullopt,
+        };
         return false;
       }
       failActiveWithFault(ErrorCode::RobotNotReady,
@@ -4338,6 +4487,12 @@ bool RuntimeControlLoop::startInternalTransition(
         status_.publishRunStatus(toStatus(*target.target_request));
       }
       if (!publish_target_failure) {
+        last_transition_start_fatal_ = TransitionStartFatal{
+            ErrorCode::ModelInferenceFailed,
+            RobotState::Fault,
+            "policy_inference_failed",
+            runtime_state_.low_ms,
+        };
         return false;
       }
       enterFault(ErrorCode::ModelInferenceFailed,

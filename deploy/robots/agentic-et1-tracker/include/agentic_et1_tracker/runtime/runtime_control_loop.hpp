@@ -130,6 +130,12 @@ class RuntimeControlLoop final {
     SafetyTerminal,
   };
 
+  enum class RunningInterruptHandoffResult {
+    Started,
+    Fallback,
+    SafetyTerminal,
+  };
+
   enum class StartupHoldMode {
     Run,
     Reduced,
@@ -146,6 +152,13 @@ class RuntimeControlLoop final {
     StopReason source_completion_reason{StopReason::None};
     ErrorCode source_completion_error{ErrorCode::Ok};
     bool reduced_target_startup_hold{false};
+  };
+
+  struct TransitionStartFatal {
+    ErrorCode error{ErrorCode::Ok};
+    RobotState robot{RobotState::Fault};
+    std::string block;
+    std::optional<std::size_t> low_ms;
   };
 
   struct UserTransitionTracks {
@@ -192,6 +205,8 @@ class RuntimeControlLoop final {
   void handleControl(ControlMode mode);
   void handleIdleConfig(std::vector<IdleMotion> motions);
   void handleInterrupt(MotionRequest request);
+  RunningInterruptHandoffResult tryStartRunningUserInterruptHandoff(
+      const MotionRequest& request);
   void cancelWaiting(StopReason reason);
   void cancelWaiting(StopReason reason, std::uint64_t sequence);
   void failWaiting(ErrorCode error);
@@ -412,6 +427,7 @@ class RuntimeControlLoop final {
   std::optional<PendingTransition> transition_;
   std::optional<LocoUpperRuntimeState> loco_upper_;
   std::optional<PolicyStepRunner> policy_runner_;
+  std::optional<TransitionStartFatal> last_transition_start_fatal_;
   std::vector<IdleMotion> idle_config_;
   std::size_t idle_next_index_{0};
   std::optional<std::size_t> idle_current_index_;

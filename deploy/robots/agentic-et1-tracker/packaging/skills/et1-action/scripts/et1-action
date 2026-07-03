@@ -1406,9 +1406,24 @@ def sequence_append_cmd(args):
 
 def sequence_replace_tail_cmd(args):
     incoming = parse_plan(args.plan_json)
+    blocked = {"value": False, "replaceable_count": 0, "submitted_count": 0}
     def replace(state):
+        segments = state.get("segments", [])
+        kept = [seg for seg in segments if seg.get("submitted")]
+        replaceable_count = sum(1 for seg in segments if not seg.get("submitted"))
+        active_segment_id = (state.get("active") or {}).get("segment_id")
+        submitted_tail_count = sum(
+            1
+            for seg in segments
+            if segment_is_unfinished_submission(seg) and seg.get("segment_id") != active_segment_id
+        )
+        blocked["replaceable_count"] = replaceable_count
+        blocked["submitted_count"] = len(kept)
+        if (not replaceable_count and kept) or submitted_tail_count:
+            blocked["value"] = True
+            state.update({"last_cmd": "sequence-replace-tail", "next": "sequence-interrupt", "heartbeat_at": now()})
+            return
         bump_epoch(state)
-        kept = [seg for seg in state.get("segments", []) if seg.get("submitted")]
         start = len(kept) + 1
         for offset, seg in enumerate(incoming):
             seg["segment_id"] = f"s{start + offset}"
@@ -1416,6 +1431,15 @@ def sequence_replace_tail_cmd(args):
         state["segments"] = kept
         state.update({"last_cmd": "sequence-replace-tail", "next": "sequence-status", "heartbeat_at": now()})
     state = update_state(args.seq_id, replace)
+    if blocked["value"]:
+        error = {
+            "code": "TAIL_ALREADY_SUBMITTED",
+            "message": "sequence tail includes submitted tracker runs; use sequence-interrupt",
+        }
+        out = sequence_output(state, ok=False, error=error, intent="replace_tail")
+        out["replaceable_count"] = blocked["replaceable_count"]
+        out["submitted_count"] = blocked["submitted_count"]
+        return out
     return sequence_output(state, intent="replace_tail")
 
 

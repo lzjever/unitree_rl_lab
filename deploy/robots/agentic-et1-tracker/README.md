@@ -142,6 +142,14 @@ Idle playback yields to user `/execute`; the accepted user run still receives
 the only waitable run id. With `hold:true`, a user run that reaches its last
 frame enters `state:"holding"` and keeps the same run id queryable through
 `GET /status?id=<id>` until another user run or a control command releases it.
+Accepted `/execute` output means the request was accepted/submitted, not that
+the robot has completed the motion; poll `GET /status?id=<id>` or full
+`GET /status` for running, done, holding, passive, or fault progress.
+`mode:"interrupt"` is the single foreground takeover API. For active running
+GeneralTracker user -> GeneralTracker user, the runtime may internally smooth
+handoff through `active.kind:"transition"` and `transition.target:"user"`; if
+that handoff is rejected, it falls back to controlled stop/restart. Clients do
+not choose a stop profile or smoothing mode.
 
 `/idle` is a config endpoint, not a run submission endpoint. It atomically
 replaces the idle pool after validating every path with the same local `.trk`
@@ -302,7 +310,7 @@ Controller states:
 | `fixstand` | Holds configured stand posture. | `/standby`, passworded `/passive`, `/urgent_stop`, `/fixstand`, `/idle {"paths":[]}` | `/execute` and non-empty `/idle` return conflict; call `/standby` first. Passworded `/passive` and `/fixstand` are the `bad_orientation` software recovery exceptions. |
 | `standby` | Velocity policy with zero command; robot stands idle. Public status reports `ctrl:"standby"`. | `/execute`, `/idle`, passworded `/passive`, `/fixstand`, `/urgent_stop` | Normal state for starting user `.trk`; idle auto-play may start only when ready/safe and no user active/queue exists. |
 | idle active (`active.kind:"idle"`) | GeneralTracker plays an idle pool motion without a user id. | `/execute`, `/standby`, `/urgent_stop`, `/idle`, passworded `/passive`, `/fixstand` | `exec:null`, user `queue` unchanged. User `/execute` preempts idle playback but keeps idle config; `/standby` stops current idle playback and keeps idle config; `/urgent_stop` clears idle config. |
-| `preparing`/`running` with `active.kind:"user"` | Preparing or executing a user `.trk`. | `/standby`, `/urgent_stop`, passworded `/passive`, `/execute` queue/interrupt, `/idle` config/clear | `queue` waits; `interrupt` preempts current user run. Poll `/status?id=<id>`. |
+| `preparing`/`running` with `active.kind:"user"` | Preparing or executing a user `.trk`. | `/standby`, `/urgent_stop`, passworded `/passive`, `/execute` queue/interrupt, `/idle` config/clear | `queue` waits; `interrupt` preempts current user run. Running GeneralTracker interrupts may expose `transition.target:"user"` before the new run is active; preparing and fallback paths use controlled stop/restart. Poll `/status?id=<id>`. |
 | holding (`active.kind:"user"`, `exec.state:"holding"`) | Holds the last reference frame of a user `.trk` submitted with `hold:true`. | `/execute` queue/interrupt, `/standby`, `/urgent_stop`, passworded `/passive`, `/fixstand`, `/idle` config/clear | Same user id remains queryable. `/urgent_stop`, passworded `/passive`, and `/fixstand` end it immediately; `/standby` is the ordinary release path. |
 | transition active (`active.kind:"transition"`) | Internal synthetic reference transition toward `transition.target`. | `/execute` queue/interrupt, `/standby`, `/urgent_stop`, passworded `/passive`, `/fixstand`, `/idle` config/clear | Not a user run; no id, queue entry, queue limit use, or user history entry. `/urgent_stop` aborts immediately; `/standby` targets the ordinary standby chain. |
 | `urgent_stopping` | Urgent-stop transition to standby, passive, fault, or manual handling. | `/status`, passworded `/passive`, `/urgent_stop`, `/idle {"paths":[]}` | `/execute` and non-empty `/idle` return conflict at the HTTP API; wait for a stable state. Ordinary `/standby` should not expose generic `stopping` as a success path. |

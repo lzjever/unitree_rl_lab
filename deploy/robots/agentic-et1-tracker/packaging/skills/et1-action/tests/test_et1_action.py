@@ -53,6 +53,8 @@ DEFAULT_FIELDS = {
     "matched",
     "motion_mode",
     "executor",
+    "replaceable_count",
+    "submitted_count",
     "next",
     "error",
 }
@@ -910,6 +912,117 @@ print(json.dumps({"ok": True}))
         self.assertEqual(state["segments"][1]["status"], "queued")
         self.assertTrue(state["segments"][1]["submitted"])
 
+    def test_sequence_queue_ahead_default_is_three_and_leaves_later_tail_local(self):
+        old_queue_ahead = os.environ.pop("ET1_ACTION_QUEUE_AHEAD", None)
+        try:
+            module = self.load_action_module()
+            self.assertEqual(module.queue_ahead_limit(), 3)
+
+            tracks = [self.ready_trk]
+            for idx in range(2, 5):
+                path = self.base / f"ready-{idx}.trk"
+                path.write_text(f"ready {idx}\n", encoding="utf-8")
+                tracks.append(path)
+            plan = {"segments": [{"trk": str(path)} for path in tracks]}
+
+            out, _ = self.cli(
+                "sequence-start",
+                "--plan-json",
+                json.dumps(plan),
+                "--stage-dir",
+                str(self.stage),
+                env_extra={"ET1_ACTION_WORKER_MAX_POLLS": "1"},
+            )
+            self.wait_for_execs(3)
+            time.sleep(0.1)
+            execs = [record for record in self.tracker.records if record[0] == "POST" and record[1] == "/execute"]
+
+            self.assertEqual(len(execs), 3, self.tracker.records)
+            self.assertEqual([execute[2]["mode"] for execute in execs], ["interrupt", "queue", "queue"])
+            state = json.loads((self.state_dir / f"{out['seq_id']}.json").read_text(encoding="utf-8"))
+            self.assertEqual([bool(seg.get("submitted")) for seg in state["segments"]], [True, True, True, False])
+        finally:
+            if old_queue_ahead is None:
+                os.environ.pop("ET1_ACTION_QUEUE_AHEAD", None)
+            else:
+                os.environ["ET1_ACTION_QUEUE_AHEAD"] = old_queue_ahead
+
+    def test_sequence_replace_submitted_tail_returns_actionable_error(self):
+        second = self.base / "ready-2.trk"
+        second.write_text("ready 2\n", encoding="utf-8")
+        plan = {"segments": [{"trk": str(self.ready_trk)}, {"trk": str(second)}]}
+        out, _ = self.cli(
+            "sequence-start",
+            "--plan-json",
+            json.dumps(plan),
+            "--stage-dir",
+            str(self.stage),
+            env_extra={"ET1_ACTION_WORKER_MAX_POLLS": "1"},
+        )
+        seq_id = out["seq_id"]
+        self.wait_for_execs(2)
+
+        out, proc = self.cli(
+            "sequence-replace-tail",
+            seq_id,
+            "--plan-json",
+            json.dumps({"segments": [{"text": "new tail"}]}),
+            check=False,
+        )
+
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["cmd"], "sequence-replace-tail")
+        self.assertEqual(out["error"]["code"], "TAIL_ALREADY_SUBMITTED")
+        self.assertEqual(out["replaceable_count"], 0)
+        self.assertEqual(out["submitted_count"], 2)
+        self.assertEqual(out["next"], "sequence-interrupt")
+        state = json.loads((self.state_dir / f"{seq_id}.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(state["segments"]), 2)
+        self.assertEqual([bool(seg.get("submitted")) for seg in state["segments"]], [True, True])
+        self.assertNotIn("new tail", [seg.get("text") for seg in state["segments"]])
+
+    def test_sequence_replace_tail_rejects_mixed_submitted_queue_ahead_tail(self):
+        tracks = [self.ready_trk]
+        for idx in range(2, 5):
+            path = self.base / f"mixed-ready-{idx}.trk"
+            path.write_text(f"ready {idx}\n", encoding="utf-8")
+            tracks.append(path)
+        plan = {"segments": [{"trk": str(path)} for path in tracks]}
+        out, _ = self.cli(
+            "sequence-start",
+            "--plan-json",
+            json.dumps(plan),
+            "--stage-dir",
+            str(self.stage),
+            env_extra={"ET1_ACTION_WORKER_MAX_POLLS": "1"},
+        )
+        seq_id = out["seq_id"]
+        self.wait_for_execs(3)
+        state_path = self.state_dir / f"{seq_id}.json"
+        before = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(before["active"]["segment_id"], "s1")
+        self.assertEqual([bool(seg.get("submitted")) for seg in before["segments"]], [True, True, True, False])
+
+        out, proc = self.cli(
+            "sequence-replace-tail",
+            seq_id,
+            "--plan-json",
+            json.dumps({"segments": [{"text": "new mixed tail"}]}),
+            check=False,
+        )
+
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["cmd"], "sequence-replace-tail")
+        self.assertEqual(out["error"]["code"], "TAIL_ALREADY_SUBMITTED")
+        self.assertEqual(out["replaceable_count"], 1)
+        self.assertEqual(out["submitted_count"], 3)
+        self.assertEqual(out["next"], "sequence-interrupt")
+        after = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(after["segments"], before["segments"])
+        self.assertNotIn("new mixed tail", [seg.get("text") for seg in after["segments"]])
+
     def test_sequence_text_segments_share_serial_artifact_root(self):
         plan = {"segments": [{"text": "first"}, {"text": "second"}]}
         out, _ = self.cli(
@@ -1242,6 +1355,10 @@ print(json.dumps({"ok": True}))
         self.assertIn("`idle-load`, `idle-clear`, or `cache-clear`", docs)
         self.assertNotIn("Treat ordinary stop, do-not-move, standing still", docs)
         self.assertIn("Direct `run-text` and `run-trk` default to tracker interrupt", docs)
+        self.assertIn("Default queue-ahead is `3`", docs)
+        self.assertIn("performance optimization, not a tracker playlist", docs)
+        self.assertIn("`TAIL_ALREADY_SUBMITTED`", docs)
+        self.assertIn("accepted/submitted does not mean the robot has completed the motion", docs)
         self.assertIn("Do not block the turn with `sleep && sequence-status`", docs)
 
     def test_release_packaging_exposes_only_et1_action_skill(self):

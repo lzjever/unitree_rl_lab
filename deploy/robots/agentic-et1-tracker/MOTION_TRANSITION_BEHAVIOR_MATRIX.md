@@ -46,7 +46,7 @@
 | idle 是 background config | 用户动作 queue/interrupt 只打断当前 idle 播放，不清 idle config；失败也保留配置并可在回到 standby 链路后恢复。只有 `/urgent_stop`、passworded `/passive`、`/idle {"paths":[]}` 清 idle config。 |
 | transition 过程中收到新的 user interrupt | 从当前 transition reference frame 重新构造到 urgent user 首帧的 synthetic transition。 |
 | transition 目标是 user 时收到新的 user queue | 保留旧 target user，新 user 排队；不抢占已有前景 user target。 |
-| active user running 是前景动作 | 不默认做 current-frame direct transition。推荐保守 controlled stop/settle 后再启动 urgent，除非未来增加 safety gate。 |
+| active user running 是前景动作 | GeneralTracker user -> GeneralTracker user interrupt 优先尝试 current-frame synthetic handoff；成功时进入 internal `transition.target:"user"`，失败时 fallback controlled stop/settle 后再启动 urgent。Preparing、LocoUpper 和 safety/fault 路径不改变。 |
 | passive/fixstand/fault/urgent_stopping 是安全、恢复或姿态控制边界 | HTTP `/execute` 在 readiness OK 时拒绝 user `.trk`；readiness/manual error 优先于 controller conflict。runtime 低层也不得在这些状态启动 waiting user。 |
 | urgent_stop/passive/fixstand/standby 是 control/safety 命令 | 不生成 user run、不进入 queue。urgent_stop/passive/fixstand 不走 smoothing；`/standby` 一般不走 smoothing，唯一例外是静态 user holding 可从 held reference 平滑到 standby reference。 |
 | synthetic transition 是内部对象 | 无 run id，不占 `queue.limit`，不进入 `queue.ids`，不进 user run history，不可通过 `GET /status?id=...` 查询。 |
@@ -57,7 +57,8 @@
 | --- | --- |
 | background transition/playback 下 user queue 抢占背景 | `transition.target=idle`、`transition.target=standby`、standby playback 收到 queue user `.trk` 时，从 current reference 平滑切到 user，不等背景完成。 |
 | `transition.target=user` 下 queue 继续等待 | 当前 transition 已归属前景 user target；新 user queue 不抢占。 |
-| active user running/preparing interrupt 继续 controlled stop | 不把前景 user interrupt 改成 current-frame direct transition。 |
+| active user running interrupt 优先 smooth handoff | active running GeneralTracker user 收到 GeneralTracker interrupt 时，从当前 reference frame 构造到新 user 首帧的 synthetic transition；benign reject fallback controlled stop，不提前失败新 user。 |
+| active user preparing interrupt 继续 controlled stop | Preparing 还没有稳定 current-frame source，继续 controlled stop/restart。 |
 | interrupt 对 background transition/playback 直接抢占 | `transition.target=idle`、`transition.target=standby`、standby playback 收到 interrupt user `.trk` 时，从 current reference 平滑切到 urgent user，并取消本地 waiting。 |
 | background queue 抢占失败语义最小化 | target user load/align/transition build 失败时 publish target `Failed`、`stop_reason=None`；old idle/standby target 不写 user history，不恢复旧 background transition/playback；停止当前 background/idle active 播放但保留 idle config，以便回到可播放 idle 的 standby 链路后恢复。 |
 
@@ -95,7 +96,7 @@ LLM agent 判断用户动作时不能只看 `ctrl:"running"`。应优先读取�
 | 事件 | 入口 | 说明 |
 | --- | --- | --- |
 | user queue | `POST /execute {"mode":"queue"}` 或省略 mode | 普通用户 `.trk`。 |
-| user interrupt | `POST /execute {"mode":"interrupt"}` | 紧急用户 `.trk`：取消本地 waiting；对 background transition/playback 从 current reference 抢占到 urgent user；对 user-owned transition 取消旧 target 后从 current reference 到 urgent user；active user preparing/running 走 controlled stop。 |
+| user interrupt | `POST /execute {"mode":"interrupt"}` | 紧急用户 `.trk`：取消本地 waiting；对 background transition/playback 从 current reference 抢占到 urgent user；对 user-owned transition 取消旧 target 后从 current reference 到 urgent user；active running GeneralTracker user 优先 smooth handoff，benign reject fallback controlled stop；active preparing 和 LocoUpper 保持 controlled stop。 |
 | idle config | `POST /idle {"paths":[...]}` | 配置 background idle pool；不是 run 提交。 |
 | idle clear | `POST /idle {"paths":[]}` | 清空 idle pool；当前 API 允许任意状态。 |
 | urgent_stop | `POST /urgent_stop` 空 body | 最高优先级紧急控制命令；不 smoothing。 |
@@ -126,9 +127,9 @@ LLM agent 判断用户动作时不能只看 `ctrl:"running"`。应优先读取�
 | active idle | user queue | 当前直接尝试 `idle current frame -> user first frame` synthetic transition；成功后 `active.kind:"transition"`、`transition.target:"user"`、`target_id` 为 user run id；失败时发布 user failed，停止当前 idle 播放但保留 idle config。 | 是 | 保持。queue 对 active idle 已经是已实现抢占；用户动作打断 idle 不清配置，失败也保留并可在回到 standby 链路后恢复。 | Current | 已有 active idle preempt 和 failure 测试。 |
 | active idle | user interrupt | 取消 waiting；同 queue，从 idle 当前帧 transition 到 urgent user。 | 是 | 保持。interrupt 不应比 queue 更慢。 | Current | 已有 active idle interrupt 测试。 |
 | active user preparing | user queue | 新 user 进入 waiting；当前 preparing user 不被打断。 | 是 | 保持。preparing 属于前景 user ownership。 | Current | preparing 专门测试可进 P2。 |
-| active user preparing | user interrupt | 取消 waiting；urgent 入 waiting；当前 active 被标记 `Stopping`，进入 `Stopping`，之后 urgent 从 standby/no-active 规则启动。不是 current-frame transition。 | 是，保守 | 保持 controlled stop。不要默认宣称 active user 可直接 current-frame transit；未来除非有 safety gate。 | P0 | 已覆盖 `[runtime-p1]` preparing interrupt controlled-stop 回归。 |
+| active user preparing | user interrupt | 取消 waiting；urgent 入 waiting；当前 active 被标记 `Stopping`，进入 `Stopping`，之后 urgent 从 standby/no-active 规则启动。不是 current-frame transition。 | 是，保守 | 保持 controlled stop。Preparing 不走 current-frame user handoff。 | P0 | 已覆盖 `[runtime-p1]` preparing interrupt controlled-stop 回归。 |
 | active user running | user queue | 新 user 进入 waiting；等待当前 user 完成/holding/urgent_stop 后启动。 | 是 | 保持 FIFO queue。 | Current | 已有基础 queue 行为；保留。 |
-| active user running | user interrupt | 取消 waiting；urgent 入 waiting；当前 user `Stopping`，`stop_reason:"interrupt"`；退出 `Stopping` 后 urgent 启动。 | 是，保守 | 保持 controlled stop/settle 后 urgent。不要改成 direct current-frame transition，除非未来引入安全判定。 | P0 | 已有 interrupt stops active 测试；保留。 |
+| active user running | user interrupt | GeneralTracker user -> GeneralTracker user 时先尝试 current-frame synthetic handoff；成功后旧 user `stopped` + `stop_reason:"interrupt"`，active 进入 `transition.target:"user"` 且 `transition.target_id` 为新 run；benign reject fallback controlled stop/settle 后 urgent 启动。 | 是 | 新主合同。不得把 benign transition reject 误标新 user failed；不得绕过 readiness/safety/fault。 | P0 | 需要 smooth success、fallback、safety 优先测试。 |
 | active user holding | user queue | waiting 不为空时，从 held/current user frame synthetic transition 到下一 user；source user 在 transition 开始时转 `done`。 | 是 | 保持。holding 是静态/可控 reference，适合作为 transition source。 | Current | 已有 holding->user 测试；保留。 |
 | active user holding | user interrupt | 取消 waiting；urgent 入 waiting；下一 tick 从 held/current frame transition 到 urgent user。 | 是 | 保持；interrupt 取消旧等待队列。 | Current | 已有 holding interrupt/transition 测试；保留。 |
 | `transition -> user` | user queue | 新 user 只进入 waiting；不中断当前 transition，旧 target user 仍优先。 | 是 | 保持。当前 transition 已经归属某个前景 user target，新 queue 不应抢占它。 | Current/P1 | 已覆盖 `[runtime-p1]` user-owned transition waits。 |
@@ -194,7 +195,8 @@ LLM agent 判断用户动作时不能只看 `ctrl:"running"`。应优先读取�
 | Current/P1 regression lock | `transition.target=user` 中 user queue 等待 | 当前 transition 已归属前景 user target，queue 不应抢占。 | 保留 `[runtime-p1]` user-owned transition waits 测试。 |
 | Current/P1 regression lock | queue 抢占 background transition/playback 的失败语义 | target user load/align/transition build 失败时不能恢复旧背景，也不能写 idle/standby history；用户动作打断 idle 不应清 idle config。 | target user publish `Failed`、`stop_reason=None`；停止当前 background/idle active 播放但保留 idle config；old background target 不写 user history；不恢复旧 background transition/playback。 |
 | Current/P1 regression lock | user/background/playback target-specific interrupt 行为 | interrupt 对 user-owned transition 取消旧 target 后 current-frame 到 urgent user；对 background transition/playback current-frame 抢占，并取消本地 waiting。 | 保留 `[runtime-p1]` target-specific interrupt tests，断言 source frame 是被打断 transition/playback 当前帧。 |
-| P0 regression lock | active user running/preparing interrupt 不能被误改成 direct current-frame transition | 前景 user 可能有动态接触、policy hidden/history 风险；这是当前保守合同，不是 P1 新能力。 | 保留 running interrupt controlled stop 测试和 `[runtime-p1]` preparing interrupt controlled stop 测试。 |
+| P0 regression lock | active user running interrupt smooth success/fallback | running GeneralTracker user interrupt 优先 current-frame transition；benign reject 回到 controlled stop；safety/readiness/fault 仍最高优先。 | 新增 running smooth handoff、fallback、no duplicate waiting、safety wins 测试；旧 running controlled-stop 测试只保留为 fallback 场景。 |
+| P0 regression lock | active user preparing interrupt remains controlled stop | Preparing 继续 controlled stop/restart，不尝试 current-frame transition。 | 保留 `[runtime-p1]` preparing interrupt controlled stop 测试。 |
 | P0 regression lock | `/passive`、`/fixstand` HTTP gate 不能被 runtime sink 语义掩盖 | `/passive` 必须有正确 password；lowcmd/manual gate 仍拒绝；readiness OK 可进 sink；readiness 非 OK 仅 `ROBOT_BAD_ORIENTATION` 且 `block=="bad_orientation"` 可作为 safety exception 进 sink；其他 readiness/fault error 拒绝。`/fixstand` 只有 readiness OK 或 bad_orientation recovery 才进入 sink。 | 回归测试分别覆盖 admitted command 与 gate rejected command；rejected path 不进 sink。 |
 | P2 backlog | active idle 收到 `/standby` 后因 idle config 保留而可能自动重新 idle 的合同需要锁定 | `/standby` 是 control command，不是 user run；保留 idle config 后，回到可播放 idle 的 standby 链路即可继续由 background idle manager 管理。 | 锁定产品合同：`/standby` 停止当前 active idle、保留 idle config；若无 user work 且 ready/safe，idle 可按现有自动播放规则重新启动。需要纯 `standby` 时，caller 先 `/idle {"paths":[]}` 再 `/standby`。 |
 | P2 backlog | preparing 状态 queue 行为可补专门测试 | preparing 与 running 同属 user-owned foreground；interrupt controlled stop 已覆盖。 | 如需更细覆盖，可补 active user preparing + queue 测试；不影响 Current/P1 合同。 |
@@ -208,7 +210,8 @@ LLM agent 判断用户动作时不能只看 `ctrl:"running"`。应优先读取�
 | --- | --- | --- |
 | none / standby | 立即按 standby->user gate 启动；source 使用 standby reference。 | 同 queue。 |
 | idle active | 抢占 idle；从 idle current frame 到 user first frame。 | 取消 waiting；从 idle current frame 到 urgent user first frame。 |
-| user preparing/running | FIFO 等当前 user。 | 取消 waiting；当前 user controlled stop/settle；urgent post-stop 启动。 |
+| user preparing | FIFO 等当前 user。 | 取消 waiting；当前 user controlled stop/settle；urgent post-stop 启动。 |
+| user running | FIFO 等当前 user。 | GeneralTracker->GeneralTracker 优先 smooth handoff；benign reject fallback controlled stop/settle；LocoUpper/safety paths unchanged。 |
 | user holding | 从 held frame 到 next user。 | 取消 waiting；从 held frame 到 urgent user。 |
 | transition target user | 保留当前 target user，新 user 排队。 | 取消旧 target；从 current transition frame 到 urgent user。 |
 | transition target idle | 抢占背景 idle target；从 current transition frame 到 user。 | 同 queue，并取消 waiting。 |
@@ -258,7 +261,7 @@ LLM agent 判断用户动作时不能只看 `ctrl:"running"`。应优先读取�
 | standby no-active | no active standby + queue user | 从 standby reference 到 user first frame transition。 |
 | standby no-active | no active standby + interrupt user | 与 queue 等价；无 active 可中断。 |
 | foreground queue | active user running + queue | 新 user 在 `queue.ids`；当前 user 不被打断。 |
-| foreground interrupt | active user running + interrupt | 当前 user `Stopping` / `Stopped` with `stop_reason:"interrupt"`；urgent post-stop 启动。 |
+| foreground interrupt | active user running + GeneralTracker interrupt | 成功时 `active.kind:"transition"`、`transition.target:"user"`、`transition.target_id` 为新 run，旧 user `stopped` + `stop_reason:"interrupt"`；fallback 时 controlled stop/restart。 |
 | holding queue | active user holding + queue | held frame -> next user transition；held user done。 |
 | holding interrupt | active user holding + interrupt | waiting canceled；held frame -> urgent user transition。 |
 | transition user queue | `transition.target=user` + queue | 旧 target user 保持；新 user 排队。 |
@@ -304,7 +307,7 @@ LLM agent 判断用户动作时不能只看 `ctrl:"running"`。应优先读取�
 - `transition.target=standby + queue`：背景 standby target canceled；从 current transition frame 到 user；不继续 standby playback。
 - `standby playback active + queue`：从 current playback frame 到 user；不等 playback 完成。
 - background queue 抢占失败：target user `Failed` with `stop_reason=None`；old idle/standby/standby playback 不写 user history；不恢复旧 background transition/playback；停止当前 background/idle active 播放但保留 idle config。
-- target-specific interrupt 回归：`transition.target=user` interrupt 取消旧 user target；`transition.target=idle`、`transition.target=standby`、standby playback interrupt 都从 current reference 到 urgent user。
+- target-specific interrupt 回归：running user interrupt 成功时 current-frame 到 urgent user；fallback 时 controlled stop；`transition.target=user` interrupt 取消旧 user target；`transition.target=idle`、`transition.target=standby`、standby playback interrupt 都从 current reference 到 urgent user。
 - status/API 回归：agent 不能只用 `ctrl:"running"` 判断 user motion；断言 `active.kind`、`transition.target/target_id`、`exec.id`、`queue.ids` 一致；blocked `/execute` 保持 readiness/manual error before controller conflict，且不调用 validator/sink/id generator。
 
 其他回归锁定，不扩大为新主路径：
@@ -324,7 +327,7 @@ LLM agent 判断用户动作时不能只看 `ctrl:"running"`。应优先读取�
 | Queue handling during transition | `CommandKind::Queue` 遇到 active transition/playback 时，如果 owner 是 background，应走 current-frame-to-user helper；如果 owner 是 user target，保持 waiting。 |
 | Background preempt failure | queue 抢占 background transition/playback 时，若 target user load/align/transition build 失败，publish target `Failed`、`stop_reason=None`；停止当前 background/idle active 播放但保留 idle config；不要恢复旧 background transition/playback；old idle/standby target 无 user history。 |
 | Interrupt handling during transition | 对 background transition/playback 保持 current-frame-to-urgent helper；对 user-owned transition 取消旧 target user 后重建到 urgent user。 |
-| Active user interrupt | 保持 controlled stop，不复用 transition helper，除非未来有明确 safety gate。 |
+| Active user interrupt | running GeneralTracker user interrupt 复用现有 current-reference synthetic transition helper；benign reject fallback controlled stop。Preparing、LocoUpper、urgent_stop/passive/fixstand/standby 不使用该 smooth user handoff。 |
 | Urgent/passive/control | urgent_stop/passive 清 idle config；fixstand/standby 保留 idle config。urgent_stop/passive/fixstand 不调用 smoothing helper；`/standby` 仅允许静态 user holding -> standby 例外。 |
 | Standby playback | 视为 background transition owner；queue/interrupt 都可抢占。 |
 | Standby active idle | 保留 idle config；不新增 idle 保留但禁播的 runtime 状态。`/standby` 回到可播放 idle 的 standby 链路后，若 idle config 非空且无 user work、ready/safe，idle 可按现有 background idle manager 规则自动重新启动；这不是 `/standby` 队列化或生成 user run。需要纯 `standby` 时，caller 先 `/idle {"paths":[]}` 再 `/standby`。 |
