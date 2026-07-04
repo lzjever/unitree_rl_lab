@@ -208,6 +208,9 @@ void RuntimeStatusStore::publishSnapshot(StatusSnapshot snapshot) {
     idle_status_ = published_idle;
   }
   snapshot_.idle = idle_status_;
+  snapshot_.pending_control =
+      pending_control_ ? std::optional<ControlMode>{pending_control_->mode}
+                       : std::nullopt;
   normalizeActive(snapshot_);
   if (snapshot_.hz == 0.0) {
     snapshot_.hz = config_.hz;
@@ -246,6 +249,9 @@ StatusSnapshot RuntimeStatusStore::snapshot() const {
     snapshot.hz = config_.hz;
   }
   snapshot.idle = idle_status_;
+  snapshot.pending_control =
+      pending_control_ ? std::optional<ControlMode>{pending_control_->mode}
+                       : std::nullopt;
   normalizeActive(snapshot);
   return snapshot;
 }
@@ -277,7 +283,7 @@ HealthSnapshot RuntimeStatusStore::health() const {
 ExecuteResult RuntimeStatusStore::acceptQueued(const ExecuteCommand& command,
                                                std::uint64_t sequence) {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (urgentStopping(snapshot_)) {
+  if (urgentStopping(snapshot_) || pending_control_.has_value()) {
     return {ErrorCode::ControlStateConflict, command.id, MotionState::Queued,
             queuedIdsLocked().size()};
   }
@@ -293,7 +299,7 @@ ExecuteResult RuntimeStatusStore::acceptQueued(const ExecuteCommand& command,
 ExecuteResult RuntimeStatusStore::acceptInterrupt(const ExecuteCommand& command,
                                                   std::uint64_t sequence) {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (urgentStopping(snapshot_)) {
+  if (urgentStopping(snapshot_) || pending_control_.has_value()) {
     return {ErrorCode::ControlStateConflict, command.id, MotionState::Queued,
             queuedIdsLocked().size()};
   }
@@ -306,7 +312,7 @@ ExecuteResult RuntimeStatusStore::acceptInterruptAfterStop(const ExecuteCommand&
                                                            std::uint64_t sequence,
                                                            std::uint64_t stop_sequence) {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (urgentStopping(snapshot_)) {
+  if (urgentStopping(snapshot_) || pending_control_.has_value()) {
     return {ErrorCode::ControlStateConflict, command.id, MotionState::Queued,
             queuedIdsLocked().size()};
   }
@@ -353,7 +359,9 @@ StopResult RuntimeStatusStore::acceptUrgentStop() {
           canceled};
 }
 
-ControlResult RuntimeStatusStore::acceptControl(ControlMode mode, bool preserve_queued) {
+ControlResult RuntimeStatusStore::acceptControl(ControlMode mode,
+                                                std::uint64_t sequence,
+                                                bool preserve_queued) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (controlBlockedByUrgentStop(snapshot_, mode)) {
     return {ErrorCode::ControlStateConflict};
@@ -369,13 +377,27 @@ ControlResult RuntimeStatusStore::acceptControl(ControlMode mode, bool preserve_
   if (mode == ControlMode::Passive || mode == ControlMode::StandbyVelocity) {
     cancelQueuedLocked(StopReason::Stop);
     if (mode == ControlMode::Passive) {
+      pending_control_ = PendingControl{mode, sequence};
+      snapshot_.pending_control = mode;
       return {ErrorCode::Ok};
     }
   }
   if (mode == ControlMode::FixStand && !preserve_queued) {
     cancelQueuedLocked(StopReason::Stop);
   }
+  pending_control_ = PendingControl{mode, sequence};
+  snapshot_.pending_control = mode;
   return {ErrorCode::Ok};
+}
+
+void RuntimeStatusStore::clearPendingControl(ControlMode mode, std::uint64_t sequence) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!pending_control_ || pending_control_->mode != mode ||
+      pending_control_->sequence != sequence) {
+    return;
+  }
+  pending_control_.reset();
+  snapshot_.pending_control.reset();
 }
 
 IdleResult RuntimeStatusStore::acceptIdleConfig(std::vector<IdleMotion> motions) {

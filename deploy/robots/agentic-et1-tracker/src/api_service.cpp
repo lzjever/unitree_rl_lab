@@ -153,6 +153,10 @@ bool executeBlockedByController(ControllerState ctrl) {
          ctrl == ControllerState::Fault;
 }
 
+bool executeBlockedByPendingControl(const StatusSnapshot& snapshot) {
+  return snapshot.pending_control.has_value();
+}
+
 bool idleConfigBlockedByController(ControllerState ctrl) {
   return ctrl == ControllerState::Starting || ctrl == ControllerState::Idle ||
          ctrl == ControllerState::Passive || ctrl == ControllerState::FixStand ||
@@ -451,6 +455,9 @@ ApiResponse AgentApiService::execute(const std::string& body) {
   if (executeBlockedByController(snapshot.ctrl)) {
     return controlStateConflict(snapshot.ctrl);
   }
+  if (executeBlockedByPendingControl(snapshot)) {
+    return controlStateConflict(ControllerState::Stopping);
+  }
 
   const std::string path = *path_it;
   const TrackValidation validation = validator_.validate(path);
@@ -558,6 +565,9 @@ ApiResponse AgentApiService::executeLocoUpper(const std::string& body) {
 
   if (executeBlockedByController(snapshot.ctrl)) {
     return controlStateConflict(snapshot.ctrl);
+  }
+  if (executeBlockedByPendingControl(snapshot)) {
+    return controlStateConflict(ControllerState::Stopping);
   }
 
   const std::string path = *path_it;

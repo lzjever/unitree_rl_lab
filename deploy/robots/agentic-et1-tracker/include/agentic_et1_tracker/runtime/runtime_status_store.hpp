@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 #include "agentic_et1_tracker/api/service.hpp"
@@ -33,13 +34,21 @@ class RuntimeStatusStore final : public StatusReader {
                                          std::uint64_t stop_sequence);
   StopResult acceptStop();
   StopResult acceptUrgentStop();
-  ControlResult acceptControl(ControlMode mode, bool preserve_queued = false);
+  ControlResult acceptControl(ControlMode mode,
+                              std::uint64_t sequence,
+                              bool preserve_queued = false);
+  void clearPendingControl(ControlMode mode, std::uint64_t sequence);
   IdleResult acceptIdleConfig(std::vector<IdleMotion> motions);
   bool clearIdleConfig();
   std::size_t cancelQueuedForStop(std::uint64_t sequence);
   std::vector<std::string> queuedIdsLocked() const;
   std::size_t cancelQueuedLocked(StopReason reason);
   std::size_t cancelQueuedAfterLocked(StopReason reason, std::uint64_t sequence);
+
+  struct PendingControl {
+    ControlMode mode{ControlMode::StandbyVelocity};
+    std::uint64_t sequence{0};
+  };
 
   RuntimeConfig config_;
   mutable std::mutex mutex_;
@@ -49,6 +58,7 @@ class RuntimeStatusStore final : public StatusReader {
   std::deque<MotionStatus> recent_;
   std::vector<IdleMotion> idle_config_;
   IdleStatus idle_status_;
+  std::optional<PendingControl> pending_control_;
 };
 
 }  // namespace agentic_et1_tracker

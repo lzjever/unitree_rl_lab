@@ -1234,15 +1234,22 @@ void RuntimeControlLoop::handleControl(ControlMode mode) {
 }
 
 void RuntimeControlLoop::handleIdleConfig(std::vector<IdleMotion> motions) {
+  if (motions.empty()) {
+    if (active_kind_ == ActiveKind::Idle) {
+      stopIdleActive();
+    } else if (active_kind_ == ActiveKind::Transition && transition_ &&
+               transition_->target_kind == TransitionTargetKind::Idle) {
+      abortTransition(MotionState::Canceled, StopReason::None, ErrorCode::Ok);
+      enterGeneralTrackerIdleState();
+    }
+    clearIdleConfig();
+    return;
+  }
   if (active_kind_ == ActiveKind::Idle) {
     stopIdleActive();
   }
   idle_config_ = std::move(motions);
   idle_next_index_ = 0;
-  if (idle_config_.empty()) {
-    clearIdleConfig();
-    return;
-  }
   if (isMotionAcceptingState()) {
     refreshReadinessForPolicyRuntime();
   }
@@ -1304,6 +1311,16 @@ void RuntimeControlLoop::handleInterrupt(MotionRequest request) {
     markActiveStopping(StopReason::Interrupt);
     post_stop_control_ = ControlMode::StandbyVelocity;
     enterStopping(StopReason::Interrupt);
+    return;
+  }
+  if (active_kind_ == ActiveKind::User && active_ &&
+      active_->state == MotionState::Holding &&
+      active_->executor == MotionExecutor::GeneralTracker &&
+      !isGeneralTrackerRequest(request)) {
+    finishActive(MotionState::Stopped, StopReason::Interrupt, ErrorCode::Ok);
+    post_stop_control_ = ControlMode::StandbyVelocity;
+    enterGeneralTrackerIdleState();
+    waiting_.push_back(std::move(request));
     return;
   }
   waiting_.push_back(std::move(request));

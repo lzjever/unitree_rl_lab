@@ -19,6 +19,7 @@
 #include "agentic_et1_tracker/runtime/runtime_bridge.hpp"
 #include "agentic_et1_tracker/runtime/runtime_control_loop.hpp"
 #include "agentic_et1_tracker/runtime/runtime_status_store.hpp"
+#include "agentic_et1_tracker/api/service.hpp"
 #include "agentic_et1_tracker/control/fixstand.hpp"
 #include "agentic_et1_tracker/control/passive.hpp"
 #include "agentic_et1_tracker/loco_upper/loco_lower_policy.hpp"
@@ -985,6 +986,31 @@ IdleMotion idleMotion(const std::filesystem::path& path, std::size_t frames = 3)
   return motion;
 }
 
+class ApiRaceValidator final : public TrackValidatorPort {
+ public:
+  TrackValidation validate(const std::string& path) override {
+    ++calls;
+    TrackMetadata metadata;
+    metadata.frames = 3;
+    metadata.duration_s = 0.06;
+    metadata.fps = 50.0;
+    metadata.canonical_path = path;
+    return {ErrorCode::Ok, metadata, ""};
+  }
+
+  int calls{0};
+};
+
+class ApiRaceIds final : public RunIdGenerator {
+ public:
+  std::string generate() override {
+    ++calls;
+    return "race-new";
+  }
+
+  int calls{0};
+};
+
 RuntimeControlLoop makeLoop(RuntimeConfig config,
                             RuntimeBridge& bridge,
                             RuntimeStatusStore& store,
@@ -1092,6 +1118,81 @@ void requireIdle(const RuntimeStatusStore& store) {
   REQUIRE(snapshot.active.id.empty());
   REQUIRE_FALSE(snapshot.idle.active);
   REQUIRE_FALSE(snapshot.exec.has_value());
+}
+
+TEST_CASE("RuntimeBridge API execute stays blocked until pending control is consumed") {
+  struct Case {
+    const char* target;
+    const char* body;
+  };
+
+  for (const auto& item : std::vector<Case>{
+           {"/standby", ""},
+           {"/fixstand", ""},
+           {"/passive", R"({"password":"galaxy"})"},
+       }) {
+    CAPTURE(item.target);
+    RuntimeConfig runtime_config = runtimeConfig();
+    RuntimeStatusStore store(runtime_config);
+    RuntimeBridge bridge(runtime_config, store);
+    ApiRaceValidator validator;
+    ApiRaceIds ids;
+    AgentApiConfig api_config;
+    api_config.passive_password = "galaxy";
+    AgentApiService service(api_config, bridge, store, validator, ids);
+
+    StatusSnapshot active;
+    active.ready = true;
+    active.mode = RuntimeMode::Sim;
+    active.robot = RobotState::Running;
+    active.ctrl = ControllerState::Running;
+    active.queue.limit = runtime_config.queue_limit;
+    active.active = {ActiveKind::User, "active-user"};
+    MotionStatus exec;
+    exec.id = "active-user";
+    exec.path = "/tracks/active.trk";
+    exec.state = MotionState::Running;
+    exec.frames = 100;
+    active.exec = exec;
+    store.publishSnapshot(active);
+
+    const ApiResponse control_response =
+        service.handle({"POST", item.target, item.body});
+    REQUIRE(control_response.status == 200);
+
+    store.publishSnapshot(active);
+
+    const ApiResponse execute_response =
+        service.handle({"POST", "/execute", R"({"path":"/tracks/new.trk"})"});
+
+    REQUIRE(execute_response.status == 409);
+    REQUIRE(execute_response.body.at("ok") == false);
+    REQUIRE(execute_response.body.at("error").at("code") ==
+            "CONTROL_STATE_CONFLICT");
+    REQUIRE(execute_response.body.at("next") == "status");
+    REQUIRE(validator.calls == 0);
+    REQUIRE(ids.calls == 0);
+
+    CommandKind expected_kind = CommandKind::Passive;
+    if (std::string(item.target) == "/standby") {
+      expected_kind = CommandKind::StandbyVelocity;
+    } else if (std::string(item.target) == "/fixstand") {
+      expected_kind = CommandKind::FixStand;
+    }
+
+    auto control_command = bridge.consumeNextCommand();
+    REQUIRE(control_command.has_value());
+    REQUIRE(control_command->kind == expected_kind);
+
+    store.publishSnapshot(active);
+
+    const ApiResponse accepted_execute_response =
+        service.handle({"POST", "/execute", R"({"path":"/tracks/new.trk"})"});
+
+    REQUIRE(accepted_execute_response.status == 200);
+    REQUIRE(validator.calls == 1);
+    REQUIRE(ids.calls == 1);
+  }
 }
 
 void requireHoldFrame(const LowCmdFrame& frame,
@@ -9172,6 +9273,81 @@ TEST_CASE("RuntimeControlLoop GeneralTracker holding queues LocoUpper without Po
   REQUIRE(tracker_policy.calls == tracker_calls_before_loco);
 }
 
+TEST_CASE("RuntimeControlLoop GeneralTracker holding interrupt to LocoUpper stops held run") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 0.04;
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  const DeployConfig deploy_config = deployConfig();
+  const LocoLowerDeployConfig loco_lower_config = locoLowerDeployConfig();
+  const LocoUpperLowCmdComposerConfig composer_config = locoUpperComposerConfig();
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  FakeVelocityPolicy loco_lower_policy(Vec(kLocoLowerPolicyJointDim, 0.5F));
+  const auto standby_track =
+      loadTrack(tmp.trkConfig(),
+                transitionReadyTrk(tmp, "loco_interrupt_gt_hold_standby.trk", 2, 20.0F));
+  auto loop = makeLocoControlLoop(config,
+                                  bridge,
+                                  store,
+                                  tmp.trkConfig(),
+                                  robot,
+                                  tracker_policy,
+                                  velocity_policy,
+                                  loco_lower_policy,
+                                  deploy_config,
+                                  velocityDeployConfig(),
+                                  fixStandConfig(),
+                                  ControlMode::StandbyVelocity,
+                                  passiveConfig(),
+                                  loco_lower_config,
+                                  composer_config,
+                                  nullptr,
+                                  standby_track);
+
+  startHoldingRun(loop,
+                  store,
+                  bridge,
+                  tmp,
+                  "gt-held-interrupt-source",
+                  nullptr,
+                  StartQueuedRunMode::AllowStandbyTransition);
+  const int tracker_calls_before_loco = tracker_policy.calls;
+  const auto loco_path =
+      identityQuaternionTrk(tmp, "loco_interrupt_after_gt_hold.trk", 4);
+  REQUIRE(bridge.submitInterrupt(
+              locoUpperCommand("loco-interrupt-after-gt-hold",
+                               loco_path,
+                               MotionMode::Interrupt,
+                               4))
+              .ok());
+
+  bool saw_loco = false;
+  for (int i = 0; i < 128; ++i) {
+    loop.tick();
+    const auto snapshot = store.snapshot();
+    const auto source = store.findRun("gt-held-interrupt-source");
+    REQUIRE(source.ok());
+    REQUIRE(source.run->state != MotionState::Done);
+    REQUIRE(source.run->stop_reason != StopReason::None);
+    if (snapshot.exec && snapshot.exec->id == "loco-interrupt-after-gt-hold" &&
+        snapshot.exec->executor == MotionExecutor::LocoUpper &&
+        loco_lower_policy.calls > 0) {
+      saw_loco = true;
+      break;
+    }
+  }
+
+  REQUIRE(saw_loco);
+  const auto source = store.findRun("gt-held-interrupt-source");
+  REQUIRE(source.ok());
+  REQUIRE(source.run->state == MotionState::Stopped);
+  REQUIRE(source.run->stop_reason == StopReason::Interrupt);
+  REQUIRE(tracker_policy.calls == tracker_calls_before_loco);
+}
+
 TEST_CASE("RuntimeControlLoop LocoUpper holding queues GeneralTracker after loco terminal") {
   TempTree tmp;
   RuntimeConfig config = runtimeConfig();
@@ -10070,6 +10246,66 @@ TEST_CASE("RuntimeControlLoop completed idle enters next idle through internal t
     }
   }
   REQUIRE(saw_transition);
+}
+
+TEST_CASE("RuntimeControlLoop idle clear aborts pending idle transition") {
+  TempTree tmp;
+  RuntimeConfig config = runtimeConfig();
+  config.transition_duration_s = 1.0;
+  const DeployConfig deploy_config = deployConfig();
+  const VelocityDeployConfig velocity_config = velocityDeployConfig();
+  const FixStandConfig fixstand_config = fixStandConfig();
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  FakeReferenceSink reference;
+  FakeRobotIO robot(readyLowState(deploy_config));
+  FakePolicy tracker_policy(floatSeq(0.0F, kPolicyJointDim));
+  FakeVelocityPolicy velocity_policy(Vec(kVelocityPolicyJointDim, 0.25F));
+  auto loop = makeControlLoop(config,
+                              bridge,
+                              store,
+                              tmp.trkConfig(),
+                              robot,
+                              tracker_policy,
+                              velocity_policy,
+                              deploy_config,
+                              velocity_config,
+                              fixstand_config,
+                              ControlMode::StandbyVelocity,
+                              passiveConfig(),
+                              &reference);
+
+  const auto idle_a = transitionReadyTrk(tmp, "idle_clear_transition_a.trk", 2, 0.1F);
+  const auto idle_b = transitionReadyTrk(tmp, "idle_clear_transition_b.trk", 2, 0.3F);
+  REQUIRE(bridge.configureIdle({idleMotion(idle_a, 2), idleMotion(idle_b, 2)}).ok());
+  loop.tick();
+  loop.tick();
+  loop.tick();
+  REQUIRE(store.snapshot().active.kind == ActiveKind::Idle);
+
+  bool saw_transition = false;
+  for (int i = 0; i < 16; ++i) {
+    loop.tick();
+    const auto snapshot = store.snapshot();
+    if (snapshot.active.kind == ActiveKind::Transition) {
+      REQUIRE(snapshot.transition.active);
+      REQUIRE(snapshot.transition.target == "idle");
+      saw_transition = true;
+      break;
+    }
+  }
+  REQUIRE(saw_transition);
+
+  REQUIRE(bridge.configureIdle({}).ok());
+  loop.tick();
+
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.active.kind == ActiveKind::None);
+  REQUIRE_FALSE(snapshot.transition.active);
+  REQUIRE_FALSE(snapshot.idle.enabled);
+  REQUIRE(snapshot.idle.n == 0);
+  REQUIRE_FALSE(snapshot.idle.active);
+  REQUIRE_FALSE(snapshot.exec.has_value());
 }
 
 TEST_CASE("RuntimeControlLoop idle to idle transition build failure does not stick or record history") {

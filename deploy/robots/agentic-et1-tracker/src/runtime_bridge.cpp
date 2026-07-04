@@ -94,7 +94,7 @@ StopResult RuntimeBridge::stop() {
 ControlResult RuntimeBridge::passive() {
   std::lock_guard<std::mutex> lock(mutex_);
   const std::uint64_t sequence = next_sequence_++;
-  const ControlResult result = status_.acceptControl(ControlMode::Passive);
+  const ControlResult result = status_.acceptControl(ControlMode::Passive, sequence);
   if (!result.ok()) {
     return result;
   }
@@ -113,7 +113,9 @@ ControlResult RuntimeBridge::fixStand() {
   const std::uint64_t sequence = next_sequence_++;
   const std::optional<std::uint64_t> stop_sequence = latestPendingStopSequence();
   const ControlResult result =
-      status_.acceptControl(ControlMode::FixStand, stop_sequence.has_value());
+      status_.acceptControl(ControlMode::FixStand,
+                            sequence,
+                            stop_sequence.has_value());
   if (!result.ok()) {
     return result;
   }
@@ -132,7 +134,8 @@ ControlResult RuntimeBridge::fixStand() {
 ControlResult RuntimeBridge::standby() {
   std::lock_guard<std::mutex> lock(mutex_);
   const std::uint64_t sequence = next_sequence_++;
-  const ControlResult result = status_.acceptControl(ControlMode::StandbyVelocity);
+  const ControlResult result =
+      status_.acceptControl(ControlMode::StandbyVelocity, sequence);
   if (!result.ok()) {
     return result;
   }
@@ -198,6 +201,9 @@ std::optional<Command> RuntimeBridge::consumeNextCommand() {
 
   Command command = *best;
   pending_.erase(best);
+  if (isControl(command.kind) && !hasPendingControlCommand()) {
+    clearPendingControlLatch(command);
+  }
   if (command.kind == CommandKind::Stop) {
     status_.cancelQueuedForStop(command.sequence);
     clearPendingMotionsThrough(command.sequence);
@@ -222,6 +228,11 @@ int RuntimeBridge::priority(CommandKind kind) {
       return 1;
   }
   return 0;
+}
+
+bool RuntimeBridge::isControl(CommandKind kind) {
+  return kind == CommandKind::Passive || kind == CommandKind::FixStand ||
+         kind == CommandKind::StandbyVelocity;
 }
 
 ControlMode controlModeForCommandKind(CommandKind kind) {
@@ -266,6 +277,19 @@ std::optional<std::uint64_t> RuntimeBridge::latestPendingStopSequence() const {
   return latest;
 }
 
+bool RuntimeBridge::hasPendingControlCommand() const {
+  return std::any_of(pending_.begin(), pending_.end(), [](const Command& command) {
+    return isControl(command.kind);
+  });
+}
+
+void RuntimeBridge::clearPendingControlLatch(const Command& command) {
+  if (!isControl(command.kind)) {
+    return;
+  }
+  status_.clearPendingControl(command.control, command.sequence);
+}
+
 void RuntimeBridge::clearPendingMotions() {
   pending_.erase(std::remove_if(pending_.begin(),
                                 pending_.end(),
@@ -277,12 +301,14 @@ void RuntimeBridge::clearPendingMotions() {
 }
 
 void RuntimeBridge::clearPendingCommands() {
-  pending_.erase(std::remove_if(pending_.begin(),
-                                pending_.end(),
-                                [](const Command& command) {
-                                  return command.kind != CommandKind::IdleConfig;
-                                }),
-                 pending_.end());
+  for (auto it = pending_.begin(); it != pending_.end();) {
+    if (it->kind == CommandKind::IdleConfig) {
+      ++it;
+      continue;
+    }
+    clearPendingControlLatch(*it);
+    it = pending_.erase(it);
+  }
 }
 
 void RuntimeBridge::clearPendingIdleConfigs() {
@@ -295,15 +321,14 @@ void RuntimeBridge::clearPendingIdleConfigs() {
 }
 
 void RuntimeBridge::clearPendingControlsAfter(std::uint64_t sequence) {
-  pending_.erase(std::remove_if(pending_.begin(),
-                                pending_.end(),
-                                [sequence](const Command& command) {
-                                  return (command.kind == CommandKind::FixStand ||
-                                          command.kind == CommandKind::Passive ||
-                                          command.kind == CommandKind::StandbyVelocity) &&
-                                         command.sequence > sequence;
-                                }),
-                 pending_.end());
+  for (auto it = pending_.begin(); it != pending_.end();) {
+    if (isControl(it->kind) && it->sequence > sequence) {
+      clearPendingControlLatch(*it);
+      it = pending_.erase(it);
+      continue;
+    }
+    ++it;
+  }
 }
 
 void RuntimeBridge::clearPendingMotionsAfter(std::uint64_t sequence) {
@@ -330,6 +355,9 @@ void RuntimeBridge::clearPendingMotionsThrough(std::uint64_t sequence) {
 }
 
 void RuntimeBridge::clearAllPendingCommands() {
+  for (const auto& command : pending_) {
+    clearPendingControlLatch(command);
+  }
   pending_.clear();
 }
 

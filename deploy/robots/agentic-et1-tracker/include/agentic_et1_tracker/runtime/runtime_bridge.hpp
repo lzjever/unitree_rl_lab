@@ -30,12 +30,15 @@ class RuntimeBridge final : public ExecutionCommandSink {
 
  private:
   static int priority(CommandKind kind);
+  static bool isControl(CommandKind kind);
 
   void push(CommandKind kind,
             MotionRequest request,
             std::uint64_t sequence,
             bool stop_requires_stopping = false);
   std::optional<std::uint64_t> latestPendingStopSequence() const;
+  bool hasPendingControlCommand() const;
+  void clearPendingControlLatch(const Command& command);
   void clearPendingMotions();
   void clearPendingCommands();
   void clearPendingIdleConfigs();

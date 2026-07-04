@@ -97,6 +97,7 @@ struct StatusSnapshot {
   std::optional<PassiveReason> passive_reason;
   PoseSnapshot pose;
   LocoUpperCapability loco_upper;
+  std::optional<ControlMode> pending_control;
 };
 
 double computeProgress(std::size_t frame, std::size_t frames, MotionState state);
