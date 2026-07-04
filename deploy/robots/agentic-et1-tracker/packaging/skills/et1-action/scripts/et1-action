@@ -22,6 +22,11 @@ GOOD_TERMINAL = {"done"}
 RUN_WAIT_SUCCESS_STATES = {"done", "holding"}
 ACTIVE_STATES = {"starting", "running", "waiting_for_generation", "canceling"}
 INACTIVE_STATES = {"canceled", "completed", "failed"}
+STANDBY_REJECT_CTRLS = {"passive", "fault", "stopping", "urgent_stopping", "fixstand"}
+STANDBY_CTRLS = {"standby", "standby_velocity"}
+STANDBY_KNOWN_CTRLS = STANDBY_REJECT_CTRLS | STANDBY_CTRLS | {"starting", "idle", "preparing", "running"}
+ACTIVE_IDLE_CTRLS = {"running"}
+ACTIVE_KINDS = {"none", "user", "idle", "transition"}
 P0_NEXT = {
     "run-text",
     "run-trk",
@@ -910,17 +915,50 @@ def standby_confirm_seconds(timeout):
 
 
 def standby_confirmed(status):
-    ctrl = status.get("ctrl") or status.get("state")
-    if ctrl in {"stopping", "urgent_stopping", "passive", "fault"}:
+    ctrl = status.get("ctrl")
+    if not isinstance(ctrl, str) or ctrl not in STANDBY_KNOWN_CTRLS:
+        return False
+    if ctrl in STANDBY_REJECT_CTRLS:
         return False
     exec_status = status.get("exec") if isinstance(status.get("exec"), dict) else {}
     if exec_status.get("state") == "stopping":
         return False
-    active = status.get("active") if isinstance(status.get("active"), dict) else {}
-    return active.get("kind") not in {"user", "transition"}
+    active = status.get("active") if isinstance(status.get("active"), dict) else None
+    if not active:
+        return False
+    active_kind = active.get("kind")
+    if active_kind not in ACTIVE_KINDS:
+        return False
+    if active_kind in {"user", "transition"}:
+        return False
+    idle = status.get("idle") if isinstance(status.get("idle"), dict) else None
+    if not idle or not isinstance(idle.get("active"), bool):
+        return False
+    idle_active = idle.get("active")
+    if active_kind == "idle":
+        return ctrl in ACTIVE_IDLE_CTRLS and idle_active is True
+    return ctrl in STANDBY_CTRLS and idle_active is False
 
 
-def standby_after_control_cmd(cmd, intent, base, timeout, poll):
+def idle_config_cleared(status):
+    idle = status.get("idle") if isinstance(status.get("idle"), dict) else None
+    if not idle:
+        return False
+    idle_n = idle.get("n")
+    return (
+        idle.get("enabled") is False
+        and idle.get("active") is False
+        and isinstance(idle_n, int)
+        and not isinstance(idle_n, bool)
+        and idle_n == 0
+    )
+
+
+def idle_clear_confirmed(status):
+    return standby_confirmed(status) and idle_config_cleared(status)
+
+
+def standby_after_control_cmd(cmd, intent, base, timeout, poll, confirm=standby_confirmed):
     out = tracker_standby(base, timeout)
     if not out.get("ok"):
         error = out.get("error", {})
@@ -932,7 +970,7 @@ def standby_after_control_cmd(cmd, intent, base, timeout, poll):
         status = tracker_status(base, timeout)
         if status.get("ok"):
             fields.update(compact_tracker_state(status))
-            if standby_confirmed(status):
+            if confirm(status):
                 return ok_doc(cmd, "run-text", **fields)
         if time.monotonic() >= deadline:
             if status and status.get("ok"):
@@ -959,7 +997,7 @@ def idle_clear_cmd(base, timeout, poll):
     if not out.get("ok"):
         error = out.get("error", {})
         return err_doc("idle-clear", error.get("code", "TRACKER_STATE_CONFLICT"), error.get("message", "idle clear failed"), "idle-clear")
-    return standby_after_control_cmd("idle-clear", "cancel_to_still", base, timeout, poll)
+    return standby_after_control_cmd("idle-clear", "cancel_to_still", base, timeout, poll, idle_clear_confirmed)
 
 
 def fixstand_cmd(base, timeout):

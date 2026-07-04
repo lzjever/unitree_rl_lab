@@ -347,7 +347,7 @@ print(json.dumps({"ok": True}))
     def test_standby_reports_idle_when_idle_config_takes_over(self):
         self.tracker.status = {
             "ok": True,
-            "ctrl": "preparing",
+            "ctrl": "running",
             "active": {"kind": "idle", "id": None},
             "idle": {"enabled": True, "active": True, "n": 2},
         }
@@ -355,10 +355,46 @@ print(json.dumps({"ok": True}))
         self.assertTrue(out["ok"])
         self.assertEqual(out["cmd"], "standby")
         self.assertEqual(out["state"], "idle")
-        self.assertEqual(out["ctrl"], "preparing")
+        self.assertEqual(out["ctrl"], "running")
         self.assertEqual(out["active"], {"kind": "idle"})
         self.assertEqual(out["idle"], {"enabled": True, "active": True, "n": 2})
         self.assertEqual([record[1] for record in self.tracker.records], ["/standby", "/status"])
+
+    def test_standby_waits_past_preparing_active_idle_transient(self):
+        self.tracker.status_sequence = [
+            {
+                "ok": True,
+                "ctrl": "preparing",
+                "active": {"kind": "idle", "id": None},
+                "idle": {"enabled": True, "active": True, "n": 2},
+            },
+            {
+                "ok": True,
+                "ctrl": "running",
+                "active": {"kind": "idle", "id": None},
+                "idle": {"enabled": True, "active": True, "n": 2},
+            },
+        ]
+
+        out, _ = self.cli(
+            "--poll",
+            "0.01",
+            "standby",
+            env_extra={"ET1_ACTION_STANDBY_CONFIRM_S": "1"},
+        )
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["cmd"], "standby")
+        self.assertEqual(out["state"], "idle")
+        self.assertEqual(out["ctrl"], "running")
+        self.assertEqual(out["active"], {"kind": "idle"})
+        self.assertEqual(out["idle"], {"enabled": True, "active": True, "n": 2})
+        status_records = [record for record in self.tracker.records if record[0] == "GET" and record[1].startswith("/status")]
+        self.assertGreaterEqual(len(status_records), 2)
+        self.assertEqual(
+            [record[1] for record in self.tracker.records],
+            ["/standby", "/status", "/status"],
+        )
 
     def test_standby_uses_standby_not_urgent_stop_and_preserves_idle_config(self):
         self.tracker.status = {
@@ -376,6 +412,38 @@ print(json.dumps({"ok": True}))
         post_paths = [record[1] for record in self.tracker.records if record[0] == "POST"]
         self.assertEqual(post_paths, ["/standby"])
         self.assertNotIn("/urgent_stop", post_paths)
+
+    def test_standby_waits_past_fixstand_active_none_transient(self):
+        self.tracker.status_sequence = [
+            {
+                "ok": True,
+                "ctrl": "fixstand",
+                "active": {"kind": "none", "id": None},
+                "idle": {"enabled": False, "active": False, "n": 0},
+            },
+            {
+                "ok": True,
+                "ctrl": "standby",
+                "active": {"kind": "none", "id": None},
+                "idle": {"enabled": False, "active": False, "n": 0},
+            },
+        ]
+
+        out, _ = self.cli(
+            "--poll",
+            "0.01",
+            "standby",
+            env_extra={"ET1_ACTION_STANDBY_CONFIRM_S": "1"},
+        )
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["cmd"], "standby")
+        self.assertEqual(out["state"], "standby")
+        self.assertEqual(out["ctrl"], "standby")
+        self.assertEqual(
+            [record[1] for record in self.tracker.records],
+            ["/standby", "/status", "/status"],
+        )
 
     def test_idle_clear_clears_idle_then_enters_standby_without_urgent_stop(self):
         state_path = self.write_active_sequence()
@@ -397,6 +465,79 @@ print(json.dumps({"ok": True}))
         post_records = [record for record in self.tracker.records if record[0] == "POST"]
         self.assertEqual([(record[1], record[2]) for record in post_records], [("/idle", {"paths": []}), ("/standby", None)])
         self.assertNotIn("/urgent_stop", [record[1] for record in post_records])
+
+    def test_idle_clear_waits_past_fixstand_and_confirms_idle_config_cleared(self):
+        self.tracker.status_sequence = [
+            {
+                "ok": True,
+                "ctrl": "fixstand",
+                "active": {"kind": "none", "id": None},
+                "idle": {"enabled": False, "active": False, "n": 0},
+            },
+            {
+                "ok": True,
+                "ctrl": "standby",
+                "active": {"kind": "none", "id": None},
+                "idle": {"enabled": False, "active": False, "n": 0},
+            },
+        ]
+
+        out, _ = self.cli(
+            "--poll",
+            "0.01",
+            "idle-clear",
+            env_extra={"ET1_ACTION_STANDBY_CONFIRM_S": "1"},
+        )
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["cmd"], "idle-clear")
+        self.assertEqual(out["state"], "standby")
+        self.assertEqual(out["ctrl"], "standby")
+        self.assertEqual(out["idle"], {"enabled": False, "active": False, "n": 0})
+        post_records = [record for record in self.tracker.records if record[0] == "POST"]
+        self.assertEqual([(record[1], record[2]) for record in post_records], [("/idle", {"paths": []}), ("/standby", None)])
+        self.assertEqual(
+            [record[1] for record in self.tracker.records],
+            ["/idle", "/standby", "/status", "/status"],
+        )
+
+    def test_idle_clear_waits_past_active_idle_until_idle_config_cleared(self):
+        self.tracker.status_sequence = [
+            {
+                "ok": True,
+                "ctrl": "running",
+                "active": {"kind": "idle", "id": None},
+                "idle": {"enabled": True, "active": True, "n": 2},
+            },
+            {
+                "ok": True,
+                "ctrl": "standby",
+                "active": {"kind": "none", "id": None},
+                "idle": {"enabled": False, "active": False, "n": 0},
+            },
+        ]
+
+        out, _ = self.cli(
+            "--poll",
+            "0.01",
+            "idle-clear",
+            env_extra={"ET1_ACTION_STANDBY_CONFIRM_S": "1"},
+        )
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["cmd"], "idle-clear")
+        self.assertEqual(out["state"], "standby")
+        self.assertEqual(out["ctrl"], "standby")
+        self.assertEqual(out["active"], {"kind": "none"})
+        self.assertEqual(out["idle"], {"enabled": False, "active": False, "n": 0})
+        post_records = [record for record in self.tracker.records if record[0] == "POST"]
+        status_records = [record for record in self.tracker.records if record[0] == "GET" and record[1].startswith("/status")]
+        self.assertEqual([(record[1], record[2]) for record in post_records], [("/idle", {"paths": []}), ("/standby", None)])
+        self.assertGreaterEqual(len(status_records), 2)
+        self.assertEqual(
+            [record[1] for record in self.tracker.records],
+            ["/idle", "/standby", "/status", "/status"],
+        )
 
     def test_standby_waits_until_user_motion_leaves_active_state(self):
         self.tracker.status_sequence = [
