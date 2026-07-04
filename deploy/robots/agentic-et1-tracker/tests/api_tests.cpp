@@ -330,6 +330,18 @@ void observeLocoUpperReady(Harness& h) {
   h.status.health_value.loco_upper.ready = true;
 }
 
+void setStandbyHandoffTransition(StatusSnapshot& snapshot) {
+  snapshot.ready = true;
+  snapshot.ctrl = ControllerState::Running;
+  snapshot.robot = RobotState::Running;
+  snapshot.err = ErrorCode::Ok;
+  snapshot.block.clear();
+  snapshot.pending_control.reset();
+  snapshot.active = {ActiveKind::Transition, ""};
+  snapshot.transition.active = true;
+  snapshot.transition.target = "standby";
+}
+
 }  // namespace
 
 TEST_CASE("POST execute defaults to queue and only submits a queue command") {
@@ -472,6 +484,24 @@ TEST_CASE("POST execute never calls loco-upper precheck") {
   REQUIRE(h.sink.queue_commands.at(0).executor == MotionExecutor::GeneralTracker);
 }
 
+TEST_CASE("POST execute rejects standby handoff transition before validation") {
+  Harness h;
+  setStandbyHandoffTransition(h.status.snapshot_value);
+
+  const auto response =
+      h.service.handle({"POST", "/execute", R"({"path":"/tracks/wave.trk"})"});
+
+  REQUIRE(response.status == 409);
+  requireFailure(response, "CONTROL_STATE_CONFLICT");
+  REQUIRE(nextAction(response) == "status");
+  REQUIRE(errorMessage(response) == "ctrl=stopping; wait /status");
+  REQUIRE(h.validator.calls == 0);
+  REQUIRE(h.prechecker.calls == 0);
+  REQUIRE(h.sink.queue_calls == 0);
+  REQUIRE(h.sink.interrupt_calls == 0);
+  REQUIRE(h.ids.calls == 0);
+}
+
 TEST_CASE("POST execute_loco_upper disabled returns compact model-not-ready failure") {
   Harness h;
 
@@ -525,6 +555,25 @@ TEST_CASE("POST execute_loco_upper queues when config is enabled and runtime is 
   REQUIRE_FALSE(command.loco_options.envelope_clamped);
   REQUIRE_FALSE(command.loco_options.upper_clamped);
   REQUIRE_FALSE(command.loco_options.upper_rate_limited);
+}
+
+TEST_CASE("POST execute_loco_upper rejects standby handoff transition before validation") {
+  Harness h(locoEnabledConfig());
+  observeLocoUpperReady(h);
+  setStandbyHandoffTransition(h.status.snapshot_value);
+
+  const auto response = h.service.handle(
+      {"POST", "/execute_loco_upper", R"({"path":"/tracks/walk-wave.trk"})"});
+
+  REQUIRE(response.status == 409);
+  requireFailure(response, "CONTROL_STATE_CONFLICT");
+  REQUIRE(nextAction(response) == "status");
+  REQUIRE(errorMessage(response) == "ctrl=stopping; wait /status");
+  REQUIRE(h.validator.calls == 0);
+  REQUIRE(h.prechecker.calls == 0);
+  REQUIRE(h.sink.queue_calls == 0);
+  REQUIRE(h.sink.interrupt_calls == 0);
+  REQUIRE(h.ids.calls == 0);
 }
 
 TEST_CASE("POST execute_loco_upper rejects enabled config when runtime is not ready") {
@@ -937,6 +986,37 @@ TEST_CASE("POST idle nonempty rejects pending control before validation") {
   REQUIRE(nextAction(response) == "status");
   REQUIRE(h.validator.calls == 0);
   REQUIRE(h.sink.idle_calls == 0);
+  REQUIRE(h.ids.calls == 0);
+}
+
+TEST_CASE("POST idle nonempty rejects standby handoff transition before validation") {
+  Harness h;
+  setStandbyHandoffTransition(h.status.snapshot_value);
+
+  const auto response =
+      h.service.handle({"POST", "/idle", R"({"paths":["/tracks/idle.trk"]})"});
+
+  REQUIRE(response.status == 409);
+  requireFailure(response, "CONTROL_STATE_CONFLICT");
+  REQUIRE(nextAction(response) == "status");
+  REQUIRE(errorMessage(response) == "ctrl=stopping; wait /status");
+  REQUIRE(h.validator.calls == 0);
+  REQUIRE(h.sink.idle_calls == 0);
+  REQUIRE(h.ids.calls == 0);
+}
+
+TEST_CASE("POST idle clear remains allowed during standby handoff transition") {
+  Harness h;
+  setStandbyHandoffTransition(h.status.snapshot_value);
+
+  const auto response = h.service.handle({"POST", "/idle", R"({"paths":[]})"});
+
+  REQUIRE(response.status == 200);
+  REQUIRE(response.body.at("idle").at("enabled") == false);
+  REQUIRE(response.body.at("idle").at("n") == 0);
+  REQUIRE(h.validator.calls == 0);
+  REQUIRE(h.sink.idle_calls == 1);
+  REQUIRE(h.sink.idle_motions.empty());
   REQUIRE(h.ids.calls == 0);
 }
 

@@ -81,4 +81,18 @@ MotionStatus makeMotionStatus(const MotionRequest& request) {
   return status;
 }
 
+bool idleConfigBlockedByController(ControllerState ctrl) {
+  return ctrl == ControllerState::Starting || ctrl == ControllerState::Idle ||
+         ctrl == ControllerState::Passive || ctrl == ControllerState::FixStand ||
+         ctrl == ControllerState::Stopping ||
+         ctrl == ControllerState::UrgentStopping ||
+         ctrl == ControllerState::Fault;
+}
+
+bool controlHandoffBlocksUserWork(const StatusSnapshot& snapshot) {
+  return snapshot.pending_control.has_value() ||
+         (snapshot.active.kind == ActiveKind::Transition &&
+          snapshot.transition.target == "standby");
+}
+
 }  // namespace agentic_et1_tracker

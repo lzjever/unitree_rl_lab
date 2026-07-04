@@ -103,5 +103,7 @@ struct StatusSnapshot {
 double computeProgress(std::size_t frame, std::size_t frames, MotionState state);
 Progress makeProgress(std::size_t frame, std::size_t frames, MotionState state);
 MotionStatus makeMotionStatus(const MotionRequest& request);
+bool idleConfigBlockedByController(ControllerState ctrl);
+bool controlHandoffBlocksUserWork(const StatusSnapshot& snapshot);
 
 }  // namespace agentic_et1_tracker

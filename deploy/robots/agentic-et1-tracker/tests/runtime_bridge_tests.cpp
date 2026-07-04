@@ -80,6 +80,15 @@ StatusSnapshot readySnapshot(ControllerState ctrl = ControllerState::Idle) {
   return snapshot;
 }
 
+StatusSnapshot standbyHandoffSnapshot() {
+  StatusSnapshot snapshot = readySnapshot(ControllerState::Running);
+  snapshot.robot = RobotState::Running;
+  snapshot.active = {ActiveKind::Transition, ""};
+  snapshot.transition.active = true;
+  snapshot.transition.target = "standby";
+  return snapshot;
+}
+
 }  // namespace
 
 TEST_CASE("RuntimeBridge admits queue requests without touching controller state") {
@@ -283,7 +292,7 @@ TEST_CASE("RuntimeBridge configureIdle publishes status without user queue state
   const RuntimeConfig config = runtimeConfig(8);
   RuntimeStatusStore store(config);
   RuntimeBridge bridge(config, store);
-  store.publishSnapshot(readySnapshot());
+  store.publishSnapshot(readySnapshot(ControllerState::StandbyVelocity));
 
   const auto result =
       bridge.configureIdle({idleMotion("/tmp/idle-a.trk"), idleMotion("/tmp/idle-b.trk")});
@@ -344,23 +353,138 @@ TEST_CASE("RuntimeBridge rejects nonempty idle config while control is pending")
 
     REQUIRE(idle.code == ErrorCode::ControlStateConflict);
     REQUIRE_FALSE(store.snapshot().idle.enabled);
+    const auto clear = bridge.configureIdle({});
+    REQUIRE(clear.code == ErrorCode::Ok);
+    REQUIRE_FALSE(store.snapshot().idle.enabled);
     auto command = bridge.consumeNextCommand();
     REQUIRE(command.has_value());
     REQUIRE(command->kind == expected_kind);
+    command = bridge.consumeNextCommand();
+    REQUIRE(command.has_value());
+    REQUIRE(command->kind == CommandKind::IdleConfig);
+    REQUIRE(command->idle_motions.empty());
     REQUIRE_FALSE(bridge.consumeNextCommand().has_value());
   }
+}
+
+TEST_CASE("RuntimeBridge rejects nonempty idle config in API-blocked controller states") {
+  const RuntimeConfig config = runtimeConfig(8);
+  for (const ControllerState ctrl :
+       {ControllerState::Starting,
+        ControllerState::Idle,
+        ControllerState::Passive,
+        ControllerState::FixStand,
+        ControllerState::Fault}) {
+    CAPTURE(toString(ctrl));
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    store.publishSnapshot(readySnapshot(ctrl));
+
+    const auto idle = bridge.configureIdle({idleMotion("/tmp/blocked-idle.trk")});
+
+    REQUIRE(idle.code == ErrorCode::ControlStateConflict);
+    REQUIRE_FALSE(store.snapshot().idle.enabled);
+    REQUIRE_FALSE(bridge.consumeNextCommand().has_value());
+
+    const auto clear = bridge.configureIdle({});
+    REQUIRE(clear.code == ErrorCode::Ok);
+    REQUIRE_FALSE(store.snapshot().idle.enabled);
+    auto command = bridge.consumeNextCommand();
+    REQUIRE(command.has_value());
+    REQUIRE(command->kind == CommandKind::IdleConfig);
+    REQUIRE(command->idle_motions.empty());
+    REQUIRE_FALSE(bridge.consumeNextCommand().has_value());
+  }
+}
+
+TEST_CASE("RuntimeBridge rejects nonempty idle config during controlled stopping") {
+  const RuntimeConfig config = runtimeConfig(8);
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  store.publishSnapshot(readySnapshot(ControllerState::Stopping));
+
+  const auto idle = bridge.configureIdle({idleMotion("/tmp/stopping-idle.trk")});
+
+  REQUIRE(idle.code == ErrorCode::ControlStateConflict);
+  REQUIRE_FALSE(store.snapshot().idle.enabled);
+  REQUIRE_FALSE(bridge.consumeNextCommand().has_value());
+
+  const auto clear = bridge.configureIdle({});
+  REQUIRE(clear.code == ErrorCode::Ok);
+  REQUIRE_FALSE(store.snapshot().idle.enabled);
+  auto command = bridge.consumeNextCommand();
+  REQUIRE(command.has_value());
+  REQUIRE(command->kind == CommandKind::IdleConfig);
+  REQUIRE(command->idle_motions.empty());
+  REQUIRE_FALSE(bridge.consumeNextCommand().has_value());
+}
+
+TEST_CASE("RuntimeBridge rejects user work during standby handoff transition") {
+  const RuntimeConfig config = runtimeConfig(8);
+
+  SECTION("queue") {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    store.publishSnapshot(standbyHandoffSnapshot());
+
+    const auto result = bridge.submitQueue(executeCommand("blocked-queue"));
+
+    REQUIRE(result.code == ErrorCode::ControlStateConflict);
+    REQUIRE(result.q == 0);
+    REQUIRE(store.snapshot().queue.ids.empty());
+    REQUIRE(store.findRun("blocked-queue").code == ErrorCode::RunNotFound);
+    REQUIRE_FALSE(bridge.consumeNextCommand().has_value());
+  }
+
+  SECTION("interrupt") {
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    store.publishSnapshot(standbyHandoffSnapshot());
+
+    const auto result =
+        bridge.submitInterrupt(executeCommand("blocked-interrupt",
+                                             MotionMode::Interrupt));
+
+    REQUIRE(result.code == ErrorCode::ControlStateConflict);
+    REQUIRE(result.q == 0);
+    REQUIRE(store.snapshot().queue.ids.empty());
+    REQUIRE(store.findRun("blocked-interrupt").code == ErrorCode::RunNotFound);
+    REQUIRE_FALSE(bridge.consumeNextCommand().has_value());
+  }
+}
+
+TEST_CASE("RuntimeBridge rejects nonempty idle config during standby handoff transition") {
+  const RuntimeConfig config = runtimeConfig(8);
+  RuntimeStatusStore store(config);
+  RuntimeBridge bridge(config, store);
+  store.publishSnapshot(standbyHandoffSnapshot());
+
+  const auto idle = bridge.configureIdle({idleMotion("/tmp/standby-handoff-idle.trk")});
+
+  REQUIRE(idle.code == ErrorCode::ControlStateConflict);
+  REQUIRE_FALSE(store.snapshot().idle.enabled);
+  REQUIRE_FALSE(bridge.consumeNextCommand().has_value());
+
+  const auto clear = bridge.configureIdle({});
+  REQUIRE(clear.code == ErrorCode::Ok);
+  REQUIRE_FALSE(store.snapshot().idle.enabled);
+  auto command = bridge.consumeNextCommand();
+  REQUIRE(command.has_value());
+  REQUIRE(command->kind == CommandKind::IdleConfig);
+  REQUIRE(command->idle_motions.empty());
+  REQUIRE_FALSE(bridge.consumeNextCommand().has_value());
 }
 
 TEST_CASE("RuntimeStatusStore disabled snapshots do not overwrite configured idle") {
   const RuntimeConfig config = runtimeConfig(8);
   RuntimeStatusStore store(config);
   RuntimeBridge bridge(config, store);
-  store.publishSnapshot(readySnapshot());
+  store.publishSnapshot(readySnapshot(ControllerState::StandbyVelocity));
 
   REQUIRE(bridge.configureIdle({idleMotion("/tmp/idle.trk")}).ok());
   REQUIRE(store.snapshot().idle.enabled);
 
-  store.publishSnapshot(readySnapshot());
+  store.publishSnapshot(readySnapshot(ControllerState::StandbyVelocity));
 
   const auto snapshot = store.snapshot();
   REQUIRE(snapshot.idle.enabled);
@@ -372,7 +496,7 @@ TEST_CASE("RuntimeBridge stop clears idle status and emits stop for idle config"
   const RuntimeConfig config = runtimeConfig(8);
   RuntimeStatusStore store(config);
   RuntimeBridge bridge(config, store);
-  store.publishSnapshot(readySnapshot());
+  store.publishSnapshot(readySnapshot(ControllerState::StandbyVelocity));
 
   REQUIRE(bridge.configureIdle({idleMotion("/tmp/idle.trk")}).ok());
   REQUIRE(store.snapshot().idle.enabled);
@@ -380,7 +504,7 @@ TEST_CASE("RuntimeBridge stop clears idle status and emits stop for idle config"
   const auto stopped = bridge.stop();
 
   REQUIRE(stopped.code == ErrorCode::Ok);
-  REQUIRE(stopped.state == ControllerState::Idle);
+  REQUIRE(stopped.state == ControllerState::StandbyVelocity);
   REQUIRE(stopped.stop_reason == StopReason::None);
   REQUIRE_FALSE(store.snapshot().idle.enabled);
   REQUIRE(store.snapshot().idle.n == 0);
@@ -489,10 +613,11 @@ TEST_CASE("RuntimeBridge urgent stop with FixStand idle config enqueues urgent c
   const RuntimeConfig config = runtimeConfig(8);
   RuntimeStatusStore store(config);
   RuntimeBridge bridge(config, store);
-  store.publishSnapshot(readySnapshot(ControllerState::FixStand));
+  store.publishSnapshot(readySnapshot(ControllerState::StandbyVelocity));
 
   REQUIRE(bridge.configureIdle({idleMotion("/tmp/fixstand-idle.trk")}).ok());
   REQUIRE(store.snapshot().idle.enabled);
+  store.publishSnapshot(readySnapshot(ControllerState::FixStand));
 
   const StopResult stopped = bridge.urgentStop();
 

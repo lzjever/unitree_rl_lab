@@ -283,7 +283,7 @@ HealthSnapshot RuntimeStatusStore::health() const {
 ExecuteResult RuntimeStatusStore::acceptQueued(const ExecuteCommand& command,
                                                std::uint64_t sequence) {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (urgentStopping(snapshot_) || pending_control_.has_value()) {
+  if (urgentStopping(snapshot_) || controlHandoffBlocksUserWork(snapshot_)) {
     return {ErrorCode::ControlStateConflict, command.id, MotionState::Queued,
             queuedIdsLocked().size()};
   }
@@ -299,7 +299,7 @@ ExecuteResult RuntimeStatusStore::acceptQueued(const ExecuteCommand& command,
 ExecuteResult RuntimeStatusStore::acceptInterrupt(const ExecuteCommand& command,
                                                   std::uint64_t sequence) {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (urgentStopping(snapshot_) || pending_control_.has_value()) {
+  if (urgentStopping(snapshot_) || controlHandoffBlocksUserWork(snapshot_)) {
     return {ErrorCode::ControlStateConflict, command.id, MotionState::Queued,
             queuedIdsLocked().size()};
   }
@@ -312,7 +312,7 @@ ExecuteResult RuntimeStatusStore::acceptInterruptAfterStop(const ExecuteCommand&
                                                            std::uint64_t sequence,
                                                            std::uint64_t stop_sequence) {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (urgentStopping(snapshot_) || pending_control_.has_value()) {
+  if (urgentStopping(snapshot_) || controlHandoffBlocksUserWork(snapshot_)) {
     return {ErrorCode::ControlStateConflict, command.id, MotionState::Queued,
             queuedIdsLocked().size()};
   }
@@ -402,7 +402,9 @@ void RuntimeStatusStore::clearPendingControl(ControlMode mode, std::uint64_t seq
 
 IdleResult RuntimeStatusStore::acceptIdleConfig(std::vector<IdleMotion> motions) {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (!motions.empty() && (urgentStopping(snapshot_) || pending_control_.has_value())) {
+  if (!motions.empty() &&
+      (idleConfigBlockedByController(snapshot_.ctrl) ||
+       controlHandoffBlocksUserWork(snapshot_))) {
     return {ErrorCode::ControlStateConflict, idle_status_};
   }
   idle_config_ = std::move(motions);

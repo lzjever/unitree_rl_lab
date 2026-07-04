@@ -153,18 +153,6 @@ bool executeBlockedByController(ControllerState ctrl) {
          ctrl == ControllerState::Fault;
 }
 
-bool blockedByPendingControl(const StatusSnapshot& snapshot) {
-  return snapshot.pending_control.has_value();
-}
-
-bool idleConfigBlockedByController(ControllerState ctrl) {
-  return ctrl == ControllerState::Starting || ctrl == ControllerState::Idle ||
-         ctrl == ControllerState::Passive || ctrl == ControllerState::FixStand ||
-         ctrl == ControllerState::Stopping ||
-         ctrl == ControllerState::UrgentStopping ||
-         ctrl == ControllerState::Fault;
-}
-
 bool fixStandRecoveryState(ControllerState ctrl) {
   return ctrl == ControllerState::Passive || ctrl == ControllerState::Fault;
 }
@@ -455,7 +443,7 @@ ApiResponse AgentApiService::execute(const std::string& body) {
   if (executeBlockedByController(snapshot.ctrl)) {
     return controlStateConflict(snapshot.ctrl);
   }
-  if (blockedByPendingControl(snapshot)) {
+  if (controlHandoffBlocksUserWork(snapshot)) {
     return controlStateConflict(ControllerState::Stopping);
   }
 
@@ -552,10 +540,6 @@ ApiResponse AgentApiService::executeLocoUpper(const std::string& body) {
     }
     return error(readiness);
   }
-  if (!capability.ready) {
-    return error(ErrorCode::ModelNotReady);
-  }
-
   const double max_radius_m =
       explicit_radius ? std::min(requested_radius_m, capability.max_radius_m)
                       : capability.default_radius_m;
@@ -566,8 +550,11 @@ ApiResponse AgentApiService::executeLocoUpper(const std::string& body) {
   if (executeBlockedByController(snapshot.ctrl)) {
     return controlStateConflict(snapshot.ctrl);
   }
-  if (blockedByPendingControl(snapshot)) {
+  if (controlHandoffBlocksUserWork(snapshot)) {
     return controlStateConflict(ControllerState::Stopping);
+  }
+  if (!capability.ready) {
+    return error(ErrorCode::ModelNotReady);
   }
 
   const std::string path = *path_it;
@@ -648,7 +635,7 @@ ApiResponse AgentApiService::idle(const std::string& body) {
     if (idleConfigBlockedByController(snapshot.ctrl)) {
       return controlStateConflict(snapshot.ctrl);
     }
-    if (blockedByPendingControl(snapshot)) {
+    if (controlHandoffBlocksUserWork(snapshot)) {
       return controlStateConflict(ControllerState::Stopping);
     }
     const ErrorCode readiness = readinessError(snapshot);

@@ -1111,6 +1111,17 @@ RuntimeControlLoop makeLocoControlLoop(
                             std::move(standby_track));
 }
 
+void publishIdleConfigurableSnapshot(RuntimeStatusStore& store) {
+  StatusSnapshot snapshot;
+  snapshot.ready = true;
+  snapshot.mode = RuntimeMode::Sim;
+  snapshot.robot = RobotState::Idle;
+  snapshot.ctrl = ControllerState::StandbyVelocity;
+  snapshot.hz = 50.0;
+  snapshot.queue.limit = 8;
+  store.publishSnapshot(snapshot);
+}
+
 void requireIdle(const RuntimeStatusStore& store) {
   const auto snapshot = store.snapshot();
   REQUIRE(snapshot.ctrl == ControllerState::Idle);
@@ -1624,6 +1635,23 @@ void requireUserTransitionStatus(const RuntimeStatusStore& store,
   REQUIRE(snapshot.queue.ids.empty());
 }
 
+void requireUserWorkRejectedDuringStandbyHandoff(const ExecuteResult& result,
+                                                 const RuntimeStatusStore& store,
+                                                 const std::string& id) {
+  REQUIRE(result.code == ErrorCode::ControlStateConflict);
+  REQUIRE(result.id == id);
+  REQUIRE(result.q == 0);
+  REQUIRE(store.findRun(id).code == ErrorCode::RunNotFound);
+  const auto snapshot = store.snapshot();
+  REQUIRE(snapshot.ctrl == ControllerState::Running);
+  REQUIRE(snapshot.active.kind == ActiveKind::Transition);
+  REQUIRE_FALSE(snapshot.exec.has_value());
+  REQUIRE(snapshot.transition.active);
+  REQUIRE(snapshot.transition.target == "standby");
+  REQUIRE(snapshot.transition.target_id.empty());
+  REQUIRE(snapshot.queue.ids.empty());
+}
+
 void requireNoActiveWorkOrBackground(const RuntimeStatusStore& store) {
   const auto snapshot = store.snapshot();
   REQUIRE(snapshot.active.kind == ActiveKind::None);
@@ -1692,6 +1720,7 @@ std::filesystem::path startCompletedUserToIdleTransition(
     const std::string& id_prefix,
     StartQueuedRunMode start_mode = StartQueuedRunMode::RequireDirectStart) {
   const auto idle_path = transitionReadyTrk(tmp, id_prefix + "_idle.trk", 3);
+  publishIdleConfigurableSnapshot(store);
   REQUIRE(bridge.configureIdle({idleMotion(idle_path, 3)}).ok());
   loop.tick();
 
@@ -1855,6 +1884,7 @@ TEST_CASE("RuntimeStatusStore suppresses stale active idle after idle overlay cl
   const RuntimeConfig config = runtimeConfig();
   RuntimeStatusStore store(config);
   RuntimeBridge bridge(config, store);
+  publishIdleConfigurableSnapshot(store);
   REQUIRE(bridge.configureIdle({idleMotion("stale_idle.trk", 3)}).ok());
 
   StatusSnapshot active_idle;
@@ -4880,6 +4910,7 @@ TEST_CASE("RuntimeControlLoop completed user enters idle through internal transi
                           standby_track);
 
   const auto idle_path = validTrk(tmp, "user_to_idle_idle.trk", 2);
+  publishIdleConfigurableSnapshot(store);
   REQUIRE(bridge.configureIdle({idleMotion(idle_path, 2)}).ok());
   loop.tick();
   REQUIRE(store.snapshot().idle.enabled);
@@ -4915,6 +4946,7 @@ TEST_CASE("RuntimeControlLoop invalid idle transition build completes user and f
   RuntimeControlLoop loop(config, bridge, store, TrkLoader(tmp.trkConfig()), &reference);
 
   const auto idle_path = zeroQuaternionTrk(tmp, "user_to_invalid_idle.trk", 2);
+  publishIdleConfigurableSnapshot(store);
   REQUIRE(bridge.configureIdle({idleMotion(idle_path, 2)}).ok());
   loop.tick();
   REQUIRE(store.snapshot().idle.enabled);
@@ -10948,16 +10980,16 @@ TEST_CASE("RuntimeControlLoop queue preempts background transition and playback 
     REQUIRE(source.active);
 
     const auto user_path = validTrk(tmp, "queue_standby_preempt_user.trk", 2);
-    REQUIRE(bridge.submitQueue(
-                executeCommand("queue-standby-preempt-user",
-                               user_path,
-                               MotionMode::Queue,
-                               2))
-                .ok());
-    loop.tick();
+    const auto result =
+        bridge.submitQueue(executeCommand("queue-standby-preempt-user",
+                                          user_path,
+                                          MotionMode::Queue,
+                                          2));
 
-    requireUserTransitionStatus(store, "queue-standby-preempt-user");
-    requireReferenceStartsFrom(reference, source);
+    requireUserWorkRejectedDuringStandbyHandoff(
+        result, store, "queue-standby-preempt-user");
+    REQUIRE(reference.latest.active);
+    REQUIRE(reference.latest.frame == source.frame);
   }
 
   SECTION("standby playback") {
@@ -10979,16 +11011,16 @@ TEST_CASE("RuntimeControlLoop queue preempts background transition and playback 
     REQUIRE(source.active);
 
     const auto user_path = validTrk(tmp, "queue_playback_preempt_user.trk", 2);
-    REQUIRE(bridge.submitQueue(
-                executeCommand("queue-playback-preempt-user",
-                               user_path,
-                               MotionMode::Queue,
-                               2))
-                .ok());
-    loop.tick();
+    const auto result =
+        bridge.submitQueue(executeCommand("queue-playback-preempt-user",
+                                          user_path,
+                                          MotionMode::Queue,
+                                          2));
 
-    requireUserTransitionStatus(store, "queue-playback-preempt-user");
-    requireReferenceStartsFrom(reference, source);
+    requireUserWorkRejectedDuringStandbyHandoff(
+        result, store, "queue-playback-preempt-user");
+    REQUIRE(reference.latest.active);
+    REQUIRE(reference.latest.frame == source.frame);
   }
 }
 
@@ -11030,7 +11062,7 @@ TEST_CASE("RuntimeControlLoop queue during user transition waits behind existing
   REQUIRE(store.findRun("queue-user-owned-new").run->state == MotionState::Queued);
 }
 
-TEST_CASE("RuntimeControlLoop failed queue preempt of standby playback drops background",
+TEST_CASE("RuntimeControlLoop queue during standby playback rejects user work",
           "[runtime-p1]") {
   TempTree tmp;
   const RuntimeConfig config = runtimeConfig();
@@ -11049,26 +11081,15 @@ TEST_CASE("RuntimeControlLoop failed queue preempt of standby playback drops bac
       loop, store, bridge, tmp, "queue-fail-playback");
   advanceToStandbyPlayback(loop, store, standby_track->metadata.frames);
 
-  const auto invalid_path = invalidContactTrk(tmp, "queue_fail_bad_user.trk");
-  REQUIRE(bridge.submitQueue(
-              executeCommand("queue-fail-bad-user",
-                             invalid_path,
-                             MotionMode::Queue,
-                             3))
-              .ok());
-  loop.tick();
+  const auto invalid_path = invalidContactTrk(tmp, "queue_rejected_bad_user.trk");
+  const auto result =
+      bridge.submitQueue(executeCommand("queue-rejected-bad-user",
+                                        invalid_path,
+                                        MotionMode::Queue,
+                                        3));
 
-  requireNoActiveWorkOrBackground(store);
-
-  const auto failed = store.findRun("queue-fail-bad-user");
-  REQUIRE(failed.ok());
-  REQUIRE(failed.run.has_value());
-  REQUIRE(failed.run->state == MotionState::Failed);
-  REQUIRE(failed.run->err == ErrorCode::TrkValidationFailed);
-  REQUIRE(failed.run->stop_reason == StopReason::None);
-
-  loop.tick();
-  requireNoActiveWorkOrBackground(store);
+  requireUserWorkRejectedDuringStandbyHandoff(
+      result, store, "queue-rejected-bad-user");
 }
 
 TEST_CASE("RuntimeControlLoop failed queue preempt of idle transition preserves idle config",
@@ -11160,16 +11181,16 @@ TEST_CASE("RuntimeControlLoop interrupt preempts background transition and playb
     REQUIRE(source.active);
 
     const auto user_path = validTrk(tmp, "interrupt_standby_user.trk", 2);
-    REQUIRE(bridge.submitInterrupt(
-                executeCommand("interrupt-standby-user",
-                               user_path,
-                               MotionMode::Interrupt,
-                               2))
-                .ok());
-    loop.tick();
+    const auto result =
+        bridge.submitInterrupt(executeCommand("interrupt-standby-user",
+                                             user_path,
+                                             MotionMode::Interrupt,
+                                             2));
 
-    requireUserTransitionStatus(store, "interrupt-standby-user");
-    requireReferenceStartsFrom(reference, source);
+    requireUserWorkRejectedDuringStandbyHandoff(
+        result, store, "interrupt-standby-user");
+    REQUIRE(reference.latest.active);
+    REQUIRE(reference.latest.frame == source.frame);
   }
 
   SECTION("standby playback") {
@@ -11191,16 +11212,16 @@ TEST_CASE("RuntimeControlLoop interrupt preempts background transition and playb
     REQUIRE(source.active);
 
     const auto user_path = validTrk(tmp, "interrupt_playback_user.trk", 2);
-    REQUIRE(bridge.submitInterrupt(
-                executeCommand("interrupt-playback-user",
-                               user_path,
-                               MotionMode::Interrupt,
-                               2))
-                .ok());
-    loop.tick();
+    const auto result =
+        bridge.submitInterrupt(executeCommand("interrupt-playback-user",
+                                             user_path,
+                                             MotionMode::Interrupt,
+                                             2));
 
-    requireUserTransitionStatus(store, "interrupt-playback-user");
-    requireReferenceStartsFrom(reference, source);
+    requireUserWorkRejectedDuringStandbyHandoff(
+        result, store, "interrupt-playback-user");
+    REQUIRE(reference.latest.active);
+    REQUIRE(reference.latest.frame == source.frame);
   }
 }
 
@@ -11386,6 +11407,7 @@ TEST_CASE("RuntimeControlLoop background and idle yaw residual gate rejects raw 
     RuntimeControlLoop loop(config, bridge, store, TrkLoader(tmp.trkConfig()), &reference);
 
     const auto idle_path = transitionReadyTrk(tmp, "idle_yaw_residual_source.trk", 3);
+    publishIdleConfigurableSnapshot(store);
     REQUIRE(bridge.configureIdle({idleMotion(idle_path, 3)}).ok());
     loop.tick();
     loop.tick();
@@ -11454,6 +11476,7 @@ TEST_CASE("RuntimeControlLoop idle interrupt yaw residual rejects raw start") {
   RuntimeControlLoop loop(config, bridge, store, TrkLoader(tmp.trkConfig()), &reference);
 
   const auto idle_path = transitionReadyTrk(tmp, "idle_interrupt_yaw_source.trk", 3);
+  publishIdleConfigurableSnapshot(store);
   REQUIRE(bridge.configureIdle({idleMotion(idle_path, 3)}).ok());
   loop.tick();
   loop.tick();
@@ -12785,6 +12808,7 @@ TEST_CASE("RuntimeControlLoop urgent_stop in idle FixStand clears idle and stays
                               ControlMode::FixStand);
 
   const auto idle_path = validTrk(tmp, "fixstand_urgent_idle_config.trk", 3);
+  publishIdleConfigurableSnapshot(store);
   REQUIRE(bridge.configureIdle({idleMotion(idle_path, 3)}).ok());
   loop.tick();
   REQUIRE(store.snapshot().ctrl == ControllerState::FixStand);
