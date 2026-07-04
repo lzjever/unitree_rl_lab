@@ -201,9 +201,6 @@ std::optional<Command> RuntimeBridge::consumeNextCommand() {
 
   Command command = *best;
   pending_.erase(best);
-  if (isControl(command.kind) && !hasPendingControlCommand()) {
-    clearPendingControlLatch(command);
-  }
   if (command.kind == CommandKind::Stop) {
     status_.cancelQueuedForStop(command.sequence);
     clearPendingMotionsThrough(command.sequence);
@@ -275,12 +272,6 @@ std::optional<std::uint64_t> RuntimeBridge::latestPendingStopSequence() const {
     }
   }
   return latest;
-}
-
-bool RuntimeBridge::hasPendingControlCommand() const {
-  return std::any_of(pending_.begin(), pending_.end(), [](const Command& command) {
-    return isControl(command.kind);
-  });
 }
 
 void RuntimeBridge::clearPendingControlLatch(const Command& command) {

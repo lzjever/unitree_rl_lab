@@ -923,6 +923,23 @@ TEST_CASE("POST idle nonempty rejects unsafe controller states before validation
   }
 }
 
+TEST_CASE("POST idle nonempty rejects pending control before validation") {
+  Harness h;
+  h.status.snapshot_value.ready = true;
+  h.status.snapshot_value.ctrl = ControllerState::Running;
+  h.status.snapshot_value.pending_control = ControlMode::FixStand;
+
+  const auto response =
+      h.service.handle({"POST", "/idle", R"({"paths":["/tracks/idle.trk"]})"});
+
+  REQUIRE(response.status == 409);
+  requireFailure(response, "CONTROL_STATE_CONFLICT");
+  REQUIRE(nextAction(response) == "status");
+  REQUIRE(h.validator.calls == 0);
+  REQUIRE(h.sink.idle_calls == 0);
+  REQUIRE(h.ids.calls == 0);
+}
+
 TEST_CASE("POST idle nonempty accepts standby and active motion states") {
   for (const ControllerState ctrl :
        {ControllerState::StandbyVelocity,

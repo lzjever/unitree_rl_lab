@@ -402,7 +402,7 @@ void RuntimeStatusStore::clearPendingControl(ControlMode mode, std::uint64_t seq
 
 IdleResult RuntimeStatusStore::acceptIdleConfig(std::vector<IdleMotion> motions) {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (!motions.empty() && urgentStopping(snapshot_)) {
+  if (!motions.empty() && (urgentStopping(snapshot_) || pending_control_.has_value())) {
     return {ErrorCode::ControlStateConflict, idle_status_};
   }
   idle_config_ = std::move(motions);

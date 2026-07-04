@@ -858,6 +858,7 @@ void RuntimeControlLoop::tick() {
       } else {
         enterGeneralTrackerIdleState();
       }
+      acknowledgeDeferredPostStopControl();
     }
     publishSnapshot();
     return;
@@ -918,9 +919,11 @@ bool RuntimeControlLoop::consumePendingCommands() {
         return true;
       case CommandKind::Passive:
         handleControl(ControlMode::Passive);
+        acknowledgeConsumedControl(ControlMode::Passive, command->sequence);
         return true;
       case CommandKind::FixStand:
         handleControl(ControlMode::FixStand);
+        acknowledgeConsumedControl(ControlMode::FixStand, command->sequence);
         if (fsm_state_ == RuntimeInternalState::Stopping ||
             (active_ && active_->executor == MotionExecutor::LocoUpper &&
              active_->state == MotionState::Stopping)) {
@@ -929,6 +932,7 @@ bool RuntimeControlLoop::consumePendingCommands() {
         break;
       case CommandKind::StandbyVelocity:
         handleControl(ControlMode::StandbyVelocity);
+        acknowledgeConsumedControl(ControlMode::StandbyVelocity, command->sequence);
         if (fsm_state_ == RuntimeInternalState::Stopping ||
             (active_ && active_->executor == MotionExecutor::LocoUpper &&
              active_->state == MotionState::Stopping)) {
@@ -978,6 +982,7 @@ void RuntimeControlLoop::consumeStoppingCommands() {
       case CommandKind::Stop:
         cancelWaiting(StopReason::Stop, command->sequence);
         post_stop_control_ = ControlMode::StandbyVelocity;
+        clearDeferredPostStopControlAck();
         break;
       case CommandKind::UrgentStop:
         handleUrgentStop(command->sequence);
@@ -986,14 +991,17 @@ void RuntimeControlLoop::consumeStoppingCommands() {
         cancelWaiting(StopReason::Stop, command->sequence);
         post_stop_control_ = ControlMode::Passive;
         handleControl(ControlMode::Passive);
+        acknowledgeConsumedControl(ControlMode::Passive, command->sequence);
         break;
       case CommandKind::FixStand:
         cancelWaiting(StopReason::Stop, command->sequence);
         post_stop_control_ = ControlMode::FixStand;
+        deferPostStopControlAck(ControlMode::FixStand, command->sequence);
         break;
       case CommandKind::StandbyVelocity:
         cancelWaiting(StopReason::Stop, command->sequence);
         post_stop_control_ = ControlMode::StandbyVelocity;
+        deferPostStopControlAck(ControlMode::StandbyVelocity, command->sequence);
         break;
       case CommandKind::IdleConfig:
         handleIdleConfig(std::move(command->idle_motions));
@@ -1007,6 +1015,34 @@ void RuntimeControlLoop::consumeStoppingCommands() {
         break;
     }
   }
+}
+
+void RuntimeControlLoop::acknowledgeConsumedControl(ControlMode mode,
+                                                    std::uint64_t sequence) {
+  consumed_control_acks_.push_back(ConsumedControlAck{mode, sequence});
+}
+
+void RuntimeControlLoop::deferPostStopControlAck(ControlMode mode,
+                                                 std::uint64_t sequence) {
+  deferred_post_stop_control_ack_ = ConsumedControlAck{mode, sequence};
+}
+
+void RuntimeControlLoop::clearDeferredPostStopControlAck() {
+  if (!deferred_post_stop_control_ack_) {
+    return;
+  }
+  status_.clearPendingControl(deferred_post_stop_control_ack_->mode,
+                              deferred_post_stop_control_ack_->sequence);
+  deferred_post_stop_control_ack_.reset();
+}
+
+void RuntimeControlLoop::acknowledgeDeferredPostStopControl() {
+  if (!deferred_post_stop_control_ack_) {
+    return;
+  }
+  acknowledgeConsumedControl(deferred_post_stop_control_ack_->mode,
+                             deferred_post_stop_control_ack_->sequence);
+  deferred_post_stop_control_ack_.reset();
 }
 
 void RuntimeControlLoop::handleStop(std::uint64_t sequence, bool requires_stopping) {
@@ -1083,6 +1119,7 @@ void RuntimeControlLoop::handleStop(std::uint64_t sequence, bool requires_stoppi
 
 void RuntimeControlLoop::handleUrgentStop(std::uint64_t sequence) {
   cancelWaiting(StopReason::UrgentStop, sequence);
+  clearDeferredPostStopControlAck();
   clearIdleConfig();
   const bool keep_fixstand =
       fsm_state_ == RuntimeInternalState::FixStand && active_kind_ == ActiveKind::None &&
@@ -5699,6 +5736,10 @@ void RuntimeControlLoop::publishSnapshot() {
   fillSnapshotPose(snapshot);
   const HealthSnapshot health = healthFromSnapshot(snapshot);
   status_.publishSnapshot(std::move(snapshot));
+  for (const auto& ack : consumed_control_acks_) {
+    status_.clearPendingControl(ack.mode, ack.sequence);
+  }
+  consumed_control_acks_.clear();
   status_.publishHealthSnapshot(health);
 }
 

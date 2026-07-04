@@ -37,7 +37,6 @@ class RuntimeBridge final : public ExecutionCommandSink {
             std::uint64_t sequence,
             bool stop_requires_stopping = false);
   std::optional<std::uint64_t> latestPendingStopSequence() const;
-  bool hasPendingControlCommand() const;
   void clearPendingControlLatch(const Command& command);
   void clearPendingMotions();
   void clearPendingCommands();

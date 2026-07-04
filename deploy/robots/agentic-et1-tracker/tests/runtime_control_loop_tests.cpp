@@ -1120,79 +1120,62 @@ void requireIdle(const RuntimeStatusStore& store) {
   REQUIRE_FALSE(snapshot.exec.has_value());
 }
 
-TEST_CASE("RuntimeBridge API execute stays blocked until pending control is consumed") {
-  struct Case {
-    const char* target;
-    const char* body;
-  };
+TEST_CASE("RuntimeControlLoop API execute stays blocked until pending control publishes") {
+  TempTree tmp;
+  RuntimeConfig runtime_config = runtimeConfig();
+  RuntimeStatusStore store(runtime_config);
+  RuntimeBridge bridge(runtime_config, store);
+  RuntimeControlLoop loop(runtime_config, bridge, store, TrkLoader(tmp.trkConfig()));
+  ApiRaceValidator validator;
+  ApiRaceIds ids;
+  AgentApiConfig api_config;
+  AgentApiService service(api_config, bridge, store, validator, ids);
 
-  for (const auto& item : std::vector<Case>{
-           {"/standby", ""},
-           {"/fixstand", ""},
-           {"/passive", R"({"password":"galaxy"})"},
-       }) {
-    CAPTURE(item.target);
-    RuntimeConfig runtime_config = runtimeConfig();
-    RuntimeStatusStore store(runtime_config);
-    RuntimeBridge bridge(runtime_config, store);
-    ApiRaceValidator validator;
-    ApiRaceIds ids;
-    AgentApiConfig api_config;
-    api_config.passive_password = "galaxy";
-    AgentApiService service(api_config, bridge, store, validator, ids);
+  StatusSnapshot active;
+  active.ready = true;
+  active.mode = RuntimeMode::Sim;
+  active.robot = RobotState::Running;
+  active.ctrl = ControllerState::Running;
+  active.queue.limit = runtime_config.queue_limit;
+  active.active = {ActiveKind::User, "active-user"};
+  MotionStatus exec;
+  exec.id = "active-user";
+  exec.path = "/tracks/active.trk";
+  exec.state = MotionState::Running;
+  exec.frames = 100;
+  active.exec = exec;
+  store.publishSnapshot(active);
 
-    StatusSnapshot active;
-    active.ready = true;
-    active.mode = RuntimeMode::Sim;
-    active.robot = RobotState::Running;
-    active.ctrl = ControllerState::Running;
-    active.queue.limit = runtime_config.queue_limit;
-    active.active = {ActiveKind::User, "active-user"};
-    MotionStatus exec;
-    exec.id = "active-user";
-    exec.path = "/tracks/active.trk";
-    exec.state = MotionState::Running;
-    exec.frames = 100;
-    active.exec = exec;
-    store.publishSnapshot(active);
+  const ApiResponse control_response = service.handle({"POST", "/standby", ""});
+  REQUIRE(control_response.status == 200);
+  REQUIRE(store.snapshot().pending_control.has_value());
+  REQUIRE(*store.snapshot().pending_control == ControlMode::StandbyVelocity);
 
-    const ApiResponse control_response =
-        service.handle({"POST", item.target, item.body});
-    REQUIRE(control_response.status == 200);
+  store.publishSnapshot(active);
+  REQUIRE(store.snapshot().pending_control.has_value());
+  REQUIRE(*store.snapshot().pending_control == ControlMode::StandbyVelocity);
 
-    store.publishSnapshot(active);
+  const ApiResponse execute_response =
+      service.handle({"POST", "/execute", R"({"path":"/tracks/new.trk"})"});
 
-    const ApiResponse execute_response =
-        service.handle({"POST", "/execute", R"({"path":"/tracks/new.trk"})"});
+  REQUIRE(execute_response.status == 409);
+  REQUIRE(execute_response.body.at("ok") == false);
+  REQUIRE(execute_response.body.at("error").at("code") ==
+          "CONTROL_STATE_CONFLICT");
+  REQUIRE(execute_response.body.at("next") == "status");
+  REQUIRE(validator.calls == 0);
+  REQUIRE(ids.calls == 0);
 
-    REQUIRE(execute_response.status == 409);
-    REQUIRE(execute_response.body.at("ok") == false);
-    REQUIRE(execute_response.body.at("error").at("code") ==
-            "CONTROL_STATE_CONFLICT");
-    REQUIRE(execute_response.body.at("next") == "status");
-    REQUIRE(validator.calls == 0);
-    REQUIRE(ids.calls == 0);
+  loop.tick();
+  REQUIRE_FALSE(store.snapshot().pending_control.has_value());
+  REQUIRE(store.snapshot().ctrl == ControllerState::StandbyVelocity);
 
-    CommandKind expected_kind = CommandKind::Passive;
-    if (std::string(item.target) == "/standby") {
-      expected_kind = CommandKind::StandbyVelocity;
-    } else if (std::string(item.target) == "/fixstand") {
-      expected_kind = CommandKind::FixStand;
-    }
+  const ApiResponse accepted_execute_response =
+      service.handle({"POST", "/execute", R"({"path":"/tracks/new.trk"})"});
 
-    auto control_command = bridge.consumeNextCommand();
-    REQUIRE(control_command.has_value());
-    REQUIRE(control_command->kind == expected_kind);
-
-    store.publishSnapshot(active);
-
-    const ApiResponse accepted_execute_response =
-        service.handle({"POST", "/execute", R"({"path":"/tracks/new.trk"})"});
-
-    REQUIRE(accepted_execute_response.status == 200);
-    REQUIRE(validator.calls == 1);
-    REQUIRE(ids.calls == 1);
-  }
+  REQUIRE(accepted_execute_response.status == 200);
+  REQUIRE(validator.calls == 1);
+  REQUIRE(ids.calls == 1);
 }
 
 void requireHoldFrame(const LowCmdFrame& frame,

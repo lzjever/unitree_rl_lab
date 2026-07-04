@@ -153,7 +153,7 @@ bool executeBlockedByController(ControllerState ctrl) {
          ctrl == ControllerState::Fault;
 }
 
-bool executeBlockedByPendingControl(const StatusSnapshot& snapshot) {
+bool blockedByPendingControl(const StatusSnapshot& snapshot) {
   return snapshot.pending_control.has_value();
 }
 
@@ -455,7 +455,7 @@ ApiResponse AgentApiService::execute(const std::string& body) {
   if (executeBlockedByController(snapshot.ctrl)) {
     return controlStateConflict(snapshot.ctrl);
   }
-  if (executeBlockedByPendingControl(snapshot)) {
+  if (blockedByPendingControl(snapshot)) {
     return controlStateConflict(ControllerState::Stopping);
   }
 
@@ -566,7 +566,7 @@ ApiResponse AgentApiService::executeLocoUpper(const std::string& body) {
   if (executeBlockedByController(snapshot.ctrl)) {
     return controlStateConflict(snapshot.ctrl);
   }
-  if (executeBlockedByPendingControl(snapshot)) {
+  if (blockedByPendingControl(snapshot)) {
     return controlStateConflict(ControllerState::Stopping);
   }
 
@@ -647,6 +647,9 @@ ApiResponse AgentApiService::idle(const std::string& body) {
     const auto snapshot = status_.snapshot();
     if (idleConfigBlockedByController(snapshot.ctrl)) {
       return controlStateConflict(snapshot.ctrl);
+    }
+    if (blockedByPendingControl(snapshot)) {
+      return controlStateConflict(ControllerState::Stopping);
     }
     const ErrorCode readiness = readinessError(snapshot);
     if (readiness != ErrorCode::Ok) {

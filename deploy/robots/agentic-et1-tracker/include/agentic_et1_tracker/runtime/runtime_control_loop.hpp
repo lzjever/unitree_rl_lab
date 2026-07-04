@@ -173,6 +173,11 @@ class RuntimeControlLoop final {
     std::shared_ptr<const TrkTrack> target_track;
   };
 
+  struct ConsumedControlAck {
+    ControlMode mode{ControlMode::StandbyVelocity};
+    std::uint64_t sequence{0};
+  };
+
   struct LocoUpperRuntimeState {
     LocoUpperRootPlan root_plan;
     std::vector<LocoUpperVelocityCommand> commands_body;
@@ -207,6 +212,10 @@ class RuntimeControlLoop final {
 
   bool consumePendingCommands();
   void consumeStoppingCommands();
+  void acknowledgeConsumedControl(ControlMode mode, std::uint64_t sequence);
+  void deferPostStopControlAck(ControlMode mode, std::uint64_t sequence);
+  void clearDeferredPostStopControlAck();
+  void acknowledgeDeferredPostStopControl();
   void handleStop(std::uint64_t sequence, bool requires_stopping);
   void handleUrgentStop(std::uint64_t sequence);
   void handleControl(ControlMode mode);
@@ -451,6 +460,8 @@ class RuntimeControlLoop final {
   StopReason stop_reason_{StopReason::None};
   bool stop_to_idle_pending_{false};
   ControlMode post_stop_control_{ControlMode::StandbyVelocity};
+  std::vector<ConsumedControlAck> consumed_control_acks_;
+  std::optional<ConsumedControlAck> deferred_post_stop_control_ack_;
   bool active_first_advance_{false};
   std::size_t stopping_hold_ticks_remaining_{0};
   std::size_t active_policy_ticks_until_next_{0};

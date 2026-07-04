@@ -310,6 +310,47 @@ TEST_CASE("RuntimeBridge configureIdle publishes status without user queue state
   REQUIRE(store.snapshot().idle.enabled);
 }
 
+TEST_CASE("RuntimeBridge rejects nonempty idle config while control is pending") {
+  const RuntimeConfig config = runtimeConfig(8);
+
+  for (const ControlMode mode :
+       {ControlMode::Passive, ControlMode::FixStand, ControlMode::StandbyVelocity}) {
+    CAPTURE(static_cast<int>(mode));
+    RuntimeStatusStore store(config);
+    RuntimeBridge bridge(config, store);
+    store.publishSnapshot(readySnapshot(ControllerState::StandbyVelocity));
+
+    CommandKind expected_kind = CommandKind::Passive;
+    ControlResult control;
+    switch (mode) {
+      case ControlMode::Passive:
+        control = bridge.passive();
+        expected_kind = CommandKind::Passive;
+        break;
+      case ControlMode::FixStand:
+        control = bridge.fixStand();
+        expected_kind = CommandKind::FixStand;
+        break;
+      case ControlMode::StandbyVelocity:
+        control = bridge.standbyVelocity();
+        expected_kind = CommandKind::StandbyVelocity;
+        break;
+    }
+    REQUIRE(control.ok());
+    REQUIRE(store.snapshot().pending_control.has_value());
+    REQUIRE(*store.snapshot().pending_control == mode);
+
+    const auto idle = bridge.configureIdle({idleMotion("/tmp/pending-control-idle.trk")});
+
+    REQUIRE(idle.code == ErrorCode::ControlStateConflict);
+    REQUIRE_FALSE(store.snapshot().idle.enabled);
+    auto command = bridge.consumeNextCommand();
+    REQUIRE(command.has_value());
+    REQUIRE(command->kind == expected_kind);
+    REQUIRE_FALSE(bridge.consumeNextCommand().has_value());
+  }
+}
+
 TEST_CASE("RuntimeStatusStore disabled snapshots do not overwrite configured idle") {
   const RuntimeConfig config = runtimeConfig(8);
   RuntimeStatusStore store(config);
