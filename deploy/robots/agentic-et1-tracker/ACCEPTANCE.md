@@ -358,7 +358,8 @@ Contract-level GA evidence must cover:
 - HTTP `/idle {"paths":[]}` clears idle config from any controller state; this
   is the only any-state idle mutation path. Skill/CLI `idle-clear` sends that
   clear request first, then requests ordinary `/standby` and confirms
-  standby/idle. It may fail from passive, fault, fixstand, or other states that
+  ordinary standby plus cleared idle config. Active idle is not an `idle-clear`
+  success state. It may fail from passive, fault, fixstand, or other states that
   cannot enter ordinary standby, even though the idle config clear request was
   issued.
 - `/status.active.kind` is authoritative. `exec` and `queue` describe user runs

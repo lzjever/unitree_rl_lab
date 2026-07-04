@@ -60,7 +60,7 @@
 - `/execute` request shape、现有错误 envelope、`.trk` 和 `motion_dirs` allowlist 校验行为不退化。
 - 用户 queue FIFO、`queue.limit`、`queue.ids`、`GET /status?id=<id>` 只代表用户提交的动作。
 - `/fixstand`、`/standby_velocity`、`/stop` 空 body 合同保持。
-- `/passive` 只接受 `{"password":"galaxy"}` 这类 JSON body；默认密码为 `galaxy`，可通过顶层 `passive_password` 配置。
+- `/passive` 只接受带 operator-provided password 的 JSON body；部署可通过顶层 `passive_password` 配置该密码。Agents/skills must not assume a default password.
 - 已有 run 状态、stop reason、queue cancel/interrupt 语义保持，除非测试明确围绕新状态链路反转。
 
 ## 3. 目标状态机和转换表
@@ -348,7 +348,7 @@ Runtime/store tests：`tests/runtime_bridge_tests.cpp`、`tests/runtime_control_
 - `/idle` 配置/清空与播放解耦；`paths:[]` 在任意状态可清空，非空配置在 `passive/fixstand/starting/stopping/fault` 返回冲突，自动播放只在 standby+ready+safe+无用户工作时发生。
 - HTTP/API 层：`passive` 正常只接受 `/fixstand` 执行恢复；`fixstand` 正常只接受 `/standby_velocity` 进入 standby；`/execute` 在 `fixstand` 返回冲突，standby 后才接受 `/execute`/可播放 idle。
 - RuntimeBridge 直连 queue-in-FixStand 仅作为内部/API-only gate 的遗留语义暂保留，用于低层 queue/stop-watermark 覆盖；不扩大到 HTTP/API `/execute` 合同。
-- 反转 active tracking orientation skip 相关测试：standby/idle/user active/preparing/running/stopping 中 bad orientation 进入 `passive`，而不是继续 track 或自动 fault。
+- 反转 active tracking orientation skip 相关测试：standby、idle、user active、preparing、running、stopping 中 bad orientation 进入 `passive`，而不是继续 track 或自动 fault。
 - 增加 FixStand 恢复例外测试：lowstate fresh、mode ok、lowcmd 未占用时 bad orientation 仍允许写 FixStand；lowcmd 占用时不允许。
 
 Robot IO tests：`tests/robot_io_tests.cpp`
@@ -385,7 +385,7 @@ MuJoCo：
 - idle 播放中提交 `/execute mode=interrupt`：尽快抢断 idle，用户动作优先。
 - 用户动作排队/运行期间 idle 不启动。
 - `/stop` 空 body：用户 active 停止，stop watermark 之前的用户 queued/pending 取消，stop 之后新接受的用户 queue/interrupt 保留；idle active 和 idle config 全部清空；active motion 后安全允许时回 `standby_velocity`，但 passive/FixStand 空闲态保持原状态。
-- 模拟 bad orientation：standby/idle/user active/preparing/running/stopping 均进入 `passive`，不能继续 idle 或 user track；FixStand 在 lowstate fresh、mode ok、lowcmd 未占用时仍可作为恢复入口。
+- 模拟 bad orientation：standby、idle、user active、preparing、running、stopping 均进入 `passive`，不能继续 idle 或 user track；FixStand 在 lowstate fresh、mode ok、lowcmd 未占用时仍可作为恢复入口。
 
 真机：
 
@@ -405,7 +405,7 @@ MuJoCo：
 - `standby_velocity` 且 ready、安全、无用户工作时才播放 idle。
 - 用户 `/execute` 总是优先；`interrupt` 能尽快抢断 idle。
 - `/stop` 空 body、最高优先级，按 stop watermark 取消用户 queued/pending，保留 stop 后新接受的用户 queue/interrupt，清 idle config，且不绕过 safety；passive 和空闲 FixStand 不被 `/stop` 推到 standby。
-- orientation outside safe limits 在 standby/idle/user active/preparing/running/stopping 进入 `passive`；FixStand 恢复例外保留。
+- orientation outside safe limits 在 standby、idle、user active、preparing、running、stopping 进入 `passive`；FixStand 恢复例外保留。
 - `lowcmd_occupied` 保持 fault/manual/operator 语义，`block` 可见且 `next:"manual"`，不自动恢复。
 - 精确测试覆盖 API、HTTP、runtime、robot_io、skill/CLI schema，相关反转测试已更新；`packaging/skills/et1-trk2motion/SKILL.md`、`references/raw-http.md` 和脚本 short status 已同步。
 

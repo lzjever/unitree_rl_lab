@@ -181,10 +181,10 @@ run, does not prove any action has completed or is playing, and does not use
 `queue.limit`, `queue.ids`, `exec`, or `GET /status?id=...`.
 The packaged CLI/skill `idle-clear` is layered on top of HTTP clear: it sends
 `POST /idle {"paths":[]}` and then requests ordinary `/standby`. The HTTP clear
-request is any-state, but CLI `idle-clear` success still requires a confirmable
-standby/idle result; from passive, fault, fixstand, or other states that cannot
-enter ordinary standby, it may return failure after the idle config clear has
-been requested.
+request is any-state, but CLI `idle-clear` success requires confirmed ordinary
+standby plus cleared idle config. Active idle is not an `idle-clear` success
+state; from passive, fault, fixstand, or other states that cannot enter ordinary
+standby, it may return failure after the idle config clear has been requested.
 
 `/standby` is the ordinary stop/standby command. It does not create a
 user run and does not clear idle config; with idle motions loaded, background
