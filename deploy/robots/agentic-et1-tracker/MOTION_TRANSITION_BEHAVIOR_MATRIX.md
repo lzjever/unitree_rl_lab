@@ -99,8 +99,8 @@ LLM agent 判断用户动作时不能只看 `ctrl:"running"`。应优先读取�
 | --- | --- | --- |
 | user queue | `POST /execute {"mode":"queue"}` 或省略 mode | 普通用户 `.trk`。 |
 | user interrupt | `POST /execute {"mode":"interrupt"}` | 紧急用户 `.trk`：取消本地 waiting；对 background transition/playback 从 current reference 抢占到 urgent user；对 user-owned transition 取消旧 target 后从 current reference 到 urgent user；active running GeneralTracker user 优先 smooth handoff，benign reject fallback controlled stop；active holding GeneralTracker user 直接尝试 held-frame -> replacement user handoff，成功后 queue empty；active preparing 和 LocoUpper 保持 controlled stop。 |
-| idle config | `POST /idle {"paths":[...]}` | 配置 background idle pool；不是 run 提交。 |
-| idle clear | `POST /idle {"paths":[]}` | 清空 idle pool；当前 API 允许任意状态。 |
+| idle config | `POST /idle {"paths":[...]}` | 配置 background idle pool；不是 run 提交。允许 public `ctrl:"standby"`、user preparing/running、以及 public `ctrl:"running"` 下的 active idle/holding/transition；拒绝 starting、legacy/internal idle、passive、fixstand、stopping、urgent_stopping、fault。 |
+| idle clear | HTTP `POST /idle {"paths":[]}` | 清空 idle pool；当前 HTTP API 允许任意状态。CLI/skill `idle-clear` 还会请求 ordinary `/standby` 并确认 standby/idle。 |
 | urgent_stop | `POST /urgent_stop` 空 body | 最高优先级紧急控制命令；不 smoothing。 |
 | passive safety command | passworded `POST /passive` | HTTP 入口必须有正确 password；lowcmd/manual gate 仍拒绝；readiness OK 时可进入 runtime sink；readiness 非 OK 时仅 `ROBOT_BAD_ORIENTATION` 且 `block=="bad_orientation"` 作为 safety exception 可进入 runtime sink。其他 readiness/fault error 拒绝，不进 sink。命令进入 runtime 后是 safety sink，不 smoothing。 |
 | fixstand | `POST /fixstand` 空 body | HTTP 入口仅在 readiness OK 或 bad_orientation recovery 场景进入 sink；其他 Fault/readiness error 先返回错误。runtime 命令效果是姿态恢复/控制，不 smoothing。 |
@@ -161,9 +161,9 @@ LLM agent 判断用户动作时不能只看 `ctrl:"running"`。应优先读取�
 | active user running/preparing | `/standby` | active user controlled stop；post-stop control standby。 | 是 | 保持，不 smoothing。 | P0 | 建议补 running/preparing -> standby 测试。 |
 | active idle | `/standby` | `stopIdleActive()`；idle config 保留，回到可播放 idle 的 standby 链路后，若 idle config 非空且无 user work、ready/safe，idle 可按现有自动播放规则重新启动。 | 是 | 保持。`/standby` 不清 idle config、不生成 user run、不进 queue；后续 idle 启动是 background idle manager 的正常行为，不是 `/standby` 队列化。若 caller 需要纯 `standby` 且不播放 idle，应先 `/idle {"paths":[]}` 再 `/standby`；不要把 urgent `/urgent_stop` 当普通待命入口。 | P2 | 保留/补测试锁定现有行为：active idle 停止、idle config 保留、满足自动播放条件时可重新 idle。 |
 | active transition | `/standby` | abort 当前 transition；进入 standby control path。 | 是 | 保持，不 smoothing；若 target 是 background standby，本命令与目标一致也不需要继续平滑。 | P0 | 补 target=user/idle/standby 分类测试。 |
-| any non-fault/non-passive safe state | nonempty `/idle` | API 允许在 `standby`、`preparing`、`running` 等状态配置；runtime 替换 idle config；若 active idle 则 stop 当前 idle。 | 是 | 保持配置和播放解耦；idle config 不生成 run。 | P2 | 已有 API/runtime idle config 测试。 |
-| passive/fixstand/urgent_stopping/fault | nonempty `/idle` | API gate 拒绝；避免未来自动播放跨过安全链路。 | 是 | 保持。 | P0 | 已有 API 测试。 |
-| any state | `/idle {"paths":[]}` | API 允许清空；runtime 清 idle config，不校验 path。 | 是 | 保持安全清空能力。 | Current | 已有 API 测试。 |
+| public standby / user preparing-running / public running active idle-holding-transition | non-empty `/idle` | API 允许配置；runtime 替换 idle config；若 active idle 则 stop 当前 idle。 | 是 | 保持配置和播放解耦；idle config 不生成 run，也不代表 idle 已完成、正在播放或已经启动。 | P2 | API/runtime idle config 测试应覆盖 accepted set：public `ctrl:"standby"`、user preparing/running、active idle、holding、transition。 |
+| starting / legacy internal idle / passive / fixstand / stopping / urgent_stopping / fault | non-empty `/idle` | API 先按 controller block set 拒绝配置，返回 controller conflict；只有 controller 允许后才检查 readiness/manual error。 | 是 | 保持明确 deny set。非空 `/idle` 不跨初始化、安全、恢复、stop/fault 边界；需要任意状态清空时只用 HTTP `/idle {"paths":[]}`。 | P0 | API/runtime idle config 测试应覆盖 rejected set 和 controller-before-readiness 顺序：starting、legacy/internal idle、passive、fixstand、stopping、urgent_stopping、fault。 |
+| any state | HTTP `/idle {"paths":[]}` | API 允许清空；runtime 清 idle config，不校验 path。 | 是 | 保持安全清空能力。CLI/skill `idle-clear` 还会请求 ordinary `/standby`，因此 CLI 成功不等同于 HTTP clear 任意状态成功。 | Current | 已有 API 测试；skill contract 覆盖 clear 后 standby confirmation。 |
 
 ### Completion / Readiness 路径
 
@@ -190,7 +190,7 @@ LLM agent 判断用户动作时不能只看 `ctrl:"running"`。应优先读取�
 
 | Class | Item | Why it matters | Required action |
 | --- | --- | --- | --- |
-| P0 regression lock | 不得让 user `.trk` 进入 starting/public idle/passive/fixstand/fault/urgent_stopping 的外部 API 合同必须持续锁住 | 安全/恢复/非 accepting 状态不能被动作请求打断；但 readiness/manual error 必须先于 controller conflict。 | 保留 `/execute` readiness-before-controller gate order；回归测试覆盖 queue/interrupt、readiness 非 OK、readiness OK conflict，以及 validator/sink/id generator 未调用。 |
+| P0 regression lock | 不得让 user `.trk` 进入 starting/legacy internal idle/passive/fixstand/stopping/fault/urgent_stopping 的外部 API 合同必须持续锁住 | 安全/恢复/非 accepting 状态不能被动作请求打断；但 readiness/manual error 必须先于 controller conflict。 | 保留 `/execute` readiness-before-controller gate order；回归测试覆盖 queue/interrupt、readiness 非 OK、readiness OK conflict，以及 validator/sink/id generator 未调用。 |
 | Current/P1 regression lock | `transition.target=idle` 中 user queue 抢占背景目标 | idle 是背景；queued user 不应等 target idle 启动或播放完成。 | 保留 `[runtime-p1]` queue preempts background transition 测试，断言从 current transition frame 到 user。 |
 | Current/P1 regression lock | `transition.target=standby` synthetic 中 user queue 抢占背景目标 | standby 是背景；queued user 不应等 standby playback。 | 保留 `[runtime-p1]` target standby queue 抢占测试，断言旧 standby target 被丢弃且不继续 playback。 |
 | Current/P1 regression lock | standby playback 中 user queue 抢占背景播放 | standby playback 仍是 background reference。 | 保留 `[runtime-p1]` standby playback queue 抢占测试，断言从 current playback frame 到 user。 |
@@ -220,7 +220,7 @@ LLM agent 判断用户动作时不能只看 `ctrl:"running"`。应优先读取�
 | transition target idle | 抢占背景 idle target；从 current transition frame 到 user。 | 同 queue，并取消 waiting。 |
 | transition target standby | 抢占背景 standby target；从 current transition frame 到 user。 | 同 queue，并取消 waiting。 |
 | standby playback | 抢占背景 playback；从 current playback frame 到 user。 | 同 queue，并取消 waiting。 |
-| starting/public idle/passive/fixstand/fault/urgent_stopping | readiness OK 时 API controller gate 拒绝；readiness 非 OK 时 readiness/manual error 优先。 | 同 queue。 |
+| starting/legacy internal idle/passive/fixstand/stopping/fault/urgent_stopping | readiness OK 时 API controller gate 拒绝；readiness 非 OK 时 readiness/manual error 优先。 | 同 queue。 |
 
 ### 5.2 Control 命令规则
 
@@ -230,8 +230,8 @@ LLM agent 判断用户动作时不能只看 `ctrl:"running"`。应优先读取�
 | `/passive` | HTTP 入口必须有正确 password；lowcmd/manual gate 仍拒绝；readiness OK 时可进入 runtime sink；readiness 非 OK 时仅 `ROBOT_BAD_ORIENTATION` 且 `block=="bad_orientation"` 作为 safety exception 可进入 runtime sink；其他 readiness/fault error 拒绝，不进 sink。命令进入 runtime 后立即 safety sink，取消 waiting，清 idle config，active user stopped，idle/transition abort，clear reference，不 smoothing。 |
 | `/fixstand` | HTTP 入口只在 readiness OK 或 bad_orientation recovery 场景进入 sink；其他 Fault/readiness error 先返回错误。runtime 命令效果是 recovery/control path；不清 idle config；FixStand 期间绝不自动播放 idle，之后必须显式 `/standby` 才可回到可播放 idle 的 standby 链路；active user controlled stop 后进入 FixStand；idle/transition abort；不 smoothing。 |
 | `/standby` | ordinary standby/control path；不清 idle config；不生成 user run、不进 queue；active user running/preparing controlled stop；静态 user holding 可走 held reference -> standby reference gated transition；active idle/transition abort。回到可播放 idle 的 standby 链路后，若 idle config 非空且无 user work、ready/safe，idle 可按现有 background idle manager 自动播放规则重新启动。需要纯 `standby` 时，caller 先 `/idle {"paths":[]}` 再 `/standby`；`/urgent_stop` 保留为 urgent/immediate 停止。 |
-| `/idle` nonempty | 只配置背景池；不生成 run；不跨 passive/fixstand/fault/urgent_stopping 自动播放。 |
-| `/idle` clear | 任意状态安全清空。 |
+| `/idle` non-empty | 只配置背景池；不生成 run；不代表 idle 已启动/正在播放/已完成。允许 public `ctrl:"standby"`、user preparing/running、以及 public `ctrl:"running"` 下的 active idle/holding/transition；拒绝 starting、legacy/internal idle、passive、fixstand、stopping、urgent_stopping、fault；blocked controller 先于 readiness/manual error 返回 conflict。 |
+| HTTP `/idle` clear | 任意状态安全清空 idle config。CLI/skill `idle-clear` 在 clear 后还要请求 ordinary `/standby` 并确认 standby/idle；不能 standby 的状态可导致 CLI 失败。 |
 
 ### 5.3 Synthetic transition 归属规则
 
@@ -296,8 +296,10 @@ LLM agent 判断用户动作时不能只看 `ctrl:"running"`。应优先读取�
 | standby explicit | active user holding + `/standby` | held reference -> standby reference transition；不生成 user run、不进入 queue。 |
 | standby explicit | active user running/preparing + `/standby` | controlled stop；post-stop standby；不做 current-frame smoothing。 |
 | standby explicit | active idle + `/standby` | idle stops；idle config 保留；回到可播放 idle 的 standby 链路后，若无 user work 且 ready/safe，可按现有 background idle manager 规则自动重新 idle；不生成 user run、不进 queue。 |
+| idle config accepted | non-empty `/idle` from public `ctrl:"standby"`, user preparing/running, active idle, holding, or active transition | idle pool is atomically replaced; no user run id, queue entry, or completion signal is created。 |
+| idle config rejected | non-empty `/idle` from starting, legacy/internal idle, passive, fixstand, stopping, urgent_stopping, or fault | request is rejected by controller gate before readiness/manual checks and before replacing idle config; HTTP `/idle {"paths":[]}` remains the any-state clear path。 |
 | safety | active idle/user/transition + readiness failure | enter Passive/Fault as mapped; user failed/stopped where applicable; idle/transition no history。 |
-| API gate | starting/public idle/passive/fixstand/urgent_stopping/fault + `/execute` queue/interrupt, readiness OK | 409 `CONTROL_STATE_CONFLICT`，不调用 validator/sink/id generator。 |
+| API gate | starting/legacy internal idle/passive/fixstand/stopping/urgent_stopping/fault + `/execute` queue/interrupt, readiness OK | 409 `CONTROL_STATE_CONFLICT`，不调用 validator/sink/id generator。 |
 | API gate order | blocked ctrl + `/execute`, readiness non-OK | readiness/manual error wins over `CONTROL_STATE_CONFLICT`，不调用 validator/sink/id generator。 |
 | API shape | `/execute` with transition params or unknown fields | 400 `REQUEST_INVALID`; API 不扩大。 |
 
@@ -335,4 +337,4 @@ LLM agent 判断用户动作时不能只看 `ctrl:"running"`。应优先读取�
 | Urgent/passive/control | urgent_stop/passive 清 idle config；fixstand/standby 保留 idle config。urgent_stop/passive/fixstand 不调用 smoothing helper；`/standby` 仅允许静态 user holding -> standby 例外。 |
 | Standby playback | 视为 background transition owner；queue/interrupt 都可抢占。 |
 | Standby active idle | 保留 idle config；不新增 idle 保留但禁播的 runtime 状态。`/standby` 回到可播放 idle 的 standby 链路后，若 idle config 非空且无 user work、ready/safe，idle 可按现有 background idle manager 规则自动重新启动；这不是 `/standby` 队列化或生成 user run。需要纯 `standby` 时，caller 先 `/idle {"paths":[]}` 再 `/standby`。 |
-| Tests | 保留 target-specific `[runtime-p1]` tests；API gate tests 确保 starting/public idle/passive/fixstand/urgent_stopping/fault 在 readiness OK 时拒绝 user `.trk`，且 `/execute` readiness 非 OK 时返回 readiness/manual error。另锁定 `/passive`：正确 password + readiness OK admitted、正确 password + bad_orientation exception admitted、无正确 password/lowcmd/manual/其他 readiness/fault error rejected，rejected path 不进 runtime sink。 |
+| Tests | 保留 target-specific `[runtime-p1]` tests；API gate tests 确保 starting/legacy internal idle/passive/fixstand/stopping/urgent_stopping/fault 在 readiness OK 时拒绝 user `.trk`，且 `/execute` readiness 非 OK 时返回 readiness/manual error。另锁定 `/passive`：正确 password + readiness OK admitted、正确 password + bad_orientation exception admitted、无正确 password/lowcmd/manual/其他 readiness/fault error rejected，rejected path 不进 runtime sink。 |

@@ -124,16 +124,22 @@ Commands:
   `/execute_loco_upper`.
   The service config key remains `default_max_radius_m`; status/health expose
   the same client-facing default as `cap.loco_upper.default_radius_m`.
-- `POST /idle`: `{"paths":["/absolute/idle-a.trk","/absolute/idle-b.trk"]}`.
-- `POST /idle`: `{"paths":[]}` clears the idle pool.
+- `POST /idle`: `{"paths":["/absolute/idle-a.trk","/absolute/idle-b.trk"]}`
+  configures the idle pool. This is config, not a run submission, and does not
+  mean idle has started, completed, or is currently playing.
+- `POST /idle`: `{"paths":[]}` clears the idle pool and is accepted in any
+  controller state.
 - `POST /urgent_stop`: empty body; urgent/immediate software stop. It stops active
   work, cancels queued work, and clears idle config. Use `/standby`
   for ordinary stop/standby when idle config should be preserved.
-- `POST /passive`: `{"password":"galaxy"}` by default; enter Passive safety
-  sink when LowCmd is free; stops active work, clears queued work, and clears
-  the idle pool. Configure the password with top-level `passive_password`.
-- `POST /fixstand`: empty body; enter fixed stand configuration/recovery. This
-  is not ordinary quiet standing.
+- `POST /passive`: `{"password":"<operator-provided-password>"}`; enter
+  Passive safety sink when LowCmd is free; stops active work, clears queued
+  work, and clears the idle pool. Configure the deployment password with
+  top-level `passive_password`. Agents and skills must not assume or look up a
+  default password; the operator must provide it explicitly.
+- `POST /fixstand`: empty body; enter fixed stand configuration/recovery only
+  when readiness is OK or the `bad_orientation` recovery exception applies.
+  This is not ordinary quiet standing.
 - `POST /standby`: empty body; enter ordinary standby/Velocity0
   standby while preserving idle config.
 
@@ -164,9 +170,21 @@ choose a stop profile or smoothing mode.
 replaces the idle pool after validating every path with the same local `.trk`
 rules as `/execute`; any failed path leaves the old idle config unchanged.
 `{"paths":[]}` clears the config without path validation and is accepted in any
-controller state. Non-empty `/idle` is accepted only after the control chain has
-reached standby, or while a user motion is preparing/running. Idle does
-not use `queue.limit`, `queue.ids`, `exec`, or `GET /status?id=...`.
+controller state. Non-empty `/idle` is accepted in public `ctrl:"standby"`,
+while a user motion is preparing/running, and in public `ctrl:"running"` states
+owned by active idle, holding user work, or an internal transition. Non-empty
+`/idle` is rejected from starting, legacy/internal idle, passive, fixstand,
+stopping, urgent_stopping, and fault. For non-empty `/idle`, the HTTP API checks
+that blocked controller set before readiness/manual errors; readiness is checked
+only after the controller allows idle config. Idle config does not create a user
+run, does not prove any action has completed or is playing, and does not use
+`queue.limit`, `queue.ids`, `exec`, or `GET /status?id=...`.
+The packaged CLI/skill `idle-clear` is layered on top of HTTP clear: it sends
+`POST /idle {"paths":[]}` and then requests ordinary `/standby`. The HTTP clear
+request is any-state, but CLI `idle-clear` success still requires a confirmable
+standby/idle result; from passive, fault, fixstand, or other states that cannot
+enter ordinary standby, it may return failure after the idle config clear has
+been requested.
 
 `/standby` is the ordinary stop/standby command. It does not create a
 user run and does not clear idle config; with idle motions loaded, background
@@ -181,11 +199,12 @@ older stop. For loco-upper this is an immediate cancellation path: runtime
 clears the active loco executor state and returns through the existing
 urgent-stop/standby bookkeeping without further loco radius-guard ticks.
 
-Control-changing routes return the current `/status.err` readiness error before
-claiming success when the runtime is unavailable or not ready. Passworded
-`/passive` and `/fixstand` are the software exceptions for
-`block:"bad_orientation"` when LowCmd is not externally occupied; neither
-bypasses `lowcmd_occupied`.
+Most control-changing routes return the current `/status.err` readiness error
+before claiming success when the runtime is unavailable or not ready. Non-empty
+`/idle` is the controller-gated exception: blocked controller states return
+controller conflict before readiness/manual errors. Passworded `/passive` and
+`/fixstand` are the software exceptions for `block:"bad_orientation"` when
+LowCmd is not externally occupied; neither bypasses `lowcmd_occupied`.
 `/standby` returns `CONTROL_STATE_CONFLICT` from `passive` and `fault`.
 
 Startup safety:
@@ -209,8 +228,10 @@ Error envelope:
 {"ok":false,"error":{"code":"CONTROL_STATE_CONFLICT","message":"ctrl=fixstand; /standby","retryable":false},"next":"standby"}
 ```
 
-`next` is one token-level action: `status`, `retry`, `wait_robot`, `fix`,
-`fixstand`, `standby`, `urgent_stop`, or `manual`.
+HTTP response `next` is one token-level action: `status`, `retry`,
+`wait_robot`, `fix`, `fixstand`, `standby`, `urgent_stop`, or `manual`. It is
+not CLI argv. For example, HTTP `next:"urgent_stop"` is mapped by the
+CLI/skill layer to `urgent-stop`.
 
 Common error handling:
 
@@ -314,24 +335,26 @@ Controller states:
 
 | ctrl | robot behavior | accepts | rejects/notes |
 | --- | --- | --- | --- |
-| `starting` | Runtime is initializing. | `/status`, `/health` | Control routes return readiness errors such as `SERVICE_NOT_READY` or `MODEL_NOT_READY`; wait for `ready:true`. |
+| `starting` | Runtime is initializing. | `/status`, `/health`, `/idle {"paths":[]}` | Non-empty `/idle` is controller-blocked and returns conflict before readiness/manual errors; other control routes return readiness errors such as `SERVICE_NOT_READY` or `MODEL_NOT_READY`. Wait for `ready:true`. |
 | `passive` | Safety sink; publishes passive damping command; idle pool is cleared. | `/fixstand`, passworded `/passive`, `/urgent_stop`, `/idle {"paths":[]}` | `/execute`, `/standby`, and non-empty `/idle` return `CONTROL_STATE_CONFLICT`. If `block:"lowcmd_occupied"`, next action is `manual`. |
 | `fixstand` | Holds configured stand posture. | `/standby`, passworded `/passive`, `/urgent_stop`, `/fixstand`, `/idle {"paths":[]}` | `/execute` and non-empty `/idle` return conflict; call `/standby` first. Passworded `/passive` and `/fixstand` are the `bad_orientation` software recovery exceptions. |
-| `standby` | Velocity policy with zero command; robot stands idle. Public status reports `ctrl:"standby"`. | `/execute`, `/idle`, passworded `/passive`, `/fixstand`, `/urgent_stop` | Normal state for starting user `.trk`; idle auto-play may start only when ready/safe and no user active/queue exists. |
-| idle active (`active.kind:"idle"`) | GeneralTracker plays an idle pool motion without a user id. | `/execute`, `/standby`, `/urgent_stop`, `/idle`, passworded `/passive`, `/fixstand` | `exec:null`, user `queue` unchanged. User `/execute` preempts idle playback but keeps idle config; `/standby` stops current idle playback and keeps idle config; `/urgent_stop` clears idle config. |
+| `standby` | Velocity policy with zero command; robot stands idle. Public status reports `ctrl:"standby"`. | `/execute`, non-empty `/idle`, `/idle {"paths":[]}`, passworded `/passive`, `/fixstand`, `/urgent_stop` | Normal state for starting user `.trk`; idle auto-play may start only when ready/safe and no user active/queue exists. |
+| legacy/internal idle | Internal idle controller state that is not the public standby contract. | `/status`, `/health`, `/idle {"paths":[]}` | Non-empty `/idle` and `/execute` return conflict; wait for public `ctrl:"standby"` or an accepted running/preparing owner. |
+| idle active (`active.kind:"idle"`) | GeneralTracker plays an idle pool motion without a user id under public `ctrl:"running"`. | `/execute`, `/standby`, `/urgent_stop`, non-empty `/idle`, `/idle {"paths":[]}`, passworded `/passive`, `/fixstand` | `exec:null`, user `queue` unchanged. User `/execute` preempts idle playback but keeps idle config; `/standby` stops current idle playback and keeps idle config; `/urgent_stop` clears idle config. |
 | `preparing`/`running` with `active.kind:"user"` | Preparing or executing a user `.trk`. | `/standby`, `/urgent_stop`, passworded `/passive`, `/execute` queue/interrupt, `/idle` config/clear | `queue` waits; `interrupt` preempts current user run. Running GeneralTracker interrupts may expose `transition.target:"user"` before the new run is active; preparing and fallback paths use controlled stop/restart. Poll `/status?id=<id>`. |
 | holding (`active.kind:"user"`, `exec.state:"holding"`) | Holds the last reference frame of a foreground user `.trk` submitted with `hold:true`. | `/execute` queue/interrupt, `/standby`, `/urgent_stop`, passworded `/passive`, `/fixstand`, `/idle` config/clear | Same user id remains queryable. `/execute` interrupt attempts held-frame -> replacement-user handoff, stops the old source as interrupt, and leaves the queue empty on success; `/execute` queue reuses the handoff and marks the old source done on success. `/urgent_stop`, passworded `/passive`, and `/fixstand` end it immediately; `/standby` is the ordinary release path. |
 | transition active (`active.kind:"transition"`) | Internal synthetic reference transition toward `transition.target`. | `/execute` queue/interrupt, `/standby`, `/urgent_stop`, passworded `/passive`, `/fixstand`, `/idle` config/clear | Not a user run; no id, queue entry, queue limit use, or user history entry. `/urgent_stop` aborts immediately; `/standby` targets the ordinary standby chain. |
+| `stopping` | Controlled stop/settle is in progress. | `/status`, passworded `/passive`, `/urgent_stop`, `/idle {"paths":[]}` | `/execute` and non-empty `/idle` return conflict at the HTTP API; wait for a stable state. |
 | `urgent_stopping` | Urgent-stop transition to standby, passive, fault, or manual handling. | `/status`, passworded `/passive`, `/urgent_stop`, `/idle {"paths":[]}` | `/execute` and non-empty `/idle` return conflict at the HTTP API; wait for a stable state. Ordinary `/standby` should not expose generic `stopping` as a success path. |
-| `fault` | Safety/manual state; no normal track execution. | passworded `/passive` only for `bad_orientation`, `/fixstand`, `/urgent_stop`, `/idle {"paths":[]}` | `/execute`, `/standby`, and non-empty `/idle` return conflict until resolved. `lowcmd_occupied` remains manual/operator. |
+| `fault` | Safety/manual state; no normal track execution. | passworded `/passive` only for `bad_orientation`, `/fixstand` only when readiness OK or `bad_orientation` recovery conditions permit, `/urgent_stop`, `/idle {"paths":[]}` | `/execute`, `/standby`, and non-empty `/idle` return conflict until resolved. Do not treat `/fixstand` as an arbitrary-fault recovery route; `lowcmd_occupied` remains manual/operator. |
 
 `/execute` checks request shape, then readiness, then controller state. If
 `starting` is not ready it returns the readiness error, not
-`CONTROL_STATE_CONFLICT`. `/execute` does not enqueue in `idle`, `passive`,
-`fixstand`, `urgent_stopping`, or `fault`; those ready controller states return
-`CONTROL_STATE_CONFLICT`. In `running` and `preparing`, queue and interrupt
-requests are accepted because the runtime can process them without manual
-control-state steps.
+`CONTROL_STATE_CONFLICT`. `/execute` does not enqueue in legacy/internal `idle`,
+`passive`, `fixstand`, `stopping`, `urgent_stopping`, or `fault`; those ready
+controller states return `CONTROL_STATE_CONFLICT`. In `running` and
+`preparing`, queue and interrupt requests are accepted because the runtime can
+process them without manual control-state steps.
 
 Startup defaults to FixStand. After a `.trk` run finishes or `/standby` completes
 from active motion, the real runtime returns to standby. `/urgent_stop` in

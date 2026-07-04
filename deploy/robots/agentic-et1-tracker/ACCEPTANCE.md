@@ -349,6 +349,18 @@ Contract-level GA evidence must cover:
   or id allocation.
 - `/idle {"paths":[...]}` atomically configures the idle pool; `{"paths":[]}`
   clears it; idle never creates a user run id.
+- Non-empty `/idle` is accepted from public `ctrl:"standby"`, user
+  preparing/running, and public `ctrl:"running"` under active idle, holding, or
+  transition. It is rejected from starting, legacy/internal idle, passive,
+  fixstand, stopping, urgent_stopping, and fault. For non-empty `/idle`, blocked
+  controller states return controller conflict before readiness/manual errors;
+  readiness is checked only after the controller allows idle config.
+- HTTP `/idle {"paths":[]}` clears idle config from any controller state; this
+  is the only any-state idle mutation path. Skill/CLI `idle-clear` sends that
+  clear request first, then requests ordinary `/standby` and confirms
+  standby/idle. It may fail from passive, fault, fixstand, or other states that
+  cannot enter ordinary standby, even though the idle config clear request was
+  issued.
 - `/status.active.kind` is authoritative. `exec` and `queue` describe user runs
   only; idle progress lives under `idle` and is not queryable by
   `GET /status?id=...`.
@@ -360,6 +372,14 @@ Contract-level GA evidence must cover:
   software recovery exceptions when LowCmd is free.
 - `/passive` clears active work, user queue, pending idle config, and idle
   status so later FixStand -> standby cannot resume old idle playback.
+- Packaged `et1-action passive` without `--password` must fail before HTTP and
+  must not issue `POST /passive`; agents and skills must not assume a default
+  passive password.
+- Legacy routes `POST /stop` and `POST /standby_velocity` remain renamed/error
+  guidance only and must not become successful control paths again.
+- The disputed state checks above are contract/API/skill assertions. They do not
+  add manual gate, E2E, visual, or standby soak coverage to the default release
+  gate; those remain opt-in instruments.
 - Real `mode_machine: 1` startup may release Unitree MotionSwitcher default
   mode before LowCmd preflight. Sim `mode_machine: 0` startup must not call
   MotionSwitcher.
