@@ -3,6 +3,7 @@
 #include <atomic>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -22,6 +23,7 @@ public:
 
 private:
     bool prepare_general_tracker_request();
+    void start_general_tracker_cjm_prompt();
     void start_live_stream_trigger();
     void stop_live_stream_trigger();
     void live_stream_trigger_loop();
@@ -30,6 +32,8 @@ private:
     std::vector<float> policy_kd_;
     std::filesystem::path general_tracker_request_file_;
     std::optional<std::string> pending_tracker_target_state_;
+    std::atomic_bool general_tracker_cjm_prompt_running_{false};
+    std::atomic_bool general_tracker_cjm_prompt_ready_{false};
     bool live_stream_trigger_enabled_ = false;
     std::string live_stream_trigger_endpoint_ = "tcp://127.0.0.1:5557";
     std::string live_stream_trigger_topic_ = "et1_track";

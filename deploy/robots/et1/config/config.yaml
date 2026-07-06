@@ -246,9 +246,46 @@ FSM:
       Dance2: "5"
       NoHeadPokerFace: "6"
     policy_dir: config/policy/general_tracker_cjm
-    policy_file: self_collision_footmesh_15k.onnx
+    # Strategy 1: 0603-self_collision_ofwr_30k.onnx + deploy.yaml
+    # Strategy 2 source: MjTM-H-ET1-SelfCollision-A3-StyleRewardV3-LegacyPd-8GPU
+    # Strategy 2 checkpoint: 2026-06-07_17-07-29_et1_track_self_collision_a3_style_reward_v3_30k/model_29999.onnx
+    # To run strategy 2 after restart:
+    # policy_file: self_collision_a3_style_reward_v3_30k.onnx
+    # deploy_file: deploy_self_collision_a3_style_reward_v3_30k.yaml
+    # Strategy 3 source: MjTM-H-ET1-SelfCollision-A3-StyleRewardV3-8GPU
+    # Strategy 3 checkpoint: 2026-06-14_11-41-58_et1_track_self_collision_a3_style_reward_v3_sdkpd_220ankle_30k/model_29999.onnx
+    # To run strategy 3 after restart:
+    # policy_file: self_collision_a3_style_reward_v3_sdkpd_220ankle_30k.onnx
+    # deploy_file: deploy_self_collision_a3_style_reward_v3_sdkpd_220ankle_30k.yaml
+    policy_file: 0603-self_collision_ofwr_30k.onnx
     deploy_file: deploy.yaml
-    motion_file: config/policy/general_tracker_cjm/params/GVHMR_dance-3.et1trk
+    motion_file: config/policy/general_tracker_cjm/params/walk_forward_amateur_001__A001.et1trk
+    policy_options:
+      a:
+        label: 0603 self collision OFWR 30k
+        policy_file: 0603-self_collision_ofwr_30k.onnx
+        deploy_file: deploy.yaml
+      b:
+        label: A3 style reward v3 legacy PD 30k
+        policy_file: self_collision_a3_style_reward_v3_30k.onnx
+        deploy_file: deploy_self_collision_a3_style_reward_v3_30k.yaml
+      c:
+        label: A3 style reward v3 SDK PD 220 ankle 30k
+        policy_file: self_collision_a3_style_reward_v3_sdkpd_220ankle_30k.onnx
+        deploy_file: deploy_self_collision_a3_style_reward_v3_sdkpd_220ankle_30k.yaml
+    motion_options:
+      a:
+        label: PokerFace004 ET1 1
+        motion_file: config/policy/general_tracker_cjm/params/PokerFace004_et1_1.et1trk
+      b:
+        label: Looking in the mirror amateur 001 A002
+        motion_file: config/policy/general_tracker_cjm/params/looking_in_the_mirror_amateur_001__A002.et1trk
+      c:
+        label: 20260328 buwenjing standcut segment 001
+        motion_file: config/policy/general_tracker_cjm/params/20260328_213652_777_buwenjing_standcut_segment_001_474_22145_sdk_order.et1trk
+      d:
+        label: Rage exaggerated 001 A001
+        motion_file: config/policy/general_tracker_cjm/params/rage_exaggerated_001__A001.et1trk
     request_file: debug/general_tracker_request.txt
     live_stream:
       enabled: false
@@ -278,7 +315,7 @@ FSM:
     policy_dir: config/policy/general_tracker_cln
     policy_file: multi_policy_footstate3.onnx
     deploy_file: deploy_fut_multi_footstate.yaml
-    motion_file: config/policy/general_tracker_cln/params/585_jiaxin.et1trk
+    motion_file: config/policy/general_tracker_cjm/params/old_data/walk_forward_weakend_sick_impro_002__A002_M.et1trk
     live_stream:
       enabled: false
       endpoint: tcp://127.0.0.1:5557

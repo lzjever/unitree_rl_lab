@@ -9,6 +9,7 @@
 #include <ctime>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <limits>
 #include <sstream>
 #include <spdlog/spdlog.h>
@@ -22,6 +23,7 @@
 std::shared_ptr<State_Track::ReferenceLoader> State_Track::reference = nullptr;
 std::mutex State_Track::pending_motion_mutex_;
 std::optional<std::filesystem::path> State_Track::pending_motion_file_;
+std::optional<State_Track::PendingPolicyMotionRequest> State_Track::pending_policy_motion_request_;
 
 namespace
 {
@@ -391,6 +393,30 @@ REGISTER_OBSERVATION(ref_com_vel_navi)
     return std::vector<float>(data.data(), data.data() + data.size());
 }
 
+REGISTER_OBSERVATION(z_style)
+{
+    if (!State_Track::reference) {
+        throw std::runtime_error("State_Track::reference is null while computing z_style.");
+    }
+    if (!State_Track::reference->has_style_z()) {
+        throw std::runtime_error("Track cache missing z_style_50/z_style while deploy requests z_style.");
+    }
+    const auto& data = State_Track::reference->z_style();
+    return std::vector<float>(data.data(), data.data() + data.size());
+}
+
+REGISTER_OBSERVATION(style_phase_z)
+{
+    if (!State_Track::reference) {
+        throw std::runtime_error("State_Track::reference is null while computing style_phase_z.");
+    }
+    if (!State_Track::reference->has_style_z()) {
+        throw std::runtime_error("Track cache missing z_style_50/z_style while deploy requests style_phase_z.");
+    }
+    const auto& data = State_Track::reference->style_phase_z();
+    return std::vector<float>(data.data(), data.data() + data.size());
+}
+
 }
 }
 
@@ -455,6 +481,8 @@ void State_Track::ReferenceLoader::reset(const Eigen::VectorXf& default_joint_po
               0.0f);
     ref_com_rel_navi_.setZero();
     ref_com_vel_navi_.setZero();
+    z_style_.setZero();
+    style_phase_z_.setZero();
     initial_ref_yaw_bias_ = 0.0f;
     anchor_frame_offset_q_ = Eigen::Quaternionf::Identity();
     if (live_stream_enabled_) {
@@ -466,6 +494,8 @@ void State_Track::ReferenceLoader::reset(const Eigen::VectorXf& default_joint_po
         root_ori_b_unbiased_ << 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f;
         xy_yaw_vel_.setZero();
         foot_support_state_.setZero();
+        z_style_.setZero();
+        style_phase_z_.setZero();
         std::fill(future_commands_.begin(), future_commands_.end(), 0.0f);
         std::fill(future_command_with_foot_support_state_.begin(),
                   future_command_with_foot_support_state_.end(),
@@ -623,6 +653,8 @@ void State_Track::ReferenceLoader::update(float time_s,
             foot_support_state_.setZero();
             ref_com_rel_navi_.setZero();
             ref_com_vel_navi_.setZero();
+            z_style_.setZero();
+            style_phase_z_.setZero();
             std::fill(future_commands_.begin(), future_commands_.end(), 0.0f);
             std::fill(future_command_with_foot_support_state_.begin(),
                       future_command_with_foot_support_state_.end(),
@@ -825,6 +857,59 @@ void State_Track::ReferenceLoader::update(float time_s,
         if (right_state >= 0 && right_state <= 2) {
             foot_support_state_[3 + right_state] = 1.0f;
         }
+    }
+
+    z_style_.setZero();
+    if (!z_style_seq_.empty()) {
+        const size_t z_offset = frame_index * kStyleZDim;
+        for (int i = 0; i < kStyleZDim; ++i) {
+            z_style_[i] = z_style_seq_[z_offset + static_cast<size_t>(i)];
+        }
+    }
+
+    style_phase_z_.setZero();
+    for (int i = 0; i < kStyleZDim; ++i) {
+        style_phase_z_[i] = z_style_[i];
+    }
+    if (!left_foot_contact_state_seq_.empty() && !right_foot_contact_state_seq_.empty()) {
+        const int left_state = static_cast<int>(left_foot_contact_state_seq_[frame_index]);
+        const int right_state = static_cast<int>(right_foot_contact_state_seq_[frame_index]);
+        const size_t next_frame = std::min(frame_index + 1, frame_count_ - 1);
+        const int next_left_state = static_cast<int>(left_foot_contact_state_seq_[next_frame]);
+        const int next_right_state = static_cast<int>(right_foot_contact_state_seq_[next_frame]);
+        if (left_state >= 0 && left_state <= 2) {
+            style_phase_z_[kStyleZDim + left_state] = 1.0f;
+        }
+        if (right_state >= 0 && right_state <= 2) {
+            style_phase_z_[kStyleZDim + 3 + right_state] = 1.0f;
+        }
+        if (next_left_state >= 0 && next_left_state <= 2) {
+            style_phase_z_[kStyleZDim + 6 + next_left_state] = 1.0f;
+        }
+        if (next_right_state >= 0 && next_right_state <= 2) {
+            style_phase_z_[kStyleZDim + 9 + next_right_state] = 1.0f;
+        }
+        auto has_landing = [&](int current_state, size_t start_frame, bool left) {
+            if (current_state != 2) {
+                return 0.0f;
+            }
+            const size_t max_frame = std::min(start_frame + 5, frame_count_ - 1);
+            for (size_t idx = start_frame + 1; idx <= max_frame; ++idx) {
+                const int state = left
+                    ? static_cast<int>(left_foot_contact_state_seq_[idx])
+                    : static_cast<int>(right_foot_contact_state_seq_[idx]);
+                if (state == 0 || state == 1) {
+                    return 1.0f;
+                }
+            }
+            return 0.0f;
+        };
+        const bool left_valid = left_state >= 0 && left_state <= 2;
+        const bool right_valid = right_state >= 0 && right_state <= 2;
+        style_phase_z_[kStyleZDim + 12] = has_landing(left_state, frame_index, true);
+        style_phase_z_[kStyleZDim + 13] = has_landing(right_state, frame_index, false);
+        style_phase_z_[kStyleZDim + 14] = left_valid && left_state != next_left_state ? 1.0f : 0.0f;
+        style_phase_z_[kStyleZDim + 15] = right_valid && right_state != next_right_state ? 1.0f : 0.0f;
     }
 
     ref_com_rel_navi_.setZero();
@@ -1065,6 +1150,8 @@ void State_Track::ReferenceLoader::apply_live_frame(const LiveFrame& frame,
     }
     ref_com_rel_navi_ = frame.ref_com_rel_navi;
     ref_com_vel_navi_ = frame.ref_com_vel_navi;
+    z_style_.setZero();
+    style_phase_z_.setZero();
 }
 
 void State_Track::ReferenceLoader::update_live_future_commands(const std::deque<LiveFrame>& queue_snapshot,
@@ -1383,6 +1470,11 @@ void State_Track::ReferenceLoader::load_cache_file(const std::filesystem::path& 
                 throw std::runtime_error("Unexpected ref_com_vel_navi shape in cache: " + cache_file.string());
             }
             convert_to_float(ref_com_vel_navi_seq_);
+        } else if (name == "z_style" || name == "z_style_50") {
+            if (dims.size() != 2 || dims[1] != kStyleZDim) {
+                throw std::runtime_error("Unexpected " + name + " shape in cache: " + cache_file.string());
+            }
+            convert_to_float(z_style_seq_);
         }
     }
 
@@ -1398,6 +1490,9 @@ void State_Track::ReferenceLoader::load_cache_file(const std::filesystem::path& 
         || (!ref_com_vel_navi_seq_.empty() && ref_com_vel_navi_seq_.size() != frame_count_ * 3)) {
         throw std::runtime_error("Reference COM observation length mismatch in cache: " + cache_file.string());
     }
+    if (!z_style_seq_.empty() && z_style_seq_.size() != frame_count_ * kStyleZDim) {
+        throw std::runtime_error("Style z observation length mismatch in cache: " + cache_file.string());
+    }
 }
 
 float State_Track::ReferenceLoader::wrap_to_pi(float angle) const
@@ -1409,13 +1504,31 @@ void State_Track::request_motion_file(const std::filesystem::path& motion_file)
 {
     std::lock_guard<std::mutex> lock(pending_motion_mutex_);
     pending_motion_file_ = motion_file;
+    pending_policy_motion_request_.reset();
     spdlog::info("Track: pending motion request set to '{}'", motion_file.string());
+}
+
+void State_Track::request_policy_motion(const std::string& policy_file,
+                                        const std::string& deploy_file,
+                                        const std::filesystem::path& motion_file)
+{
+    std::lock_guard<std::mutex> lock(pending_motion_mutex_);
+    pending_motion_file_.reset();
+    pending_policy_motion_request_ = PendingPolicyMotionRequest{
+        policy_file,
+        deploy_file,
+        motion_file,
+    };
+    spdlog::info("Track: pending policy '{}' deploy '{}' motion '{}'",
+                 policy_file,
+                 deploy_file,
+                 motion_file.string());
 }
 
 bool State_Track::has_pending_motion_request()
 {
     std::lock_guard<std::mutex> lock(pending_motion_mutex_);
-    return pending_motion_file_.has_value();
+    return pending_motion_file_.has_value() || pending_policy_motion_request_.has_value();
 }
 
 std::optional<std::filesystem::path> State_Track::consume_pending_motion_file()
@@ -1426,12 +1539,20 @@ std::optional<std::filesystem::path> State_Track::consume_pending_motion_file()
     return motion_file;
 }
 
+std::optional<State_Track::PendingPolicyMotionRequest> State_Track::consume_pending_policy_motion_request()
+{
+    std::lock_guard<std::mutex> lock(pending_motion_mutex_);
+    auto request = pending_policy_motion_request_;
+    pending_policy_motion_request_.reset();
+    return request;
+}
+
 State_Track::State_Track(int state_mode, std::string state_string)
     : FSMState(state_mode, state_string)
 {
     spdlog::info("Track: constructing state '{}'", state_string);
     auto cfg = param::config["FSM"][state_string];
-    auto policy_dir = param::parser_policy_dir(cfg["policy_dir"].as<std::string>());
+    policy_dir_ = param::parser_policy_dir(cfg["policy_dir"].as<std::string>());
 
     no_global_mode_ = cfg["no_global_mode"].as<bool>(false);
     spdlog::info("Track: no_global_mode = {}", no_global_mode_ ? "true" : "false");
@@ -1521,23 +1642,6 @@ State_Track::State_Track(int state_mode, std::string state_string)
         }
     }
 
-    const std::string policy_file = cfg["policy_file"] ? cfg["policy_file"].as<std::string>() : "policy.onnx";
-    const std::string deploy_file = cfg["deploy_file"] ? cfg["deploy_file"].as<std::string>() : "deploy.yaml";
-    const auto policy_path = policy_dir / "exported" / policy_file;
-    const auto deploy_path = policy_dir / "params" / deploy_file;
-    YAML::Node deploy_cfg = YAML::LoadFile(deploy_path);
-    if (deploy_cfg["joint_ids_map"]) {
-        const auto joint_ids_map = deploy_cfg["joint_ids_map"].as<std::vector<int>>();
-        for (const int joint_id : joint_ids_map) {
-            if (joint_id < 0 || joint_id >= ReferenceLoader::kJointDim) {
-                throw std::runtime_error(
-                    "Track: deploy joint_ids_map contains index "
-                    + std::to_string(joint_id)
-                    + " outside ET1 live/reference joint dimension "
-                    + std::to_string(ReferenceLoader::kJointDim));
-            }
-        }
-    }
     request_file_ = cfg["request_file"]
         ? std::filesystem::path(cfg["request_file"].as<std::string>())
         : std::filesystem::path("debug/general_tracker_request.txt");
@@ -1549,20 +1653,43 @@ State_Track::State_Track(int state_mode, std::string state_string)
     if (!default_motion_file_.is_absolute()) {
         default_motion_file_ = param::proj_dir / default_motion_file_;
     }
-    const float deploy_step_dt = deploy_cfg["step_dt"].as<float>();
-    reference_fps_ = deploy_step_dt > 0.0f ? 1.0f / deploy_step_dt : 50.0f;
-    if (cfg["fps"]) {
-        const float configured_fps = cfg["fps"].as<float>();
-        if (std::abs(configured_fps - reference_fps_) > 1e-3f) {
-            spdlog::warn(
-                "Track: ignoring FSM fps={} because deploy step_dt={} implies fps={}",
-                configured_fps,
-                deploy_step_dt,
-                reference_fps_);
+
+    if (cfg["policy_options"] && cfg["policy_options"].IsMap()) {
+        for (const auto& item : cfg["policy_options"]) {
+            PolicyOption option;
+            option.key = item.first.as<std::string>();
+            option.label = item.second["label"]
+                ? item.second["label"].as<std::string>()
+                : option.key;
+            option.policy_file = item.second["policy_file"].as<std::string>();
+            option.deploy_file = item.second["deploy_file"].as<std::string>();
+            policy_options_.push_back(option);
         }
+        spdlog::info("Track: loaded {} interactive policy options", policy_options_.size());
     }
+    if (cfg["motion_options"] && cfg["motion_options"].IsMap()) {
+        for (const auto& item : cfg["motion_options"]) {
+            MotionOption option;
+            option.key = item.first.as<std::string>();
+            option.label = item.second["label"]
+                ? item.second["label"].as<std::string>()
+                : option.key;
+            option.motion_file = item.second["motion_file"].as<std::string>();
+            if (!option.motion_file.is_absolute()) {
+                option.motion_file = param::proj_dir / option.motion_file;
+            }
+            motion_options_.push_back(option);
+        }
+        spdlog::info("Track: loaded {} interactive motion options", motion_options_.size());
+    }
+
     spdlog::info("Track: resolved default motion file '{}'", default_motion_file_.string());
-    reference_future_horizon_ = infer_future_horizon(deploy_cfg);
+
+    const std::string policy_file = cfg["policy_file"] ? cfg["policy_file"].as<std::string>() : "policy.onnx";
+    const std::string deploy_file = cfg["deploy_file"] ? cfg["deploy_file"].as<std::string>() : "deploy.yaml";
+    configure_tracking_policy(policy_file, deploy_file, true);
+
+    const auto deploy_cfg = env->cfg;
     if (cfg["live_stream"] && cfg["live_stream"]["enabled"].as<bool>(false)) {
         live_stream_enabled_ = true;
         ReferenceLoader::LiveStreamConfig live_config;
@@ -1605,19 +1732,6 @@ State_Track::State_Track(int state_mode, std::string state_string)
     } else {
         spdlog::info("Track: reference pointer initialized");
     }
-
-    spdlog::info("Track: loading deploy config '{}'", deploy_path.string());
-    env = std::make_unique<isaaclab::ManagerBasedRLEnv>(
-        deploy_cfg,
-        std::make_shared<unitree::BaseArticulation<LowState_t::SharedPtr, HighState_t::SharedPtr>>(
-            FSMState::lowstate, FSMState::highstate)
-    );
-    policy_kp_ = env->cfg["policy_kp"].as<std::vector<float>>();
-    policy_kd_ = env->cfg["policy_kd"].as<std::vector<float>>();
-    configure_pd_gain_randomization();
-    spdlog::info("Track: deploy config loaded, constructing ONNX session '{}'", policy_path.string());
-    env->alg = std::make_unique<isaaclab::OrtRunner>(policy_path.string());
-    spdlog::info("Track: ONNX session created successfully");
 
     if (hybrid_locomotion_enabled_) {
         const auto locomotion_policy_dir = param::parser_policy_dir(
@@ -1679,6 +1793,138 @@ long long State_Track::active_motion_duration_ms() const
 {
     const float duration_s = reference_ ? std::max(0.0f, reference_->duration()) : 0.0f;
     return static_cast<long long>(std::round(duration_s * 1000.0f));
+}
+
+bool State_Track::configure_tracking_policy(const std::string& policy_file,
+                                            const std::string& deploy_file,
+                                            bool force_reload,
+                                            const std::optional<std::filesystem::path>& reference_probe_motion)
+{
+    if (!force_reload && policy_file == active_policy_file_ && deploy_file == active_deploy_file_ && env) {
+        return true;
+    }
+
+    const auto policy_path = policy_dir_ / "exported" / policy_file;
+    const auto deploy_path = policy_dir_ / "params" / deploy_file;
+    spdlog::info("Track: loading deploy config '{}'", deploy_path.string());
+    YAML::Node deploy_cfg = YAML::LoadFile(deploy_path);
+    if (deploy_cfg["joint_ids_map"]) {
+        const auto joint_ids_map = deploy_cfg["joint_ids_map"].as<std::vector<int>>();
+        for (const int joint_id : joint_ids_map) {
+            if (joint_id < 0 || joint_id >= ReferenceLoader::kJointDim) {
+                throw std::runtime_error(
+                    "Track: deploy joint_ids_map contains index "
+                    + std::to_string(joint_id)
+                    + " outside ET1 live/reference joint dimension "
+                    + std::to_string(ReferenceLoader::kJointDim));
+            }
+        }
+    }
+
+    const float deploy_step_dt = deploy_cfg["step_dt"].as<float>();
+    reference_fps_ = deploy_step_dt > 0.0f ? 1.0f / deploy_step_dt : 50.0f;
+    const auto cfg = param::config["FSM"][getStateString()];
+    if (cfg["fps"]) {
+        const float configured_fps = cfg["fps"].as<float>();
+        if (std::abs(configured_fps - reference_fps_) > 1e-3f) {
+            spdlog::warn(
+                "Track: ignoring FSM fps={} because deploy step_dt={} implies fps={}",
+                configured_fps,
+                deploy_step_dt,
+                reference_fps_);
+        }
+    }
+    reference_future_horizon_ = infer_future_horizon(deploy_cfg);
+
+    if ((reference_probe_motion || !reference_) && !live_stream_enabled_) {
+        std::filesystem::path motion_file = reference_probe_motion
+            ? *reference_probe_motion
+            : default_motion_file_;
+        if (!motion_file.is_absolute()) {
+            motion_file = param::proj_dir / motion_file;
+        }
+        reference_ = std::make_shared<ReferenceLoader>(
+            motion_file,
+            reference_fps_,
+            reference_future_horizon_);
+        reference = reference_;
+    }
+
+    env = std::make_unique<isaaclab::ManagerBasedRLEnv>(
+        deploy_cfg,
+        std::make_shared<unitree::BaseArticulation<LowState_t::SharedPtr, HighState_t::SharedPtr>>(
+            FSMState::lowstate, FSMState::highstate)
+    );
+    policy_kp_ = env->cfg["policy_kp"].as<std::vector<float>>();
+    policy_kd_ = env->cfg["policy_kd"].as<std::vector<float>>();
+    configure_pd_gain_randomization();
+    spdlog::info("Track: deploy config loaded, constructing ONNX session '{}'", policy_path.string());
+    env->alg = std::make_unique<isaaclab::OrtRunner>(policy_path.string());
+    spdlog::info("Track: ONNX session created successfully");
+
+    active_policy_file_ = policy_file;
+    active_deploy_file_ = deploy_file;
+    return true;
+}
+
+bool State_Track::run_interactive_selection_prompt()
+{
+    if (policy_options_.empty() || motion_options_.empty()) {
+        return false;
+    }
+
+    std::cout << "\nGeneralTrackerCJM policy options:\n";
+    for (const auto& option : policy_options_) {
+        std::cout << "  [" << option.key << "] " << option.label
+                  << " (" << option.policy_file << " + " << option.deploy_file << ")\n";
+    }
+    std::cout << "Select policy: " << std::flush;
+
+    std::string policy_key;
+    if (!(std::cin >> policy_key)) {
+        spdlog::warn("Track: failed to read interactive policy selection");
+        return false;
+    }
+    const auto policy_it = std::find_if(
+        policy_options_.begin(),
+        policy_options_.end(),
+        [&policy_key](const PolicyOption& option) { return option.key == policy_key; });
+    if (policy_it == policy_options_.end()) {
+        spdlog::warn("Track: unknown interactive policy selection '{}'", policy_key);
+        return false;
+    }
+
+    std::cout << "\nGeneralTrackerCJM motion options:\n";
+    for (const auto& option : motion_options_) {
+        std::cout << "  [" << option.key << "] " << option.label
+                  << " (" << option.motion_file.string() << ")\n";
+    }
+    std::cout << "Select motion: " << std::flush;
+
+    std::string motion_key;
+    if (!(std::cin >> motion_key)) {
+        spdlog::warn("Track: failed to read interactive motion selection");
+        return false;
+    }
+    const auto motion_it = std::find_if(
+        motion_options_.begin(),
+        motion_options_.end(),
+        [&motion_key](const MotionOption& option) { return option.key == motion_key; });
+    if (motion_it == motion_options_.end()) {
+        spdlog::warn("Track: unknown interactive motion selection '{}'", motion_key);
+        return false;
+    }
+
+    interactive_selected_motion_file_ = motion_it->motion_file;
+    configure_tracking_policy(
+        policy_it->policy_file,
+        policy_it->deploy_file,
+        false,
+        interactive_selected_motion_file_);
+    spdlog::info("Track: selected policy '{}' and motion '{}'",
+                 policy_it->label,
+                 motion_it->motion_file.string());
+    return true;
 }
 
 bool State_Track::consume_app_start_request()
@@ -1746,8 +1992,26 @@ void State_Track::enter()
     startup_alignment_pending_ = false;
     startup_upper_body_interp_active_ = false;
     tracking_playback_time_ = 0.0f;
+    interactive_selected_motion_file_.reset();
 
     if (consume_app_start_request()) {
+        if (!active_tracking_ && !hybrid_locomotion_enabled_) {
+            playback_complete_ = true;
+            return;
+        }
+    } else if (auto policy_motion_request = consume_pending_policy_motion_request()) {
+        configure_tracking_policy(
+            policy_motion_request->policy_file,
+            policy_motion_request->deploy_file,
+            false,
+            policy_motion_request->motion_file);
+        active_tracking_ = start_requested_motion(policy_motion_request->motion_file);
+        if (!active_tracking_ && !hybrid_locomotion_enabled_) {
+            playback_complete_ = true;
+            return;
+        }
+    } else if (interactive_selected_motion_file_) {
+        active_tracking_ = start_requested_motion(*interactive_selected_motion_file_);
         if (!active_tracking_ && !hybrid_locomotion_enabled_) {
             playback_complete_ = true;
             return;

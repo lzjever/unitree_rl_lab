@@ -18,6 +18,13 @@ layout、状态机切换或运行命令。
 python3 scripts/et1/convert_track_npz.py --input motion.npz --output motion.et1trk
 ```
 
+style-conditioned GeneralTrackerCJM 策略需要额外保留 `z_style_50`，使用专用
+转换脚本：
+
+```bash
+python3 scripts/et1/convert_style_track_npz.py --input motion.npz --output motion.et1trk
+```
+
 转换脚本支持以下 profile：
 
 - `auto`：要求基础 motion 数组；如果源文件中存在 foot-support/reference-COM
@@ -86,6 +93,7 @@ python3 scripts/et1/convert_track_npz.py --input motion.npz --output motion.et1t
 | `right_foot_contact_state` | `(frames,)` | 右脚支撑/接触状态编号 |
 | `ref_com_rel_navi` | `(frames, 3)` | navigation frame 下的参考 COM 相对位置 |
 | `ref_com_vel_navi` | `(frames, 3)` | navigation frame 下的参考 COM 速度 |
+| `z_style_50` 或 `z_style` | `(frames, 16)` | style-conditioned tracker 使用的逐帧 style latent |
 
 `left_foot_contact_state` 和 `right_foot_contact_state` 只能包含 `0`、`1`、
 `2`。运行时会被转换成 6 维 `command_foot_support_state`：
@@ -109,3 +117,7 @@ root 姿态、速度、脚支撑状态和参考 COM 信息。
 如果 cache 中没有 `left_foot_contact_state` 或 `right_foot_contact_state`，
 `command_foot_support_state` 会保持全 0。`ref_com_rel_navi` 和
 `ref_com_vel_navi` 缺失时，对应参考 COM 观测也会保持全 0。
+
+style-conditioned deploy 如果请求 `z_style` 或 `style_phase_z`，cache 必须包含
+`z_style_50` 或 `z_style`，否则运行时会直接报错。不要用全 0 style latent 代替
+真实 style 数据。

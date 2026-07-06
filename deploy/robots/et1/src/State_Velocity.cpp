@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <sstream>
 #include <unordered_map>
 #include <zmq.hpp>
@@ -83,6 +84,21 @@ std::string tracker_target_from_token(const std::string& token)
     const auto it = aliases.find(token);
     return it == aliases.end() ? "" : it->second;
 }
+
+struct TrackerPolicyOption
+{
+    std::string key;
+    std::string label;
+    std::string policy_file;
+    std::string deploy_file;
+};
+
+struct TrackerMotionOption
+{
+    std::string key;
+    std::string label;
+    std::filesystem::path motion_file;
+};
 }
 
 bool State_Velocity::prepare_general_tracker_request()
@@ -161,6 +177,31 @@ State_Velocity::State_Velocity(int state_mode, std::string state_string)
     policy_kp_ = env->cfg["policy_kp"] ? env->cfg["policy_kp"].as<std::vector<float>>() : env->robot->data.joint_stiffness;
     policy_kd_ = env->cfg["policy_kd"] ? env->cfg["policy_kd"].as<std::vector<float>>() : env->robot->data.joint_damping;
 
+    if (FSMStringMap.right.count("GeneralTrackerCJM")) {
+        const int cjm_state = FSMStringMap.right.at("GeneralTrackerCJM");
+        registered_checks.erase(
+            std::remove_if(
+                registered_checks.begin(),
+                registered_checks.end(),
+                [cjm_state](const TransitionCheck& check) {
+                    return check.target_state == cjm_state && check.reason == "keyboard 3";
+                }),
+            registered_checks.end());
+        registered_checks.push_back({
+            [this]() -> bool {
+                if (general_tracker_cjm_prompt_ready_.exchange(false)) {
+                    return true;
+                }
+                if (keyboard && keyboard->on_pressed && keyboard->key() == "3") {
+                    start_general_tracker_cjm_prompt();
+                }
+                return false;
+            },
+            cjm_state,
+            "interactive GeneralTrackerCJM policy/motion selection"
+        });
+    }
+
     if (cfg["live_stream_trigger"] && cfg["live_stream_trigger"]["enabled"].as<bool>(false)) {
         const auto trigger_cfg = cfg["live_stream_trigger"];
         live_stream_trigger_enabled_ = true;
@@ -238,6 +279,106 @@ State_Velocity::State_Velocity(int state_mode, std::string state_string)
         FSMStringMap.right.at("Passive"),
         "bad_orientation"
     });
+}
+
+void State_Velocity::start_general_tracker_cjm_prompt()
+{
+    if (general_tracker_cjm_prompt_running_.exchange(true)) {
+        return;
+    }
+
+    std::thread([this] {
+        auto finish = [this]() {
+            general_tracker_cjm_prompt_running_ = false;
+        };
+
+        try {
+            const auto tracker_cfg = param::config["FSM"]["GeneralTrackerCJM"];
+            std::vector<TrackerPolicyOption> policy_options;
+            std::vector<TrackerMotionOption> motion_options;
+
+            if (tracker_cfg["policy_options"] && tracker_cfg["policy_options"].IsMap()) {
+                for (const auto& item : tracker_cfg["policy_options"]) {
+                    TrackerPolicyOption option;
+                    option.key = item.first.as<std::string>();
+                    option.label = item.second["label"]
+                        ? item.second["label"].as<std::string>()
+                        : option.key;
+                    option.policy_file = item.second["policy_file"].as<std::string>();
+                    option.deploy_file = item.second["deploy_file"].as<std::string>();
+                    policy_options.push_back(option);
+                }
+            }
+            if (tracker_cfg["motion_options"] && tracker_cfg["motion_options"].IsMap()) {
+                for (const auto& item : tracker_cfg["motion_options"]) {
+                    TrackerMotionOption option;
+                    option.key = item.first.as<std::string>();
+                    option.label = item.second["label"]
+                        ? item.second["label"].as<std::string>()
+                        : option.key;
+                    option.motion_file = item.second["motion_file"].as<std::string>();
+                    if (!option.motion_file.is_absolute()) {
+                        option.motion_file = param::proj_dir / option.motion_file;
+                    }
+                    motion_options.push_back(option);
+                }
+            }
+
+            if (policy_options.empty() || motion_options.empty()) {
+                spdlog::warn("Velocity: GeneralTrackerCJM policy_options or motion_options are empty");
+                finish();
+                return;
+            }
+
+            std::cout << "\nGeneralTrackerCJM policy options:\n";
+            for (const auto& option : policy_options) {
+                std::cout << "  [" << option.key << "] " << option.label
+                          << " (" << option.policy_file << " + " << option.deploy_file << ")\n";
+            }
+            const std::string policy_key = keyboard
+                ? trim_copy(keyboard->getString("Select policy: "))
+                : "";
+            const auto policy_it = std::find_if(
+                policy_options.begin(),
+                policy_options.end(),
+                [&policy_key](const TrackerPolicyOption& option) { return option.key == policy_key; });
+            if (policy_it == policy_options.end()) {
+                spdlog::warn("Velocity: unknown GeneralTrackerCJM policy selection '{}'", policy_key);
+                finish();
+                return;
+            }
+
+            std::cout << "\nGeneralTrackerCJM motion options:\n";
+            for (const auto& option : motion_options) {
+                std::cout << "  [" << option.key << "] " << option.label
+                          << " (" << option.motion_file.string() << ")\n";
+            }
+            const std::string motion_key = keyboard
+                ? trim_copy(keyboard->getString("Select motion: "))
+                : "";
+            const auto motion_it = std::find_if(
+                motion_options.begin(),
+                motion_options.end(),
+                [&motion_key](const TrackerMotionOption& option) { return option.key == motion_key; });
+            if (motion_it == motion_options.end()) {
+                spdlog::warn("Velocity: unknown GeneralTrackerCJM motion selection '{}'", motion_key);
+                finish();
+                return;
+            }
+
+            State_Track::request_policy_motion(
+                policy_it->policy_file,
+                policy_it->deploy_file,
+                motion_it->motion_file);
+            general_tracker_cjm_prompt_ready_ = true;
+            spdlog::info("Velocity: GeneralTrackerCJM selection ready policy '{}' motion '{}'",
+                         policy_it->label,
+                         motion_it->motion_file.string());
+        } catch (const std::exception& e) {
+            spdlog::error("Velocity: GeneralTrackerCJM selection prompt failed: {}", e.what());
+        }
+        finish();
+    }).detach();
 }
 
 void State_Velocity::start_live_stream_trigger()

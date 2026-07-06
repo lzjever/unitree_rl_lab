@@ -31,6 +31,8 @@ public:
         static constexpr int kFutureCommandDim = 6 + 3 + kJointDim;
         static constexpr int kFootSupportStateDim = 6;
         static constexpr int kFutureCommandWithFootSupportDim = kFutureCommandDim + kFootSupportStateDim;
+        static constexpr int kStyleZDim = 16;
+        static constexpr int kStylePhaseDim = 32;
         static constexpr uint32_t kCacheVersion = 1;
 
         // A compact runtime cache generated from the original NPZ track.
@@ -83,6 +85,9 @@ public:
         const Eigen::Matrix<float, 6, 1>& command_foot_support_state() const { return foot_support_state_; }
         const Eigen::Vector3f& ref_com_rel_navi() const { return ref_com_rel_navi_; }
         const Eigen::Vector3f& ref_com_vel_navi() const { return ref_com_vel_navi_; }
+        const Eigen::Matrix<float, kStyleZDim, 1>& z_style() const { return z_style_; }
+        const Eigen::Matrix<float, kStylePhaseDim, 1>& style_phase_z() const { return style_phase_z_; }
+        bool has_style_z() const { return !z_style_seq_.empty(); }
         Eigen::VectorXf sample_joint_pos(float time_s) const;
         size_t current_frame_index() const { return current_frame_index_; }
         float current_time_s() const { return current_time_s_; }
@@ -144,6 +149,7 @@ public:
         std::vector<float> body_ang_vel_w_seq_;
         std::vector<float> ref_com_rel_navi_seq_;
         std::vector<float> ref_com_vel_navi_seq_;
+        std::vector<float> z_style_seq_;
         std::vector<int64_t> left_foot_contact_state_seq_;
         std::vector<int64_t> right_foot_contact_state_seq_;
 
@@ -159,6 +165,8 @@ public:
         Eigen::Matrix<float, 6, 1> foot_support_state_ = Eigen::Matrix<float, 6, 1>::Zero();
         Eigen::Vector3f ref_com_rel_navi_ = Eigen::Vector3f::Zero();
         Eigen::Vector3f ref_com_vel_navi_ = Eigen::Vector3f::Zero();
+        Eigen::Matrix<float, kStyleZDim, 1> z_style_ = Eigen::Matrix<float, kStyleZDim, 1>::Zero();
+        Eigen::Matrix<float, kStylePhaseDim, 1> style_phase_z_ = Eigen::Matrix<float, kStylePhaseDim, 1>::Zero();
         size_t frame_count_ = 0;
         size_t current_frame_index_ = 0;
         float current_time_s_ = 0.0f;
@@ -187,10 +195,20 @@ public:
 
     static std::shared_ptr<ReferenceLoader> reference;
     static void request_motion_file(const std::filesystem::path& motion_file);
+    static void request_policy_motion(const std::string& policy_file,
+                                      const std::string& deploy_file,
+                                      const std::filesystem::path& motion_file);
     static bool has_pending_motion_request();
 
 private:
+    struct PendingPolicyMotionRequest
+    {
+        std::string policy_file;
+        std::string deploy_file;
+        std::filesystem::path motion_file;
+    };
     static std::optional<std::filesystem::path> consume_pending_motion_file();
+    static std::optional<PendingPolicyMotionRequest> consume_pending_policy_motion_request();
     void dump_first_frame_debug(const std::unordered_map<std::string, std::vector<float>>& obs,
                                 const std::vector<float>& action,
                                 const std::vector<float>& target_q);
@@ -219,6 +237,11 @@ private:
     void reset_pd_gain_scales();
     bool poll_motion_request_file();
     bool route_profile_request_to(const std::string& target_state);
+    bool run_interactive_selection_prompt();
+    bool configure_tracking_policy(const std::string& policy_file,
+                                   const std::string& deploy_file,
+                                   bool force_reload = false,
+                                   const std::optional<std::filesystem::path>& reference_probe_motion = std::nullopt);
     bool consume_app_start_request();
     bool start_requested_motion(const std::filesystem::path& motion_file);
     void run_tracking_policy();
@@ -239,6 +262,25 @@ private:
     std::unique_ptr<isaaclab::ManagerBasedRLEnv> env;
     std::unique_ptr<isaaclab::ManagerBasedRLEnv> locomotion_env_;
     std::shared_ptr<ReferenceLoader> reference_;
+    struct PolicyOption
+    {
+        std::string key;
+        std::string label;
+        std::string policy_file;
+        std::string deploy_file;
+    };
+    struct MotionOption
+    {
+        std::string key;
+        std::string label;
+        std::filesystem::path motion_file;
+    };
+    std::filesystem::path policy_dir_;
+    std::string active_policy_file_;
+    std::string active_deploy_file_;
+    std::vector<PolicyOption> policy_options_;
+    std::vector<MotionOption> motion_options_;
+    std::optional<std::filesystem::path> interactive_selected_motion_file_;
     std::filesystem::path default_motion_file_;
     std::filesystem::path request_file_;
     float reference_fps_ = 50.0f;
@@ -302,6 +344,7 @@ private:
 
     static std::mutex pending_motion_mutex_;
     static std::optional<std::filesystem::path> pending_motion_file_;
+    static std::optional<PendingPolicyMotionRequest> pending_policy_motion_request_;
 };
 
 REGISTER_FSM(State_Track)
